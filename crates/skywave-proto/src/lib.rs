@@ -147,7 +147,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`limits::MESSAGE_PREVIEW_MAX_BYTES`].
 /// Compressed transport ([`encoding`]): event batches and blob bodies as
 /// zstd frames when asked for, blob ranges counting decoded bytes.
-pub const PROTOCOL_VERSION: u32 = 24;
+///
+/// v25: how full a context is and what a subagent ran. `context_tokens` and
+/// `context_window` on [`TurnUsage`], and `EventKind::SubagentUsage`
+/// ([`SubagentUsage`]): a finished subagent's own figures, by its call.
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -459,6 +463,9 @@ pub enum EventKind {
     /// just before the turn's closing `SessionStateChanged`, at most once a
     /// turn. Not notable.
     TurnUsage(TurnUsage),
+    /// A subagent finished, and its agent reported what it ran: at most once
+    /// a subagent, inside a turn or outside any. Not notable.
+    SubagentUsage(SubagentUsage),
     /// A `SetPermissionMode` command asked the agent for `mode`. Answered
     /// by a `PermissionModeChanged` or `PermissionModeRefused` naming the
     /// command; see [`AgentSettings`].
@@ -785,6 +792,7 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
+            | EventKind::SubagentUsage(_)
             | EventKind::PermissionModeChanged { .. }
             | EventKind::PermissionModeRefused { .. }
             | EventKind::ModelChanged { .. }
@@ -840,6 +848,7 @@ impl EventKind {
             | EventKind::ApprovalCancelled { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
+            | EventKind::SubagentUsage(_)
             | EventKind::PermissionModeChanged { .. }
             | EventKind::PermissionModeRefused { .. }
             | EventKind::ModelChanged { .. }
@@ -879,6 +888,7 @@ impl EventKind {
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
+            | EventKind::SubagentUsage(_)
             | EventKind::PermissionModeRequested { .. }
             | EventKind::PermissionModeChanged { .. }
             | EventKind::PermissionModeRefused { .. }
@@ -958,6 +968,7 @@ impl EventKind {
             | EventKind::SessionArchived { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
+            | EventKind::SubagentUsage(_)
             | EventKind::PermissionModeRequested { .. }
             | EventKind::PermissionModeChanged { .. }
             | EventKind::PermissionModeRefused { .. }
@@ -1609,6 +1620,12 @@ pub struct TurnUsage {
     pub cost_usd: Option<f64>,
     /// The model that ran the turn, as the agent names it.
     pub model: Option<String>,
+    /// How full the context is as the turn ends: the tokens the next request
+    /// will read. Not a sum over the turn. `None` when the agent reported no
+    /// fill (a cleared context's turn, an interrupt while text streamed).
+    pub context_tokens: Option<u64>,
+    /// How many tokens the context of the turn's model holds.
+    pub context_window: Option<u64>,
 }
 
 impl TurnUsage {
@@ -1616,6 +1633,23 @@ impl TurnUsage {
     pub fn is_empty(&self) -> bool {
         *self == TurnUsage::default()
     }
+}
+
+/// What a finished subagent ran, as its agent reported it when it ended.
+/// Agent-agnostic (D3). A figure the agent does not report is `None`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SubagentUsage {
+    /// The call that ran the subagent.
+    pub call: CallId,
+    /// Wall-clock time it ran, in milliseconds.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// The tool calls it made.
+    #[serde(default)]
+    pub tool_uses: Option<u64>,
+    /// How full its own context was when it ended. Not what it spent.
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
 }
 
 /// Agent state as recorded in the log.

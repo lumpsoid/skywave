@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use skywave_core::{
-    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView,
-    ConversationItem, ConversationPicker, ConversationsStatus, ConversationsUnavailable, Decision,
-    Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing, Pause, PendingSession,
-    PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, SessionId,
-    SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState, SubagentStatus, TaskId, TaskKind,
+    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextFill,
+    ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
+    ConversationsUnavailable, Decision, Delivery, DeviceRef, Effort, FailReason, ImportOutcome,
+    Outgoing, Pause, PendingSession, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    RunWhen, Schedule, SessionId, SessionRef, SessionUsage, SessionView, ShellEnd, ShellRun,
+    ShellRunState, SubagentStatus, TaskId, TaskKind,
 };
+
+use crate::text::clean_line;
 
 /// How an own command went out, all by this device's clock. Once answered,
 /// what each step took from the queueing: `queued 14:02:11 · sent +3.2s ·
@@ -196,6 +199,72 @@ pub fn tokens(n: u64) -> String {
     } else {
         format!("{value:.0}{unit}")
     }
+}
+
+/// How full the current context is, for the session footer: `ctx
+/// 19.3k/1M · 2%`, `ctx 19.3k` when the window is not known, `ctx ?` when
+/// the fill is not (D46: after a context starts or is switched to, or a turn
+/// that reported none). Never added to a subagent's figures.
+pub fn context_label(fill: Option<ContextFill>) -> String {
+    let Some(ContextFill {
+        tokens: used,
+        window,
+    }) = fill
+    else {
+        return "ctx ?".to_owned();
+    };
+    match window.filter(|&w| w > 0) {
+        Some(window) => {
+            let percent = (used.saturating_mul(100) + window / 2) / window;
+            let percent = if percent == 0 && used > 0 {
+                "<1%".to_owned()
+            } else {
+                format!("{percent}%")
+            };
+            format!("ctx {}/{} · {percent}", tokens(used), window_size(window))
+        }
+        None => format!("ctx {}", tokens(used)),
+    }
+}
+
+/// A context window, round: "1M", "200k", "1.5M".
+fn window_size(n: u64) -> String {
+    tokens(n).replace(".0", "")
+}
+
+/// What a session's turns took, for its footer, in order: `last turn
+/// 12.4s`, `3.1k in / 812 out`, `$0.04`, the context fill
+/// ([`context_label`]), `session $1.27`, `<model>` (with `model`; a head
+/// that names the model elsewhere leaves it out). Figures the agent did not
+/// report are left out.
+pub fn session_usage_fields(usage: &SessionUsage, model: bool) -> Vec<String> {
+    let turn = &usage.last_turn;
+    let mut fields = Vec::new();
+    if let Some(ms) = turn.duration_ms {
+        fields.push(turn_time(ms));
+    }
+    match (turn.tokens_in, turn.tokens_out) {
+        (Some(read), Some(written)) => {
+            fields.push(format!("{} in / {} out", tokens(read), tokens(written)));
+        }
+        (Some(read), None) => fields.push(format!("{} in", tokens(read))),
+        (None, Some(written)) => fields.push(format!("{} out", tokens(written))),
+        (None, None) => {}
+    }
+    if let Some(cost) = turn.cost_usd {
+        fields.push(dollars(cost));
+    }
+    if let Some(first) = fields.first_mut() {
+        *first = format!("last turn {first}");
+    }
+    fields.push(context_label(usage.context));
+    if let Some(cost) = usage.total.cost_usd {
+        fields.push(format!("session {}", dollars(cost)));
+    }
+    if let Some(name) = usage.total.model.as_ref().filter(|_| model) {
+        fields.push(clean_line(name));
+    }
+    fields
 }
 
 /// A cost in US dollars to 2–3 significant digits: "$0.0014", "$0.04",
@@ -888,13 +957,29 @@ pub fn viewing_hint(view: &SessionView) -> Option<String> {
 
 /// How a subagent stands, for the row of its `Agent` call and the header of
 /// its view: `running · 14 steps · Write src/sync.rs`, then `finished · 14
-/// steps`. What it did last is said only while it runs.
+/// steps`. What it did last is said only while it runs. Once its agent
+/// reported what it ran, what it reported: `finished · 1 step · 4.3s · ctx
+/// 11.9k`, its own count of tool calls for the steps and its context at
+/// its end (D46), never "tokens used".
 pub fn subagent_status(status: &SubagentStatus) -> String {
-    let steps = count(status.steps as usize, "step", "steps");
+    let usage = status.usage.as_ref().filter(|_| !status.live);
+    let steps = usage
+        .and_then(|u| u.tool_uses)
+        .map_or(status.steps as usize, |n| n as usize);
+    let steps = count(steps, "step", "steps");
     match (&status.last, status.live) {
         (Some(last), true) => format!("running · {steps} · {last}"),
         (None, true) => format!("running · {steps}"),
-        (_, false) => format!("finished · {steps}"),
+        (_, false) => {
+            let mut line = format!("finished · {steps}");
+            if let Some(ms) = usage.and_then(|u| u.duration_ms) {
+                line.push_str(&format!(" · {}", turn_time(ms)));
+            }
+            if let Some(context) = usage.and_then(|u| u.context_tokens) {
+                line.push_str(&format!(" · ctx {}", tokens(context)));
+            }
+            line
+        }
     }
 }
 
@@ -1386,7 +1471,99 @@ mod tests {
             live,
             steps,
             last: last.map(str::to_owned),
+            usage: None,
         }
+    }
+
+    #[test]
+    fn a_finished_subagent_says_what_its_agent_reported_it_ran() {
+        let figures = |tool_uses, duration_ms, context_tokens| SubagentStatus {
+            usage: Some(skywave_core::SubagentUsage {
+                call: CallId::new(),
+                duration_ms,
+                tool_uses,
+                context_tokens,
+            }),
+            ..status(false, 3, None)
+        };
+        assert_eq!(
+            subagent_status(&figures(Some(1), Some(4_284), Some(11_850))),
+            "finished · 1 step · 4.3s · ctx 12k"
+        );
+        assert_eq!(
+            subagent_status(&figures(Some(6), Some(61_000), Some(13_097))),
+            "finished · 6 steps · 1m 01s · ctx 13k"
+        );
+        // A figure not reported is left out; the steps are then its own.
+        assert_eq!(
+            subagent_status(&figures(None, None, Some(9_936))),
+            "finished · 3 steps · ctx 9.9k"
+        );
+        // Stopped: none reported.
+        assert_eq!(
+            subagent_status(&status(false, 3, None)),
+            "finished · 3 steps"
+        );
+        // While it runs, none is shown.
+        let running = SubagentStatus {
+            live: true,
+            ..figures(Some(1), Some(4_284), Some(11_850))
+        };
+        assert_eq!(subagent_status(&running), "running · 3 steps");
+    }
+
+    #[test]
+    fn the_context_label_says_the_fill_of_the_window_or_unknown() {
+        let fill = |tokens, window| Some(ContextFill { tokens, window });
+        assert_eq!(
+            context_label(fill(19_337, Some(1_000_000))),
+            "ctx 19k/1M · 2%"
+        );
+        assert_eq!(
+            context_label(fill(150_000, Some(200_000))),
+            "ctx 150k/200k · 75%"
+        );
+        assert_eq!(
+            context_label(fill(3_010, Some(1_000_000))),
+            "ctx 3.0k/1M · <1%"
+        );
+        assert_eq!(context_label(fill(812, None)), "ctx 812");
+        assert_eq!(context_label(fill(812, Some(0))), "ctx 812");
+        assert_eq!(context_label(None), "ctx ?");
+    }
+
+    #[test]
+    fn the_session_usage_fields_put_the_fill_after_the_last_turn() {
+        let turn = skywave_core::TurnUsage {
+            duration_ms: Some(12_400),
+            tokens_in: Some(3_100),
+            tokens_out: Some(812),
+            cost_usd: Some(0.04),
+            model: Some("model-a".into()),
+            context_tokens: Some(19_337),
+            context_window: Some(1_000_000),
+        };
+        let mut usage = SessionUsage::new(&turn);
+        assert_eq!(
+            session_usage_fields(&usage, true),
+            [
+                "last turn 12.4s",
+                "3.1k in / 812 out",
+                "$0.04",
+                "ctx 19k/1M · 2%",
+                "session $0.04",
+                "model-a",
+            ]
+        );
+        // A turn that reported no fill: unknown.
+        usage.add(&skywave_core::TurnUsage {
+            duration_ms: Some(30_000),
+            ..Default::default()
+        });
+        assert_eq!(
+            session_usage_fields(&usage, false),
+            ["last turn 30.0s", "ctx ?", "session $0.04"]
+        );
     }
 
     #[test]

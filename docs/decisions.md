@@ -1193,3 +1193,34 @@ decoded bytes or of the decoded-length header, and adds
 Rust, but compresses text worse and slower than zstd); compressing
 commands and the other JSON replies (small, or rare; the device would
 decode them already, so the server could start any time).
+
+## D46. Context fill and a subagent's figures: two numbers, shown apart, at the end
+Two figures tell a user how much room the agent has. The main thread's
+context fill goes in the session footer of every head (`ctx 19k/1M · 2%`).
+A finished subagent's own figures go in its run view and its `Agent` call's
+row (`finished · 1 step · 4.3s · ctx 12k`).
+- **Separate, never added.** A subagent's context is not the main
+  thread's: its requests never appear in the main turn's figures, and the
+  main thread holds only its report. The two numbers sit in different parts
+  of the UI. The subagent's is labelled as its context at its end, never as
+  tokens used: it is not what the subagent spent.
+- **Updated at turn end only.** The fill rides on `TurnUsage`
+  (`context_tokens`, `context_window`); no extra log events. Within a turn
+  the footer shows the fill as of the last turn's end.
+- **Display only.** No warning threshold and no colour levels: the agent
+  compacts on its own, and a level would be a guess at a limit it may not
+  use.
+- **Unknown, not stale.** The fill shows unknown (`ctx ?`) once a context
+  starts or the session switches to another context, and after a turn that
+  reported no fill (a cleared context's turn, an interrupt while text
+  streamed), until a turn reports one. An automatic compaction needs no rule
+  of its own: its turn already reports the fill after it.
+- **A subagent's figures only when it finished.** A stopped subagent shows
+  none, as its agent reports none. Figures logged as `SubagentUsage` by its
+  call, at most once.
+**Rejected:** the main thread's per-message usage (its output count is a
+mid-stream snapshot); a compaction's own token count as the fill (it leaves
+out the system prompt and tools); asking the agent for its effective limit
+after each turn (an extra round trip on an undocumented request, for the
+rare user who lowered the compaction point; the window shown is the model's
+own).

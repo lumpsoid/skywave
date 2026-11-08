@@ -66,7 +66,7 @@ pub use lock::LockError;
 pub use pairing::{
     PairError, PairUri, Paired, normalize_code, pair, pair_and_report, parse_pair_uri,
 };
-pub use projection::{BlobFate, SessionSummary, SessionUsage, TurnRecord};
+pub use projection::{BlobFate, ContextFill, SessionSummary, SessionUsage, TurnRecord};
 pub use seam::{Request, Seam};
 pub use search::Query;
 pub use skywave_proto::Fingerprint;
@@ -88,9 +88,9 @@ pub use view::{
     RejectReason, RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId,
     Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
     SettingChange, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet,
-    SnippetId, SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval,
-    ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody,
-    WorkdirFetch, WorkdirPane, WorkdirView,
+    SnippetId, SubagentHeader, SubagentStatus, SubagentUsage, TaskId, TaskKind, TimelineItem,
+    ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState,
+    WorkdirBody, WorkdirFetch, WorkdirPane, WorkdirView,
 };
 pub use view::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,

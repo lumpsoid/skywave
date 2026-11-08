@@ -7,8 +7,8 @@ use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
     Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen,
-    SessionId, SessionListView, SessionRow, SessionState, SessionUsage, SessionView, SettingsView,
-    Snippet, StorageView, SubagentHeader, TimelineItem, UsageView, ViewState,
+    SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet,
+    StorageView, SubagentHeader, TimelineItem, UsageView, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -18,7 +18,7 @@ use skywave_present::format::{
     conversations_empty, conversations_status, delivery_label, dollars, effort_label,
     effort_refusal, fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal,
     model_refusal, move_refusal, offered_modes, outgoing_label, repeat_word, scope_label,
-    stop_heading, stop_warning, subagent_status, task_kind_word, tokens, trail, turn_time,
+    session_usage_fields, stop_heading, stop_warning, subagent_status, task_kind_word, trail,
     viewing_hint, work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
@@ -440,7 +440,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
         usage: session
             .usage
             .as_ref()
-            .map(|usage| usage_fields(usage, session.agent.model.is_none()))
+            .map(|usage| session_usage_fields(usage, session.agent.model.is_none()))
             .unwrap_or_default(),
         approval: session
             .pending_approval
@@ -654,38 +654,6 @@ fn mode_view(mode: PermissionMode) -> PermissionModeView {
         PermissionMode::DontAsk => PermissionModeView::DontAsk,
         PermissionMode::Bypass => PermissionModeView::Bypass,
     }
-}
-
-/// `last turn 12.4s`, `3.1k in / 812 out`, `$0.04`, `session $1.27`,
-/// `<model>` (with `model`: the model chip names it once the agent has),
-/// with the figures the agent did not report left out.
-fn usage_fields(usage: &SessionUsage, model: bool) -> Vec<String> {
-    let turn = &usage.last_turn;
-    let mut fields = Vec::new();
-    if let Some(ms) = turn.duration_ms {
-        fields.push(turn_time(ms));
-    }
-    match (turn.tokens_in, turn.tokens_out) {
-        (Some(read), Some(written)) => {
-            fields.push(format!("{} in / {} out", tokens(read), tokens(written)));
-        }
-        (Some(read), None) => fields.push(format!("{} in", tokens(read))),
-        (None, Some(written)) => fields.push(format!("{} out", tokens(written))),
-        (None, None) => {}
-    }
-    if let Some(cost) = turn.cost_usd {
-        fields.push(dollars(cost));
-    }
-    if let Some(first) = fields.first_mut() {
-        *first = format!("last turn {first}");
-    }
-    if let Some(cost) = usage.total.cost_usd {
-        fields.push(format!("session {}", dollars(cost)));
-    }
-    if let Some(name) = usage.total.model.as_ref().filter(|_| model) {
-        fields.push(clean_line(name));
-    }
-    fields
 }
 
 /// The panel over the composer while the agent is blocked: the call it

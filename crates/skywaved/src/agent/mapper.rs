@@ -454,6 +454,19 @@ impl EventMapper {
                     tracing::debug!("dropping turn usage outside a turn or with nothing in it");
                 }
             }
+            // Inside a turn (a foreground subagent) or outside any (a
+            // background one): its call is what says whose figures they are.
+            AdapterEvent::SubagentUsage { call, usage } => {
+                if let Some(logged) = self.linked(Some(&call)) {
+                    let kind = EventKind::SubagentUsage(proto::SubagentUsage {
+                        call: logged.id,
+                        duration_ms: usage.duration_ms,
+                        tool_uses: usage.tool_uses,
+                        context_tokens: usage.context_tokens,
+                    });
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+            }
             AdapterEvent::TurnEnded(outcome) => {
                 self.turn_open = false;
                 let (reason, state) = match outcome {
