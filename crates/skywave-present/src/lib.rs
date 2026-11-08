@@ -16,6 +16,8 @@
 //!   shows beneath its title, and what a copy takes.
 //! - [`format`](mod@format): sizes, durations, token counts, costs, delivery,
 //!   download and failure wording.
+//! - [`limits`]: the usage limits page: a row per limit, when it was
+//!   read, and why there is nothing to list.
 //! - [`link`]: why the link is reconnecting, and the re-pair notice for
 //!   a rejection only pairing again fixes.
 //! - [`markdown`]: an agent message as flat blocks of styled spans, and
@@ -41,6 +43,7 @@ pub mod blob_actions;
 pub mod clip;
 pub mod crop;
 pub mod format;
+pub mod limits;
 pub mod link;
 pub mod markdown;
 pub mod output;

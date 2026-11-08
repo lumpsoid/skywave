@@ -80,6 +80,9 @@ pub struct Setup {
     /// Changes the adapter's `initialize` request before it is written: to
     /// record what the CLI does with a handshake skywaved no longer sends.
     pub initialize: Option<fn(&mut Value)>,
+    /// Write no `initialize`: start returns once the process runs, as for
+    /// the usage limits read, which sends its one request without one.
+    pub no_handshake: bool,
 }
 
 /// A scratch workdir. Dropped, it takes the CLI's project dir for it (the
@@ -195,7 +198,8 @@ pub struct Session {
 }
 
 impl Session {
-    /// Starts `claude` in the setup's workdir and completes the handshake.
+    /// Starts `claude` in the setup's workdir and completes the handshake
+    /// (none with [`Setup::no_handshake`]).
     pub fn start(claude: &str, recorder: Shared, setup: Setup) -> Result<Session, Stop> {
         Session::start_or_refusal(claude, recorder, setup)?
             .map_err(|why| Stop::Stalled(format!("the CLI refused to start: {why}")))
@@ -278,6 +282,9 @@ impl Session {
         };
         let env: String = setup.env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
         session.note(&format!("argv: {env}claude {}", args.join(" ")));
+        if setup.no_handshake {
+            return Ok(Ok(session));
+        }
         let mut start = session.protocol.start();
         if let Some(change) = setup.initialize {
             start.writes.iter_mut().for_each(change);

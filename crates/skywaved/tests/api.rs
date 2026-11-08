@@ -21,11 +21,13 @@ use skywave_proto::{
     BlobId, BlobRef, BlobStorage, BlobUse, ChangesResult, Command, CommandId, CommandKind,
     CommandResult, ContextId, ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry,
     DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse,
-    ImportOutcome, LineSpan, ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER,
-    RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage,
-    StorageReport, ToolResult, path,
+    ImportOutcome, LimitSeverity, LimitWindow, LineSpan, ListResult, PROTOCOL_VERSION, PairRequest,
+    PairResponse, RUN_HEADER, RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin,
+    ShellEnd, ShellRunStorage, StorageReport, ToolResult, UsageLimit, UsageLimitsResult, limits,
+    path,
 };
 use skywaved::agent::fake::Gate;
+use skywaved::agent::{LimitsError, UsageLimitsSource};
 use skywaved::blobs::BlobStore;
 use skywaved::crop::CropHook;
 use skywaved::disk::{Disk, FreeSpace};
@@ -1216,6 +1218,64 @@ async fn conversations_are_unavailable_without_a_source() {
         reply.json::<ConversationsResult>(),
         ConversationsResult::Unavailable
     );
+}
+
+/// Answers each usage limits read with the next of `answers`.
+struct ScriptedLimits(std::sync::Mutex<Vec<Result<Vec<UsageLimit>, LimitsError>>>);
+
+impl UsageLimitsSource for ScriptedLimits {
+    fn read(
+        &self,
+        _deadline: Instant,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<UsageLimit>, LimitsError>> {
+        let answer = self.0.lock().unwrap().remove(0);
+        Box::pin(async move { answer })
+    }
+}
+
+#[tokio::test]
+async fn usage_limits_answer_what_the_agent_reports() {
+    let unavailable = Fixture::start().await;
+    let creds = unavailable.pair().await;
+    let mut device = unavailable.client(&creds).await;
+    let reply = device.get(path::USAGE_LIMITS).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.json::<UsageLimitsResult>(),
+        UsageLimitsResult::Unavailable
+    );
+
+    let limit = |scope: Option<&str>| UsageLimit {
+        window: LimitWindow::Weekly,
+        scope: scope.map(str::to_owned),
+        percent: Some(22),
+        severity: Some(LimitSeverity::Normal),
+        resets_at: None,
+    };
+    let long = format!("{}\nsecond line", "m".repeat(200));
+    let source = ScriptedLimits(std::sync::Mutex::new(vec![
+        Ok(vec![limit(None), limit(Some(&long))]),
+        Err(LimitsError::Failed(format!("{}\nmore", "x".repeat(300)))),
+    ]));
+    let options = ServerOptions {
+        usage_limits: Arc::new(source),
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_configured(|log| log, options).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let before = Utc::now();
+    let UsageLimitsResult::Read { at, limits } = device.get(path::USAGE_LIMITS).await.json() else {
+        panic!("expected the limits");
+    };
+    assert!(at >= before);
+    let cut = format!("{}…", "m".repeat(limits::TITLE_MAX_CHARS - 1));
+    assert_eq!(limits, [limit(None), limit(Some(&cut))]);
+    let UsageLimitsResult::Failed { reason } = device.get(path::USAGE_LIMITS).await.json() else {
+        panic!("expected a failure");
+    };
+    assert_eq!(reason.chars().count(), limits::REFUSAL_MAX_CHARS);
+    assert!(!reason.contains("more"));
 }
 
 #[tokio::test]

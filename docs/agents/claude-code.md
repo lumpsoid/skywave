@@ -1101,6 +1101,50 @@ The call's display titles it with the first question, and its result reads
 replay test `replay_questions_are_asked_and_answered` checks every recorded
 answer byte for byte.
 
+### 3.15 Usage limits: `get_usage` [C]
+
+Probed and recorded with 2.1.310 on 2026-11-08 (`get_usage.ndjson`,
+recorded by `skywave-claude-compat --only get_usage --record`, which checks
+it). The SDK calls it `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()`,
+so the compat check is what tells us when it changes. A process started
+with skywaved's argv answers it **without a handshake and without a turn**,
+in under a second:
+
+```json
+{"type":"control_request","request_id":"skywave_usage",
+ "request":{"subtype":"get_usage","skip_behaviors":true}}
+```
+
+The success `response` holds:
+
+- `rate_limits_available` (bool) and `subscription_type` (`"max"`).
+- `rate_limits.limits[]`, the list the adapter reads. Each entry:
+  `{kind: session | weekly_all | weekly_scoped, group: session | weekly,
+  percent: 0-100, severity: normal | warning, resets_at: RFC 3339,
+  is_active, scope: null | {model: {id, display_name}, surface}}`. Seen:
+  `session` at 75–80% with `severity: "warning"`, `weekly_all` at 22%,
+  and a `weekly_scoped` limit of one model (`display_name: "Fable"`).
+- `rate_limits.five_hour` / `seven_day`: `{utilization, resets_at,
+  *_dollars, locked_reason}`, the same figures again. `utilization` is a
+  percent (0–100), **not** the 0–1 fraction `rate_limit_event` carries.
+- `rate_limits.extra_usage`, `spend`, `seven_day_breakdown`,
+  `weekly_scoped_shares`, `model_scoped`: overage credits and how use
+  splits. Not read. Several codename keys are `null`; never depend on
+  them.
+- `session`: this process's own cost and time (zero). Not read.
+- `behaviors`: advice on how to spend what is left, per day and week;
+  `null` with `skip_behaviors: true`, which the adapter always sends.
+
+How skywaved uses it (`agent/claude_code/limits.rs`): each
+`GET /v1/usage-limits` starts a process like a session's, under a new
+`--session-id`, in the first root, writes the one request, reads until its
+`control_response` and kills the process. No message, so no transcript is
+written (the compat check asserts it): the read never shows up as an
+outside conversation. A `group` or `severity` the adapter does not know is
+left out (the compat check watches for new ones); `rate_limits_available:
+false` reads as no limits. An error answer, or an exit before the answer,
+is `Failed` with the CLI's words.
+
 ## 4. Interrupt
 
 Request **[C]**:

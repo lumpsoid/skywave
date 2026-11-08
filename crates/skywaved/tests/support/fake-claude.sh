@@ -44,6 +44,11 @@
 # A user message carrying a `uuid` is taken up at once, as the real CLI
 # takes one up when idle (§3.11): `command_lifecycle` `queued` and
 # `started` name it before the turn's `system/init`.
+# `get_usage` is answered without a handshake, as the real CLI's (§3.15),
+# with a session limit at 75% and a weekly one of model "Fable" at 0%; a
+# workdir holding ./usage-refused gets a refusal instead, one holding
+# ./usage-silent no answer at all, and one holding ./usage-crash an exit 3
+# with a stderr line.
 
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
@@ -109,6 +114,16 @@ tool_result() {
 
 while IFS= read -r line; do
   case "$line" in
+    *'"subtype":"get_usage"'*)
+      if [ -e usage-refused ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Not logged in"}}\n' "$(reqid "$line")"
+      elif [ -e usage-crash ]; then
+        echo "Invalid API key" >&2
+        exit 3
+      elif [ ! -e usage-silent ]; then
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"session":{"total_cost_usd":0},"subscription_type":"max","rate_limits_available":true,"rate_limits":{"limits":[{"kind":"session","group":"session","percent":75,"severity":"warning","resets_at":"2026-11-08T20:20:00.259325+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":0,"severity":"normal","resets_at":"2026-11-15T00:00:00+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]},"behaviors":null}}}\n' "$(reqid "$line")"
+      fi
+      ;;
     *'"subtype":"initialize"'*)
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"%s","account":{"email":"user@example.com"},"current_permission_mode":"%s","session_state":"idle"}}}\n' "$(reqid "$line")" "$version" "$mode"
       ;;

@@ -4371,6 +4371,62 @@ fn storage_asks_the_server_and_lists_what_takes_the_most() {
 }
 
 #[test]
+fn usage_limits_are_asked_once_kept_and_refreshed_on_r() {
+    let mut h = Harness::paired();
+    assert_eq!(
+        h.key(KeyCode::Char('L')),
+        Some(Action::Navigate(Route::UsageLimits))
+    );
+    let req = match h.drain_requests().as_slice() {
+        [Request::UsageLimits { req }] => *req,
+        other => panic!("expected one usage limits request, got {other:?}"),
+    };
+    assert_contains(&h.screen(), "Asking the agent…");
+    let read = skywave_proto::UsageLimitsResult::Read {
+        at: mockup_now() - TimeDelta::minutes(12),
+        limits: vec![
+            skywave_proto::UsageLimit {
+                window: skywave_proto::LimitWindow::Session,
+                scope: None,
+                percent: Some(75),
+                severity: Some(skywave_proto::LimitSeverity::Warning),
+                resets_at: Some(mockup_now() + TimeDelta::minutes(90)),
+            },
+            skywave_proto::UsageLimit {
+                window: skywave_proto::LimitWindow::Weekly,
+                scope: Some("Fable".into()),
+                percent: None,
+                severity: None,
+                resets_at: None,
+            },
+        ],
+    };
+    h.seam.usage_limits_answered(req, Ok(read)).unwrap();
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "Read 12 min ago");
+    assert_contains(&screen, "Session          75%  resets in 1 h 30 min");
+    assert_contains(&screen, "Weekly · Fable");
+    assert_contains(&screen, "use not reported");
+
+    // Kept: after a restart the page shows them and asks nothing.
+    let mut h = h.restart();
+    h.drain_requests();
+    h.key(KeyCode::Char('L'));
+    assert!(h.drain_requests().is_empty());
+    assert_contains(&h.screen(), "Weekly · Fable");
+
+    assert_eq!(h.key(KeyCode::Char('r')), Some(Action::RefreshUsageLimits));
+    assert!(matches!(
+        h.drain_requests().as_slice(),
+        [Request::UsageLimits { .. }]
+    ));
+    assert_contains(&h.screen(), "Refreshing…");
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert!(matches!(h.app.view().screen, Screen::SessionList(_)));
+}
+
+#[test]
 fn settings_explain_the_blob_policy() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('s'));

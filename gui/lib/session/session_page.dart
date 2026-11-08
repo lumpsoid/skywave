@@ -389,6 +389,14 @@ class _SessionPageState extends State<SessionPage> {
         onTap: () => pickContext(context, screen, widget.send),
       ),
       _MenuItem(
+        icon: Icons.speed,
+        title: 'Usage limits',
+        subtitle: "The agent account's limits",
+        onTap: () => widget.send.act(
+          const ActionIntentNavigate(route: RouteView.usageLimits),
+        ),
+      ),
+      _MenuItem(
         icon: Icons.pending_actions,
         title: 'Background work',
         subtitle: screen.workLabel ?? 'nothing running',

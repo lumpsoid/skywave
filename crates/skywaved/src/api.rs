@@ -48,6 +48,14 @@
 //! [`CONVERSATIONS_TIMEOUT`], past which the reply is a 503. Titles and
 //! first prompts are cut to one line of the wire limits.
 //!
+//! **Usage limits** (`GET /v1/usage-limits`): the account's limits as the
+//! agent reports them now, a 200
+//! [`UsageLimitsResult`](skywave_proto::UsageLimitsResult) (`Unavailable`
+//! for an agent that reports none, `Failed` with the agent's reason). The
+//! source gets [`USAGE_LIMITS_DEADLINE`], past which it answers `Failed`;
+//! [`USAGE_LIMITS_TIMEOUT`] is the outer bound, a 503. A scope is cut to
+//! one line of the wire limit. Nothing is stored.
+//!
 //! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/list` and
 //! `/v1/workdir/file`, D36): reads of a session's workdir, every outcome a
 //! 200 [`ChangesResult`](skywave_proto::ChangesResult),
@@ -117,15 +125,15 @@ use rustls_pki_types::CertificateDer;
 use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
     DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery, HelloResponse, ImportOutcome,
-    LineSpan, PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, WorkdirQuery, check_conversation_id,
-    limits, path,
+    LineSpan, PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, UsageLimit, UsageLimitsResult,
+    WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::agent::import::{self, Prepared};
 use crate::agent::mapper::cut_line;
-use crate::agent::{self, OutsideConversations, SourceError};
+use crate::agent::{self, LimitsError, OutsideConversations, SourceError, UsageLimitsSource};
 use crate::blobs::BlobStore;
 use crate::commands::Preparation;
 use crate::crop::{self, CropHook};
@@ -159,6 +167,12 @@ pub const WORKDIR_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest a storage report may take before the reply gives up with a 503.
 /// Longer than [`storage::REPORT_DEADLINE`], which stops the report itself.
 pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the agent gets to report its usage limits before the answer is
+/// `Failed`.
+pub const USAGE_LIMITS_DEADLINE: Duration = Duration::from_secs(15);
+/// Longest a usage limits read may take before the reply gives up with a
+/// 503; longer than [`USAGE_LIMITS_DEADLINE`], which stops the read itself.
+pub const USAGE_LIMITS_TIMEOUT: Duration = Duration::from_secs(20);
 /// Blocking file-system work (dirs, conversations, workdir reads and
 /// storage reports) that may run at once; see the module docs, "Blocking
 /// file-system work".
@@ -192,6 +206,7 @@ pub(crate) struct Api {
     shutdown: watch::Receiver<bool>,
     /// What an adopting `CreateSession` imports from.
     outside: Arc<dyn OutsideConversations>,
+    usage_limits: Arc<dyn UsageLimitsSource>,
     import_deadline: Duration,
     conversations_timeout: Duration,
     crop_deadline: Duration,
@@ -237,6 +252,7 @@ impl Api {
             server_id,
             shutdown,
             outside: options.outside,
+            usage_limits: options.usage_limits,
             import_deadline: options.import_deadline,
             conversations_timeout: options.conversations_timeout,
             crop_deadline: options.crop_deadline,
@@ -296,6 +312,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::DIRS, get(list_dirs))
         .route(path::CONVERSATIONS, get(list_conversations))
         .route(path::STORAGE, get(storage_report))
+        .route(path::USAGE_LIMITS, get(usage_limits))
         .route(path::WORKDIR_CHANGES, get(workdir_changes))
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
@@ -762,6 +779,38 @@ fn to_wire(conversation: agent::OutsideConversation) -> skywave_proto::OutsideCo
         messages: conversation.messages,
         session: conversation.session,
     }
+}
+
+async fn usage_limits(State(api): State<Arc<Api>>) -> Response {
+    let read = api
+        .usage_limits
+        .read(Instant::now() + USAGE_LIMITS_DEADLINE);
+    let result = match tokio::time::timeout(USAGE_LIMITS_TIMEOUT, read).await {
+        Ok(Ok(limits)) => UsageLimitsResult::Read {
+            at: Utc::now(),
+            limits: limits
+                .into_iter()
+                .map(|limit| UsageLimit {
+                    scope: limit
+                        .scope
+                        .map(|scope| cut_line(&scope, limits::TITLE_MAX_CHARS).0),
+                    ..limit
+                })
+                .collect(),
+        },
+        Ok(Err(LimitsError::Unavailable)) => UsageLimitsResult::Unavailable,
+        Ok(Err(LimitsError::Failed(reason))) => {
+            tracing::warn!(%reason, "usage limits read failed");
+            UsageLimitsResult::Failed {
+                reason: cut_line(&reason, limits::REFUSAL_MAX_CHARS).0,
+            }
+        }
+        Err(_) => {
+            tracing::warn!("usage limits read timed out");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    Json(result).into_response()
 }
 
 /// The storage report (module `storage`) on a blocking thread: a 200, a

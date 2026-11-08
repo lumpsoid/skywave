@@ -3,7 +3,8 @@
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
 //! the pull cursor, blob rows, settings, the server's device names (from
-//! `hello`), the latest answer to each workdir read, and this device's
+//! `hello`), the latest answer to each workdir read and to the usage limits
+//! read, and this device's
 //! drafts, read
 //! marks, locally deleted sessions and alerted approvals (D5: never
 //! synced). Startup always reads everything back from here
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
     ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, MIGRATED_SINCE,
-    ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
+    ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId, UsageLimitsResult,
 };
 use uuid::Uuid;
 
@@ -379,6 +380,16 @@ BEGIN
     DELETE FROM blob_failures WHERE blob_id = old.id;
 END;
 "#,
+    r#"
+-- The latest answer to the usage limits read (`Store::put_usage_limits`,
+-- protocol v27): one row, the `UsageLimitsResult` as JSON. Cleared with
+-- the replica. A replica from before this never asked: nothing to
+-- backfill. `IF NOT EXISTS` as above.
+CREATE TABLE IF NOT EXISTS usage_limits (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    result TEXT NOT NULL CHECK (json_valid(result))
+);
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -398,7 +409,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
-    [v23_to_v24, v24_to_v25, v25_to_v26];
+    [v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
 /// what is stored, and how each is moved:
@@ -436,6 +447,14 @@ fn v24_to_v25(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// - `CommandKind::AnswerQuestion` and `RejectReason::BadAnswer`: new, so
 ///   no v25 outbox entry holds either.
 fn v25_to_v26(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v26 to v27, as the server's step of the same name. v27 added the usage
+/// limits read, whose answer lives in `usage_limits`, a table the schema
+/// migration before this step made empty: no v26 row holds one, and
+/// nothing else stored changes.
+fn v26_to_v27(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -835,6 +854,9 @@ pub struct Snapshot {
     /// The latest stored answer to each workdir read
     /// ([`Store::put_workdir`]).
     pub workdirs: HashMap<WorkdirAsk, WorkdirAnswer>,
+    /// The latest stored answer to the usage limits read
+    /// ([`Store::put_usage_limits`]); `None` until one is.
+    pub usage_limits: Option<UsageLimitsResult>,
 }
 
 /// Handle to the replica database.
@@ -922,6 +944,7 @@ impl Store {
             snippets: self.snippets()?,
             turns: self.turns()?,
             workdirs: self.workdirs()?,
+            usage_limits: self.usage_limits()?,
         })
     }
 
@@ -1739,6 +1762,30 @@ impl Store {
         Ok(Some(stored))
     }
 
+    /// Keeps `result` as the latest answer to the usage limits read,
+    /// replacing the one before. Stores whatever it is given; which
+    /// answers are worth keeping (not a `Failed`) is the caller's rule.
+    pub fn put_usage_limits(&mut self, result: &UsageLimitsResult) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO usage_limits (id, result) VALUES (0, ?1)
+             ON CONFLICT (id) DO UPDATE SET result = excluded.result",
+            [to_json(result)?],
+        )?;
+        Ok(())
+    }
+
+    /// The latest stored answer to the usage limits read; `None` until one
+    /// is stored.
+    pub fn usage_limits(&self) -> Result<Option<UsageLimitsResult>, StoreError> {
+        let json: Option<String> = self
+            .conn
+            .query_row("SELECT result FROM usage_limits WHERE id = 0", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(json.as_deref().map(serde_json::from_str).transpose()?)
+    }
+
     /// The latest stored answer to each workdir read.
     pub fn workdirs(&self) -> Result<HashMap<WorkdirAsk, WorkdirAnswer>, StoreError> {
         let mut stmt = self
@@ -2133,7 +2180,8 @@ fn stamped_protocol(conn: &Connection) -> Result<Option<u32>, StoreError> {
 
 /// Deletes what the server's log produced: the events and what is folded
 /// from them, the cursor, the outbox, blob rows, stored workdir answers,
-/// offered models and the server's device names. What is this device's
+/// the stored usage limits, offered models and the server's device names.
+/// What is this device's
 /// alone is the caller's to keep or drop.
 fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(
@@ -2148,6 +2196,7 @@ fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
          DELETE FROM offered_models;
          DELETE FROM workdir_snapshots;
          DELETE FROM workdir_blob_refs;
+         DELETE FROM usage_limits;
          DELETE FROM server_log;",
     )?;
     Ok(())

@@ -22,6 +22,7 @@ use crate::address::ServerAddress;
 use crate::completion::Completer;
 use crate::conversations::Conversations;
 use crate::identity::Identity;
+use crate::limits::UsageLimits;
 use crate::projection::{
     BlobFate, FIRST_PROMPT_MAX_CHARS, SessionSummary, TurnRecord, blob_refs, first_line, is_notable,
 };
@@ -45,8 +46,9 @@ use crate::view::{
     SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow,
     SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
     ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
-    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView,
-    ViewState, WorkdirBody, WorkdirPane, WorkdirView,
+    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
+    WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -100,6 +102,9 @@ enum Place {
     Pairing,
     Usage,
     Storage,
+    /// The usage limits page, opened from the session on screen, if any:
+    /// back returns there.
+    UsageLimits(Option<SessionId>),
     Session(SessionId),
     /// The session's workdir, on [`Model::workdir_pane`].
     Workdir(SessionId),
@@ -147,6 +152,7 @@ impl From<Route> for Place {
             Route::Pairing => Place::Pairing,
             Route::Usage => Place::Usage,
             Route::Storage => Place::Storage,
+            Route::UsageLimits => Place::UsageLimits(None),
         }
     }
 }
@@ -248,6 +254,9 @@ pub(crate) struct Model {
     conversations: Conversations,
     /// The storage screen's report; in memory only.
     storage: Storage,
+    /// The usage limits page: the stored answer, and the read in flight
+    /// or failed (in memory only).
+    usage_limits: UsageLimits,
     /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
     /// new session is not in the replica yet: its command, and the session
     /// it was asked from, still on screen. In memory only.
@@ -315,6 +324,7 @@ impl Model {
             completer: Completer::default(),
             conversations: Conversations::default(),
             storage: Storage::default(),
+            usage_limits: UsageLimits::default(),
             opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
@@ -350,6 +360,7 @@ impl Model {
         self.models = snapshot.models;
         self.turns = snapshot.turns;
         self.workdirs.stored = snapshot.workdirs;
+        self.usage_limits.stored = snapshot.usage_limits;
         self.open = None;
         // Never forget what is still pending: an approval that came in
         // during a catch-up must still alert once it is over, and one
@@ -484,6 +495,17 @@ impl Model {
                 }
                 let online = self.online();
                 self.storage
+                    .refresh(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::RefreshUsageLimits => {
+                if self.device().is_none() || !matches!(self.place, Place::UsageLimits(_)) {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.usage_limits
                     .refresh(online)
                     .map(Effect::Request)
                     .into_iter()
@@ -863,21 +885,26 @@ impl Model {
                 _ => Vec::new(),
             },
             Action::Navigate(route) => {
-                self.place = route.into();
+                let from = self.open_session();
+                self.place = match route {
+                    Route::UsageLimits => Place::UsageLimits(from),
+                    route => route.into(),
+                };
                 self.open = None;
                 self.viewing = None;
                 self.subagent = None;
                 self.completer.end();
                 self.conversations.end();
-                if self.place != Place::Storage || self.device().is_none() {
+                if self.device().is_none() {
                     return Vec::new();
                 }
                 let online = self.online();
-                self.storage
-                    .open(online)
-                    .map(Effect::Request)
-                    .into_iter()
-                    .collect()
+                let asked = match self.place {
+                    Place::Storage => self.storage.open(online),
+                    Place::UsageLimits(_) => self.usage_limits.open(online),
+                    _ => None,
+                };
+                asked.map(Effect::Request).into_iter().collect()
             }
             Action::Back => {
                 // A subagent shown steps out to the one it runs under, then
@@ -925,6 +952,12 @@ impl Model {
             Place::SessionList => return None,
             Place::Archived | Place::Settings | Place::Pairing | Place::Usage | Place::Storage => {
                 Route::SessionList
+            }
+            Place::UsageLimits(from) => {
+                return Some(match from.filter(|id| self.summary(*id).is_some()) {
+                    Some(id) => Action::OpenSession(id),
+                    None => Action::Navigate(Route::SessionList),
+                });
             }
             Place::Session(id) => {
                 if self.archived(self.summary(id)?) {
@@ -1700,6 +1733,22 @@ impl Model {
         self.conversations.listed(req, result);
     }
 
+    /// Whether `req` is the usage limits read the page waits on
+    /// ([`Seam::usage_limits_answered`](crate::Seam::usage_limits_answered)).
+    pub(crate) fn usage_limits_awaited(&self, req: u64) -> bool {
+        self.usage_limits.awaited(req)
+    }
+
+    /// The awaited usage limits read got no answer to keep.
+    pub(crate) fn usage_limits_failed(&mut self, why: UsageLimitsUnavailable) {
+        self.usage_limits.failed(why);
+    }
+
+    /// The awaited usage limits read's answer, stored.
+    pub(crate) fn usage_limits_stored(&mut self, answer: UsageLimitsResult) {
+        self.usage_limits.answered(answer);
+    }
+
     pub(crate) fn storage_reported(
         &mut self,
         req: u64,
@@ -1925,6 +1974,7 @@ impl Model {
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
             Place::Usage => Screen::Usage(self.usage_view()),
             Place::Storage => Screen::Storage(self.storage_view()),
+            Place::UsageLimits(_) => Screen::UsageLimits(self.usage_limits.view()),
             Place::Session(id) => match self.session_view(id) {
                 Some(view) => Screen::Session(Box::new(view)),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
@@ -4117,6 +4167,7 @@ mod tests {
             snippets: Vec::new(),
             turns: Vec::new(),
             workdirs: HashMap::new(),
+            usage_limits: None,
         }
     }
 
@@ -8264,6 +8315,7 @@ mod tests {
             snippets: model.snippets.list().to_vec(),
             turns: model.turns.clone(),
             workdirs: model.workdirs.stored.clone(),
+            usage_limits: model.usage_limits.stored.clone(),
         }
     }
 
@@ -8954,6 +9006,109 @@ mod tests {
         assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
     }
 
+    fn usage_limits_view(f: &Fixture) -> crate::view::UsageLimitsView {
+        match f.model.view().screen {
+            Screen::UsageLimits(view) => view,
+            other => panic!("expected the usage limits page, got {other:?}"),
+        }
+    }
+
+    fn usage_limits_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::UsageLimits { req })] => Some(*req),
+            other => panic!("expected a usage limits request, got {other:?}"),
+        }
+    }
+
+    fn limits_read(percent: u32) -> UsageLimitsResult {
+        UsageLimitsResult::Read {
+            at: Utc::now(),
+            limits: vec![skywave_proto::UsageLimit {
+                window: skywave_proto::LimitWindow::Weekly,
+                scope: None,
+                percent: Some(percent),
+                severity: None,
+                resets_at: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_usage_limits_page_asks_while_nothing_is_stored_and_on_refresh() {
+        use crate::view::{UsageLimitsStatus, UsageLimitsUnavailable};
+
+        let mut f = Fixture::paired();
+        assert_eq!(
+            usage_limits_req(&f.dispatch(Action::RefreshUsageLimits)),
+            None,
+            "not on the page"
+        );
+        let first = usage_limits_req(&f.dispatch(Action::Navigate(Route::UsageLimits))).unwrap();
+        assert_eq!(usage_limits_view(&f).status, UsageLimitsStatus::Loading);
+        assert!(f.model.usage_limits_awaited(first));
+        f.model.usage_limits_stored(limits_read(40));
+        let view = usage_limits_view(&f);
+        assert_eq!(view.status, UsageLimitsStatus::Idle);
+        let stored = view.answer.unwrap();
+
+        // Stored: reopening shows it and asks nothing.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert_eq!(
+            usage_limits_req(&f.dispatch(Action::Navigate(Route::UsageLimits))),
+            None
+        );
+        assert_eq!(usage_limits_view(&f).answer, Some(stored.clone()));
+
+        // A refresh asks; a failure keeps the stored answer.
+        let second = usage_limits_req(&f.dispatch(Action::RefreshUsageLimits)).unwrap();
+        assert_ne!(second, first);
+        assert!(!f.model.usage_limits_awaited(first));
+        f.model
+            .usage_limits_failed(UsageLimitsUnavailable::Failed("not logged in".into()));
+        let view = usage_limits_view(&f);
+        assert_eq!(
+            view.status,
+            UsageLimitsStatus::Unavailable(UsageLimitsUnavailable::Failed("not logged in".into()))
+        );
+        assert_eq!(view.answer, Some(stored.clone()));
+
+        // Offline nothing is asked, and the stored answer still shows.
+        f.model.set_link(Link::Reconnecting {
+            attempt: 1,
+            retry_at: Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
+        });
+        assert_eq!(
+            usage_limits_req(&f.dispatch(Action::RefreshUsageLimits)),
+            None
+        );
+        let view = usage_limits_view(&f);
+        assert_eq!(
+            view.status,
+            UsageLimitsStatus::Unavailable(UsageLimitsUnavailable::Offline)
+        );
+        assert_eq!(view.answer, Some(stored));
+    }
+
+    #[test]
+    fn back_from_the_usage_limits_page_returns_where_it_was_opened() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.model.usage_limits.stored = Some(limits_read(10));
+        f.open(sid);
+        f.dispatch(Action::Navigate(Route::UsageLimits));
+        assert!(f.model.view().can_go_back);
+        f.dispatch(Action::Back);
+        assert_eq!(f.model.place, Place::Session(sid));
+
+        f.dispatch(Action::Navigate(Route::SessionList));
+        f.dispatch(Action::Navigate(Route::UsageLimits));
+        f.dispatch(Action::Back);
+        assert_eq!(f.model.place, Place::SessionList);
+    }
+
     fn crop(blob: BlobId) -> Action {
         Action::CropBlob {
             blob,
@@ -9343,6 +9498,7 @@ mod tests {
             Screen::Settings(_) => "settings",
             Screen::Usage(_) => "usage",
             Screen::Storage(_) => "storage",
+            Screen::UsageLimits(_) => "usage limits",
             Screen::Workdir(_) => "workdir",
             Screen::Crop(_) => "crop",
             Screen::Session(v) if v.archived => "archived session",
