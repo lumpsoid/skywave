@@ -2461,8 +2461,12 @@ void main() {
       await tester.tap(find.byTooltip('Agent settings'));
       await tester.pumpAndSettle();
       expect(find.text("accept edits → don't ask"), findsOneWidget);
+      final sheet = find.byType(BottomSheet);
       expect(
-        find.text('claude-sonnet-5-5-20261001 → claude-opus-5-5'),
+        find.descendant(
+          of: sheet,
+          matching: find.text('claude-sonnet-5-5-20261001 → claude-opus-5-5'),
+        ),
         findsOneWidget,
       );
       await tester.tap(find.text('Permission mode'));
@@ -2497,11 +2501,22 @@ void main() {
         ),
         findsOneWidget,
       );
+      // The folded chip shows only the model; the sheet lists the rest.
+      expect(find.text('unknown → claude-opus-5-5'), findsOneWidget);
+      expect(find.text('mode unknown'), findsNothing);
       await tester.tap(find.byTooltip('Agent settings'));
       await tester.pumpAndSettle();
-      expect(find.text('mode unknown'), findsOneWidget);
-      expect(find.text('unknown → claude-opus-5-5'), findsOneWidget);
-      expect(find.text('effort unknown'), findsOneWidget);
+      final sheet = find.byType(BottomSheet);
+      for (final label in [
+        'mode unknown',
+        'unknown → claude-opus-5-5',
+        'effort unknown',
+      ]) {
+        expect(
+          find.descendant(of: sheet, matching: find.text(label)),
+          findsOneWidget,
+        );
+      }
     });
 
     testWidgets('the agent state shows once, its full label as a tooltip', (

@@ -8,7 +8,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// The session's status under its header: the agent's state (the one
 /// place it shows; its full label is the tooltip), a stop on its way, the agent's mode and model (a tap switches them; a refusal
-/// turns them red), the rules granted here (a tap lists them), and the
+/// turns them red; on a phone one chip shows the model and a tap lists
+/// them all), the rules granted here (a tap lists them), and the
 /// usage summary at the end, its fields dropped from the front when the
 /// line is short of room.
 class StatusLine extends StatelessWidget {
@@ -170,21 +171,24 @@ class StatusLine extends StatelessWidget {
             ),
         ];
         // Each chip's share of the line, less its gap (8) and chrome; a
-        // line too narrow for every label in full folds the chips into
-        // one that lists them.
+        // phone, or a line too narrow for every label in full, folds the
+        // chips into one that shows the model and lists them all.
         // The state takes what it needs, up to a third of the line.
         final leftWidth = width(TextSpan(children: left));
         final stateRoom = 0.3 * constraints.maxWidth;
         final line = constraints.maxWidth - 32 - min(leftWidth, stateRoom);
         var labelRoom = line / chips.length - 8 - _Chip.chrome;
-        if (chips.any(
-          (chip) => width(TextSpan(text: chip.label, style: style)) > labelRoom,
-        )) {
+        if (isCompact(context) ||
+            chips.any(
+              (chip) =>
+                  width(TextSpan(text: chip.label, style: style)) > labelRoom,
+            )) {
           final all = chips;
           chips = [
             _Chip(
               icon: Icons.tune,
-              label: all.map((chip) => chip.label).join(' · '),
+              label: settings.modelLabel,
+              spoken: all.map((chip) => chip.label).join(' · '),
               refusal:
                   settings.modeRefusal ??
                   settings.modelRefusal ??
@@ -251,6 +255,7 @@ class _Chip extends StatelessWidget {
     required this.tooltip,
     required this.onTap,
     this.refusal,
+    this.spoken,
   });
 
   /// Its padding (6 a side), icon (14) and gap (4) around the label.
@@ -258,6 +263,9 @@ class _Chip extends StatelessWidget {
 
   final IconData icon;
   final String label;
+
+  /// What a screen reader hears for its value, when [label] shows less.
+  final String? spoken;
   final String tooltip;
   final VoidCallback onTap;
 
@@ -281,7 +289,7 @@ class _Chip extends StatelessWidget {
         child: Semantics(
           button: true,
           label: [
-            '$tooltip: $label',
+            '$tooltip: ${spoken ?? label}',
             if (refusal case final refusal?) 'refused: $refusal',
           ].join(', '),
           excludeSemantics: true,
