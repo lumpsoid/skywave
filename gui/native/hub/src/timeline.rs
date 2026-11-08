@@ -17,8 +17,8 @@ use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
     bytes, context_moved_line, context_started_line, context_switched_line, decision_label,
-    delivery_label, dollars, fail_reason, import_finished_line, moved_from_line, outgoing_label,
-    percent, seconds, subagent_status, took_label, turn_time,
+    delivery_label, dollars, download_state, fail_reason, import_finished_line, moved_from_line,
+    outgoing_label, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, change_note, delivery, sections, selectable, starts_turn,
@@ -780,41 +780,18 @@ fn more_note(section: &Section, preview: usize, shown: usize) -> Option<String> 
     ))
 }
 
-/// A section's blob with where its download stands, worded as the TUI
-/// words an expanded section's: `not downloaded · 4.0 KiB`, `downloading
-/// · 1.0 KiB of 4.0 KiB (25%)`.
+/// A section's blob with where its download stands ([`download_state`]):
+/// `not downloaded · 4.0 KiB`, `downloading · 1.0 KiB of 4.0 KiB (25%)`.
 pub fn blob_facts(blob: &BlobView) -> BlobFacts {
-    let (state, label) = match &blob.state {
-        BlobState::NotDownloaded { size } => (
-            BlobStateKind::NotDownloaded,
-            format!("not downloaded · {}", bytes(*size)),
-        ),
-        BlobState::Requested { size } => (
-            BlobStateKind::Requested,
-            format!("requested · waiting for a slot · {}", bytes(*size)),
-        ),
-        BlobState::Downloading { got, size, paused } => {
-            let progress = format!(
-                "downloading · {} of {} ({}%)",
-                bytes(*got),
-                bytes(*size),
-                percent(*got, *size)
-            );
-            if *paused {
-                (
-                    BlobStateKind::Paused,
-                    format!("{progress} · paused, offline"),
-                )
-            } else {
-                (BlobStateKind::Downloading, progress)
-            }
-        }
-        BlobState::Failed { size, reason } => (
-            BlobStateKind::Failed,
-            format!("download failed: {} · {}", clean_line(reason), bytes(*size)),
-        ),
-        BlobState::Available { .. } => (BlobStateKind::Available, "downloaded".to_owned()),
+    let state = match &blob.state {
+        BlobState::NotDownloaded { .. } => BlobStateKind::NotDownloaded,
+        BlobState::Requested { .. } => BlobStateKind::Requested,
+        BlobState::Downloading { paused: true, .. } => BlobStateKind::Paused,
+        BlobState::Downloading { paused: false, .. } => BlobStateKind::Downloading,
+        BlobState::Failed { .. } => BlobStateKind::Failed,
+        BlobState::Available { .. } => BlobStateKind::Available,
     };
+    let label = download_state(&blob.state);
     // What the server did to it is said beside where it stands.
     let label = match change_note(blob) {
         Some(note) => format!("{label} · {note}"),

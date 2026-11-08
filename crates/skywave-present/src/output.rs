@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use skywave_core::{BlobView, FullView, ShellRun, ShellRunState};
+use skywave_core::{Action, BlobState, BlobView, FullView, ShellRun, ShellRunState};
 use skywave_proto::strip_ansi;
 
 use crate::sections::{deleted_note, whole_lines};
@@ -78,6 +78,18 @@ pub fn output_text(bytes: &[u8], cut: bool) -> String {
     }
 }
 
+/// The download `run`'s output blob needs before it can be shown or copied
+/// whole: none while it is here or on its way, or for a run without one.
+/// A failed download is asked for again.
+pub fn output_download(run: &ShellRun) -> Option<Action> {
+    let blob = run.output.as_ref()?.blob()?;
+    matches!(
+        blob.state,
+        BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
+    )
+    .then_some(Action::DownloadBlob(blob.id))
+}
+
 /// The line count of `run`'s whole output so far: what a crop kept once
 /// the server cropped it, else the run's own count ([`whole_lines`]).
 pub fn output_lines(run: &ShellRun) -> u32 {
@@ -92,7 +104,7 @@ pub fn lines_before(run: &ShellRun, text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use skywave_core::{BlobId, BlobState, CommandId, DeviceId, DeviceRef, RunWhen, ShellEnd};
+    use skywave_core::{BlobId, CommandId, DeviceId, DeviceRef, RunWhen, ShellEnd};
 
     use super::*;
 
@@ -185,6 +197,51 @@ mod tests {
         assert_eq!(output_text(raw, false), "ial line\nred\n\u{fffd}ok\n");
         // A cut tail of one line keeps it: nothing else would show.
         assert_eq!(output_text(b"no newline", true), "no newline");
+    }
+
+    #[test]
+    fn an_output_is_downloaded_unless_here_or_on_its_way() {
+        let id = BlobId::new();
+        let with = |state: BlobState| {
+            let mut done = run(DONE, "y\nz", 40);
+            done.output = Some(FullView::Blob(BlobView {
+                id,
+                state,
+                change: None,
+                pending: None,
+            }));
+            output_download(&done)
+        };
+        let fetch = Some(Action::DownloadBlob(id));
+        assert_eq!(with(BlobState::NotDownloaded { size: 9 }), fetch);
+        // A failed download is retried.
+        assert_eq!(
+            with(BlobState::Failed {
+                size: 9,
+                reason: "gone".into()
+            }),
+            fetch
+        );
+        assert_eq!(with(BlobState::Requested { size: 9 }), None);
+        assert_eq!(
+            with(BlobState::Downloading {
+                got: 1,
+                size: 9,
+                paused: false
+            }),
+            None
+        );
+        assert_eq!(
+            with(BlobState::Available {
+                path: "/blobs/x".into()
+            }),
+            None
+        );
+        // No blob, or none kept: nothing to download.
+        assert_eq!(output_download(&run(DONE, "y\nz", 2)), None);
+        let mut lost = run(DONE, "y\nz", 40);
+        lost.output = Some(FullView::Lost);
+        assert_eq!(output_download(&lost), None);
     }
 
     #[test]

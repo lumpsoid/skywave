@@ -95,6 +95,55 @@ pub fn blob_size(state: &BlobState) -> Option<u64> {
     }
 }
 
+/// Where a blob's download stands, in full: what a head shows in place of
+/// content that is not here (an expanded section, the crop page, a workdir
+/// file): `not downloaded · 4.0 KiB`, `requested · waiting for a slot ·
+/// 4.0 KiB`, `downloading · 1.0 KiB of 4.0 KiB (25%)`, with ` · paused,
+/// offline` while the link is down, `download failed: {reason} · 4.0 KiB`,
+/// `downloaded`. A head adds its own hint (how to download, to retry).
+pub fn download_state(state: &BlobState) -> String {
+    match state {
+        BlobState::NotDownloaded { size } => format!("not downloaded · {}", bytes(*size)),
+        BlobState::Requested { size } => {
+            format!("requested · waiting for a slot · {}", bytes(*size))
+        }
+        BlobState::Downloading { got, size, paused } => format!(
+            "downloading · {} of {} ({}%){}",
+            bytes(*got),
+            bytes(*size),
+            percent(*got, *size),
+            paused_word(*paused)
+        ),
+        BlobState::Failed { size, reason } => format!(
+            "download failed: {} · {}",
+            crate::text::clean_line(reason),
+            bytes(*size)
+        ),
+        BlobState::Available { .. } => "downloaded".to_owned(),
+    }
+}
+
+/// Where a blob's download stands once it started, briefly, for a note
+/// that names its size beside it: `requested`, `downloading 25%`,
+/// `downloading 25% · paused, offline`, `download failed`. `None` before
+/// it started and once the blob is here.
+pub fn download_brief(state: &BlobState) -> Option<String> {
+    match state {
+        BlobState::Requested { .. } => Some("requested".to_owned()),
+        BlobState::Downloading { got, size, paused } => Some(format!(
+            "downloading {}%{}",
+            percent(*got, *size),
+            paused_word(*paused)
+        )),
+        BlobState::Failed { .. } => Some("download failed".to_owned()),
+        BlobState::NotDownloaded { .. } | BlobState::Available { .. } => None,
+    }
+}
+
+fn paused_word(paused: bool) -> &'static str {
+    if paused { " · paused, offline" } else { "" }
+}
+
 /// `got` of `size` as a whole percentage, at most 100; an empty size is
 /// done.
 pub fn percent(got: u64, size: u64) -> u64 {
