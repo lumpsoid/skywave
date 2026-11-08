@@ -450,6 +450,25 @@ void main() {
       semantics.dispose();
     });
 
+    testWidgets('a first prompt longer than two lines ends in an ellipsis', (
+      tester,
+    ) async {
+      // Rust sends the first prompt whole; the row fits it to its room.
+      final long = 'word ' * 40;
+      await phone(tester, list(rows: [sessionRow('a', title: long)]));
+      expect(tester.takeException(), isNull);
+      final title = find.textContaining(long);
+      expect(tester.widget<Text>(title).overflow, TextOverflow.ellipsis);
+      expect(
+        tester
+            .renderObject<RenderParagraph>(
+              find.descendant(of: title, matching: find.byType(RichText)),
+            )
+            .didExceedMaxLines,
+        isTrue,
+      );
+    });
+
     testWidgets('the menu is a sheet with the full name and path; a tap '
         'closes it and runs the action', (tester) async {
       await phone(tester, list(rows: [sessionRow('a')]));
