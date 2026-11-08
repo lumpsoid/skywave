@@ -728,12 +728,14 @@ impl ShellRunner {
         }
     }
 
+    /// Makes the output file at `path` the run's blob by renaming it into
+    /// the store, not copying it: on a nearly full disk a copy of up to
+    /// `output_max` bytes could fail where the rename cannot.
     fn put_output(&self, path: &Path) -> Result<skywave_proto::BlobRef> {
-        let file = std::fs::File::open(path).map_err(|source| Error::Io {
-            context: format!("opening {}", path.display()),
-            source,
-        })?;
-        self.storage.put_blob(file)
+        let blobs = &self.storage.blobs;
+        let meta = blobs.adopt(path)?;
+        blobs.record(self.storage.db.conn(), &meta)?;
+        Ok(meta.blob_ref())
     }
 
     /// Logs `ShellFinished` `kind`.
