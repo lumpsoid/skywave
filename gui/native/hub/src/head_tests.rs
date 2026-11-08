@@ -3739,6 +3739,52 @@ fn an_expanded_run_carries_its_whole_downloaded_output_stripped() {
     assert_eq!(row.tail, "line 3\nline 4");
 }
 
+fn notices(outs: &[Out]) -> Vec<String> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::Effect(PlatformEffect::Notice { text }) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A run whose output was deleted on the server copies the tail it kept,
+/// and the notice says that is all it is, and why.
+#[test]
+fn copying_a_run_whose_output_was_deleted_says_so() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    let blob = skywave_proto::BlobId::new();
+    let output = skywave_proto::BlobRef {
+        id: blob,
+        size: 4000,
+        sha256: skywave_proto::ContentHash::of(b""),
+    };
+    let run = rig.finished_run("make test", "line 39\nline 40", 40, Some(output));
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 3, 0).unwrap();
+    let me = rig.me;
+    rig.log_shell(
+        CommandId::new(),
+        at,
+        EventKind::BlobDeleted {
+            blob,
+            holds: skywave_core::BlobUse::ShellOutput,
+            by: me,
+        },
+    );
+    let outs = rig.copy_run(run);
+    assert_eq!(copied(&outs), ["line 39\nline 40"]);
+    assert!(rig.actions.is_empty(), "nothing to download");
+    assert_eq!(
+        notices(&outs),
+        ["copied 15 B · only the kept tail · Deleted by you"]
+    );
+
+    // Positive control: a run with all of its output says only how much.
+    let whole = rig.finished_run("ls", "a\nb", 2, None);
+    assert_eq!(notices(&rig.copy_run(whole)), ["copied 3 B"]);
+}
+
 #[test]
 fn an_expanded_run_without_a_blob_shows_its_own_text_and_what_is_missing() {
     let mut rig = Rig::new();

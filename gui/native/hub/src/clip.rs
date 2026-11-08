@@ -54,11 +54,22 @@ pub fn copy(content: Content, max: usize) -> Copied {
 
 /// Copies `run`'s whole output ([`whole_output`]), at most `max` bytes of
 /// it: its blob ANSI stripped once downloaded, else the run's own text,
-/// stripped already.
+/// stripped already. A copy of only part of it says so
+/// ([`WholeOutput::copy_note`]).
 pub fn copy_output(run: &ShellRun, max: usize) -> Copied {
-    match whole_output(run) {
+    let whole = whole_output(run);
+    match &whole {
         WholeOutput::Here(text) | WholeOutput::Partial { text, .. } => {
-            copy(Content::Text(text.to_owned()), max)
+            match (
+                copy(Content::Text((*text).to_owned()), max),
+                whole.copy_note(),
+            ) {
+                (Copied::Text { text, notice }, Some(note)) => Copied::Text {
+                    text,
+                    notice: format!("{notice} · {note}"),
+                },
+                (copied, _) => copied,
+            }
         }
         WholeOutput::Blob(blob) => match &blob.state {
             BlobState::Available { path } => {
@@ -66,7 +77,7 @@ pub fn copy_output(run: &ShellRun, max: usize) -> Copied {
             }
             _ => copy(
                 Content::Blob {
-                    blob: blob.clone(),
+                    blob: (*blob).clone(),
                     strip: None,
                 },
                 max,

@@ -8633,14 +8633,22 @@ fn y_copies_a_runs_output_with_ansi_stripped() {
     let row = line_with(&h.screen(), "exit 1");
     assert_contains(&row, &took_label(Duration::from_secs(5)));
 
-    // Not here yet: the preview, stripped already.
-    assert_eq!(h.key(KeyCode::Char('y')), None);
-    assert_eq!(clip(&h), Some(Clip::Text("the tail\n".into())));
-    send_copy(&mut h, clipboard::MAX);
+    // Not here yet: downloaded first, never just the preview copied.
     assert_eq!(
-        h.key(KeyCode::Char('d')),
+        h.key(KeyCode::Char('y')),
         Some(Action::DownloadBlob(blob_id))
     );
+    assert_eq!(clip(&h), None);
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("downloading 40 B · press y again when it is here")
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+    // On its way: asked for once only.
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), None);
+    assert_contains(&notice(&h).unwrap(), "downloading");
+    assert_eq!(h.key(KeyCode::Char('d')), None, "on its way already");
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("blob");
@@ -8655,6 +8663,11 @@ fn y_copies_a_runs_output_with_ansi_stripped() {
     assert_eq!(
         send_copy(&mut h, clipboard::MAX),
         clipboard::osc52(b"red\nthe tail\n").into_bytes()
+    );
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("copied 13 B · sent to terminal clipboard"),
+        "all of it: no note"
     );
     // Expanded, the whole output shows, stripped too.
     h.key(KeyCode::Enter);
@@ -8692,9 +8705,17 @@ fn a_runs_deleted_or_cropped_output_says_so() {
         (h.screen(), download, h)
     };
 
-    let (screen, download, _) = shown(&|id, blob, me| blob_deleted(id, 3, blob, me));
+    let (screen, download, mut h) = shown(&|id, blob, me| blob_deleted(id, 3, blob, me));
     assert_contains(&screen, "… 39 earlier lines · Deleted by you");
     assert_eq!(download, None, "nothing to download");
+    // Copied, it is the kept tail, and the notice says that is all.
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), Some(Clip::Text("the tail\n".into())));
+    send_copy(&mut h, clipboard::MAX);
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("copied 9 B · sent to terminal clipboard · only the kept tail · Deleted by you")
+    );
 
     let (into_id, into) = blob(300);
     let (screen, download, mut h) =
