@@ -1054,6 +1054,21 @@ void main() {
       expect(panel().shape, isA<RoundedRectangleBorder>());
     });
 
+    testWidgets('a short panel leaves no gap under the composer', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(360, 780);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withPreview(1)),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(tester.getBottomLeft(find.byType(Composer)).dy, 780);
+    });
+
     testWidgets('answered: the answer shows and the buttons go', (
       tester,
     ) async {
