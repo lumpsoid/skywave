@@ -549,7 +549,8 @@ async fn full_turn_through_commands() {
         kinds[2],
         EventKind::AgentMessage {
             parent: None,
-            text: "Writing a file.".into()
+            text: "Writing a file.".into(),
+            full: None,
         }
     );
     assert!(matches!(&kinds[3], EventKind::ApprovalRequested { tool, .. } if tool == "write"));
@@ -567,7 +568,8 @@ async fn full_turn_through_commands() {
         kinds[6],
         EventKind::AgentMessage {
             parent: None,
-            text: "Done.".into()
+            text: "Done.".into(),
+            full: None,
         }
     );
     assert_eq!(kinds[7], state(SessionState::Idle));
@@ -684,7 +686,8 @@ async fn first_of_two_devices_answering_wins() {
     );
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "Not writing it.".into()
+        text: "Not writing it.".into(),
+        full: None,
     }));
     let answers: Vec<_> = agent
         .inputs(f.session_id)
@@ -741,7 +744,8 @@ async fn interrupt_with_pending_approval_returns_to_idle() {
     let kinds = f.wait_count("second idle", 2, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "echo: again".into()
+        text: "echo: again".into(),
+        full: None,
     }));
     assert_eq!(
         agent.inputs(f.session_id),
@@ -776,7 +780,8 @@ async fn crash_mid_turn_then_next_message_resumes() {
     let kinds = f.wait_count("idle", 1, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "echo: second".into()
+        text: "echo: second".into(),
+        full: None,
     }));
     assert_eq!(
         agent.inputs(f.session_id),
@@ -855,7 +860,8 @@ async fn daemon_restart_cancels_pending_approvals_and_resumes() {
     let kinds = f.wait_count("idle", 1, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "echo: again".into()
+        text: "echo: again".into(),
+        full: None,
     }));
     assert_eq!(
         agent.inputs(f.session_id),
@@ -887,7 +893,8 @@ async fn daemon_restart_delivers_pending_messages_once() {
     let kinds = f.wait_count("second reply", 2, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "echo: two".into()
+        text: "echo: two".into(),
+        full: None,
     }));
     supervisor.shutdown().await.unwrap();
 
@@ -1282,6 +1289,7 @@ async fn a_message_taken_up_inside_a_turn_the_agent_started_is_settled() {
         *k == EventKind::AgentMessage {
             parent: None,
             text: "echo: queued".into(),
+            full: None,
         }
     };
     let kinds = f.wait_count("the message's answer", 1, answer).await;
@@ -1584,7 +1592,8 @@ async fn a_turn_the_agent_starts_itself_is_not_cut_by_the_idle_timer() {
     assert!(!kinds.iter().any(is_errored), "log: {kinds:#?}");
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "tick".into()
+        text: "tick".into(),
+        full: None,
     }));
     assert_eq!(
         agent.inputs(f.session_id),
@@ -2229,7 +2238,8 @@ async fn a_stop_ends_the_live_tasks_and_the_next_start_has_none() {
     supervisor.shutdown().await.unwrap();
     assert!(f.kinds().contains(&EventKind::AgentMessage {
         parent: None,
-        text: "fresh".into()
+        text: "fresh".into(),
+        full: None,
     }));
     // The set, its end at the stop, and nothing for the empty report.
     assert_eq!(tasks_changed(&f).len(), 2, "log: {:#?}", f.kinds());
@@ -2267,7 +2277,8 @@ async fn stop_mid_turn_interrupts_shuts_down_and_resumes() {
     let kinds = f.wait_count("second idle", 2, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "echo: again".into()
+        text: "echo: again".into(),
+        full: None,
     }));
     supervisor.shutdown().await.unwrap();
     assert_eq!(
@@ -3438,6 +3449,7 @@ fn reply(text: &str) -> EventKind {
     EventKind::AgentMessage {
         parent: None,
         text: format!("echo: {text}"),
+        full: None,
     }
 }
 
@@ -4611,6 +4623,7 @@ fn said(text: &str) -> EventKind {
     EventKind::AgentMessage {
         parent: None,
         text: text.into(),
+        full: None,
     }
 }
 
@@ -4823,11 +4836,17 @@ fn tool_events(kinds: &[EventKind]) -> (Vec<ToolCall>, Vec<ToolResult>) {
 #[tokio::test]
 async fn a_blob_that_cannot_be_written_is_marked_lost_and_the_turn_goes_on() {
     let mut f = Fixture::new();
-    let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    // Past `INLINE_MAX_BYTES`, so the output is meant to be a blob.
+    let long: String = (0..100).map(|i| format!("line {i:<40}\n")).collect();
+    // Past `MESSAGE_WHOLE_MAX_BYTES`, so its whole is meant to be a blob.
+    let report = long.repeat(5);
     let turn = || {
         [
-            Step::tool_call("shell", json!({ "command": long.clone() })),
+            // `timeout` is a field the generic display leaves out, so the
+            // input needs a blob of its own beside the command's body.
+            Step::tool_call("shell", json!({ "command": long.clone(), "timeout": 5 })),
             Step::tool_result(long.clone()),
+            Step::text(&report),
             Step::text("done"),
         ]
     };
@@ -4862,8 +4881,24 @@ async fn a_blob_that_cannot_be_written_is_marked_lost_and_the_turn_goes_on() {
     );
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "done".into()
+        text: "done".into(),
+        full: None,
     }));
+    // Each turn's long message's whole, in log order.
+    let message_fulls = |kinds: &[EventKind]| -> Vec<Full> {
+        kinds
+            .iter()
+            .filter_map(|k| match k {
+                EventKind::AgentMessage { full, .. } => full.clone(),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        message_fulls(&kinds),
+        [Full::Lost],
+        "the long message's blob could not be written"
+    );
     let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
     assert!(failed.is_err(), "a blob write is no supervisor failure");
 
@@ -4877,6 +4912,9 @@ async fn a_blob_that_cannot_be_written_is_marked_lost_and_the_turn_goes_on() {
     assert!(blob(&calls[1].input).is_some());
     let output = blob(&results[1].output).expect("the output's blob");
     assert_eq!(output.size, long.len() as u64);
+    let fulls = message_fulls(&kinds);
+    let message = fulls[1].blob().expect("the long message's blob");
+    assert_eq!(message.size, report.len() as u64);
     supervisor.shutdown().await.unwrap();
 }
 
@@ -4948,6 +4986,7 @@ async fn a_write_lock_held_for_seconds_only_delays_the_supervisor() {
         k.contains(&EventKind::AgentMessage {
             parent: None,
             text: "before".into(),
+            full: None,
         })
     })
     .await;
@@ -4976,7 +5015,8 @@ async fn a_write_lock_held_for_seconds_only_delays_the_supervisor() {
     );
     assert!(kinds.contains(&EventKind::AgentMessage {
         parent: None,
-        text: "after".into()
+        text: "after".into(),
+        full: None,
     }));
     holder.join().unwrap();
     let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
@@ -4990,7 +5030,8 @@ async fn a_write_lock_held_for_seconds_only_delays_the_supervisor() {
 #[tokio::test]
 async fn a_restart_while_blobs_cannot_be_stored_recovers_and_runs() {
     let mut f = Fixture::new();
-    let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    // Past `INLINE_MAX_BYTES`, so the output is meant to be a blob.
+    let long: String = (0..100).map(|i| format!("line {i:<40}\n")).collect();
     let gate = Gate::new();
     let agent = FakeAgent::new(
         FakeScript::new()

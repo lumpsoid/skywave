@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use skywave_core::{BlobView, FullView, ShellRun, ShellRunState};
+use skywave_core::{Action, BlobState, BlobView, FullView, ShellRun, ShellRunState};
 use skywave_proto::strip_ansi;
 
 use crate::sections::{deleted_note, whole_lines};
@@ -33,6 +33,19 @@ pub enum WholeOutput<'a> {
     },
 }
 
+impl WholeOutput<'_> {
+    /// What a head adds to its "copied" notice for a copy of this output's
+    /// text: for [`WholeOutput::Partial`], that only the kept tail went
+    /// and why (`only the kept tail · Deleted by laptop`), so a copy of
+    /// part of an output never passes for all of it. `None` otherwise.
+    pub fn copy_note(&self) -> Option<String> {
+        match self {
+            WholeOutput::Partial { note, .. } => Some(format!("only the kept tail · {note}")),
+            WholeOutput::Here(_) | WholeOutput::Blob(_) => None,
+        }
+    }
+}
+
 /// The note on a running run's output: its whole output is a blob only
 /// once it finished.
 pub const OUTPUT_SO_FAR: &str = "the newest lines so far; the whole output once it finishes";
@@ -46,6 +59,8 @@ pub fn whole_output(run: &ShellRun) -> WholeOutput<'_> {
     let text = run.tail_or_preview.as_str();
     match &run.output {
         Some(FullView::Blob(blob)) => return WholeOutput::Blob(blob),
+        // A run's output is never inline; were it, it would be all of it.
+        Some(FullView::Inline(whole)) => return WholeOutput::Here(whole),
         Some(FullView::Deleted { by }) => {
             return WholeOutput::Partial {
                 text,
@@ -78,6 +93,18 @@ pub fn output_text(bytes: &[u8], cut: bool) -> String {
     }
 }
 
+/// The download `run`'s output blob needs before it can be shown or copied
+/// whole: none while it is here or on its way, or for a run without one.
+/// A failed download is asked for again.
+pub fn output_download(run: &ShellRun) -> Option<Action> {
+    let blob = run.output.as_ref()?.blob()?;
+    matches!(
+        blob.state,
+        BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
+    )
+    .then_some(Action::DownloadBlob(blob.id))
+}
+
 /// The line count of `run`'s whole output so far: what a crop kept once
 /// the server cropped it, else the run's own count ([`whole_lines`]).
 pub fn output_lines(run: &ShellRun) -> u32 {
@@ -92,7 +119,7 @@ pub fn lines_before(run: &ShellRun, text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use skywave_core::{BlobId, BlobState, CommandId, DeviceId, DeviceRef, RunWhen, ShellEnd};
+    use skywave_core::{BlobId, CommandId, DeviceId, DeviceRef, RunWhen, ShellEnd};
 
     use super::*;
 
@@ -164,6 +191,18 @@ mod tests {
                 note: "Deleted by laptop".into()
             }
         );
+        // A copy of it says it is only the tail, and why.
+        assert_eq!(
+            whole_output(&long).copy_note().as_deref(),
+            Some("only the kept tail · Deleted by laptop")
+        );
+        assert_eq!(whole_output(&short).copy_note(), None);
+        let blob_run = {
+            let mut r = run(DONE, "y\nz", 40);
+            r.output = Some(FullView::Blob(blob.clone()));
+            r
+        };
+        assert_eq!(whole_output(&blob_run).copy_note(), None);
 
         // Running: the tail is all of it only while no line is left out.
         let going = run(ShellRunState::Running, "a\nb", 2);
@@ -185,6 +224,51 @@ mod tests {
         assert_eq!(output_text(raw, false), "ial line\nred\n\u{fffd}ok\n");
         // A cut tail of one line keeps it: nothing else would show.
         assert_eq!(output_text(b"no newline", true), "no newline");
+    }
+
+    #[test]
+    fn an_output_is_downloaded_unless_here_or_on_its_way() {
+        let id = BlobId::new();
+        let with = |state: BlobState| {
+            let mut done = run(DONE, "y\nz", 40);
+            done.output = Some(FullView::Blob(BlobView {
+                id,
+                state,
+                change: None,
+                pending: None,
+            }));
+            output_download(&done)
+        };
+        let fetch = Some(Action::DownloadBlob(id));
+        assert_eq!(with(BlobState::NotDownloaded { size: 9 }), fetch);
+        // A failed download is retried.
+        assert_eq!(
+            with(BlobState::Failed {
+                size: 9,
+                reason: "gone".into()
+            }),
+            fetch
+        );
+        assert_eq!(with(BlobState::Requested { size: 9 }), None);
+        assert_eq!(
+            with(BlobState::Downloading {
+                got: 1,
+                size: 9,
+                paused: None
+            }),
+            None
+        );
+        assert_eq!(
+            with(BlobState::Available {
+                path: "/blobs/x".into()
+            }),
+            None
+        );
+        // No blob, or none kept: nothing to download.
+        assert_eq!(output_download(&run(DONE, "y\nz", 2)), None);
+        let mut lost = run(DONE, "y\nz", 40);
+        lost.output = Some(FullView::Lost);
+        assert_eq!(output_download(&lost), None);
     }
 
     #[test]

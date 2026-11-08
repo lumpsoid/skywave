@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use skywave_proto::limits::{
-    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES,
-    SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX,
-    TITLE_MAX_CHARS,
+    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, MESSAGE_PREVIEW_MAX_BYTES, PREVIEW_MAX_BYTES,
+    PREVIEW_MAX_LINES, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS,
+    TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BackgroundTask, BodyFormat, CallId, Command, CommandId,
@@ -137,6 +137,7 @@ impl Fixture {
             EventKind::ToolCall(ToolCall { input, .. })
             | EventKind::ApprovalRequested { input, .. } => input,
             EventKind::ToolResult(ToolResult { output, .. }) => output,
+            EventKind::AgentMessage { full, .. } => full,
             other => panic!("no blob in {other:?}"),
         }
         .as_ref()
@@ -283,7 +284,8 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         kinds[2],
         EventKind::AgentMessage {
             parent: None,
-            text: "Looking around.".into()
+            text: "Looking around.".into(),
+            full: None,
         }
     );
     // An input of one string field is shown whole by the generic display.
@@ -361,7 +363,8 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         kinds[9],
         EventKind::AgentMessage {
             parent: None,
-            text: "Done.".into()
+            text: "Done.".into(),
+            full: None,
         }
     );
     assert_eq!(kinds[10], state(SessionState::Idle));
@@ -549,13 +552,15 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
             state(SessionState::AgentWorking),
             EventKind::AgentMessage {
                 parent: None,
-                text: "working".into()
+                text: "working".into(),
+                full: None,
             },
             state(SessionState::Idle),
             state(SessionState::AgentWorking),
             EventKind::AgentMessage {
                 parent: None,
-                text: "released".into()
+                text: "released".into(),
+                full: None,
             },
             state(SessionState::Idle),
         ]
@@ -608,7 +613,8 @@ async fn denied_approval_runs_the_deny_branch() {
         kinds[n - 2],
         EventKind::AgentMessage {
             parent: None,
-            text: "Skipping.".into()
+            text: "Skipping.".into(),
+            full: None,
         }
     );
     assert_eq!(kinds[n - 1], state(SessionState::Idle));
@@ -1309,6 +1315,10 @@ fn large_content_gives_small_events_and_blobs() {
                     shows_all_input: true,
                 }),
             },
+            AdapterEvent::Text {
+                text: huge.clone(),
+                parent: None,
+            },
         ],
     );
     let kinds = f.kinds();
@@ -1325,19 +1335,21 @@ fn large_content_gives_small_events_and_blobs() {
     }
     let title = format!("{}…", "é".repeat(TITLE_MAX_CHARS - 1));
 
-    // The generic display: the cut first line, the whole text as a body;
-    // the whole input as a blob.
-    let EventKind::ToolCall(ToolCall { display, .. }) = &kinds[1] else {
+    // The generic display: the cut first line, the whole text as a body,
+    // which holds the input's one field: no input blob beside it.
+    let EventKind::ToolCall(ToolCall {
+        display,
+        input: call_input,
+        ..
+    }) = &kinds[1]
+    else {
         panic!("expected ToolCall, got {:?}", kinds[1]);
     };
     assert_eq!(display.title, title);
     let body = display.body.as_ref().expect("a cut title has a body");
     assert_eq!((body.format, body.lines), (BodyFormat::Text, 4001));
     assert!(body.full.is_some());
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&f.blob(&kinds[1])).unwrap(),
-        input
-    );
+    assert_eq!(call_input, &None);
 
     // An approval for no logged call: generic summary, the input as a blob.
     let EventKind::ApprovalRequested { call, summary, .. } = &kinds[2] else {
@@ -1376,7 +1388,34 @@ fn large_content_gives_small_events_and_blobs() {
         .and_then(Full::blob)
         .expect("a cut body has its text as a blob");
     assert_eq!(full.size, huge.len() as u64);
-    assert!(input.is_some(), "a cut display blobs the input");
+    // The cut title and detail are held nowhere else.
+    assert!(input.is_some(), "a cut title or detail blobs the input");
+
+    // A long message: its head up to a line break, the whole as a blob
+    // the storage report counts as a message's.
+    let EventKind::AgentMessage { text, .. } = &kinds[5] else {
+        panic!("expected AgentMessage, got {:?}", kinds[5]);
+    };
+    assert!(text.len() <= MESSAGE_PREVIEW_MAX_BYTES && text.len() > 1024);
+    assert!(text.ends_with('\n') && huge.starts_with(text.as_str()));
+    assert_eq!(f.blob(&kinds[5]), huge);
+    let wire = serde_json::to_string(&kinds[5]).unwrap();
+    assert!(wire.len() < MESSAGE_PREVIEW_MAX_BYTES + 1024, "{wire}");
+    let holds: Vec<String> = f
+        .storage
+        .db
+        .conn()
+        .prepare("SELECT holds FROM event_blobs ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        holds.last().map(String::as_str),
+        Some("message"),
+        "{holds:?}"
+    );
 }
 
 #[test]
@@ -1457,7 +1496,7 @@ fn content_shown_whole_makes_no_blob() {
 }
 
 #[test]
-fn omitted_input_and_a_separate_preview_are_blobs() {
+fn omitted_input_is_a_blob_and_a_separate_preview_keeps_the_output_whole() {
     let mut f = Fixture::new();
     let mut mapper = EventMapper::new(
         f.session_id,
@@ -1511,12 +1550,13 @@ fn omitted_input_and_a_separate_preview_are_blobs() {
         serde_json::from_str::<serde_json::Value>(&f.blob(&kinds[1])).unwrap(),
         input
     );
-    // The preview is the adapter's text; the output keeps the note.
+    // The preview is the adapter's text; the output keeps the note, inline
+    // as it is small (a large one is a blob: the mapper's unit tests).
     let EventKind::ToolResult(result) = &kinds[2] else {
         panic!("expected ToolResult, got {:?}", kinds[2]);
     };
     assert_eq!((result.preview.as_str(), result.lines), ("built", 2));
-    assert_eq!(f.blob(&kinds[2]), note);
+    assert_eq!(result.output, Some(Full::Inline(note.into())));
     // A preview equal to the output is no reason for a blob.
     let EventKind::ToolResult(result) = &kinds[3] else {
         panic!("expected ToolResult, got {:?}", kinds[3]);
@@ -1622,7 +1662,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
 }
 
 /// A shell call shown by the adapter with `title` and no body; the input is
-/// a blob exactly when the body is cut.
+/// never a blob: the title, or its stand-in body when cut, holds it.
 fn shell_call(f: &mut Fixture, title: &str) -> ToolDisplay {
     let mut mapper = EventMapper::new(
         f.session_id,
@@ -1653,8 +1693,7 @@ fn shell_call(f: &mut Fixture, title: &str) -> ToolDisplay {
     let EventKind::ToolCall(call) = f.kinds().remove(1) else {
         panic!("expected ToolCall");
     };
-    let body_cut = call.display.body.as_ref().is_some_and(|b| b.full.is_some());
-    assert_eq!(call.input.is_some(), body_cut, "{call:?}");
+    assert_eq!(call.input, None, "{call:?}");
     call.display
 }
 
@@ -1695,6 +1734,131 @@ fn a_huge_command_blobs_the_body() {
         panic!("the body is a blob: {:?}", body.full);
     };
     assert_eq!(full.size, huge.trim().len() as u64);
+}
+
+/// The input of the first `tool` call the real CLI recorded in transcript
+/// fixture `name` (`tests/fixtures/claude-code/transcripts/`).
+fn recorded_input(name: &str, tool: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-code/transcripts")
+        .join(format!("{name}.jsonl"));
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| line["message"]["content"].as_array().cloned())
+        .flatten()
+        .find(|block| block["type"] == "tool_use" && block["name"] == tool)
+        .map(|block| block["input"].clone())
+        .unwrap_or_else(|| panic!("no {tool} call in {name}"))
+}
+
+/// Logs a call to `tool` with `input`, shown as the Claude Code adapter
+/// shows it, and returns its `ToolCall`.
+fn adapter_call(f: &mut Fixture, tool: &str, input: serde_json::Value) -> ToolCall {
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+        AgentWork::default(),
+    );
+    let display = agent::claude_code::display::call_display(tool, &input);
+    assert!(display.is_some(), "the adapter shows {tool}");
+    let started = AdapterEvent::TurnStarted { message: true };
+    mapper.apply(&f.log, &mut f.storage, started).unwrap();
+    let seqs = mapper
+        .apply(
+            &f.log,
+            &mut f.storage,
+            AdapterEvent::ToolCall {
+                call: Some("c1".into()),
+                parent: None,
+                name: tool.into(),
+                input,
+                display,
+            },
+        )
+        .unwrap();
+    let batch = f.log.read(&f.storage.db, Seq(seqs[0].0 - 1), 1).unwrap();
+    match batch.events.into_iter().next().map(|e| e.kind) {
+        Some(EventKind::ToolCall(call)) => call,
+        other => panic!("expected ToolCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_big_call_shown_whole_stores_its_content_once() {
+    let huge = huge_text();
+    let mut write = recorded_input("tools", "Write");
+    write["content"] = huge.clone().into();
+    let mut edit = recorded_input("tools", "Edit");
+    edit["old_string"] = huge.clone().into();
+    edit["new_string"] = huge.replace("00042", "42").into();
+    let mut bash = recorded_input("tools", "Bash");
+    bash["command"] = huge.clone().into();
+
+    for (tool, input) in [("Write", write), ("Edit", edit), ("Bash", bash)] {
+        let mut f = Fixture::new();
+        let call = adapter_call(&mut f, tool, input);
+        let body = call.display.body.as_ref().expect("a big call has a body");
+        assert!(matches!(body.full, Some(Full::Blob(_))), "{tool}: {body:?}");
+        assert_eq!(call.input, None, "{tool}: the body holds the input");
+        let kind = EventKind::ToolCall(call);
+        assert_eq!(kind.blobs().count(), 1, "{tool}: one blob");
+    }
+}
+
+#[test]
+fn a_call_with_input_the_display_leaves_out_keeps_its_input_blob() {
+    // Recorded as the CLI sent it: `run_in_background` is shown nowhere.
+    let agent_input = recorded_input("subagent", "Agent");
+    assert_eq!(agent_input["run_in_background"], json!(false));
+    // A big command beside a field the display leaves out.
+    let mut bash = recorded_input("tools", "Bash");
+    bash["command"] = huge_text().into();
+    bash["timeout"] = json!(600000);
+
+    for (tool, input) in [("Agent", agent_input), ("Bash", bash)] {
+        let mut f = Fixture::new();
+        let call = adapter_call(&mut f, tool, input.clone());
+        let kind = EventKind::ToolCall(call);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&f.blob(&kind)).unwrap(),
+            input,
+            "{tool}: the whole input is a blob"
+        );
+    }
+}
+
+#[test]
+fn deleting_a_big_calls_body_leaves_no_other_copy_of_its_content() {
+    let mut f = Fixture::new();
+    let marker = "a line only this write holds";
+    let content = format!("{marker}\n{}", huge_text());
+    let mut write = recorded_input("tools", "Write");
+    write["content"] = content.clone().into();
+    adapter_call(&mut f, "Write", write);
+
+    let holding = |f: &Fixture| -> Vec<skywave_proto::BlobId> {
+        let mut ids = Vec::new();
+        for kind in f.kinds() {
+            for (_, blob) in kind.blobs() {
+                if let Some(mut file) = f.storage.open_blob(blob.id).unwrap() {
+                    let mut text = String::new();
+                    file.read_to_string(&mut text).unwrap();
+                    if text.contains(marker) {
+                        ids.push(blob.id);
+                    }
+                }
+            }
+        }
+        ids
+    };
+    let held = holding(&f);
+    assert_eq!(held.len(), 1, "the content is stored once: {held:?}");
+
+    accepted(f.handle(CommandKind::DeleteBlob { blob: held[0] }));
+    assert!(f.storage.open_blob(held[0]).unwrap().is_none());
+    assert_eq!(holding(&f), Vec::new(), "no other blob holds the content");
 }
 
 #[test]
@@ -2101,7 +2265,7 @@ fn message_parents(kinds: &[EventKind]) -> Vec<(String, Option<CallId>)> {
     kinds
         .iter()
         .filter_map(|k| match k {
-            EventKind::AgentMessage { text, parent } => Some((text.clone(), *parent)),
+            EventKind::AgentMessage { text, parent, .. } => Some((text.clone(), *parent)),
             _ => None,
         })
         .collect()

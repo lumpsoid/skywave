@@ -3,7 +3,8 @@
 //! the rules are here so every head matches alike.
 //!
 //! What the view holds is searched: messages (pending and imported ones too), errors,
-//! tool names, titles, details, statuses and the bounded previews. So is
+//! tool names, titles, details, statuses, the bounded previews and the
+//! whole outputs that came inline in their events. So is
 //! the content of the blobs behind the timeline that are already
 //! downloaded, as far as the head reads them ([`BlobText`]); a search
 //! never downloads one, and says how many it could not search. A timeline
@@ -212,10 +213,18 @@ pub fn find(
 }
 
 /// The blobs whose content an entry shows, in the order it shows them: a
-/// call's body and output, and its whole input only when it has neither
-/// (the input is then all there is to see).
+/// call's body and output, its whole input only when it has neither nor
+/// an inline output (the input is then all there is to see), and its
+/// approval's own input when that differs from the call's; a long
+/// message's whole text.
 pub fn blobs(entry: &Entry) -> Vec<&BlobView> {
     match entry {
+        Entry::AgentMessage { full, .. }
+        | Entry::Imported {
+            entry:
+                ImportedEntry::UserMessage { full, .. } | ImportedEntry::AgentMessage { full, .. },
+            ..
+        } => full.as_ref().and_then(FullView::blob).into_iter().collect(),
         Entry::Tool(view)
         | Entry::Imported {
             entry: ImportedEntry::Tool(view),
@@ -246,16 +255,21 @@ fn tool_blobs(view: &ToolView) -> Vec<&BlobView> {
             .as_ref()
             .and_then(|body| body.full.as_ref()?.blob()),
     );
+    let mut inline = false;
     if let ToolOutcome::Done {
         output: Some(output),
         ..
     } = &view.outcome
     {
         out.extend(output.blob());
+        inline = output.inline().is_some();
     }
-    if out.is_empty() {
+    // As `skywave_present::sections` offers it: not beside an inline output.
+    if out.is_empty() && !inline {
         out.extend(view.input.as_ref().and_then(FullView::blob));
     }
+    // What the approval asked, when it differs from the call's input.
+    out.extend(view.approval_input().and_then(FullView::blob));
     out
 }
 
@@ -264,12 +278,23 @@ fn tool_texts(view: &ToolView) -> Vec<&str> {
     out.extend(view.detail.as_deref());
     out.extend(view.body.as_ref().map(|body| body.preview.as_str()));
     if let ToolOutcome::Done {
-        status, preview, ..
+        status,
+        preview,
+        output,
+        ..
     } = &view.outcome
     {
         out.extend(status.as_deref());
         out.push(preview);
+        out.extend(output.as_ref().and_then(FullView::inline));
     }
+    out
+}
+
+/// A lone result's summary, and its whole output when that is inline.
+fn result_texts<'a>(summary: &'a str, output: &'a Option<FullView>) -> Vec<&'a str> {
+    let mut out = vec![summary];
+    out.extend(output.as_ref().and_then(FullView::inline));
     out
 }
 
@@ -280,19 +305,19 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         TimelineItem::Logged { entry, .. } => entry,
     };
     match entry {
-        Entry::UserMessage { text, .. } | Entry::AgentMessage { text } => vec![text],
+        Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => vec![text],
         Entry::AgentErrored { message } => vec![message],
         Entry::AgentVersionUnconfirmed { version, .. } => vec![version],
         Entry::Tool(view) => tool_texts(view),
         Entry::Imported { entry, .. } => match entry {
-            ImportedEntry::UserMessage { text } | ImportedEntry::AgentMessage { text } => {
+            ImportedEntry::UserMessage { text, .. } | ImportedEntry::AgentMessage { text, .. } => {
                 vec![text]
             }
             ImportedEntry::Tool(view) => tool_texts(view),
-            ImportedEntry::ToolResult { summary, .. } => vec![summary],
+            ImportedEntry::ToolResult { summary, output } => result_texts(summary, output),
         },
         Entry::ToolCall { name, summary, .. } => vec![name, summary],
-        Entry::ToolResult { summary, .. } => vec![summary],
+        Entry::ToolResult { summary, output } => result_texts(summary, output),
         Entry::Approval { tool, summary, .. } => vec![tool, summary],
         Entry::Renamed { name, .. } => name.as_deref().into_iter().collect(),
         Entry::ContextStarted { name, .. }
@@ -336,7 +361,7 @@ mod tests {
     use super::*;
     use crate::view::{
         BodyFormat, BodyView, CallId, CommandId, ContextId, DeviceId, DeviceRef, Outgoing, Seq,
-        ToolKind, ToolView,
+        ToolApproval, ToolKind, ToolView,
     };
 
     /// The matching items' indices, no blob downloaded.
@@ -404,7 +429,16 @@ mod tests {
     fn an_empty_query_matches_nothing() {
         let query = Query::new("");
         assert!(query.ranges("anything").is_empty());
-        assert!(indices(&[logged(Entry::AgentMessage { text: "x".into() })], &query).is_empty());
+        assert!(
+            indices(
+                &[logged(Entry::AgentMessage {
+                    text: "x".into(),
+                    full: None,
+                })],
+                &query
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -441,6 +475,7 @@ mod tests {
             }),
             logged(Entry::AgentMessage {
                 text: "an agent reply".into(),
+                full: None,
             }),
             logged(Entry::AgentErrored {
                 message: "rate limited".into(),
@@ -560,6 +595,80 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_output_is_searched_as_text_at_hand() {
+        let inline = |text: &str| Some(FullView::Inline(text.into()));
+        let mut call = done("exit 0", "ok");
+        if let ToolOutcome::Done { output, .. } = &mut call {
+            *output = inline("ok\nnote for the model");
+        }
+        let timeline = vec![
+            logged(Entry::Tool(Box::new(tool(call)))),
+            logged(Entry::ToolResult {
+                summary: "output".into(),
+                output: inline("a lone note for the model"),
+            }),
+            // Control: the same words absent.
+            logged(Entry::ToolResult {
+                summary: "output".into(),
+                output: inline("nothing here"),
+            }),
+        ];
+        // Never through the blob callback: there is no blob.
+        assert_eq!(
+            indices(&timeline, &Query::new("note for the model")),
+            [0, 1]
+        );
+        let found = find(&timeline, &Query::new("note"), &mut |_| None);
+        assert_eq!((found.not_downloaded, found.cut), (0, 0));
+    }
+
+    #[test]
+    fn a_long_messages_whole_text_is_searched_once_here() {
+        let here = blob(BlobState::Available {
+            path: "/data/blobs/m".into(),
+        });
+        let away = blob(BlobState::NotDownloaded { size: 40_000 });
+        let timeline = vec![
+            logged(Entry::AgentMessage {
+                text: "# Report".into(),
+                full: Some(FullView::Blob(here.clone())),
+            }),
+            logged(Entry::Imported {
+                at: DateTime::UNIX_EPOCH,
+                entry: ImportedEntry::UserMessage {
+                    text: "log:".into(),
+                    full: Some(FullView::Blob(away)),
+                },
+            }),
+            // Control: a whole message without the words.
+            logged(Entry::AgentMessage {
+                text: "nothing".into(),
+                full: None,
+            }),
+        ];
+        let mut asked = Vec::new();
+        let found = find(&timeline, &Query::new("deep finding"), &mut |view| {
+            asked.push(view.id);
+            Some(BlobText {
+                text: "# Report\n\nthe deep finding\n".into(),
+                cut: false,
+            })
+        });
+        assert_eq!(asked, [here.id]);
+        assert_eq!(found.not_downloaded, 1);
+        assert_eq!(
+            found.hits,
+            [Hit {
+                index: 0,
+                blob: Some(BlobLine {
+                    id: here.id,
+                    line: 2
+                }),
+            }]
+        );
+    }
+
+    #[test]
     fn blob_callback_not_called_for_undownloaded_blobs() {
         let available = blob(BlobState::Available {
             path: "/data/blobs/x".into(),
@@ -570,7 +679,7 @@ mod tests {
             result(blob(BlobState::Downloading {
                 got: 1,
                 size: 10,
-                paused: true,
+                paused: Some(crate::view::Pause::Offline),
             })),
             result(blob(BlobState::Failed {
                 size: 10,
@@ -651,6 +760,46 @@ mod tests {
         // An unreadable blob is skipped.
         let found = find(&timeline, &Query::new("warning"), &mut |_| None);
         assert!(found.hits.is_empty());
+    }
+
+    #[test]
+    fn an_approvals_own_input_is_searched_when_it_differs() {
+        let path = || BlobState::Available {
+            path: "/data/blobs/x".into(),
+        };
+        let (input, asked) = (blob(path()), blob(path()));
+        let approval = |own: &BlobView| ToolApproval {
+            id: crate::view::ApprovalId::new(),
+            status: crate::view::ApprovalStatus::Pending,
+            answer: None,
+            input: Some(FullView::Blob(own.clone())),
+        };
+        let mut view = tool(ToolOutcome::Running {
+            since: DateTime::UNIX_EPOCH,
+        });
+        view.body = None;
+        view.input = Some(FullView::Blob(input.clone()));
+        view.approval = Some(approval(&asked));
+        let texts = [(input.id, "rm -rf build\n"), (asked.id, "rm -rf /\n")];
+        let mut read = |view: &BlobView| {
+            let (_, text) = texts.iter().find(|(id, _)| *id == view.id).unwrap();
+            Some(BlobText {
+                text: (*text).into(),
+                cut: false,
+            })
+        };
+        let timeline = vec![logged(Entry::Tool(Box::new(view.clone())))];
+        let found = find(&timeline, &Query::new("rm -rf /"), &mut read);
+        assert_eq!(
+            found.hits[0].blob,
+            Some(BlobLine {
+                id: asked.id,
+                line: 0
+            })
+        );
+        // The call's own input blob over again is not searched twice.
+        view.approval = Some(approval(&input));
+        assert_eq!(blobs(&Entry::Tool(Box::new(view))), vec![&input]);
     }
 
     #[test]

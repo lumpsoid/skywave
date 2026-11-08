@@ -15,6 +15,7 @@ pub mod db;
 pub mod devices;
 pub mod dirs;
 pub mod disk;
+mod encoding;
 pub mod error;
 pub mod event_log;
 pub mod identity;

@@ -217,6 +217,7 @@ impl Fixture {
                 EventKind::AgentMessage {
                     parent: None,
                     text: text.into(),
+                    full: None,
                 },
             )
             .unwrap()
@@ -892,7 +893,8 @@ async fn long_poll_returns_when_an_event_is_appended() {
         batch.events[0].kind,
         EventKind::AgentMessage {
             parent: None,
-            text: "news".into()
+            text: "news".into(),
+            full: None,
         }
     );
 }
@@ -1025,6 +1027,126 @@ async fn blobs_download_whole_or_by_range() {
         device.get("/v1/blobs/not-a-uuid").await.status,
         StatusCode::BAD_REQUEST
     );
+}
+
+/// D45: a request that accepts zstd gets an event batch and a blob as one
+/// zstd frame, a blob range counted in decoded bytes, and a body under
+/// `COMPRESS_MIN_BYTES` as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn batches_and_blobs_come_compressed_when_asked() {
+    use skywave_proto::encoding::{COMPRESS_MIN_BYTES, DECODED_LENGTH_HEADER, ZSTD};
+    let zstd_header = [(header::ACCEPT_ENCODING, ZSTD)];
+    let mut f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    for i in 0..200 {
+        f.append(session, &format!("message {i} of a long conversation"));
+    }
+
+    // A batch: the frame decodes to the very body sent to a request that
+    // does not ask, and is smaller.
+    let uri = events_uri(Seq::ZERO, 0);
+    let plain = device.get(&uri).await;
+    assert!(plain.headers.get(header::CONTENT_ENCODING).is_none());
+    let packed = device
+        .send(Method::GET, &uri, &zstd_header, Bytes::new())
+        .await;
+    assert_eq!(packed.status, StatusCode::OK);
+    assert_eq!(packed.header(header::CONTENT_ENCODING), ZSTD);
+    assert_eq!(packed.header(header::CONTENT_TYPE), "application/json");
+    assert!(
+        packed.body.len() * 4 < plain.body.len(),
+        "{}",
+        packed.body.len()
+    );
+    assert_eq!(
+        zstd::stream::decode_all(&packed.body[..]).unwrap(),
+        plain.body
+    );
+    // An empty long-poll answer is tiny: sent as it is.
+    let head = f.log.head();
+    let empty = device
+        .send(
+            Method::GET,
+            &events_uri(head, 0),
+            &zstd_header,
+            Bytes::new(),
+        )
+        .await;
+    assert!((empty.body.len() as u64) < COMPRESS_MIN_BYTES);
+    assert!(empty.headers.get(header::CONTENT_ENCODING).is_none());
+    assert!(empty.json::<EventBatch>().events.is_empty());
+
+    // A blob, whole and from an offset.
+    let content: Vec<u8> = (0..30_000u32)
+        .flat_map(|i| format!("output line {i}\n").into_bytes())
+        .collect();
+    let size = content.len();
+    let store = BlobStore::new(f.storage.dir.blobs_dir());
+    let blob = store.put(f.storage.db.conn(), &content[..]).unwrap();
+    let uri = path::blob(blob.id);
+    let decoded_length = header::HeaderName::from_static(DECODED_LENGTH_HEADER);
+
+    let whole = device
+        .send(Method::GET, &uri, &zstd_header, Bytes::new())
+        .await;
+    assert_eq!(whole.status, StatusCode::OK);
+    assert_eq!(whole.header(header::CONTENT_ENCODING), ZSTD);
+    assert_eq!(whole.header(decoded_length.clone()), size.to_string());
+    assert!(whole.headers.get(header::CONTENT_LENGTH).is_none());
+    assert!(whole.body.len() * 4 < size, "{}", whole.body.len());
+    assert_eq!(zstd::stream::decode_all(&whole.body[..]).unwrap(), content);
+
+    let have = 123_457;
+    let rest = device
+        .send(
+            Method::GET,
+            &uri,
+            &[
+                zstd_header[0].clone(),
+                (header::RANGE, &format!("bytes={have}-")),
+            ],
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(rest.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(rest.header(header::CONTENT_ENCODING), ZSTD);
+    assert_eq!(
+        rest.header(header::CONTENT_RANGE),
+        format!("bytes {have}-{}/{size}", size - 1),
+        "the range counts decoded bytes"
+    );
+    assert_eq!(rest.header(decoded_length), (size - have).to_string());
+    assert_eq!(
+        zstd::stream::decode_all(&rest.body[..]).unwrap(),
+        &content[have..]
+    );
+
+    // A tiny blob, and a range under the threshold, go as they are.
+    let tiny = store.put(f.storage.db.conn(), &b"tiny"[..]).unwrap();
+    let reply = device
+        .send(
+            Method::GET,
+            &path::blob(tiny.id),
+            &zstd_header,
+            Bytes::new(),
+        )
+        .await;
+    assert!(reply.headers.get(header::CONTENT_ENCODING).is_none());
+    assert_eq!(reply.header(header::CONTENT_LENGTH), "4");
+    assert_eq!(&reply.body[..], b"tiny");
+    let reply = device
+        .send(
+            Method::GET,
+            &uri,
+            &[zstd_header[0].clone(), (header::RANGE, "bytes=-100")],
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
+    assert!(reply.headers.get(header::CONTENT_ENCODING).is_none());
+    assert_eq!(&reply.body[..], &content[size - 100..]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

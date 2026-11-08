@@ -10,8 +10,9 @@ use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
     Draft, Entry, FailReason, Fingerprint, FullView, Link, Outgoing, PairedCredentials,
-    PairingStatus, Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView, ShellAlert,
-    ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem, ViewState,
+    PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView,
+    ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem,
+    ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
@@ -498,6 +499,7 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "hi".into(),
+                    full: None,
                 },
             ),
         ],
@@ -642,7 +644,7 @@ fn blob_progress_is_persisted_and_shown() {
             got: 1000,
             size: 9000,
             // A detached core has no link.
-            paused: true,
+            paused: Some(Pause::Offline),
         }
     );
     assert!(
@@ -659,7 +661,7 @@ fn blob_progress_is_persisted_and_shown() {
             got: 1000,
             size: 9000,
             // A detached core has no link.
-            paused: true,
+            paused: Some(Pause::Offline),
         }
     );
 }
@@ -1191,7 +1193,7 @@ fn messages(timeline: &[TimelineItem]) -> Vec<(Option<skywave_proto::CallId>, St
         .filter_map(|item| match item {
             TimelineItem::Logged {
                 parent,
-                entry: Entry::AgentMessage { text },
+                entry: Entry::AgentMessage { text, .. },
                 ..
             } => Some((*parent, text.clone())),
             _ => None,
@@ -1274,7 +1276,7 @@ fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_time
         .events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::AgentMessage { parent, text } => Some((*parent, text.clone())),
+            EventKind::AgentMessage { parent, text, .. } => Some((*parent, text.clone())),
             _ => None,
         })
         .collect();

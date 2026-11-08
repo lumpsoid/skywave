@@ -23,7 +23,7 @@ use skywave_present::format::{
     task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
 };
 use skywave_present::sections::{
-    ItemKey, Section, approval_lost, gated_item, sections, tool_sections,
+    ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
 };
 use skywave_present::text::clean;
 
@@ -475,8 +475,29 @@ fn gated_call(view: &ToolView, width: usize) -> Vec<Line<'static>> {
 /// First, that the server could not keep some of what the call will do, if
 /// so: the user decides on what is shown. Then the first section shown
 /// while collapsed, capped to `max_rows`; with none, where to see the whole
-/// input if there is one.
+/// input if there is one. Last, that the approval asked about an input
+/// other than the call's, and where to see it.
 fn gated_content(
+    prompt: &ApprovalPrompt,
+    sections: &[Section],
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut out = call_content(prompt, sections, width, max_rows);
+    if let Some(note) = asked_note(sections) {
+        let hint = Span::raw(format!("{note} · v to see it")).yellow();
+        out.extend(wrap(
+            vec![Span::raw("  ")],
+            vec![Span::raw("  ")],
+            vec![hint],
+            width,
+        ));
+    }
+    out
+}
+
+/// [`gated_content`] up to what the approval asked about.
+fn call_content(
     prompt: &ApprovalPrompt,
     sections: &[Section],
     width: usize,
@@ -497,7 +518,13 @@ fn gated_content(
         out.extend(preview_lines(section, width, max_rows));
         return out;
     }
-    out.extend(sections.iter().find_map(Section::blob).map(input_line));
+    out.extend(
+        sections
+            .iter()
+            .filter(|s| !s.asked)
+            .find_map(Section::blob)
+            .map(input_line),
+    );
     out
 }
 

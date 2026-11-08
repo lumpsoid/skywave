@@ -4,10 +4,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use skywave_proto::limits::{
-    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS,
-    MODEL_MAX_CHARS, MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS,
-    RULE_LABEL_MAX_CHARS, RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX,
-    STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
+    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, INLINE_MAX_BYTES, MESSAGE_PREVIEW_MAX_BYTES,
+    MESSAGE_WHOLE_MAX_BYTES, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS,
+    MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
+    RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS,
+    TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, Body, BodyFormat, CallId,
@@ -123,10 +124,14 @@ const AGENT_EXITED: &str = "agent exited";
 /// (`Body::full`) when its preview is shorter; a result's output when its
 /// preview does not hold all of it (it was cut, or the adapter previewed
 /// other text, e.g. without notes meant for the model); a call's input
-/// (pretty JSON, or the string itself) when its display does not show all
-/// of it: its title, detail or body was cut, or the display (the adapter's,
-/// by `shows_all_input`, or the generic one) left fields out. Agent text stays inline:
-/// `AgentMessage` has no blob field.
+/// (pretty JSON, or the string itself) when its display does not carry all
+/// of it: its title (beside a body) or detail was cut, or the display (the
+/// adapter's, by `shows_all_input`, or the generic one) left fields out. A
+/// cut body does not count: its blob holds it whole, so a big call's content
+/// is stored once. Agent text stays whole in its `AgentMessage` up to
+/// [`MESSAGE_WHOLE_MAX_BYTES`]; a longer one is its head
+/// ([`MESSAGE_PREVIEW_MAX_BYTES`]) and `full`, a blob holding it whole
+/// ([`message`]).
 ///
 /// **Generic display.** A call the adapter gives no display for is shown as
 /// kind [`ToolKind::Other`] titled with its input: the input itself if it is
@@ -316,7 +321,12 @@ impl EventMapper {
             }
             AdapterEvent::Text { text, parent } => {
                 let parent = self.linked(parent.as_ref()).map(|c| c.id);
-                seqs.push(self.append(log, storage, EventKind::AgentMessage { parent, text })?);
+                let (text, full) = message(&mut stored(storage), text)?;
+                seqs.push(self.append(
+                    log,
+                    storage,
+                    EventKind::AgentMessage { parent, text, full },
+                )?);
             }
             AdapterEvent::ToolCall {
                 call,
@@ -859,14 +869,21 @@ fn stored(storage: &Storage) -> impl FnMut(&[u8]) -> Result<Full> + '_ {
     }
 }
 
-/// The bounded display for a call and, when it does not show all of the
+/// The bounded display for a call and, when it does not carry all of the
 /// input, the input as a blob.
+///
+/// A cut body does not make the input a blob: the body's own blob
+/// (`Body::full`) holds its whole text, as a cut title's stand-in body does,
+/// so a big Write, Edit or shell command is stored once and deleting that
+/// blob frees its bytes. Only what no event field holds whole makes one: a
+/// field the adapter's display left out (`shows_all_input`), a cut detail, or
+/// a cut title beside a body.
 pub(crate) fn call_display(
     put: &mut impl FnMut(&[u8]) -> Result<Full>,
     input: &Value,
     display: Option<ToolDisplay>,
 ) -> Result<(proto::ToolDisplay, Option<Full>)> {
-    let (display, shown_whole) = match display {
+    let (display, carried_whole) = match display {
         Some(display) => {
             let omits_input = !display.shows_all_input;
             let (title, title_cut) = cut_line(&display.title, TITLE_MAX_CHARS);
@@ -881,33 +898,28 @@ pub(crate) fn call_display(
                 Some(body) => (Some(display_body(put, body)?), title_cut),
                 None => (title_body(put, &display.title, title_cut)?, false),
             };
-            let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
                 kind: display.kind,
                 title,
                 detail,
                 body,
             };
-            (
-                display,
-                !(omits_input || title_cut || detail_cut || body_cut),
-            )
+            (display, !(omits_input || title_cut || detail_cut))
         }
         None => {
             let (text, whole) = generic_text(input);
             let (title, title_cut) = cut_line(&text, TITLE_MAX_CHARS);
             let body = title_body(put, &text, title_cut)?;
-            let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
                 kind: ToolKind::Other,
                 title,
                 detail: None,
                 body,
             };
-            (display, whole && !body_cut)
+            (display, whole)
         }
     };
-    let blob = if shown_whole {
+    let blob = if carried_whole {
         None
     } else {
         Some(input_blob(put, input)?)
@@ -952,7 +964,10 @@ pub(crate) fn display_body(
 }
 
 /// A result's preview (of the adapter's preview text, else of the output),
-/// with the output as a blob when the preview does not hold all of it.
+/// with the whole output when the preview does not hold all of it: inline
+/// up to [`INLINE_MAX_BYTES`], else as a blob. An adapter's preview nearly
+/// always differs from its output (notes for the model, line numbers, a
+/// header), so without the inline case nearly every result made a blob.
 pub(crate) fn tool_result(
     put: &mut impl FnMut(&[u8]) -> Result<Full>,
     call: Option<CallId>,
@@ -960,10 +975,14 @@ pub(crate) fn tool_result(
 ) -> Result<ToolResult> {
     let shown = result.preview.as_deref().unwrap_or(&result.output);
     let (preview, cut) = cut_preview(shown);
-    let output = if cut || shown != result.output {
-        Some(put(result.output.as_bytes())?)
-    } else {
+    let whole = !cut && shown == result.output;
+    let lines = line_count(&result.output);
+    let output = if whole {
         None
+    } else if result.output.len() <= INLINE_MAX_BYTES {
+        Some(Full::Inline(result.output))
+    } else {
+        Some(put(result.output.as_bytes())?)
     };
     Ok(ToolResult {
         call,
@@ -972,7 +991,7 @@ pub(crate) fn tool_result(
             .status
             .map(|status| cut_line(&status, STATUS_MAX_CHARS).0),
         preview,
-        lines: line_count(&result.output),
+        lines,
         output,
     })
 }
@@ -1156,6 +1175,28 @@ fn cut_preview(text: &str) -> (String, bool) {
     (text[..end].to_owned(), cut)
 }
 
+/// A message's `text` and `full`: the whole text up to
+/// [`MESSAGE_WHOLE_MAX_BYTES`]; past it, its head of at most
+/// [`MESSAGE_PREVIEW_MAX_BYTES`] (cut after the last line break in it, if
+/// any, else on a char boundary) and the whole as a blob.
+pub(crate) fn message(
+    put: &mut impl FnMut(&[u8]) -> Result<Full>,
+    text: String,
+) -> Result<(String, Option<Full>)> {
+    if text.len() <= MESSAGE_WHOLE_MAX_BYTES {
+        return Ok((text, None));
+    }
+    let mut end = MESSAGE_PREVIEW_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(at) = text[..end].rfind('\n') {
+        end = at + 1;
+    }
+    let full = put(text.as_bytes())?;
+    Ok((text[..end].to_owned(), Some(full)))
+}
+
 fn line_count(text: &str) -> u32 {
     u32::try_from(text.lines().count()).unwrap_or(u32::MAX)
 }
@@ -1240,6 +1281,85 @@ mod tests {
         assert_eq!(short.preview, "a\nb\n");
 
         assert_eq!(stored, vec![long.into_bytes()]);
+    }
+
+    #[test]
+    fn a_small_output_travels_inline_and_only_a_large_one_makes_a_blob() {
+        let mut stored: Vec<Vec<u8>> = Vec::new();
+        let blob = Full::Blob(proto::BlobRef {
+            id: proto::BlobId::new(),
+            size: 0,
+            sha256: proto::ContentHash::of(b""),
+        });
+        let mut put = |bytes: &[u8]| {
+            stored.push(bytes.to_vec());
+            Ok(blob.clone())
+        };
+        let result = |preview: Option<&str>, output: &str| ResultDisplay {
+            is_error: false,
+            status: None,
+            preview: preview.map(str::to_owned),
+            output: output.to_owned(),
+        };
+
+        // An edit: an empty preview beside the note to the model.
+        let note = "The file a.txt has been updated. file state is current in your context";
+        let edit = tool_result(&mut put, None, result(Some(""), note)).unwrap();
+        assert_eq!(edit.preview, "");
+        assert_eq!(edit.output, Some(Full::Inline(note.to_owned())));
+
+        // Cut, but small enough to carry: the whole of it, inline.
+        let long: String = (0..=PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();
+        let cut = tool_result(&mut put, None, result(None, &long)).unwrap();
+        assert_eq!(cut.output, Some(Full::Inline(long.clone())));
+        assert_eq!(cut.lines, line_count(&long));
+
+        // At the threshold still inline; one byte past it, a blob.
+        let at = "x".repeat(INLINE_MAX_BYTES);
+        let inline = tool_result(&mut put, None, result(Some(""), &at)).unwrap();
+        assert_eq!(inline.output, Some(Full::Inline(at)));
+        let past = "x".repeat(INLINE_MAX_BYTES + 1);
+        let large = tool_result(&mut put, None, result(Some(""), &past)).unwrap();
+        assert_eq!(large.output, Some(blob.clone()));
+
+        // The preview holds it all: nothing more.
+        let whole = tool_result(&mut put, None, result(None, "ok\n")).unwrap();
+        assert_eq!((whole.preview.as_str(), whole.output), ("ok\n", None));
+
+        assert_eq!(stored, vec![past.into_bytes()], "only the large one");
+    }
+
+    #[test]
+    fn only_a_long_message_is_cut_to_its_head_beside_a_blob() {
+        let mut stored: Vec<Vec<u8>> = Vec::new();
+        let blob = Full::Blob(proto::BlobRef {
+            id: proto::BlobId::new(),
+            size: 0,
+            sha256: proto::ContentHash::of(b""),
+        });
+        let mut put = |bytes: &[u8]| {
+            stored.push(bytes.to_vec());
+            Ok(blob.clone())
+        };
+
+        // At the threshold still whole.
+        let at = "x".repeat(MESSAGE_WHOLE_MAX_BYTES);
+        assert_eq!(message(&mut put, at.clone()).unwrap(), (at, None));
+
+        // Past it: the head ends after the last line break in it.
+        let line = format!("{}\n", "y".repeat(99));
+        let long = line.repeat(MESSAGE_WHOLE_MAX_BYTES / 100 + 1);
+        let (head, full) = message(&mut put, long.clone()).unwrap();
+        assert_eq!(full, Some(blob.clone()));
+        assert_eq!(head, line.repeat(MESSAGE_PREVIEW_MAX_BYTES / 100));
+        assert!(long.starts_with(&head));
+
+        // No line break in it: cut on a char boundary.
+        let wide = "é".repeat(MESSAGE_WHOLE_MAX_BYTES);
+        let (head, _) = message(&mut put, wide.clone()).unwrap();
+        assert_eq!(head, "é".repeat(MESSAGE_PREVIEW_MAX_BYTES / 2));
+
+        assert_eq!(stored, vec![long.into_bytes(), wide.into_bytes()]);
     }
 
     #[test]

@@ -820,7 +820,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -921,6 +921,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
                         EventKind::AgentMessage {
                             parent: None,
                             text: "hi".into(),
+                            full: None,
                         },
                     ),
                 ],
@@ -949,7 +950,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1165,6 +1166,7 @@ fn notable_count_is_projected_and_backfilled() {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "ok".into(),
+                    full: None,
                 },
             ),
             event(
@@ -1338,7 +1340,139 @@ fn stamp(dir: &Path) -> Vec<u32> {
 }
 
 #[test]
-fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() {
+fn a_replica_of_every_migrated_protocol_version_opens_restamped() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    for older in skywave_proto::MIGRATED_SINCE..skywave_core::PROTOCOL_VERSION {
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        conn.execute("UPDATE protocol_stamp SET version = ?1", [older])
+            .unwrap();
+        drop(conn);
+        drop(Store::open(&dir).unwrap());
+        assert_eq!(
+            stamp(&dir),
+            vec![skywave_core::PROTOCOL_VERSION],
+            "from {older}"
+        );
+    }
+}
+
+/// The tool results a v23 replica holds (as its wire snapshot wrote them)
+/// read unchanged once v24's step ran: a whole output stays the blob or
+/// loss it was.
+#[test]
+fn v24_reads_the_tool_results_a_v23_replica_holds() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let session = "01920000-0000-7000-8000-000000000001";
+    let event = |kind: &str| {
+        format!(
+            r#"{{"session_id":"{session}","at":"2026-10-29T12:00:00Z","command_id":null,"context":"{session}","kind":{kind}}}"#
+        )
+    };
+    let v23 = [
+        event(
+            r#"{"type":"tool_result","call":"01920000-0000-7000-8000-000000000007","is_error":false,"status":"exit 0","preview":"running","lines":40,"output":{"blob":{"id":"01920000-0000-7000-8000-000000000005","size":48213,"sha256":"7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"}}}"#,
+        ),
+        event(
+            r#"{"type":"tool_result","call":null,"is_error":false,"status":null,"preview":"running","lines":40,"output":"lost"}"#,
+        ),
+        event(
+            r#"{"type":"tool_result","call":null,"is_error":true,"status":"exit 1","preview":"no such file","lines":1,"output":null}"#,
+        ),
+    ];
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    for (seq, json) in (1i64..).zip(&v23) {
+        conn.execute(
+            "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
+            rusqlite::params![seq, session, json],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE protocol_stamp SET version = 23", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![24]);
+    let id = SessionId(session.parse().unwrap());
+    let outputs: Vec<Option<Full>> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, event)| match event.kind {
+            EventKind::ToolResult(ToolResult { output, .. }) => output,
+            other => panic!("not a result: {other:?}"),
+        })
+        .collect();
+    assert!(matches!(&outputs[0], Some(Full::Blob(b)) if b.size == 48213));
+    assert_eq!(outputs[1..], [Some(Full::Lost), None]);
+}
+
+/// The messages a v23 replica holds (its wire snapshot's, without `full`)
+/// read as whole messages once v24's step ran.
+#[test]
+fn v24_reads_the_messages_a_v23_replica_holds() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let session = "01920000-0000-7000-8000-000000000001";
+    let event = |kind: &str| {
+        format!(
+            r#"{{"session_id":"{session}","at":"2026-10-29T12:00:00Z","command_id":null,"context":"{session}","kind":{kind}}}"#
+        )
+    };
+    let v23 = [
+        event(r#"{"type":"agent_message","text":"Running cargo test.","parent":null}"#),
+        event(
+            r#"{"type":"imported","at":null,"item":{"type":"user_message","text":"Where is the event log?"}}"#,
+        ),
+        event(
+            r#"{"type":"imported","at":null,"item":{"type":"agent_message","text":"In crates/skywaved/src/event_log.rs."}}"#,
+        ),
+    ];
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    for (seq, json) in (1i64..).zip(&v23) {
+        conn.execute(
+            "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
+            rusqlite::params![seq, session, json],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE protocol_stamp SET version = 23", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![24]);
+    let id = SessionId(session.parse().unwrap());
+    let texts: Vec<(String, bool)> =
+        store
+            .session_events(id)
+            .unwrap()
+            .into_iter()
+            .map(|(_, event)| match event.kind {
+                EventKind::AgentMessage { text, full, .. }
+                | EventKind::Imported {
+                    item:
+                        ImportedItem::UserMessage { text, full }
+                        | ImportedItem::AgentMessage { text, full },
+                    ..
+                } => (text, full.is_none()),
+                other => panic!("not a message: {other:?}"),
+            })
+            .collect();
+    assert_eq!(
+        texts,
+        [
+            ("Running cargo test.".to_owned(), true),
+            ("Where is the event log?".to_owned(), true),
+            ("In crates/skywaved/src/event_log.rs.".to_owned(), true),
+        ]
+    );
+}
+
+#[test]
+fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_cannot_migrate() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -1347,7 +1481,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() 
 
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     for other in [
-        skywave_core::PROTOCOL_VERSION - 1,
+        skywave_proto::MIGRATED_SINCE - 1,
         skywave_core::PROTOCOL_VERSION + 1,
     ] {
         conn.execute("UPDATE protocol_stamp SET version = ?1", [other])
@@ -1365,7 +1499,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() 
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2077,6 +2211,7 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
                         EventKind::AgentMessage {
                             parent: None,
                             text: "ok".into(),
+                            full: None,
                         },
                     ),
                 ],
@@ -2223,6 +2358,7 @@ fn a_v8_replica_moves_into_first_contexts() {
                     EventKind::AgentMessage {
                         parent: None,
                         text: "hi".into(),
+                        full: None,
                     },
                 ),
             ],
@@ -2258,7 +2394,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2768,7 +2904,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -3050,7 +3186,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -3096,6 +3232,7 @@ fn adopted_log(session: SessionId, output: &BlobRef) -> Vec<Event> {
                 at: None,
                 item: ImportedItem::UserMessage {
                     text: "fix the build".into(),
+                    full: None,
                 },
             },
         ),
@@ -3176,7 +3313,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -3215,7 +3352,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -3628,7 +3765,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -3655,4 +3792,120 @@ fn the_fates_migration_keeps_a_populated_replica() {
         store.blob_fates().unwrap()[&log.blob.id],
         BlobFate::Deleted { by }
     );
+}
+
+/// A given-up download stays `Failed`, with its reason, over a reopen;
+/// any other status written clears the reason, and the blob's row going
+/// takes it along.
+#[test]
+fn a_failed_blob_keeps_its_reason_over_a_reopen() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let failed = BlobStatus::Failed {
+        reason: "blob hash mismatch".into(),
+    };
+    store.set_blob_status(log.blob.id, &failed).unwrap();
+    drop(store);
+
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, failed);
+    assert_eq!(store.blobs().unwrap()[0].status, failed);
+    assert_eq!(store.load().unwrap().blobs[0].status, failed);
+
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let rows = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row("SELECT count(*) FROM blob_failures", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(&conn), 1);
+    let partial = BlobStatus::Downloading {
+        got: 1,
+        path: "blobs/x.part".into(),
+    };
+    store.set_blob_status(log.blob.id, &partial).unwrap();
+    assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, partial);
+    assert_eq!(rows(&conn), 0, "a download under way is no failure");
+    store
+        .set_blob_status(log.blob.id, &BlobStatus::NotDownloaded)
+        .unwrap();
+    assert_eq!(
+        store.blob(log.blob.id).unwrap().unwrap().status,
+        BlobStatus::NotDownloaded
+    );
+
+    store.set_blob_status(log.blob.id, &failed).unwrap();
+    assert_eq!(rows(&conn), 1);
+    store.delete_session_locally(log.a, at(2)).unwrap();
+    assert!(store.blob(log.blob.id).unwrap().is_none());
+    assert_eq!(rows(&conn), 0, "the failure went with the blob's row");
+}
+
+/// A stopped download keeps its progress and partial file over a reopen,
+/// apart from both `NotDownloaded` and `Downloading`; a failure or a
+/// plain `NotDownloaded` written over it clears them.
+#[test]
+fn a_stopped_download_keeps_its_progress_over_a_reopen() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let stopped = BlobStatus::Stopped {
+        got: 3,
+        path: "blobs/x.part".into(),
+    };
+    store.set_blob_status(log.blob.id, &stopped).unwrap();
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, stopped);
+    assert_eq!(store.load().unwrap().blobs[0].status, stopped);
+    let failed = BlobStatus::Failed {
+        reason: "gone".into(),
+    };
+    store.set_blob_status(log.blob.id, &failed).unwrap();
+    assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, failed);
+    store.set_blob_status(log.blob.id, &stopped).unwrap();
+    store
+        .set_blob_status(log.blob.id, &BlobStatus::NotDownloaded)
+        .unwrap();
+    assert_eq!(
+        store.blob(log.blob.id).unwrap().unwrap().status,
+        BlobStatus::NotDownloaded
+    );
+}
+
+/// The failures migration adds its table and trigger to a populated
+/// replica, whose blobs read as before and can fail from then on.
+#[test]
+fn the_failures_migration_keeps_a_populated_replica() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let before = store.blobs().unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER blob_failures_go_with_blobs;
+         DROP TABLE blob_failures;",
+    )
+    .unwrap();
+    drop(conn);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(store.blobs().unwrap(), before);
+    let failed = BlobStatus::Failed {
+        reason: "not found".into(),
+    };
+    store.set_blob_status(log.blob.id, &failed).unwrap();
+    assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, failed);
+    store.delete_session_locally(log.a, at(2)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM blob_failures", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "the trigger is back");
 }

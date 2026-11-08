@@ -21,8 +21,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
-    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, ModelChoice,
-    PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
+    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, MIGRATED_SINCE,
+    ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -363,6 +363,22 @@ CREATE TABLE IF NOT EXISTS blob_fates (
     seq INTEGER NOT NULL
 );
 "#,
+    r#"
+-- Why the download of a `not_downloaded` blob was given up
+-- (BlobStatus::Failed), so a restart keeps it failed and `Eager` leaves it
+-- until it is asked for again. Any other status written deletes the row,
+-- as does the trigger with the blob's row. A table, not a state, so the
+-- `blobs` CHECK stays and this reruns over a current schema; a replica
+-- from before this kept failures in memory only: nothing to backfill.
+CREATE TABLE IF NOT EXISTS blob_failures (
+    blob_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS blob_failures_go_with_blobs AFTER DELETE ON blobs
+BEGIN
+    DELETE FROM blob_failures WHERE blob_id = old.id;
+END;
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -370,6 +386,33 @@ const STAMPED_SINCE: i64 = 21;
 
 /// Highest schema version this build understands.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// Rewrites the wire JSON the replica holds (events, the outbox's commands,
+/// ...) from one `PROTOCOL_VERSION` to the next. It runs in the open's
+/// transaction, after the schema migrations, so it reads the current schema.
+type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
+
+/// Step `i` moves the stored wire JSON from protocol version
+/// `MIGRATED_SINCE + i` to the next (D43), as the server's step of the same
+/// bump moves its log. Every bump adds one, a no-op saying so if nothing
+/// stored changed; the length makes a bump without one fail to compile.
+/// Append; never edit a released one.
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [v23_to_v24];
+
+/// v23 to v24, as the server's step of the same name. What v24 changed of
+/// what is stored, and how each is moved:
+/// - `Full::Inline` (a small tool output carried in its event): new, so no
+///   v23 event has one; v23's `Full::Blob` and `Full::Lost` read unchanged.
+/// - `full` on `AgentMessage` and on an imported `UserMessage` or
+///   `AgentMessage` (a long message's whole text as a blob): a new
+///   optional field, which v23 JSON lacks and reads as `None`, so no event
+///   is rewritten; v23's long messages stay whole in their events.
+/// - Compressed event batches and blob bodies (D45): transport only. A
+///   `.part` file and its recorded progress count decoded bytes, as they
+///   did, so a v23 download resumes unchanged; nothing stored changes.
+fn v23_to_v24(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
 
 /// The files SQLite keeps beside [`DB_FILE`] in WAL mode.
 const WAL_FILES: [&str; 2] = ["core.db-wal", "core.db-shm"];
@@ -392,10 +435,14 @@ pub enum StoreError {
     },
     #[error("database schema version {found} is newer than supported version {SCHEMA_VERSION}")]
     NewerSchema { found: i64 },
-    /// The replica was written by a build of another protocol version,
-    /// whose stored wire JSON this build may not read (alpha: never
-    /// migrated; [`Store::reset_replica`] starts it again).
-    #[error("the replica was written for protocol version {found}, this build speaks {current}")]
+    /// The replica was written by a protocol version this build cannot
+    /// migrate (older than `MIGRATED_SINCE`, or newer than its own), whose
+    /// stored wire JSON it may not read; [`Store::reset_replica`] starts it
+    /// again.
+    #[error(
+        "the replica was written for protocol version {found}, this build migrates versions {} to {current}",
+        MIGRATED_SINCE
+    )]
     ProtocolMismatch { found: u32, current: u32 },
     /// The replica breaks an invariant of its own schema.
     #[error("the replica is corrupt: {0}")]
@@ -454,6 +501,30 @@ impl StoreError {
             _ => false,
         }
     }
+
+    /// Whether the write failed because the device's disk (or the user's
+    /// quota) is full: SQLite's `SQLITE_FULL`, or a file the store writes
+    /// failing as [`io_disk_full`] says.
+    pub fn disk_full(&self) -> bool {
+        match self {
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) => {
+                failure.code == rusqlite::ErrorCode::DiskFull
+            }
+            StoreError::DataDir { source, .. } | StoreError::Replace { source, .. } => {
+                io_disk_full(source)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether an I/O error says the device's disk is full: `ENOSPC`
+/// (`StorageFull`) or a quota (`EDQUOT`, `QuotaExceeded`).
+pub(crate) fn io_disk_full(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
 }
 
 /// Whether blobs download alongside metadata or on explicit intent (D6).
@@ -603,8 +674,25 @@ impl OutboxEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BlobStatus {
     NotDownloaded,
+    /// Not downloaded: the download was given up for `reason`. It stays
+    /// so, across restarts and whatever the [`BlobPolicy`], until it is
+    /// asked for again.
+    Failed {
+        reason: String,
+    },
     /// `got` bytes of the content are in the partial file at `path`.
     Downloading {
+        got: u64,
+        path: PathBuf,
+    },
+    /// Not downloaded, nor downloading: a download nobody asked for,
+    /// stopped when the policy went back to `OnDemand`. The `got` bytes it
+    /// paid for stay in the partial file at `path`, so asking for the blob
+    /// (or `Eager`) resumes from them; a restart under `OnDemand` leaves
+    /// it (`crate::blobs`, "What gets downloaded"). Stored as
+    /// `not_downloaded` with `got` and `path` set, which no other status
+    /// writes, so the `blobs` CHECK and the schema stay.
+    Stopped {
         got: u64,
         path: PathBuf,
     },
@@ -741,8 +829,9 @@ impl Store {
     /// nothing is in flight after a restart, and the server dedups the
     /// resend (D7). Their `tries` are kept: they may have gone out.
     ///
-    /// A replica stamped with another `PROTOCOL_VERSION` is refused with
-    /// [`StoreError::ProtocolMismatch`] before anything reads it.
+    /// A replica stamped with an older `PROTOCOL_VERSION` since
+    /// `MIGRATED_SINCE` is migrated to this build's; any other is refused
+    /// with [`StoreError::ProtocolMismatch`] before anything reads it.
     pub fn open(data_dir: &Path) -> Result<Store, StoreError> {
         Store::init(connect(data_dir)?)
     }
@@ -1507,21 +1596,38 @@ impl Store {
             .optional()?)
     }
 
+    /// Writes `status` as `id`'s; a failure's reason goes to
+    /// `blob_failures`, and any other status clears it, in one transaction.
     pub fn set_blob_status(&self, id: BlobId, status: &BlobStatus) -> Result<(), StoreError> {
         let (state, got, path) = match status {
-            BlobStatus::NotDownloaded => ("not_downloaded", None, None),
+            BlobStatus::NotDownloaded | BlobStatus::Failed { .. } => ("not_downloaded", None, None),
             BlobStatus::Downloading { got, path } => {
                 ("downloading", Some(u64_sql(*got)?), Some(path_sql(path)?))
             }
+            BlobStatus::Stopped { got, path } => (
+                "not_downloaded",
+                Some(u64_sql(*got)?),
+                Some(path_sql(path)?),
+            ),
             BlobStatus::Available { path } => ("available", None, Some(path_sql(path)?)),
         };
-        let changed = self.conn.execute(
+        let id_sql = id.0.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE blobs SET state = ?2, got = ?3, path = ?4 WHERE id = ?1",
-            params![id.0.to_string(), state, got, path],
+            params![id_sql, state, got, path],
         )?;
         if changed == 0 {
             return Err(StoreError::UnknownBlob(id));
         }
+        tx.execute("DELETE FROM blob_failures WHERE blob_id = ?1", [&id_sql])?;
+        if let BlobStatus::Failed { reason } = status {
+            tx.execute(
+                "INSERT INTO blob_failures (blob_id, reason) VALUES (?1, ?2)",
+                params![id_sql, reason],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1919,7 +2025,8 @@ fn connect(data_dir: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-/// Whether [`migrate`] refuses a replica of another protocol version.
+/// Whether [`migrate`] migrates the stored wire JSON from the replica's
+/// protocol stamp, refusing one it cannot migrate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stamp {
     Check,
@@ -1941,9 +2048,9 @@ fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
         return Err(StoreError::NewerSchema { found });
     }
     // Before any migration reads the stored JSON.
-    if stamp == Stamp::Check && found >= STAMPED_SINCE {
+    let protocol = if stamp == Stamp::Check && found >= STAMPED_SINCE {
         match stamped_protocol(tx)? {
-            Some(PROTOCOL_VERSION) => {}
+            Some(found) if (MIGRATED_SINCE..=PROTOCOL_VERSION).contains(&found) => Some(found),
             Some(found) => {
                 return Err(StoreError::ProtocolMismatch {
                     found,
@@ -1952,10 +2059,15 @@ fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
             }
             None => return Err(StoreError::Corrupt("protocol_stamp has no row")),
         }
-    }
+    } else {
+        None
+    };
     let start = usize::try_from(found).unwrap_or(0);
     for script in &MIGRATIONS[start..] {
         tx.execute_batch(script)?;
+    }
+    if let Some(protocol) = protocol {
+        migrate_protocol(tx, protocol, &PROTOCOL_STEPS)?;
     }
     // A fresh replica, or one from before the stamp, gets this build's.
     tx.execute(
@@ -1963,6 +2075,26 @@ fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
         [PROTOCOL_VERSION],
     )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Runs the `steps` from protocol version `stamp` on and restamps the
+/// replica with the version they end at.
+fn migrate_protocol(
+    tx: &Transaction<'_>,
+    stamp: u32,
+    steps: &[ProtocolStep],
+) -> Result<(), StoreError> {
+    let first = (stamp - MIGRATED_SINCE) as usize;
+    for (i, step) in steps.iter().enumerate().skip(first) {
+        let from = MIGRATED_SINCE + i as u32;
+        tracing::info!(from, to = from + 1, "migrating the replica's protocol data");
+        step(tx)?;
+    }
+    tx.execute(
+        "UPDATE protocol_stamp SET version = ?1 WHERE id = 1",
+        [MIGRATED_SINCE + steps.len() as u32],
+    )?;
     Ok(())
 }
 
@@ -2393,14 +2525,24 @@ fn register_blob(tx: &Transaction<'_>, blob: &BlobRef) -> Result<bool, StoreErro
 /// Columns [`blob_from_row`] reads, from `blobs`.
 const BLOB_COLUMNS: &str = "id, size, state, got, path,
     EXISTS (SELECT 1 FROM workdir_blob_refs r WHERE r.blob_id = blobs.id),
-    (SELECT h.sha256 FROM blob_hashes h WHERE h.blob_id = blobs.id)";
+    (SELECT h.sha256 FROM blob_hashes h WHERE h.blob_id = blobs.id),
+    (SELECT f.reason FROM blob_failures f WHERE f.blob_id = blobs.id)";
 
 fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
     let state: String = row.get(2)?;
     let got: Option<i64> = row.get(3)?;
     let path: Option<String> = row.get(4)?;
+    let failed: Option<String> = row.get(7)?;
     let status = match (state.as_str(), got, path) {
-        ("not_downloaded", _, _) => BlobStatus::NotDownloaded,
+        // A failure clears `got` and `path`, so the two never meet.
+        ("not_downloaded", Some(got), Some(path)) if failed.is_none() => BlobStatus::Stopped {
+            got: u64::try_from(got).map_err(|e| bad_value(3, Type::Integer, e))?,
+            path: path.into(),
+        },
+        ("not_downloaded", _, _) => match failed {
+            Some(reason) => BlobStatus::Failed { reason },
+            None => BlobStatus::NotDownloaded,
+        },
         ("downloading", Some(got), Some(path)) => BlobStatus::Downloading {
             got: u64::try_from(got).map_err(|e| bad_value(3, Type::Integer, e))?,
             path: path.into(),
@@ -2478,4 +2620,35 @@ fn u64_sql(value: u64) -> Result<i64, StoreError> {
 fn path_sql(path: &Path) -> Result<&str, StoreError> {
     path.to_str()
         .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Steps that each record that they ran.
+    const TEST_STEPS: [ProtocolStep; 3] = [
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (0)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (1)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (2)", []).map(drop)?),
+    ];
+
+    #[test]
+    fn protocol_steps_run_from_the_stamp_on() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn, Stamp::Check).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch("CREATE TEMP TABLE ran (step INTEGER)")
+            .unwrap();
+        migrate_protocol(&tx, MIGRATED_SINCE + 1, &TEST_STEPS).unwrap();
+        let ran: Vec<u32> = tx
+            .prepare("SELECT step FROM ran ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ran, [1, 2], "from the stamp's step on, in order");
+        assert_eq!(stamped_protocol(&tx).unwrap(), Some(MIGRATED_SINCE + 3));
+    }
 }

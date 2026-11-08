@@ -633,6 +633,10 @@ pub struct ApprovalPanel {
     /// Where the whole input is when nothing else shows: `full input
     /// 4.0 KiB`.
     pub input_label: Option<String>,
+    /// The approval asked about an input other than the call's: `approval
+    /// input: differs from the call's · 4.0 KiB`. Revealing the call
+    /// shows it, labelled so.
+    pub asked_label: Option<String>,
     /// The server could not keep some of what the call will do, so what
     /// shows is only a summary or a start: said up front, since the user
     /// decides on it. `None` when everything was kept.

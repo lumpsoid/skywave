@@ -385,7 +385,8 @@ async fn an_adopting_create_logs_its_session_the_history_then_the_finish_naming_
     assert_eq!(
         imported[0].1,
         ImportedItem::UserMessage {
-            text: "list the files".into()
+            text: "list the files".into(),
+            full: None,
         }
     );
     let ImportedItem::ToolCall(call) = &imported[1].1 else {
@@ -408,7 +409,8 @@ async fn an_adopting_create_logs_its_session_the_history_then_the_finish_naming_
     assert_eq!(
         imported[3].1,
         ImportedItem::AgentMessage {
-            text: "There are many files.".into()
+            text: "There are many files.".into(),
+            full: None,
         }
     );
 

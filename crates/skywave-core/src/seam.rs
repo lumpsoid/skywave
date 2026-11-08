@@ -196,9 +196,11 @@ impl Seam {
         &self,
         id: BlobId,
     ) -> Result<Option<(BlobRecord, BlobLease)>, CoreError> {
-        let state = lock(&self.core.shared.state);
-        let lease = state.blob_lease(id);
-        Ok(state.store.blob(id)?.map(|record| (record, lease)))
+        let mut state = lock(&self.core.shared.state);
+        let Some(record) = state.store.blob(id)? else {
+            return Ok(None);
+        };
+        Ok(Some((record, state.blob_lease(id))))
     }
 
     /// The crops this device still makes itself, in log order
@@ -228,11 +230,11 @@ impl Seam {
         &self,
         crop: PendingCrop,
     ) -> Result<Option<(BlobRecord, BlobLease, Option<CropSource>)>, CoreError> {
-        let state = lock(&self.core.shared.state);
-        let lease = state.blob_lease(crop.into);
+        let mut state = lock(&self.core.shared.state);
         let Some(record) = state.store.blob(crop.into)? else {
             return Ok(None);
         };
+        let lease = state.blob_lease(crop.into);
         let path = match state.store.blob(crop.from)? {
             Some(BlobRecord {
                 status: BlobStatus::Available { path },
@@ -571,6 +573,7 @@ impl Seam {
                 let blobs = state.store.reset_for_server(address)?;
                 state.server_epoch += 1;
                 state.model.replica_reset(state.store.load()?);
+                state.blobs_purged(&blobs);
                 remove_all_blob_files(&data_dir);
                 if !blobs.is_empty() {
                     requests.push(Request::BlobsPurged(blobs));
@@ -628,8 +631,9 @@ impl Seam {
         })
     }
 
-    /// The download of `id` was given up for `reason`: back to
-    /// `NotDownloaded`, the reason shown until it is asked for again.
+    /// The download of `id` was given up for `reason`: it is
+    /// [`BlobStatus::Failed`], stored, so it stays so across restarts and
+    /// shows the reason until it is asked for again.
     pub fn blob_failed(&self, id: BlobId, reason: impl Into<String>) -> Result<(), CoreError> {
         self.fail_blob(id, None, reason.into())
     }
@@ -652,12 +656,47 @@ impl Seam {
     ) -> Result<(), CoreError> {
         self.update(|state| {
             check_lease(state, id, lease)?;
-            state
-                .store
-                .set_blob_status(id, &BlobStatus::NotDownloaded)?;
-            state.model.blob_failed(id, reason);
+            let status = BlobStatus::Failed { reason };
+            state.store.set_blob_status(id, &status)?;
+            state.model.blob_status(id, status);
             Ok(((), Vec::new()))
         })
+    }
+
+    /// The blob queue dropped `id`, a download nobody asked for, as the
+    /// policy is `OnDemand`: a blob left `Downloading` becomes
+    /// [`BlobStatus::Stopped`] with the progress it recorded, its `.part`
+    /// kept; any other status stays. No lease: no worker holds the blob
+    /// (the queue calls this as its worker lets go, or for a blob nobody
+    /// held), and a row purged and registered again meanwhile is not
+    /// `Downloading`.
+    pub(crate) fn blob_stopped(&self, id: BlobId) -> Result<(), CoreError> {
+        self.update(|state| {
+            let Some(BlobRecord {
+                status: BlobStatus::Downloading { got, path },
+                ..
+            }) = state.store.blob(id)?
+            else {
+                return Ok(((), Vec::new()));
+            };
+            let status = BlobStatus::Stopped { got, path };
+            state.store.set_blob_status(id, &status)?;
+            state.model.blob_status(id, status);
+            Ok(((), Vec::new()))
+        })
+    }
+
+    /// The blob queue paused every download on a full device disk, or
+    /// resumed them; the views say so. Nothing is stored: a restart
+    /// resumes.
+    pub(crate) fn blobs_disk_full(&self, full: bool) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state| {
+                state.model.set_blobs_disk_full(full);
+                Ok(((), Vec::new()))
+            })
+            .unwrap_or_else(|never| match never {});
     }
 
     /// Runs a change that persists before touching the model, so a failed
@@ -681,7 +720,7 @@ impl Seam {
 /// id now.
 fn check_lease(state: &State, id: BlobId, lease: Option<BlobLease>) -> Result<(), CoreError> {
     match lease {
-        Some(lease) if lease != state.blob_lease(id) => Err(StoreError::UnknownBlob(id).into()),
+        Some(lease) if !state.lease_current(id, lease) => Err(StoreError::UnknownBlob(id).into()),
         _ => Ok(()),
     }
 }

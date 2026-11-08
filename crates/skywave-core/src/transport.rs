@@ -130,7 +130,8 @@ pub trait Transport: Send + Sync {
     }
 }
 
-/// A blob response whose body is still arriving.
+/// A blob response whose body is still arriving. Offsets, sizes and chunks
+/// are the blob's own bytes, whatever the transport compressed (D45).
 pub struct BlobDownload {
     /// Offset of the first body byte. Normally the requested `from`; 0 if
     /// the server sent the whole blob instead of the range.

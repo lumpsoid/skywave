@@ -137,7 +137,23 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `LineSpan`s) logged as `EventKind::BlobCropped`; the refusals
 /// `UnknownBlob`, `BlobGone`, `NotCroppable` and `BadCrop`; and
 /// `output_blob` on [`ShellRunStorage`], the run's blob a device acts on.
-pub const PROTOCOL_VERSION: u32 = 23;
+///
+/// v24: [`Full::Inline`]: a tool result's whole output of at most
+/// [`limits::INLINE_MAX_BYTES`] travels in the event instead of a blob.
+/// Long messages: `full` on `EventKind::AgentMessage` and on
+/// `ImportedItem::UserMessage` and `ImportedItem::AgentMessage`, the whole
+/// text as a [`BlobUse::Message`] blob of a message longer than
+/// [`limits::MESSAGE_WHOLE_MAX_BYTES`], whose `text` is then its first
+/// [`limits::MESSAGE_PREVIEW_MAX_BYTES`].
+/// Compressed transport ([`encoding`]): event batches and blob bodies as
+/// zstd frames when asked for, blob ranges counting decoded bytes.
+pub const PROTOCOL_VERSION: u32 = 24;
+
+/// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
+/// a device's replica) this build migrates (D43). Each later version has
+/// one migration step on each side, from the version before it, and a bump
+/// does not compile until both have one. Data from before it is refused.
+pub const MIGRATED_SINCE: u32 = 23;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -267,7 +283,7 @@ impl Seq {
     }
 }
 
-/// Reference to large content. Content is always referenced, never inlined.
+/// Reference to content kept as a blob, outside the event.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct BlobRef {
     pub id: BlobId,
@@ -285,17 +301,20 @@ pub struct BlobRef {
 pub enum Full {
     /// Kept as a blob.
     Blob(BlobRef),
+    /// Carried here, in the event: at most [`limits::INLINE_MAX_BYTES`],
+    /// too small to be worth a blob.
+    Inline(String),
     /// The server could not store it (a full disk): only the preview or
     /// summary is left, and heads say so.
     Lost,
 }
 
 impl Full {
-    /// The blob holding the whole content, unless it was lost.
+    /// The blob holding the whole content, unless it is inline or lost.
     pub fn blob(&self) -> Option<&BlobRef> {
         match self {
             Full::Blob(blob) => Some(blob),
-            Full::Lost => None,
+            Full::Inline(_) | Full::Lost => None,
         }
     }
 }
@@ -367,11 +386,17 @@ pub enum EventKind {
         device_id: DeviceId,
         text: String,
     },
+    /// `text` is the whole message unless `full` is set: then it is the
+    /// message's head ([`limits::MESSAGE_PREVIEW_MAX_BYTES`]) and `full`
+    /// the whole, a [`BlobUse::Message`] blob (or [`Full::Lost`]).
     AgentMessage {
         text: String,
         /// The `Agent` call that started the subagent speaking; `None` for
         /// the main agent.
         parent: Option<CallId>,
+        /// The whole message, when it is longer than
+        /// [`limits::MESSAGE_WHOLE_MAX_BYTES`]. Never [`Full::Inline`].
+        full: Option<Full>,
     },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
@@ -660,11 +685,15 @@ pub struct LineSpan {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImportedItem {
+    /// `text` and `full` as on `EventKind::AgentMessage`.
     UserMessage {
         text: String,
+        full: Option<Full>,
     },
+    /// `text` and `full` as on `EventKind::AgentMessage`.
     AgentMessage {
         text: String,
+        full: Option<Full>,
     },
     ToolCall(ToolCall),
     /// Links by `call` to an imported `ToolCall`.
@@ -882,8 +911,9 @@ impl EventKind {
 
     /// The blobs the event references, with what each holds: a tool call's
     /// input and the whole of its display body, a result's output, an
-    /// approval's input, a finished shell run's whole output; the same for
-    /// an imported call or result. A [`Full::Lost`] references none. A
+    /// approval's input, a finished shell run's whole output, a long
+    /// message's whole text; the same for an imported call, result or
+    /// message. A [`Full::Inline`] or [`Full::Lost`] references none. A
     /// `BlobCropped` yields its `into`, the blob it made, with what it holds.
     pub fn blobs(&self) -> impl Iterator<Item = (BlobUse, &BlobRef)> {
         fn full(holds: BlobUse, full: &Option<Full>) -> Option<(BlobUse, &BlobRef)> {
@@ -911,9 +941,15 @@ impl EventKind {
                 (output.as_ref().map(|b| (BlobUse::ShellOutput, b)), None)
             }
             EventKind::BlobCropped { holds, into, .. } => (Some((*holds, into)), None),
+            EventKind::AgentMessage { full: whole, .. }
+            | EventKind::Imported {
+                item:
+                    ImportedItem::UserMessage { full: whole, .. }
+                    | ImportedItem::AgentMessage { full: whole, .. },
+                ..
+            } => (full(BlobUse::Message, whole), None),
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
-            | EventKind::AgentMessage { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::ApprovalCancelled { .. }
             | EventKind::TurnInterrupted
@@ -947,11 +983,7 @@ impl EventKind {
             | EventKind::ShellOutput { .. }
             | EventKind::ImportFinished { .. }
             // It names a blob it deleted; it references none.
-            | EventKind::BlobDeleted { .. }
-            | EventKind::Imported {
-                item: ImportedItem::UserMessage { .. } | ImportedItem::AgentMessage { .. },
-                ..
-            } => (None, None),
+            | EventKind::BlobDeleted { .. } => (None, None),
         };
         first.into_iter().chain(second)
     }
@@ -971,6 +1003,10 @@ pub enum BlobUse {
     ApprovalInput,
     /// A finished shell run's whole output.
     ShellOutput,
+    /// A long message's whole text (`full` on `EventKind::AgentMessage`
+    /// and on an imported message). Not croppable: a message cut to some of
+    /// its lines says something else.
+    Message,
 }
 
 /// Size caps on the bounded text in tool events. Producers (the server)
@@ -987,6 +1023,32 @@ pub mod limits {
     pub const PREVIEW_MAX_LINES: usize = 8;
     /// Most UTF-8 bytes in a preview.
     pub const PREVIEW_MAX_BYTES: usize = 512;
+    /// Most UTF-8 bytes of a tool result's whole output carried in its
+    /// event ([`Full::Inline`](crate::Full::Inline)) rather than as a blob.
+    /// A blob costs a file, two fsyncs and a row on the server, and under
+    /// the eager policy a request per device, each with a round trip on a
+    /// bad link and headers worth hundreds of bytes; below a few KiB that
+    /// costs more than the bytes it keeps out of the log. 4 KiB holds the
+    /// common small results whole (an edit's note to the model, a short
+    /// read, a grep's file list) while capping what every device pulls per
+    /// result at eight previews' worth.
+    pub const INLINE_MAX_BYTES: usize = 4096;
+    /// Longest message (`EventKind::AgentMessage`, an imported message)
+    /// whose text travels whole in its event, in UTF-8 bytes. Messages are
+    /// the conversation every head shows unasked, so they get four times a
+    /// tool output's [`INLINE_MAX_BYTES`]: 16 KiB is several screens, which
+    /// holds nearly every reply whole. Past it is a report or a dump, which
+    /// would otherwise reach every device as event data however rarely it
+    /// is read; it travels as a [`MESSAGE_PREVIEW_MAX_BYTES`] head and a
+    /// blob. A typed `SendMessage` is bounded by [`MESSAGE_MAX_BYTES`]
+    /// instead, and its `UserMessage` stays whole: the server hands that
+    /// text to the agent.
+    pub const MESSAGE_WHOLE_MAX_BYTES: usize = 16 * 1024;
+    /// Most UTF-8 bytes of a long message's head, its `text` beside the
+    /// blob that holds it whole: about a screen, enough to tell what the
+    /// message is about. Cut at the last line break in it, if any, else on
+    /// a char boundary.
+    pub const MESSAGE_PREVIEW_MAX_BYTES: usize = 2048;
     /// Longest session name (`RenameSession`, `SessionRenamed`), in chars.
     pub const SESSION_NAME_MAX_CHARS: usize = 80;
     /// Longest context name (`SessionCreated::context_name`,
@@ -1525,7 +1587,8 @@ pub struct ToolResult {
     pub preview: String,
     /// Line count of the whole output.
     pub lines: u32,
-    /// The whole output, when `preview` does not hold all of it.
+    /// The whole output, when `preview` does not hold all of it: inline
+    /// when it is at most [`limits::INLINE_MAX_BYTES`], else a blob.
     pub output: Option<Full>,
 }
 
@@ -2480,14 +2543,102 @@ pub mod path {
     }
 }
 
+/// Transport compression of event batches and blob bodies (D45).
+///
+/// A request that sends `Accept-Encoding: zstd` ([`ZSTD`]) gets a body of
+/// at least [`COMPRESS_MIN_BYTES`] from `GET` [`path::EVENTS`] or a blob
+/// download as one zstd frame, with `Content-Encoding: zstd`; a shorter
+/// body, or a request that does not ask, gets the bytes as they are. A
+/// batch's frame is sent whole, with its `Content-Length`; a blob's is
+/// streamed as it is made, without one. The frame is the transport's alone: hashes,
+/// sizes and progress all count the decoded bytes.
+///
+/// A blob's `Range` and `Content-Range` count decoded bytes too, unlike
+/// plain HTTP (where a range of a `Content-Encoding` counts encoded ones):
+/// a resumed download asks for the decoded bytes from where its `.part`
+/// file ends, and the server compresses exactly that range as a fresh
+/// frame. A compressed blob response names its decoded length in
+/// [`DECODED_LENGTH_HEADER`].
+pub mod encoding {
+    /// The `Accept-Encoding` and `Content-Encoding` token: one zstd frame.
+    pub const ZSTD: &str = "zstd";
+    /// Bodies shorter than this travel uncompressed: a frame's overhead
+    /// and the CPU would buy nothing on them.
+    pub const COMPRESS_MIN_BYTES: u64 = 1024;
+    /// On a compressed blob response, the number of decoded bytes its
+    /// frame holds: the blob's size for a 200, the range's length for a
+    /// 206 (which `Content-Range` also gives).
+    pub const DECODED_LENGTH_HEADER: &str = "skywave-decoded-length";
+
+    /// Whether an `Accept-Encoding` value lists [`ZSTD`] (any weight but
+    /// an explicit `q=0`).
+    pub fn accepts_zstd(accept_encoding: &str) -> bool {
+        accept_encoding.split(',').any(|coding| {
+            let mut parts = coding.split(';').map(str::trim);
+            parts
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(ZSTD))
+                && !parts.any(|param| {
+                    param
+                        .strip_prefix("q=")
+                        .and_then(|q| q.parse::<f32>().ok())
+                        .is_some_and(|q| q == 0.0)
+                })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn accept_encoding_lists_zstd() {
+        use encoding::accepts_zstd;
+        for yes in ["zstd", "gzip, zstd", "ZSTD;q=0.5", " br , zstd ; q=1"] {
+            assert!(accepts_zstd(yes), "{yes}");
+        }
+        for no in ["", "gzip", "zstdx", "zstd;q=0", "zstd; q=0.0", "identity"] {
+            assert!(!accepts_zstd(no), "{no}");
+        }
+    }
+
+    #[test]
     fn seq_next_saturates_instead_of_overflowing() {
         assert_eq!(Seq::ZERO.next(), Seq(1));
         assert_eq!(Seq(u64::MAX).next(), Seq(u64::MAX));
+    }
+
+    #[test]
+    fn a_long_messages_blob_holds_a_message() {
+        let blob = BlobRef {
+            id: BlobId::new(),
+            size: 40_000,
+            sha256: ContentHash::of(b""),
+        };
+        let agent = |full| EventKind::AgentMessage {
+            text: "# Report".into(),
+            parent: None,
+            full,
+        };
+        let imported = |item| EventKind::Imported { at: None, item };
+        for kind in [
+            agent(Some(Full::Blob(blob.clone()))),
+            imported(ImportedItem::UserMessage {
+                text: "log:".into(),
+                full: Some(Full::Blob(blob.clone())),
+            }),
+            imported(ImportedItem::AgentMessage {
+                text: "# Report".into(),
+                full: Some(Full::Blob(blob.clone())),
+            }),
+        ] {
+            let uses: Vec<_> = kind.blobs().collect();
+            assert_eq!(uses, [(BlobUse::Message, &blob)], "{kind:?}");
+        }
+        // A whole or lost message references none.
+        assert_eq!(agent(None).blobs().count(), 0);
+        assert_eq!(agent(Some(Full::Lost)).blobs().count(), 0);
     }
 
     #[test]
@@ -2508,6 +2659,7 @@ mod tests {
             EventKind::AgentMessage {
                 parent: None,
                 text: "x".into(),
+                full: None,
             },
             EventKind::SessionStopped,
             EventKind::SessionRenamed {
@@ -2534,7 +2686,10 @@ mod tests {
     fn imported_history_is_the_daemons_and_its_end_the_commands() {
         let imported = EventKind::Imported {
             at: None,
-            item: ImportedItem::UserMessage { text: "hi".into() },
+            item: ImportedItem::UserMessage {
+                text: "hi".into(),
+                full: None,
+            },
         };
         let finished = EventKind::ImportFinished {
             outcome: ImportOutcome::Imported { items: 1 },
@@ -2844,7 +2999,8 @@ mod tests {
         assert!(
             !EventKind::AgentMessage {
                 parent: None,
-                text: "x".into()
+                text: "x".into(),
+                full: None,
             }
             .logged_by_command()
         );

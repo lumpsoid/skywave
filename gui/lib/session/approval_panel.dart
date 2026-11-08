@@ -205,6 +205,13 @@ class _ApprovalPanelViewState extends State<ApprovalPanelView> {
             padding: const EdgeInsets.only(top: 4),
             child: Text(input, style: small),
           ),
+        // What the approval asked differs from the call shown: Show call
+        // reveals it, labelled.
+        if (approval.askedLabel case final asked?)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(asked, style: small?.copyWith(color: colors.warning)),
+          ),
         if (approval.alwaysLabel case final always?)
           Padding(
             padding: const EdgeInsets.only(top: 6),

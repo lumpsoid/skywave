@@ -968,6 +968,38 @@ void main() {
       expect(find.text(lost), findsNothing);
       expect(find.byIcon(Icons.warning_amber_rounded), findsNothing);
     });
+
+    testWidgets('an input the approval asked beyond the call is named', (
+      tester,
+    ) async {
+      const asked = "approval input: differs from the call's · 2.0 KiB";
+      ApprovalPanel withAsked(String? said) => ApprovalPanel(
+        approvalId: 'a1',
+        kind: ToolKindView.shell,
+        tool: 'Bash',
+        title: r'$ make',
+        askedLabel: said,
+        canAnswer: true,
+        suggestions: const [],
+        alwaysPicks: false,
+      );
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withAsked(asked)),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text(asked), findsOneWidget);
+
+      // Control: nothing asked beyond the call, nothing named.
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withAsked(null)),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text(asked), findsNothing);
+    });
   });
 
   group('composer', () {

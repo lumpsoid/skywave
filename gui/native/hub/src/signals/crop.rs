@@ -19,6 +19,7 @@ pub enum BlobUseView {
     ToolOutput,
     ApprovalInput,
     ShellOutput,
+    Message,
 }
 
 /// The blob a timeline item's output, a shell run's output or a storage

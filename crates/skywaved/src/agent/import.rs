@@ -28,7 +28,7 @@ use skywave_proto::{
     CallId, ContextId, EventKind, Full, ImportOutcome, ImportedItem, SessionId, ToolCall,
 };
 
-use super::mapper::{call_display, cut_line, tool_result};
+use super::mapper::{call_display, cut_line, message, tool_result};
 use super::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, OutsideConversations};
 use crate::blobs::{BlobMeta, BlobStore};
 use crate::error::Result;
@@ -233,12 +233,16 @@ impl Prepared {
         };
         let (at, event) = match item {
             HistoryItem::User { at, text } => {
-                return Ok(Some((at, ImportedItem::UserMessage { text })));
+                let (text, full) = message(&mut put, text)?;
+                return Ok(Some((at, ImportedItem::UserMessage { text, full })));
             }
             HistoryItem::Agent { at, event } => (at, event),
         };
         let item = match event {
-            AdapterEvent::Text { text, .. } => ImportedItem::AgentMessage { text },
+            AdapterEvent::Text { text, .. } => {
+                let (text, full) = message(&mut put, text)?;
+                ImportedItem::AgentMessage { text, full }
+            }
             AdapterEvent::ToolCall {
                 call,
                 name,
@@ -289,6 +293,7 @@ mod tests {
     use super::*;
     use crate::agent::fake::FakeOutside;
     use crate::agent::{ResultDisplay, ToolDisplay, ToolKind};
+    use skywave_proto::limits::{MESSAGE_PREVIEW_MAX_BYTES, MESSAGE_WHOLE_MAX_BYTES};
 
     fn files(dir: &Path) -> usize {
         std::fs::read_dir(dir).unwrap().count()
@@ -333,7 +338,8 @@ mod tests {
                 text: "hi".into(),
             },
             call("t1", "ls".into()),
-            result("t1", long(500)),
+            // Past `INLINE_MAX_BYTES`, so a blob.
+            result("t1", long(1000)),
             HistoryItem::Agent {
                 at: None,
                 event: AdapterEvent::TurnStarted { message: true },
@@ -381,6 +387,10 @@ mod tests {
             panic!("{:?}", items[4]);
         };
         assert_eq!(unlinked.call, None);
+        assert!(matches!(
+            &items[3].1,
+            ImportedItem::AgentMessage { text, full: None } if text == "done"
+        ));
         assert_eq!(files(&dir.path().join("blobs")), 1);
         // Dropped unlogged, its blob goes too.
         drop(prepared);
@@ -409,6 +419,49 @@ mod tests {
             }
         );
         assert_eq!(files(&dir.path().join("blobs")), 0);
+    }
+
+    #[test]
+    fn long_messages_are_their_heads_beside_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("blobs")).unwrap();
+        let source = FakeOutside::new();
+        let report = long(MESSAGE_WHOLE_MAX_BYTES / 5 + 1);
+        let items = vec![
+            HistoryItem::User {
+                at: None,
+                text: report.clone(),
+            },
+            HistoryItem::Agent {
+                at: None,
+                event: AdapterEvent::Text {
+                    text: report.clone(),
+                    parent: None,
+                },
+            },
+        ];
+        source.conversation(dir.path(), "c", HistoryRead::Read { items });
+        let blobs = BlobStore::new(dir.path().join("blobs"));
+        let workdir = dir.path().to_str().unwrap();
+        let prepared = prepare(
+            &source,
+            blobs,
+            workdir,
+            "c",
+            Instant::now() + IMPORT_DEADLINE,
+        );
+        let items = prepared.read.as_ref().unwrap();
+        for (_, item) in items {
+            let (ImportedItem::UserMessage { text, full }
+            | ImportedItem::AgentMessage { text, full }) = item
+            else {
+                panic!("{item:?}");
+            };
+            assert_eq!(text, &long(MESSAGE_PREVIEW_MAX_BYTES / 5));
+            let blob = full.as_ref().and_then(Full::blob).expect("a blob");
+            assert_eq!(blob.size, report.len() as u64);
+        }
+        assert_eq!(files(&dir.path().join("blobs")), 2);
     }
 
     #[test]

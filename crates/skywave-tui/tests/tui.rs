@@ -1816,6 +1816,7 @@ fn every_timeline_entry_renders_distinctly() {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "Looking.\nSecond line".into(),
+                    full: None,
                 },
             ),
             event(
@@ -2035,6 +2036,54 @@ fn an_approval_of_a_call_warns_of_its_own_lost_input() {
     assert!(!screen.contains("could not store"), "{screen}");
 }
 
+/// An approval asking with an input other than its call's offers that
+/// input: the panel names it, and the call, revealed, shows it labelled.
+#[test]
+fn an_approval_offers_its_own_input_when_it_differs() {
+    let ask = |input: Option<Full>| {
+        let (mut h, id, _) = open_session();
+        let call_id = CallId::new();
+        let tool = call(call_id, "Bash", ToolKind::Shell, "make");
+        pull(
+            &mut h,
+            vec![
+                event(id, 1, EventKind::ToolCall(tool)),
+                event(
+                    id,
+                    2,
+                    EventKind::ApprovalRequested {
+                        id: ApprovalId::new(),
+                        call: Some(call_id),
+                        tool: "Bash".into(),
+                        summary: "make".into(),
+                        input,
+                        suggestions: Vec::new(),
+                    },
+                ),
+            ],
+        );
+        h
+    };
+    let label = "approval input: differs from the call's";
+
+    let mut h = ask(Some(Full::Blob(blob(4096).1)));
+    let screen = h.screen();
+    assert_contains(&screen, &format!("{label} · 4.0 KiB · v to see it"));
+    // Collapsed, the timeline does not show it.
+    assert!(!screen.contains(&format!("│ {label}")), "{screen}");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('v'));
+    assert_contains(&h.screen(), &format!("│ {label}"));
+
+    // Control: asking what the call holds offers nothing extra.
+    let mut h = ask(None);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('v'));
+    let screen = h.screen();
+    assert_contains(&screen, "Approval needed");
+    assert!(!screen.contains(label), "{screen}");
+}
+
 /// A cut result whose output the server could not keep says so under its
 /// preview, where a kept one says where its blob stands.
 #[test]
@@ -2065,6 +2114,145 @@ fn a_lost_output_says_so_under_its_preview() {
     let screen = h.screen();
     assert_contains(&screen, "│ … full 9.8 KiB · not downloaded");
     assert!(!screen.contains("could not store"), "{screen}");
+}
+
+#[test]
+fn an_inline_output_expands_to_all_of_it_without_a_download() {
+    let (mut h, id, _) = open_session();
+    let whole: String = (0..12).map(|i| format!("file-{i:03}\n")).collect();
+    let c = CallId::new();
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall(call(c, "Glob", ToolKind::Search, "*")),
+            ),
+            event(
+                id,
+                2,
+                EventKind::ToolResult(ToolResult {
+                    output: Some(Full::Inline(whole)),
+                    lines: 12,
+                    ..result(c, false, "12 files", "file-000")
+                }),
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "│ file-000 ");
+    assert_contains(&screen, "│ … +11 lines ");
+    assert!(!screen.contains("file-011"), "collapsed: {screen}");
+    assert!(!screen.contains("not downloaded"), "{screen}");
+    assert!(!screen.contains("not stored"), "{screen}");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    // Nothing to fetch, and `d` asks for nothing.
+    assert_eq!(h.key(KeyCode::Char('d')), None);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert!(h.drain_requests().is_empty());
+    let screen = h.screen();
+    assert_contains(&screen, "│ file-011 ");
+    assert!(!screen.contains("+11 lines"), "expanded: {screen}");
+}
+
+/// A long message shows its head and where its whole stands; expanding
+/// fetches the whole and shows it beneath the head; `y` copies the whole.
+#[test]
+fn a_long_message_shows_its_head_and_expands_to_its_whole() {
+    let (blob_id, whole) = blob(40_000);
+    let long = |full| EventKind::AgentMessage {
+        parent: None,
+        text: "# Report\nhead line\n".into(),
+        full: Some(full),
+    };
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, long(Full::Blob(whole)))]);
+    let screen = h.screen();
+    assert_contains(&screen, "agent: # Report");
+    assert_contains(&screen, "head line");
+    assert_contains(&screen, "│ … full 39.1 KiB · not downloaded ");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    // `y` takes the whole, never the head alone.
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+    assert_eq!(h.key(KeyCode::Enter), None, "already asked for");
+    let dir = tempfile::tempdir().unwrap();
+    downloaded(
+        &mut h,
+        &dir,
+        "m",
+        blob_id,
+        b"# Report\nhead line\nthe deep finding\n",
+    );
+    assert_contains(&h.screen(), "│ the deep finding ");
+    h.key(KeyCode::Char('y'));
+    assert!(
+        matches!(clip(&h), Some(Clip::File { .. })),
+        "{:?}",
+        clip(&h)
+    );
+    // Collapsed again: the head, and that the whole is here.
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    assert!(!screen.contains("the deep finding"), "{screen}");
+    assert_contains(&screen, "│ … downloaded ");
+
+    // Lost: the head is all there is, and it says so.
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, long(Full::Lost))]);
+    assert_contains(&h.screen(), "│ … the server could not store the rest");
+
+    // Control: a whole message says nothing more.
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, agent("# Report\nhead line\n"))]);
+    let screen = h.screen();
+    assert_contains(&screen, "head line");
+    assert!(!screen.contains("│ …"), "{screen}");
+}
+
+#[test]
+fn an_inline_output_expanded_is_cut_short_like_a_blob() {
+    let (mut h, id, _) = open_session();
+    let whole: String = (0..500).map(|i| format!("l{i:03}\n")).collect();
+    let c = CallId::new();
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall(call(c, "Glob", ToolKind::Search, "*")),
+            ),
+            event(
+                id,
+                2,
+                EventKind::ToolResult(ToolResult {
+                    output: Some(Full::Inline(whole)),
+                    lines: 500,
+                    ..result(c, false, "500 files", "l000")
+                }),
+            ),
+        ],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Enter);
+    let mut screen = h.screen();
+    for _ in 0..100 {
+        if screen.contains("cut short") {
+            break;
+        }
+        h.key(KeyCode::PageDown);
+        screen = h.screen();
+    }
+    assert_contains(&screen, "… cut short: 400 lines of 2.4 KiB shown");
+    assert!(!screen.contains("l400"), "past the cap: {screen}");
 }
 
 fn blob_deleted(id: SessionId, minute: u32, blob: BlobId, by: DeviceId) -> Event {
@@ -2143,6 +2331,50 @@ fn a_deleted_or_cropped_output_says_so_under_its_preview() {
     assert_eq!(
         h.key(KeyCode::Char('d')),
         Some(Action::DownloadBlob(into_id))
+    );
+}
+
+/// Expanding a cropped output keeps saying what the crop kept, beside
+/// where its new blob stands.
+#[test]
+fn an_expanded_cropped_output_still_says_what_the_crop_kept() {
+    let (mut h, id, me) = open_session();
+    let (kept, (_, into)) = (blob(9_000), blob(300));
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, output_result(40, kept.1)),
+            blob_cropped(id, 2, kept.0, into, me),
+        ],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    // Control: expanded, so the collapsed summary is gone.
+    assert!(!screen.contains("full 300 B"), "{screen}");
+    assert_contains(
+        &screen,
+        "│ requested · waiting for a slot · 300 B · Cropped by you: kept 2 of 40 lines",
+    );
+}
+
+/// Expanding an output whose delete is pending keeps saying so under it.
+#[test]
+fn an_expanded_output_still_says_its_delete_is_pending() {
+    let (mut h, id, _) = open_session();
+    let (_, output) = blob(10_000);
+    pull(&mut h, vec![event(id, 1, output_result(40, output))]);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Char('D'));
+    h.key(KeyCode::Char('y'));
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    assert!(!screen.contains("full 9.8 KiB"), "{screen}");
+    assert_contains(
+        &screen,
+        "│ requested · waiting for a slot · 9.8 KiB · Delete queued",
     );
 }
 
@@ -2633,6 +2865,7 @@ fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionI
                 10,
                 ImportedItem::UserMessage {
                     text: "why is the build red".into(),
+                    full: None,
                 },
             ),
             imported(
@@ -2651,6 +2884,7 @@ fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionI
                 14,
                 ImportedItem::AgentMessage {
                     text: "it builds now".into(),
+                    full: None,
                 },
             ),
             event(id, 1, EventKind::ImportFinished { outcome }),
@@ -2883,6 +3117,7 @@ fn movable_context() -> (Harness, SessionId, DeviceId) {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "alpha answer".into(),
+                    full: None,
                 },
             ),
             Event {
@@ -3348,6 +3583,7 @@ fn timeline_follows_new_items_until_scrolled_back() {
                     EventKind::AgentMessage {
                         parent: None,
                         text: format!("message {i:02}"),
+                        full: None,
                     },
                 )
             })
@@ -3415,6 +3651,7 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
             EventKind::AgentMessage {
                 parent: None,
                 text: format!("chatter {i}"),
+                full: None,
             },
         )
     }));
@@ -4279,6 +4516,7 @@ fn agent(text: &str) -> EventKind {
     EventKind::AgentMessage {
         parent: None,
         text: text.into(),
+        full: None,
     }
 }
 
@@ -7684,6 +7922,7 @@ fn moving_the_current_context_warns_but_another_does_not() {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "alpha answer".into(),
+                    full: None,
                 },
             ),
             event(
@@ -8509,14 +8748,22 @@ fn y_copies_a_runs_output_with_ansi_stripped() {
     let row = line_with(&h.screen(), "exit 1");
     assert_contains(&row, &took_label(Duration::from_secs(5)));
 
-    // Not here yet: the preview, stripped already.
-    assert_eq!(h.key(KeyCode::Char('y')), None);
-    assert_eq!(clip(&h), Some(Clip::Text("the tail\n".into())));
-    send_copy(&mut h, clipboard::MAX);
+    // Not here yet: downloaded first, never just the preview copied.
     assert_eq!(
-        h.key(KeyCode::Char('d')),
+        h.key(KeyCode::Char('y')),
         Some(Action::DownloadBlob(blob_id))
     );
+    assert_eq!(clip(&h), None);
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("downloading 40 B · press y again when it is here")
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+    // On its way: asked for once only.
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), None);
+    assert_contains(&notice(&h).unwrap(), "downloading");
+    assert_eq!(h.key(KeyCode::Char('d')), None, "on its way already");
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("blob");
@@ -8531,6 +8778,11 @@ fn y_copies_a_runs_output_with_ansi_stripped() {
     assert_eq!(
         send_copy(&mut h, clipboard::MAX),
         clipboard::osc52(b"red\nthe tail\n").into_bytes()
+    );
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("copied 13 B · sent to terminal clipboard"),
+        "all of it: no note"
     );
     // Expanded, the whole output shows, stripped too.
     h.key(KeyCode::Enter);
@@ -8568,9 +8820,17 @@ fn a_runs_deleted_or_cropped_output_says_so() {
         (h.screen(), download, h)
     };
 
-    let (screen, download, _) = shown(&|id, blob, me| blob_deleted(id, 3, blob, me));
+    let (screen, download, mut h) = shown(&|id, blob, me| blob_deleted(id, 3, blob, me));
     assert_contains(&screen, "… 39 earlier lines · Deleted by you");
     assert_eq!(download, None, "nothing to download");
+    // Copied, it is the kept tail, and the notice says that is all.
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), Some(Clip::Text("the tail\n".into())));
+    send_copy(&mut h, clipboard::MAX);
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("copied 9 B · sent to terminal clipboard · only the kept tail · Deleted by you")
+    );
 
     let (into_id, into) = blob(300);
     let (screen, download, mut h) =
@@ -9082,7 +9342,7 @@ fn shift_d_on_an_output_asks_and_only_y_deletes_it() {
     assert_eq!(h.key(KeyCode::Char('D')), None);
     assert_eq!(
         footer(&h),
-        "Delete this output from the server and from every device? This can't be undone. y/N"
+        "Delete this tool output from the server and from every device? This can't be undone. y/N"
     );
     assert_eq!(h.key(KeyCode::Esc), None, "Esc answers no");
     assert!(matches!(h.app.view().screen, Screen::Session(_)));
@@ -9314,7 +9574,7 @@ fn storage_rows_move_with_j_k_and_act_on_their_blob() {
     assert_eq!(h.key(KeyCode::Char('K')), None);
     let before = outbox_len(&h);
     assert_eq!(h.key(KeyCode::Char('D')), None);
-    assert_contains(&footer(&h), "Delete this output from the server");
+    assert_contains(&footer(&h), "Delete this tool output from the server");
     assert_eq!(h.key(KeyCode::Esc), None);
     assert!(matches!(h.app.view().screen, Screen::Storage(_)));
     assert_eq!(outbox_len(&h), before, "nothing sent");
@@ -9326,6 +9586,7 @@ fn storage_rows_move_with_j_k_and_act_on_their_blob() {
     h.key(KeyCode::Tab);
     assert_contains(&line_with(&h.screen(), "> "), "$ make all");
     h.key(KeyCode::Char('D'));
+    assert_contains(&footer(&h), "Delete this shell output from the server");
     assert_eq!(
         h.key(KeyCode::Char('y')),
         Some(Action::DeleteBlob(run_output))

@@ -5,9 +5,9 @@
 //! call; this turns keys into its actions.
 
 use crossterm::event::KeyCode;
-use skywave_core::{Action, BlobId, LineSpan};
+use skywave_core::{Action, BlobId, BlobUse, LineSpan};
 use skywave_present::blob_actions::{
-    BlobAction, BlobTarget, DELETE_CONFIRMATION, crop_confirmation, pending_note,
+    BlobAction, BlobTarget, crop_confirmation, delete_confirmation, pending_note,
 };
 use skywave_present::crop::kept;
 
@@ -17,7 +17,8 @@ use super::App;
 /// undone; `y` sends it, any other key drops it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobConfirm {
-    Delete(BlobId),
+    /// Deleting `blob`, which holds `holds` (the question names it).
+    Delete { blob: BlobId, holds: BlobUse },
     /// Keeping `keep` of the blob's `of` lines.
     Crop {
         blob: BlobId,
@@ -30,7 +31,7 @@ impl BlobConfirm {
     /// The question, in [`skywave_present::blob_actions`]'s words.
     pub fn question(&self) -> String {
         match self {
-            BlobConfirm::Delete(_) => DELETE_CONFIRMATION.to_owned(),
+            BlobConfirm::Delete { holds, .. } => delete_confirmation(*holds),
             BlobConfirm::Crop { keep, of, .. } => {
                 crop_confirmation(u32::try_from(kept(keep)).unwrap_or(u32::MAX), *of)
             }
@@ -39,7 +40,7 @@ impl BlobConfirm {
 
     fn action(self) -> Action {
         match self {
-            BlobConfirm::Delete(blob) => Action::DeleteBlob(blob),
+            BlobConfirm::Delete { blob, .. } => Action::DeleteBlob(blob),
             BlobConfirm::Crop { blob, keep, .. } => Action::CropBlob { blob, keep },
         }
     }
@@ -51,9 +52,10 @@ impl BlobConfirm {
 pub(super) fn key_on(target: BlobTarget, code: KeyCode) -> BlobKey {
     let offered = |action| target.offers.contains(&action);
     match code {
-        KeyCode::Char('D') if offered(BlobAction::Delete) => {
-            BlobKey::Ask(BlobConfirm::Delete(target.blob))
-        }
+        KeyCode::Char('D') if offered(BlobAction::Delete) => BlobKey::Ask(BlobConfirm::Delete {
+            blob: target.blob,
+            holds: target.holds,
+        }),
         KeyCode::Char('K') if offered(BlobAction::Crop) => BlobKey::Send(target.open_crop()),
         KeyCode::Char('D' | 'K') => match &target.pending {
             Some(pending) => BlobKey::Say(pending_note(pending)),
