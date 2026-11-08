@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use skywave_proto::limits::{
-    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES,
-    SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX,
-    TITLE_MAX_CHARS,
+    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, MESSAGE_PREVIEW_MAX_BYTES, PREVIEW_MAX_BYTES,
+    PREVIEW_MAX_LINES, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS,
+    TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BackgroundTask, BodyFormat, CallId, Command, CommandId,
@@ -137,6 +137,7 @@ impl Fixture {
             EventKind::ToolCall(ToolCall { input, .. })
             | EventKind::ApprovalRequested { input, .. } => input,
             EventKind::ToolResult(ToolResult { output, .. }) => output,
+            EventKind::AgentMessage { full, .. } => full,
             other => panic!("no blob in {other:?}"),
         }
         .as_ref()
@@ -283,7 +284,8 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         kinds[2],
         EventKind::AgentMessage {
             parent: None,
-            text: "Looking around.".into()
+            text: "Looking around.".into(),
+            full: None,
         }
     );
     // An input of one string field is shown whole by the generic display.
@@ -361,7 +363,8 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         kinds[9],
         EventKind::AgentMessage {
             parent: None,
-            text: "Done.".into()
+            text: "Done.".into(),
+            full: None,
         }
     );
     assert_eq!(kinds[10], state(SessionState::Idle));
@@ -549,13 +552,15 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
             state(SessionState::AgentWorking),
             EventKind::AgentMessage {
                 parent: None,
-                text: "working".into()
+                text: "working".into(),
+                full: None,
             },
             state(SessionState::Idle),
             state(SessionState::AgentWorking),
             EventKind::AgentMessage {
                 parent: None,
-                text: "released".into()
+                text: "released".into(),
+                full: None,
             },
             state(SessionState::Idle),
         ]
@@ -608,7 +613,8 @@ async fn denied_approval_runs_the_deny_branch() {
         kinds[n - 2],
         EventKind::AgentMessage {
             parent: None,
-            text: "Skipping.".into()
+            text: "Skipping.".into(),
+            full: None,
         }
     );
     assert_eq!(kinds[n - 1], state(SessionState::Idle));
@@ -1309,6 +1315,10 @@ fn large_content_gives_small_events_and_blobs() {
                     shows_all_input: true,
                 }),
             },
+            AdapterEvent::Text {
+                text: huge.clone(),
+                parent: None,
+            },
         ],
     );
     let kinds = f.kinds();
@@ -1380,6 +1390,32 @@ fn large_content_gives_small_events_and_blobs() {
     assert_eq!(full.size, huge.len() as u64);
     // The cut title and detail are held nowhere else.
     assert!(input.is_some(), "a cut title or detail blobs the input");
+
+    // A long message: its head up to a line break, the whole as a blob
+    // the storage report counts as a message's.
+    let EventKind::AgentMessage { text, .. } = &kinds[5] else {
+        panic!("expected AgentMessage, got {:?}", kinds[5]);
+    };
+    assert!(text.len() <= MESSAGE_PREVIEW_MAX_BYTES && text.len() > 1024);
+    assert!(text.ends_with('\n') && huge.starts_with(text.as_str()));
+    assert_eq!(f.blob(&kinds[5]), huge);
+    let wire = serde_json::to_string(&kinds[5]).unwrap();
+    assert!(wire.len() < MESSAGE_PREVIEW_MAX_BYTES + 1024, "{wire}");
+    let holds: Vec<String> = f
+        .storage
+        .db
+        .conn()
+        .prepare("SELECT holds FROM event_blobs ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        holds.last().map(String::as_str),
+        Some("message"),
+        "{holds:?}"
+    );
 }
 
 #[test]
@@ -2229,7 +2265,7 @@ fn message_parents(kinds: &[EventKind]) -> Vec<(String, Option<CallId>)> {
     kinds
         .iter()
         .filter_map(|k| match k {
-            EventKind::AgentMessage { text, parent } => Some((text.clone(), *parent)),
+            EventKind::AgentMessage { text, parent, .. } => Some((text.clone(), *parent)),
             _ => None,
         })
         .collect()

@@ -131,6 +131,7 @@ mod tests {
             seq,
             Entry::AgentMessage {
                 text: text.to_owned(),
+                full: None,
             },
         )
     }

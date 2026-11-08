@@ -224,7 +224,7 @@ impl SessionSummary {
             // prompt titles the session, as the import precedes every
             // message sent through Skywave.
             EventKind::Imported { item, .. } => {
-                if let ImportedItem::UserMessage { text } = item
+                if let ImportedItem::UserMessage { text, .. } = item
                     && self.first_prompt.is_none()
                 {
                     self.first_prompt = first_line(text, FIRST_PROMPT_MAX_CHARS);
@@ -516,6 +516,7 @@ mod tests {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "x".into(),
+                    full: None,
                 },
             ),
         );
@@ -722,6 +723,7 @@ mod tests {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "hi".into(),
+                    full: None,
                 },
             ),
         );
@@ -870,6 +872,7 @@ mod tests {
         let message = |parent| EventKind::AgentMessage {
             text: "done".into(),
             parent,
+            full: None,
         };
         assert!(is_notable(&message(None)));
         assert!(!is_notable(&message(Some(skywave_proto::CallId::new()))));

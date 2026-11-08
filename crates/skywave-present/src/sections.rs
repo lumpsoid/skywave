@@ -151,6 +151,10 @@ pub struct Section<'a> {
     pub hidden: bool,
     /// The call's whole input rather than what it did.
     pub input: bool,
+    /// The whole of a long message, whose head the message itself shows
+    /// (`text` is empty): collapsed, it shows no lines, only where the
+    /// whole stands; expanded, the whole beneath the head.
+    pub message: bool,
 }
 
 /// What a head says of an input the server could not keep: the summary is
@@ -172,6 +176,16 @@ impl<'a> Section<'a> {
             full: None,
             hidden: false,
             input: false,
+            message: false,
+        }
+    }
+
+    /// A long message's whole text.
+    fn message(full: &'a FullView) -> Section<'a> {
+        Section {
+            full: Some(full),
+            message: true,
+            ..Section::text("")
         }
     }
 
@@ -268,7 +282,9 @@ pub fn change_note(blob: &BlobView) -> Option<String> {
 /// already: it is never what this names.
 pub fn unseen_blob(entry: &Entry) -> Option<String> {
     let sections = sections(entry);
-    let shown = |s: &Section| !s.hidden && !s.text.strip_suffix('\n').unwrap_or(s.text).is_empty();
+    let shown = |s: &Section| {
+        !s.hidden && (s.message || !s.text.strip_suffix('\n').unwrap_or(s.text).is_empty())
+    };
     if sections.iter().any(|s| shown(s) && s.elsewhere()) {
         return None;
     }
@@ -352,6 +368,19 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
             entry: ImportedEntry::Tool(view),
             ..
         } => return tool_sections(view),
+        Entry::AgentMessage {
+            full: Some(full), ..
+        }
+        | Entry::Imported {
+            entry:
+                ImportedEntry::UserMessage {
+                    full: Some(full), ..
+                }
+                | ImportedEntry::AgentMessage {
+                    full: Some(full), ..
+                },
+            ..
+        } => out.push(Section::message(full)),
         _ => {}
     }
     out
@@ -375,6 +404,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             full: body.full.as_ref(),
             hidden: false,
             input: false,
+            message: false,
         });
     }
     if let ToolOutcome::Done {
@@ -398,6 +428,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             full: output.as_ref(),
             hidden: !is_error && view.body.is_some() && view.kind != ToolKind::Shell,
             input: false,
+            message: false,
         });
     }
     // A lost or deleted input always stands, so the loss is said: no other
@@ -472,6 +503,24 @@ pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
             entry: ImportedEntry::ToolResult { .. },
             ..
         } => Vec::new(),
+        // A long message's head shows whole while collapsed; the rest is
+        // only in its blob.
+        Entry::AgentMessage {
+            text,
+            full: Some(_),
+        }
+        | Entry::Imported {
+            entry:
+                ImportedEntry::UserMessage {
+                    text,
+                    full: Some(_),
+                }
+                | ImportedEntry::AgentMessage {
+                    text,
+                    full: Some(_),
+                },
+            ..
+        } => text.lines().map(str::to_owned).collect(),
         _ => return false,
     };
     for section in sections(entry).iter().filter(|s| !s.hidden) {
@@ -532,23 +581,36 @@ impl Content {
 /// `ToolDisplay::title`); a copied command goes without it.
 const PROMPT: &str = "$ ";
 
-/// A message's text, logged, pending or imported.
-fn message(item: &TimelineItem) -> Option<&str> {
-    match item {
+/// A message's text, logged, pending or imported: the blob holding a long
+/// one whole, else its text (all there is once the blob was lost or
+/// deleted).
+fn message(item: &TimelineItem) -> Option<Content> {
+    let (text, full) = match item {
         TimelineItem::Pending { text, .. }
         | TimelineItem::Logged {
+            entry: Entry::UserMessage { text, .. },
+            ..
+        } => (text, None),
+        TimelineItem::Logged {
             entry:
-                Entry::UserMessage { text, .. }
-                | Entry::AgentMessage { text }
+                Entry::AgentMessage { text, full }
                 | Entry::Imported {
                     entry:
-                        ImportedEntry::UserMessage { text } | ImportedEntry::AgentMessage { text },
+                        ImportedEntry::UserMessage { text, full }
+                        | ImportedEntry::AgentMessage { text, full },
                     ..
                 },
             ..
-        } => Some(text),
-        _ => None,
-    }
+        } => (text, full.as_ref()),
+        _ => return None,
+    };
+    Some(match full.and_then(FullView::blob) {
+        Some(blob) => Content::Blob {
+            blob: blob.clone(),
+            strip: None,
+        },
+        None => Content::Text(text.clone()),
+    })
 }
 
 /// The main copy target: a message's text; else the last section shown
@@ -556,8 +618,8 @@ fn message(item: &TimelineItem) -> Option<&str> {
 /// shows in its stead, its body while no result is here; else the call, as
 /// [`call_content`].
 pub fn main_content(item: &TimelineItem) -> Option<Content> {
-    if let Some(text) = message(item) {
-        return Some(Content::Text(text.to_owned()));
+    if let Some(content) = message(item) {
+        return Some(content);
     }
     let TimelineItem::Logged { entry, .. } = item else {
         return None;
@@ -574,8 +636,8 @@ pub fn main_content(item: &TimelineItem) -> Option<Content> {
 /// has one, else its title) without the `$ ` prompt; title and detail of
 /// any other call; a message's text.
 pub fn call_content(item: &TimelineItem) -> Option<Content> {
-    if let Some(text) = message(item) {
-        return Some(Content::Text(text.to_owned()));
+    if let Some(content) = message(item) {
+        return Some(content);
     }
     let TimelineItem::Logged { entry, .. } = item else {
         return None;
@@ -845,6 +907,76 @@ mod tests {
             main_content(&item(entry.clone())),
             Some(Content::Blob { .. })
         ));
+    }
+
+    #[test]
+    fn a_long_message_is_its_head_with_its_whole_as_a_blob() {
+        let item = |entry: Entry| TimelineItem::Logged {
+            parent: None,
+            seq: Seq(1),
+            at: Utc::now(),
+            context: skywave_core::ContextId::first_of(skywave_core::SessionId::new()),
+            entry,
+        };
+        let agent = |full| Entry::AgentMessage {
+            text: "# Report\nfirst part\n".into(),
+            full,
+        };
+        let imported = |full| Entry::Imported {
+            at: Utc::now(),
+            entry: ImportedEntry::UserMessage {
+                text: "# Report\nfirst part\n".into(),
+                full,
+            },
+        };
+        for entry in [agent(Some(kept_blob())), imported(Some(kept_blob()))] {
+            let shown = sections(&entry);
+            assert_eq!(shown.len(), 1, "{entry:?}");
+            assert!(shown[0].message && !shown[0].hidden);
+            assert_eq!(shown[0].text, "", "the message shows its head");
+            assert!(shown[0].blob().is_some());
+            assert!(wanted_blob(&entry).is_some(), "a download fetches it");
+            // Its section says where the blob stands: no aside.
+            assert_eq!(unseen_blob(&entry), None);
+            // A copy takes the whole text.
+            assert!(matches!(
+                main_content(&item(entry.clone())),
+                Some(Content::Blob { strip: None, .. })
+            ));
+            assert!(matches!(
+                call_content(&item(entry.clone())),
+                Some(Content::Blob { .. })
+            ));
+            // A match past the head shows once expanded.
+            assert!(match_hidden(&entry, &Query::new("second part")));
+            assert!(!match_hidden(&entry, &Query::new("first part")));
+        }
+
+        // Deleted or lost: the head is all a copy takes, and it says why.
+        let deleted = agent(Some(FullView::Deleted {
+            by: device("laptop", false),
+        }));
+        assert_eq!(
+            sections(&deleted)[0].note().as_deref(),
+            Some("Deleted by laptop")
+        );
+        assert_eq!(
+            main_content(&item(deleted)),
+            Some(Content::Text("# Report\nfirst part\n".into()))
+        );
+        assert_eq!(
+            sections(&agent(Some(FullView::Lost)))[0].lost(),
+            Some(CONTENT_LOST)
+        );
+
+        // Control: a whole message has no section, and a copy takes it.
+        let whole = agent(None);
+        assert!(sections(&whole).is_empty());
+        assert!(!match_hidden(&whole, &Query::new("second part")));
+        assert_eq!(
+            main_content(&item(whole)),
+            Some(Content::Text("# Report\nfirst part\n".into()))
+        );
     }
 
     fn kept_blob() -> FullView {

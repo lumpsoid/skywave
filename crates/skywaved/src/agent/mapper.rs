@@ -4,10 +4,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use skywave_proto::limits::{
-    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, INLINE_MAX_BYTES, MODEL_DETAIL_MAX_CHARS,
-    MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS, MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES,
-    REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS, RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS,
-    SCHEDULES_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
+    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, INLINE_MAX_BYTES, MESSAGE_PREVIEW_MAX_BYTES,
+    MESSAGE_WHOLE_MAX_BYTES, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS,
+    MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
+    RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS,
+    TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, Body, BodyFormat, CallId,
@@ -127,8 +128,10 @@ const AGENT_EXITED: &str = "agent exited";
 /// of it: its title (beside a body) or detail was cut, or the display (the
 /// adapter's, by `shows_all_input`, or the generic one) left fields out. A
 /// cut body does not count: its blob holds it whole, so a big call's content
-/// is stored once. Agent text stays inline:
-/// `AgentMessage` has no blob field.
+/// is stored once. Agent text stays whole in its `AgentMessage` up to
+/// [`MESSAGE_WHOLE_MAX_BYTES`]; a longer one is its head
+/// ([`MESSAGE_PREVIEW_MAX_BYTES`]) and `full`, a blob holding it whole
+/// ([`message`]).
 ///
 /// **Generic display.** A call the adapter gives no display for is shown as
 /// kind [`ToolKind::Other`] titled with its input: the input itself if it is
@@ -318,7 +321,12 @@ impl EventMapper {
             }
             AdapterEvent::Text { text, parent } => {
                 let parent = self.linked(parent.as_ref()).map(|c| c.id);
-                seqs.push(self.append(log, storage, EventKind::AgentMessage { parent, text })?);
+                let (text, full) = message(&mut stored(storage), text)?;
+                seqs.push(self.append(
+                    log,
+                    storage,
+                    EventKind::AgentMessage { parent, text, full },
+                )?);
             }
             AdapterEvent::ToolCall {
                 call,
@@ -1167,6 +1175,28 @@ fn cut_preview(text: &str) -> (String, bool) {
     (text[..end].to_owned(), cut)
 }
 
+/// A message's `text` and `full`: the whole text up to
+/// [`MESSAGE_WHOLE_MAX_BYTES`]; past it, its head of at most
+/// [`MESSAGE_PREVIEW_MAX_BYTES`] (cut after the last line break in it, if
+/// any, else on a char boundary) and the whole as a blob.
+pub(crate) fn message(
+    put: &mut impl FnMut(&[u8]) -> Result<Full>,
+    text: String,
+) -> Result<(String, Option<Full>)> {
+    if text.len() <= MESSAGE_WHOLE_MAX_BYTES {
+        return Ok((text, None));
+    }
+    let mut end = MESSAGE_PREVIEW_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(at) = text[..end].rfind('\n') {
+        end = at + 1;
+    }
+    let full = put(text.as_bytes())?;
+    Ok((text[..end].to_owned(), Some(full)))
+}
+
 fn line_count(text: &str) -> u32 {
     u32::try_from(text.lines().count()).unwrap_or(u32::MAX)
 }
@@ -1297,6 +1327,39 @@ mod tests {
         assert_eq!((whole.preview.as_str(), whole.output), ("ok\n", None));
 
         assert_eq!(stored, vec![past.into_bytes()], "only the large one");
+    }
+
+    #[test]
+    fn only_a_long_message_is_cut_to_its_head_beside_a_blob() {
+        let mut stored: Vec<Vec<u8>> = Vec::new();
+        let blob = Full::Blob(proto::BlobRef {
+            id: proto::BlobId::new(),
+            size: 0,
+            sha256: proto::ContentHash::of(b""),
+        });
+        let mut put = |bytes: &[u8]| {
+            stored.push(bytes.to_vec());
+            Ok(blob.clone())
+        };
+
+        // At the threshold still whole.
+        let at = "x".repeat(MESSAGE_WHOLE_MAX_BYTES);
+        assert_eq!(message(&mut put, at.clone()).unwrap(), (at, None));
+
+        // Past it: the head ends after the last line break in it.
+        let line = format!("{}\n", "y".repeat(99));
+        let long = line.repeat(MESSAGE_WHOLE_MAX_BYTES / 100 + 1);
+        let (head, full) = message(&mut put, long.clone()).unwrap();
+        assert_eq!(full, Some(blob.clone()));
+        assert_eq!(head, line.repeat(MESSAGE_PREVIEW_MAX_BYTES / 100));
+        assert!(long.starts_with(&head));
+
+        // No line break in it: cut on a char boundary.
+        let wide = "é".repeat(MESSAGE_WHOLE_MAX_BYTES);
+        let (head, _) = message(&mut put, wide.clone()).unwrap();
+        assert_eq!(head, "é".repeat(MESSAGE_PREVIEW_MAX_BYTES / 2));
+
+        assert_eq!(stored, vec![long.into_bytes(), wide.into_bytes()]);
     }
 
     #[test]

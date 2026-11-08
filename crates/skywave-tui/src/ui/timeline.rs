@@ -546,9 +546,13 @@ impl Layout<'_> {
                 };
                 return self.message(lead, label, bar, text, mark);
             }
-            Entry::AgentMessage { text } => {
+            // A long message's whole is a section beneath it.
+            Entry::AgentMessage { text, .. } => {
                 let label = vec![Span::raw("agent: ").green().bold()];
-                return self.message(lead, label, Color::Green, text, mark);
+                (
+                    self.message(lead, label, Color::Green, text, mark),
+                    Style::new().green(),
+                )
             }
             Entry::Interrupted => {
                 let mut spans = lead;
@@ -579,18 +583,24 @@ impl Layout<'_> {
             }
             // The outside conversation's user wrote it, not a device.
             Entry::Imported {
-                entry: ImportedEntry::UserMessage { text },
+                entry: ImportedEntry::UserMessage { text, .. },
                 ..
             } => {
                 let label = vec![Span::raw("you").blue().bold(), Span::raw(": ")];
-                return self.message(imported(lead), label, Color::Blue, text, mark);
+                (
+                    self.message(imported(lead), label, Color::Blue, text, mark),
+                    Style::new().blue(),
+                )
             }
             Entry::Imported {
-                entry: ImportedEntry::AgentMessage { text },
+                entry: ImportedEntry::AgentMessage { text, .. },
                 ..
             } => {
                 let label = vec![Span::raw("agent: ").green().bold()];
-                return self.message(imported(lead), label, Color::Green, text, mark);
+                (
+                    self.message(imported(lead), label, Color::Green, text, mark),
+                    Style::new().green(),
+                )
             }
             Entry::Imported {
                 entry: ImportedEntry::Tool(view),
@@ -826,9 +836,11 @@ impl Layout<'_> {
                     }
                 },
             }
-        } else if preview.is_empty() {
+        } else if preview.is_empty() && !section.message {
             // Nothing worth a line, e.g. a write's output beside its status;
-            // `lines` then counts what the agent was told, not content.
+            // `lines` then counts what the agent was told, not content. A
+            // long message's whole still says where it stands, under the
+            // head the message shows.
             return (Vec::new(), None);
         } else {
             let shown: Vec<String> = preview

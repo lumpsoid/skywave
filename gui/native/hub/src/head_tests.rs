@@ -125,12 +125,14 @@ fn imported_history_has_its_own_row_kinds_at_the_agents_time() {
         adopted_created("3f2a"),
         imported(ImportedItem::UserMessage {
             text: "fix the build".into(),
+            full: None,
         }),
         imported(ImportedItem::ToolCall(tool_call)),
         imported(ImportedItem::ToolResult(result(Some(call)))),
         imported(ImportedItem::ToolResult(result(None))),
         imported(ImportedItem::AgentMessage {
             text: "fixed".into(),
+            full: None,
         }),
         EventKind::ImportFinished {
             outcome: ImportOutcome::Imported { items: 5 },
@@ -138,6 +140,7 @@ fn imported_history_has_its_own_row_kinds_at_the_agents_time() {
         EventKind::AgentMessage {
             parent: None,
             text: "live again".into(),
+            full: None,
         },
     ];
     rig.seam
@@ -2101,6 +2104,7 @@ fn a_context_moves_once_the_core_offers_it_and_a_queued_move_can_be_discarded() 
         EventKind::AgentMessage {
             parent: None,
             text: "done".into(),
+            full: None,
         },
     ]);
     let row = rig.open_session().contexts[0].clone();
@@ -2319,6 +2323,63 @@ fn an_edit_expanded_before_its_result_downloads_the_output_when_it_comes() {
     rig.results();
     rig.view();
     assert_eq!(rig.actions.len(), 1, "dispatched {:?}", rig.actions);
+}
+
+/// A long message: its head as the row's text, where its whole stands as
+/// a section beneath; expanding fetches the whole and shows it, a copy
+/// takes it, and its blob may be deleted but not cropped.
+#[test]
+fn a_long_message_shows_its_head_and_expands_to_its_whole() {
+    use crate::signals::{BlobUseView, CopyWhat};
+    use skywave_proto::{BlobId, BlobRef, ContentHash, EventKind, Full};
+    let mut rig = Rig::new();
+    let blob = BlobId::new();
+    rig.log(vec![EventKind::AgentMessage {
+        text: "# Report\nhead line".into(),
+        parent: None,
+        full: Some(Full::Blob(BlobRef {
+            id: blob,
+            size: 40_000,
+            sha256: ContentHash::of(b""),
+        })),
+    }]);
+    let row = rig.rows().last().unwrap().clone();
+    assert_eq!(row.kind, RowKind::AgentMessage);
+    assert_eq!(row.text, "# Report\nhead line");
+    assert!(row.expandable && !row.expanded);
+    // Collapsed: no lines, only where the whole stands.
+    assert_eq!(row.sections.len(), 1, "{row:?}");
+    assert!(row.sections[0].lines.is_empty());
+    let facts = row.sections[0].blob.as_ref().expect("its blob");
+    assert_eq!(facts.label, "not downloaded · 39.1 KiB");
+    let target = row.blob_target.as_ref().expect("a target");
+    assert!(!target.can_crop && target.delete_question.is_some());
+    assert_eq!(target.holds, BlobUseView::Message);
+
+    rig.actions.clear();
+    rig.intent(GuiIntent::ExpandItem {
+        key: row.key.clone(),
+    });
+    assert_eq!(rig.actions, [Action::DownloadBlob(blob)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    std::fs::write(&path, b"# Report\nhead line\nthe deep finding\n").unwrap();
+    rig.seam
+        .blob_status(blob, skywave_core::BlobStatus::Available { path })
+        .unwrap();
+    rig.view();
+    let row = rig.rows().last().unwrap().clone();
+    let lines: Vec<&str> = row.sections[0]
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(lines, ["# Report", "head line", "the deep finding"]);
+    let outs = rig.intent(GuiIntent::Copy {
+        key: row.key,
+        what: CopyWhat::Main,
+    });
+    assert_eq!(copied(&outs), ["# Report\nhead line\nthe deep finding\n"]);
 }
 
 #[test]
@@ -2753,6 +2814,7 @@ fn conversation_only_leaves_tool_calls_out_of_the_rows_until_switched_off() {
         EventKind::AgentMessage {
             parent: None,
             text: "looking".into(),
+            full: None,
         },
         a_call(
             None,

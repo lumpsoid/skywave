@@ -248,7 +248,7 @@ fn row(
             });
             row.outgoing = outgoing.as_ref().map(outgoing_view);
         }
-        Entry::AgentMessage { text } => {
+        Entry::AgentMessage { text, .. } => {
             set(&mut row, RowKind::AgentMessage, clean_text(text));
             row.author = Some("agent".to_owned());
         }
@@ -299,11 +299,11 @@ fn row(
         Entry::Imported { entry: item, .. } => {
             row.mark = Some(IMPORTED_MARK.to_owned());
             match item {
-                ImportedEntry::UserMessage { text } => {
+                ImportedEntry::UserMessage { text, .. } => {
                     set(&mut row, RowKind::ImportedUserMessage, clean_text(text));
                     row.author = Some("you".to_owned());
                 }
-                ImportedEntry::AgentMessage { text } => {
+                ImportedEntry::AgentMessage { text, .. } => {
                     set(&mut row, RowKind::ImportedAgentMessage, clean_text(text));
                     row.author = Some("agent".to_owned());
                 }
@@ -731,8 +731,10 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
             },
         }
     } else {
-        if preview.is_empty() {
+        if preview.is_empty() && !section.message {
             // Nothing worth a line, e.g. a write's output beside its status.
+            // A long message's whole still says where it stands, under the
+            // head the message shows.
             return None;
         }
         let shown: Vec<String> = preview
@@ -919,7 +921,10 @@ mod tests {
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, minute, 0).unwrap(),
             context: ContextId::new(),
-            entry: Entry::AgentMessage { text: text.into() },
+            entry: Entry::AgentMessage {
+                text: text.into(),
+                full: None,
+            },
         }
     }
 
@@ -1172,6 +1177,7 @@ mod tests {
                 full: Some(&blob),
                 hidden: false,
                 input: false,
+                message: false,
             };
             let view = section_view(&section, expanded, &mut BlobHeads::default()).unwrap();
             (view.note, view.blob.unwrap().label)
@@ -1234,6 +1240,7 @@ mod tests {
             full,
             hidden: false,
             input: false,
+            message: false,
         };
         let view = |full, expanded| {
             section_view(&section(full), expanded, &mut BlobHeads::default()).unwrap()

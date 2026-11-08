@@ -403,6 +403,10 @@ const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usiz
 /// what is stored, and how each is moved:
 /// - `Full::Inline` (a small tool output carried in its event): new, so no
 ///   v23 event has one; v23's `Full::Blob` and `Full::Lost` read unchanged.
+/// - `full` on `AgentMessage` and on an imported `UserMessage` or
+///   `AgentMessage` (a long message's whole text as a blob): a new
+///   optional field, which v23 JSON lacks and reads as `None`, so no event
+///   is rewritten; v23's long messages stay whole in their events.
 fn v23_to_v24(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
