@@ -4427,6 +4427,42 @@ fn usage_limits_are_asked_once_kept_and_refreshed_on_r() {
 }
 
 #[test]
+fn the_session_info_page_shows_the_session_its_usage_and_its_subagents() {
+    let (mut h, id, _) = with_subagent(false);
+    pull(&mut h, two_turns(id));
+    h.drain_requests();
+    assert_eq!(
+        h.key(KeyCode::Char('I')),
+        Some(Action::OpenSessionInfo { session_id: id })
+    );
+    assert!(matches!(
+        h.drain_requests().as_slice(),
+        [Request::UsageLimits { .. }]
+    ));
+    let screen = h.screen();
+    assert_contains(&screen, "Workdir  /srv/work");
+    assert_contains(&screen, "Asking the agent…");
+    assert_contains(&screen, "Tokens in   3.1k");
+    assert_contains(&screen, "Context     19k/1M · 2%");
+    assert_contains(&screen, "Cost        $1.27");
+
+    // The rest is below: scrolled to, it stops at the last line.
+    for _ in 0..40 {
+        h.key(KeyCode::Char('j'));
+    }
+    let screen = h.screen();
+    assert_contains(&screen, "model-a        $1.23 · tokens unknown · 1 turn");
+    assert_contains(&screen, "Subagents (1)");
+    assert_contains(&screen, "Explore");
+    assert_contains(&screen, "finished · 3 steps");
+    assert!(h.app.ui().info.top < 40);
+
+    assert_eq!(h.key(KeyCode::Char('r')), Some(Action::RefreshUsageLimits));
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+}
+
+#[test]
 fn settings_explain_the_blob_policy() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('s'));

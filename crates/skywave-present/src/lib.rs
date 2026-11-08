@@ -24,6 +24,8 @@
 //!   which of its links a head may open.
 //! - [`output`]: where a shell run's whole output is, the download it
 //!   needs, and how a head reads a downloaded one.
+//! - [`session_info`]: a session's info page: what it is, what its turns
+//!   took and by which models, how its agent is set, and its subagents.
 //! - [`usage`]: cost and tokens totalled across sessions for the usage
 //!   screen.
 //! - [`text`]: agent content made safe to show: control characters
@@ -50,6 +52,7 @@ pub mod output;
 pub mod policy;
 pub mod question;
 pub mod sections;
+pub mod session_info;
 pub mod storage;
 pub mod text;
 pub mod usage;

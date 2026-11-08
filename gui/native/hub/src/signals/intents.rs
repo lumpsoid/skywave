@@ -377,6 +377,11 @@ pub enum ActionIntent {
     OpenWorkdir {
         session_id: String,
     },
+    /// The session's info page; it asks for the usage limits if none are
+    /// stored.
+    OpenSessionInfo {
+        session_id: String,
+    },
     /// A pane of the workdir screen: `path` names the diff's file, the
     /// directory or the file (ignored for `Changes`); `untracked` tells a
     /// diff's two entries for one path apart.

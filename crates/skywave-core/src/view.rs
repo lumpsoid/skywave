@@ -472,6 +472,7 @@ pub enum Screen {
     Usage(UsageView),
     Storage(StorageView),
     UsageLimits(UsageLimitsView),
+    SessionInfo(Box<SessionInfoView>),
     Workdir(WorkdirView),
     Crop(CropView),
 }
@@ -878,6 +879,33 @@ pub struct UsageLimitsView {
     /// The latest stored answer, never a `Failed`; `None` until one came.
     /// A `Read` names when the agent reported it.
     pub answer: Option<UsageLimitsResult>,
+}
+
+/// One session's particulars
+/// ([`Action::OpenSessionInfo`](crate::Action::OpenSessionInfo)): what it
+/// is, what its turns took, how its agent is set, every subagent it ran,
+/// and the usage limits of the account the agent runs as. All from the
+/// replica, so it reads offline; only the limits are asked for, on
+/// opening while none are stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInfoView {
+    pub id: SessionId,
+    /// As [`SessionRow::title`].
+    pub title: String,
+    pub workdir: Option<String>,
+    /// What the session's turns took, as [`SessionView::usage`].
+    pub usage: Option<SessionUsage>,
+    /// The session's turns that reported usage, in log order: what a head
+    /// sums by model.
+    pub turns: Vec<TurnRecord>,
+    /// As [`SessionView::agent`].
+    pub agent: AgentView,
+    /// The subagents the session ran, in any context and nested ones too,
+    /// in the order they were launched, each as its view's header shows
+    /// it.
+    pub subagents: Vec<SubagentHeader>,
+    /// As the usage limits page's.
+    pub limits: UsageLimitsView,
 }
 
 /// Where a read of the usage limits stands.

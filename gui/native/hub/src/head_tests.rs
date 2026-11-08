@@ -1799,16 +1799,11 @@ fn the_usage_limits_page_shows_each_limit_with_its_bar() {
     rig.results();
     rig.view();
     let page = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
-        ScreenView::UsageLimits {
-            status_label,
-            read_label,
-            rows,
-            empty_label,
-        } => (
-            status_label.clone(),
-            read_label.clone(),
-            rows.clone(),
-            empty_label.clone(),
+        ScreenView::UsageLimits { limits } => (
+            limits.status_label.clone(),
+            limits.read_label.clone(),
+            limits.rows.clone(),
+            limits.empty_label.clone(),
         ),
         other => panic!("not the usage limits page: {other:?}"),
     };
@@ -1860,6 +1855,47 @@ fn the_usage_limits_page_shows_each_limit_with_its_bar() {
         action: ActionIntent::RefreshUsageLimits,
     });
     assert_eq!(rig.actions.last(), Some(&Action::RefreshUsageLimits));
+}
+
+#[test]
+fn the_session_info_page_shows_its_sections_limits_and_subagents() {
+    let mut rig = Rig::new();
+    rig.seam
+        .set_link(skywave_core::Link::Online { latency_ms: 5 });
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::OpenSessionInfo {
+            session_id: rig.session.0.to_string(),
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::OpenSessionInfo {
+            session_id: rig.session
+        })
+    );
+    match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::SessionInfo {
+            session_id,
+            sections,
+            limits,
+            subagents,
+            subagents_empty_label,
+        } => {
+            assert_eq!(*session_id, rig.session.0.to_string());
+            let titles: Vec<_> = sections.iter().map(|s| s.title.as_str()).collect();
+            assert_eq!(titles, ["Session", "Usage", "Agent"]);
+            assert_eq!(sections[0].fields[1].label, "Workdir");
+            assert_eq!(limits.status_label.as_deref(), Some("Asking the agent…"));
+            assert!(subagents.is_empty());
+            assert_eq!(
+                subagents_empty_label.as_deref(),
+                Some(skywave_present::session_info::NO_SUBAGENTS)
+            );
+        }
+        other => panic!("not the session info page: {other:?}"),
+    }
 }
 
 #[test]

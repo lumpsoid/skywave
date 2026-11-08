@@ -389,11 +389,11 @@ class _SessionPageState extends State<SessionPage> {
         onTap: () => pickContext(context, screen, widget.send),
       ),
       _MenuItem(
-        icon: Icons.speed,
-        title: 'Usage limits',
-        subtitle: "The agent account's limits",
+        icon: Icons.info_outline,
+        title: 'Session info',
+        subtitle: 'Usage, limits, agent and subagents',
         onTap: () => widget.send.act(
-          const ActionIntentNavigate(route: RouteView.usageLimits),
+          ActionIntentOpenSessionInfo(sessionId: screen.sessionId),
         ),
       ),
       _MenuItem(

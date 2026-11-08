@@ -16,6 +16,15 @@ use crate::notify;
 const BAR: usize = 30;
 
 pub(super) fn render(frame: &mut Frame, area: Rect, view: &UsageLimitsView, now: DateTime<Utc>) {
+    frame.render_widget(
+        Paragraph::new(lines(view, now)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The page's lines: where a read stands, when the limits were read, then
+/// each limit with its bar.
+pub(super) fn lines(view: &UsageLimitsView, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(status) = status_line(view) {
         lines.push(Line::from(status).dark_gray());
@@ -36,7 +45,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, view: &UsageLimitsView, now:
             }
         }
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    lines
 }
 
 /// A limit as its label, use and reset, then its bar.
