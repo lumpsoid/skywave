@@ -23,6 +23,7 @@ use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
     offered_modes,
 };
+use skywave_present::output::output_download;
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
     ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
@@ -1268,26 +1269,13 @@ impl SessionUi {
             self.shell_expanded.remove(&run.run);
             return None;
         }
-        run.output
-            .as_ref()
-            .and_then(FullView::blob)
-            .and_then(output_download)
+        output_download(run)
     }
 }
 
 /// The link stopped for a reason only pairing again fixes.
 fn needs_repair(link: &Link) -> bool {
     matches!(link, Link::Rejected(rejection) if rejection.needs_repair())
-}
-
-/// The download a run's output blob needs before it can be shown or
-/// copied: none while it is here or on its way.
-fn output_download(blob: &BlobView) -> Option<Action> {
-    matches!(
-        blob.state,
-        BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
-    )
-    .then_some(Action::DownloadBlob(blob.id))
 }
 
 /// The composer's text as the core keeps it for `view`'s mode.
@@ -2658,12 +2646,7 @@ impl App {
                     None
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => session.toggle_run(view),
-                KeyCode::Char('d') => session
-                    .selected_run(view)?
-                    .output
-                    .as_ref()
-                    .and_then(FullView::blob)
-                    .and_then(output_download),
+                KeyCode::Char('d') => output_download(session.selected_run(view)?),
                 KeyCode::Char('y') => {
                     let run = session.selected_run(view)?.clone();
                     self.copy_run(&run)

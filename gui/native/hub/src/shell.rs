@@ -15,7 +15,8 @@ use skywave_present::format::{
     outgoing_label, queued_label, shell_end_label, shell_prompt, shell_took, when_marker,
 };
 use skywave_present::output::{
-    OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_lines, output_text, whole_output,
+    OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_download, output_lines, output_text,
+    whole_output,
 };
 
 use crate::signals::{ShellPromptView, ShellRunKind, ShellRunRow, ShellUpdate};
@@ -105,22 +106,10 @@ fn whole(run: &ShellRun, outputs: &mut Outputs) -> (Option<String>, Option<Strin
     }
 }
 
-/// The download an expanded run's output needs: none while it is here or
-/// on its way, or for a run without one.
+/// The download the output of `view`'s run `run` needs once expanded
+/// ([`output_download`]).
 pub fn output_fetch(view: &SessionView, run: CommandId) -> Option<Action> {
-    let blob = view
-        .shell
-        .runs
-        .iter()
-        .find(|r| r.run == run)?
-        .output
-        .as_ref()?
-        .blob()?;
-    matches!(
-        blob.state,
-        BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
-    )
-    .then_some(Action::DownloadBlob(blob.id))
+    output_download(view.shell.runs.iter().find(|r| r.run == run)?)
 }
 
 fn row(run: &ShellRun, now: DateTime<Utc>) -> ShellRunRow {

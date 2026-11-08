@@ -12,7 +12,7 @@ use skywave_core::{
     ToolKind, ToolOutcome, ToolView,
 };
 
-use crate::format::{bytes, device_word, percent};
+use crate::format::{blob_size, bytes, device_word, download_brief};
 
 /// Most preview lines an item shows while collapsed.
 pub const PREVIEW_LINES: usize = 8;
@@ -269,19 +269,28 @@ pub fn unseen_blob(entry: &Entry) -> Option<String> {
         FullView::Deleted { by } => return Some(format!("{what} · {}", deleted_note(by))),
         FullView::Lost => return Some(format!("{what} not stored")),
     };
-    let state = match &blob.state {
-        BlobState::NotDownloaded { size } => bytes(*size),
-        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
-        BlobState::Downloading { got, size, paused } => format!(
-            "{} · downloading {}%{}",
-            bytes(*size),
-            percent(*got, *size),
-            if *paused { " · paused, offline" } else { "" }
+    let size = bytes(blob_size(&blob.state)?);
+    Some(match download_brief(&blob.state) {
+        Some(brief) => format!("{what} {size} · {brief}"),
+        None => format!("{what} {size}"),
+    })
+}
+
+/// While collapsed, where the download of the blob behind a shown section
+/// stands: `full 4.0 KiB · not downloaded`, `full 4.0 KiB · requested`,
+/// `downloading 25%` (the progress is what counts then),
+/// `full 4.0 KiB · download failed`, `downloaded`. A head adds its own
+/// hint (how to retry).
+pub fn collapsed_download(state: &BlobState) -> String {
+    match (state, download_brief(state)) {
+        (BlobState::Available { .. }, _) => "downloaded".to_owned(),
+        (BlobState::Downloading { .. }, Some(progress)) => progress,
+        (_, brief) => format!(
+            "full {} · {}",
+            bytes(blob_size(state).unwrap_or_default()),
+            brief.as_deref().unwrap_or("not downloaded")
         ),
-        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
-        BlobState::Available { .. } => return None,
-    };
-    Some(format!("{what} {state}"))
+    }
 }
 
 /// The first of `sections` whose whole content the server could not keep,
@@ -770,5 +779,104 @@ mod tests {
             change: None,
             pending: None,
         })
+    }
+
+    /// One blob in each download state, with the progress `got` of 4 KiB.
+    fn states() -> [BlobState; 6] {
+        let size = 4096;
+        [
+            BlobState::NotDownloaded { size },
+            BlobState::Requested { size },
+            BlobState::Downloading {
+                got: 1024,
+                size,
+                paused: false,
+            },
+            BlobState::Downloading {
+                got: 1024,
+                size,
+                paused: true,
+            },
+            BlobState::Failed {
+                size,
+                reason: "gone".into(),
+            },
+            BlobState::Available {
+                path: "/blobs/a".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_collapsed_unseen_blob_names_its_size_and_download() {
+        let entry = |state: BlobState| {
+            let mut view = call(
+                None,
+                Some(FullView::Blob(BlobView {
+                    id: BlobId::new(),
+                    state,
+                    change: None,
+                    pending: None,
+                })),
+            );
+            view.body = None;
+            Entry::Tool(Box::new(view))
+        };
+        let said: Vec<_> = states()
+            .into_iter()
+            .map(|state| unseen_blob(&entry(state)))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                Some("input 4.0 KiB".to_owned()),
+                Some("input 4.0 KiB · requested".to_owned()),
+                Some("input 4.0 KiB · downloading 25%".to_owned()),
+                Some("input 4.0 KiB · downloading 25% · paused, offline".to_owned()),
+                Some("input 4.0 KiB · download failed".to_owned()),
+                // Here: the expanded item shows it.
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_collapsed_section_says_where_its_download_stands() {
+        let said: Vec<_> = states().iter().map(collapsed_download).collect();
+        assert_eq!(
+            said,
+            [
+                "full 4.0 KiB · not downloaded",
+                "full 4.0 KiB · requested",
+                // The progress is what counts while it downloads.
+                "downloading 25%",
+                "downloading 25% · paused, offline",
+                "full 4.0 KiB · download failed",
+                "downloaded",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_expanded_section_says_where_its_download_stands_in_full() {
+        let mut states = states().to_vec();
+        // A reason is shown as its first line, control characters dropped.
+        states.push(BlobState::Failed {
+            size: 10,
+            reason: "bad\u{7} hash\nmore".into(),
+        });
+        let said: Vec<_> = states.iter().map(crate::format::download_state).collect();
+        assert_eq!(
+            said,
+            [
+                "not downloaded · 4.0 KiB",
+                "requested · waiting for a slot · 4.0 KiB",
+                "downloading · 1.0 KiB of 4.0 KiB (25%)",
+                "downloading · 1.0 KiB of 4.0 KiB (25%) · paused, offline",
+                "download failed: gone · 4.0 KiB",
+                "downloaded",
+                "download failed: bad hash · 10 B",
+            ]
+        );
     }
 }
