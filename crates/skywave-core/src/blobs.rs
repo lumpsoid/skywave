@@ -243,10 +243,89 @@ impl Queued {
     }
 }
 
+/// The blobs waiting, in the order workers take them, each at most once,
+/// with their ids beside for a constant-time membership check. Every
+/// change goes through these methods, so the two never disagree.
+#[derive(Debug, Default)]
+struct Waiting {
+    order: VecDeque<Queued>,
+    ids: HashSet<BlobId>,
+}
+
+impl Waiting {
+    fn contains(&self, id: BlobId) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Queued> + ExactSizeIterator {
+        self.order.iter()
+    }
+
+    fn admit(&mut self, id: BlobId) {
+        let fresh = self.ids.insert(id);
+        debug_assert!(fresh, "{id:?} waits twice");
+    }
+
+    fn push_front(&mut self, item: Queued) {
+        self.admit(item.id);
+        self.order.push_front(item);
+    }
+
+    fn push_back(&mut self, item: Queued) {
+        self.admit(item.id);
+        self.order.push_back(item);
+    }
+
+    fn insert(&mut self, at: usize, item: Queued) {
+        self.admit(item.id);
+        self.order.insert(at, item);
+    }
+
+    fn remove_at(&mut self, at: usize) -> Option<Queued> {
+        let item = self.order.remove(at)?;
+        self.ids.remove(&item.id);
+        Some(item)
+    }
+
+    /// Takes `id` out; a scan only when it is there.
+    fn remove(&mut self, id: BlobId) -> Option<Queued> {
+        if !self.ids.remove(&id) {
+            return None;
+        }
+        let at = self.order.iter().position(|q| q.id == id);
+        at.and_then(|at| self.order.remove(at))
+    }
+
+    /// Keeps the entries `keep` says, in order.
+    fn retain(&mut self, mut keep: impl FnMut(&Queued) -> bool) {
+        let ids = &mut self.ids;
+        self.order.retain(|q| {
+            let kept = keep(q);
+            if !kept {
+                ids.remove(&q.id);
+            }
+            kept
+        });
+        debug_assert_eq!(self.order.len(), self.ids.len());
+    }
+
+    /// The order and the ids name the same blobs, each once.
+    #[cfg(test)]
+    fn consistent(&self) -> bool {
+        self.order.len() == self.ids.len() && self.order.iter().all(|q| self.ids.contains(&q.id))
+    }
+}
+
 #[derive(Debug, Default)]
 struct Queue {
     policy: BlobPolicy,
-    waiting: VecDeque<Queued>,
+    waiting: Waiting,
+    /// Blobs whose download may have started since the store was read: a
+    /// worker took them, or the store left them `Downloading`. Only these
+    /// can be `Downloading` with nobody holding them, so only these are
+    /// stopped when `OnDemand` drops them ([`BlobQueue::set_policy`]),
+    /// rather than one replica read per blob dropped.
+    started: HashSet<BlobId>,
     /// Blobs a worker holds.
     active: HashSet<BlobId>,
     /// Blobs asked for while a worker held them: queued again, as asked
@@ -261,7 +340,7 @@ struct Queue {
 
 impl Queue {
     fn holds(&self, id: BlobId) -> bool {
-        self.active.contains(&id) || self.waiting.iter().any(|q| q.id == id)
+        self.active.contains(&id) || self.waiting.contains(id)
     }
 
     /// Whether a worker holding `item` lets it go now: the policy is
@@ -300,8 +379,7 @@ impl Queue {
             .copied()
             .collect();
         for crop in fresh.iter().rev() {
-            let wanted = self.waiting.iter().any(|q| q.id == crop.into && q.wanted);
-            self.waiting.retain(|q| q.id != crop.into);
+            let wanted = self.waiting.remove(crop.into).is_some_and(|q| q.wanted);
             self.waiting.push_front(Queued {
                 wanted,
                 ..Queued::local_crop(*crop)
@@ -326,6 +404,9 @@ pub(crate) struct BlobQueue {
     /// its lock, so the views follow it in order; none in tests that only
     /// drive the queue.
     view: Option<Seam>,
+    /// How many times [`BlobQueue::stop`] was called.
+    #[cfg(test)]
+    stops: std::sync::atomic::AtomicUsize,
 }
 
 impl BlobQueue {
@@ -361,6 +442,7 @@ impl BlobQueue {
             let on_demand = settings.blob_policy == BlobPolicy::OnDemand;
             for blob in &blobs {
                 if matches!(blob.status, BlobStatus::Downloading { .. }) {
+                    queue.started.insert(blob.id);
                     queue.waiting.push_back(if on_demand || blob.workdir {
                         Queued::wanted(blob.id)
                     } else {
@@ -383,10 +465,9 @@ impl BlobQueue {
         if queue.active.contains(&id) {
             queue.again.insert(id);
         } else {
-            let found = queue.waiting.iter().find(|q| q.id == id);
+            let found = queue.waiting.remove(id);
             let reserved = found.is_some_and(|q| q.reserved);
             let source = found.map_or(Source::Network, |q| q.source);
-            queue.waiting.retain(|q| q.id != id);
             queue.waiting.push_front(Queued {
                 reserved,
                 source,
@@ -414,14 +495,19 @@ impl BlobQueue {
                     }
                     kept
                 });
-                // Every dropped one, whatever `blobs` says: that snapshot
-                // was read before this lock, and a worker may have recorded
-                // progress and let the blob go since (or the read failed
-                // and `blobs` is empty). `stop` reads the row itself. Under
-                // the queue's lock, so a request made meanwhile resumes
-                // from the stopped row, never races its stop.
+                // Every dropped one that may have started, whatever
+                // `blobs` says: that snapshot was read before this lock,
+                // and a worker may have recorded progress and let the blob
+                // go since (or the read failed and `blobs` is empty).
+                // `stop` reads the row itself, so it is called only for
+                // the few started ones ([`Queue::started`]), not for each
+                // of a big eager queue. Under the queue's lock, so a
+                // request made meanwhile resumes from the stopped row,
+                // never races its stop.
                 for id in dropped {
-                    self.stop(id);
+                    if queue.started.remove(&id) {
+                        self.stop(id);
+                    }
                 }
             }
             BlobPolicy::Eager => {
@@ -435,6 +521,9 @@ impl BlobQueue {
                             | BlobStatus::Downloading { .. }
                     );
                     if !blob.workdir && eager {
+                        if matches!(blob.status, BlobStatus::Downloading { .. }) {
+                            queue.started.insert(blob.id);
+                        }
                         queue.push_back(blob.id);
                     }
                 }
@@ -488,6 +577,9 @@ impl BlobQueue {
     /// [`BlobQueue::set_disk_full`]), so a request for it waits until the
     /// row says what it kept.
     fn stop(&self, id: BlobId) {
+        #[cfg(test)]
+        self.stops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(view) = &self.view else { return };
         match view.blob_stopped(id) {
             Ok(()) | Err(CoreError::Superseded) => {}
@@ -537,9 +629,16 @@ impl BlobQueue {
     /// longer. One a worker holds is let go by the worker itself, when its
     /// next report finds the blob unknown.
     pub(crate) fn purged(&self, ids: &[BlobId]) {
+        let ids: HashSet<BlobId> = ids.iter().copied().collect();
         let mut queue = lock(&self.queue);
         queue.waiting.retain(|q| !ids.contains(&q.id));
         queue.again.retain(|id| !ids.contains(id));
+        // One a worker holds may record progress (on a row registered
+        // again) until it lets go: it stays started.
+        let Queue {
+            started, active, ..
+        } = &mut *queue;
+        started.retain(|id| !ids.contains(id) || active.contains(id));
     }
 
     /// Waits for the next blob `slot` takes and holds it.
@@ -563,9 +662,10 @@ impl BlobQueue {
                     Slot::Wanted => (queue.waiting.iter().position(|q| q.reserved))
                         .or_else(|| queue.waiting.iter().position(|q| q.wanted && ready(q))),
                 };
-                if let Some(mut item) = at.and_then(|at| queue.waiting.remove(at)) {
+                if let Some(mut item) = at.and_then(|at| queue.waiting.remove_at(at)) {
                     item.reserved = false;
                     queue.active.insert(item.id);
+                    queue.started.insert(item.id);
                     return Claim {
                         queue: self,
                         item,
@@ -737,7 +837,10 @@ impl Claim<'_> {
                     },
                 );
             }
-            LetGo::Yielded => self.queue.stop(id),
+            LetGo::Yielded => {
+                queue.started.remove(&id);
+                self.queue.stop(id);
+            }
             // A local crop not yet tried keeps its source.
             _ if again => queue.waiting.push_front(Queued {
                 wanted: true,
@@ -753,8 +856,14 @@ impl Claim<'_> {
                 queue.waiting.push_front(self.item);
             }
             // Dropped under `OnDemand`: what it got stays, `Stopped`.
-            LetGo::Unfinished => self.queue.stop(id),
-            LetGo::Finished => {}
+            LetGo::Unfinished => {
+                queue.started.remove(&id);
+                self.queue.stop(id);
+            }
+            // Available, failed or gone: nothing left to stop.
+            LetGo::Finished => {
+                queue.started.remove(&id);
+            }
         }
     }
 }
@@ -1809,9 +1918,7 @@ mod tests {
         f.until_crop_ended(crop).await;
         f.queue.local_crops(&[crop]);
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !lock(&f.queue.queue).waiting.is_empty()
-                || !lock(&f.queue.queue).active.is_empty()
-            {
+            while !waiting(&f.queue).is_empty() || !lock(&f.queue.queue).active.is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -2225,8 +2332,9 @@ mod tests {
         queue.set_policy(BlobPolicy::OnDemand, &[]);
         queue.want(c);
         let q = lock(&queue.queue);
+        let waiting: Vec<Queued> = q.waiting.iter().copied().collect();
         assert_eq!(
-            Vec::from(q.waiting.clone()),
+            waiting,
             [
                 Queued {
                     wanted: true,
@@ -2235,8 +2343,9 @@ mod tests {
                 Queued::local_crop(first),
             ]
         );
-        assert!(!q.ready(&q.waiting[0]), "waits for the crop that makes b");
-        assert!(q.ready(&q.waiting[1]));
+        assert!(q.waiting.consistent());
+        assert!(!q.ready(&waiting[0]), "waits for the crop that makes b");
+        assert!(q.ready(&waiting[1]));
     }
 
     #[tokio::test]
@@ -2537,7 +2646,7 @@ mod tests {
         downloader.abort();
 
         assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "not retried");
-        assert!(lock(&f.queue.queue).waiting.is_empty());
+        assert!(waiting(&f.queue).is_empty());
         assert_eq!(f.seam.blob(f.blob.id).unwrap(), None);
         assert!(!f.part().exists(), "the part file it wrote is gone");
         let done = blob_dir(&f.seam.data_dir()).join(f.blob.id.0.to_string());
@@ -3012,11 +3121,59 @@ mod tests {
     }
 
     fn waiting(queue: &BlobQueue) -> Vec<(BlobId, bool)> {
-        lock(&queue.queue)
-            .waiting
-            .iter()
-            .map(|q| (q.id, q.wanted))
-            .collect()
+        let queue = lock(&queue.queue);
+        assert!(queue.waiting.consistent(), "order and ids agree");
+        queue.waiting.iter().map(|q| (q.id, q.wanted)).collect()
+    }
+
+    fn stops(queue: &BlobQueue) -> usize {
+        queue.stops.load(Ordering::Relaxed)
+    }
+
+    /// A first sync's worth of blobs: registering them (twice), switching
+    /// to `Eager` over them, purging half and switching to `OnDemand` each
+    /// check membership per blob, which must not scan the queue (50k
+    /// blobs scanned per blob would be billions of comparisons, minutes in
+    /// a debug build). The switch to `OnDemand` stops only the one blob a
+    /// worker took, not every blob it drops.
+    #[tokio::test]
+    async fn a_large_queue_registers_switches_and_purges_without_scanning() {
+        const COUNT: usize = 50_000;
+        let queue = BlobQueue::default();
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        let ids: Vec<BlobId> = (0..COUNT).map(|_| ProtoBlobId::new()).collect();
+        queue.registered(&ids);
+        queue.registered(&ids);
+        let records: Vec<BlobRecord> = (ids.iter())
+            .map(|&id| BlobRecord {
+                id,
+                size: 1,
+                sha256: ContentHash::of(b""),
+                status: BlobStatus::NotDownloaded,
+                workdir: false,
+            })
+            .collect();
+        queue.set_policy(BlobPolicy::Eager, &records);
+        let ids_waiting: Vec<BlobId> = waiting(&queue).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids_waiting, ids, "registration order, no duplicates");
+
+        // A worker takes the first and lets it go unfinished: it waits at
+        // the front again, started.
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!(claim.item.id, ids[0]);
+        drop(claim);
+        assert_eq!(waiting(&queue).len(), COUNT);
+
+        let (gone, kept) = ids.split_at(COUNT / 2);
+        queue.purged(&gone[1..]);
+        let left: Vec<BlobId> = waiting(&queue).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(left[0], ids[0]);
+        assert_eq!(left[1..], *kept);
+
+        let before = stops(&queue);
+        queue.set_policy(BlobPolicy::OnDemand, &records);
+        assert!(waiting(&queue).is_empty());
+        assert_eq!(stops(&queue) - before, 1, "only the started blob");
     }
 
     #[test]
@@ -3332,8 +3489,8 @@ mod tests {
 
     /// The engine reads the blobs before the queue's lock: a blob whose
     /// worker recorded progress and let it go after that read (a yield to
-    /// a crop, a full disk) is still stopped, as is every dropped blob
-    /// when the read failed and the list is empty.
+    /// a crop, a full disk) is still stopped, as is every dropped blob a
+    /// worker took when the read failed and the list is empty.
     #[tokio::test]
     async fn the_switch_to_on_demand_stops_what_a_stale_snapshot_missed() {
         for empty in [false, true] {
@@ -3341,11 +3498,16 @@ mod tests {
             let before = f.seam.blobs().unwrap();
             f.queue.set_policy(BlobPolicy::Eager, &before);
             assert_eq!(waiting(&f.queue), [(f.blob.id, false)]);
+            // A worker takes it, records progress and lets it go, unfinished:
+            // under `Eager` it waits at the front again.
+            let claim = ready_now(f.queue.next(Slot::Any)).await.expect("queued");
             let started = BlobStatus::Downloading {
                 got: 1000,
                 path: f.part(),
             };
             f.seam.blob_status(f.blob.id, started).unwrap();
+            drop(claim);
+            assert_eq!(waiting(&f.queue), [(f.blob.id, false)]);
 
             let snapshot: &[BlobRecord] = if empty { &[] } else { &before };
             assert_eq!(
