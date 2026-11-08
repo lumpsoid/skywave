@@ -489,7 +489,11 @@ the daemon's appends, which would otherwise stop `serve` (below).
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
-  fetched on demand (D11). Each such field (`ToolCall::input`,
+  fetched on demand (D11). A call's input is a blob only when its display
+  does not carry all of it (the adapter's display left a field out, or the
+  detail, or a title beside a body, was cut); a cut body's blob already
+  holds it whole, so a big Write, Edit or command is stored once and
+  deleting that blob frees its bytes. Each such field (`ToolCall::input`,
   `Body::full`, `ToolResult::output`, `ApprovalRequested::input`) is a
   `Full`: `None` when the preview holds it all, `Blob` with the reference,
   `Inline` with the content itself, or `Lost` when the blob could not be

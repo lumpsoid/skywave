@@ -123,9 +123,11 @@ const AGENT_EXITED: &str = "agent exited";
 /// (`Body::full`) when its preview is shorter; a result's output when its
 /// preview does not hold all of it (it was cut, or the adapter previewed
 /// other text, e.g. without notes meant for the model); a call's input
-/// (pretty JSON, or the string itself) when its display does not show all
-/// of it: its title, detail or body was cut, or the display (the adapter's,
-/// by `shows_all_input`, or the generic one) left fields out. Agent text stays inline:
+/// (pretty JSON, or the string itself) when its display does not carry all
+/// of it: its title (beside a body) or detail was cut, or the display (the
+/// adapter's, by `shows_all_input`, or the generic one) left fields out. A
+/// cut body does not count: its blob holds it whole, so a big call's content
+/// is stored once. Agent text stays inline:
 /// `AgentMessage` has no blob field.
 ///
 /// **Generic display.** A call the adapter gives no display for is shown as
@@ -859,14 +861,21 @@ fn stored(storage: &Storage) -> impl FnMut(&[u8]) -> Result<Full> + '_ {
     }
 }
 
-/// The bounded display for a call and, when it does not show all of the
+/// The bounded display for a call and, when it does not carry all of the
 /// input, the input as a blob.
+///
+/// A cut body does not make the input a blob: the body's own blob
+/// (`Body::full`) holds its whole text, as a cut title's stand-in body does,
+/// so a big Write, Edit or shell command is stored once and deleting that
+/// blob frees its bytes. Only what no event field holds whole makes one: a
+/// field the adapter's display left out (`shows_all_input`), a cut detail, or
+/// a cut title beside a body.
 pub(crate) fn call_display(
     put: &mut impl FnMut(&[u8]) -> Result<Full>,
     input: &Value,
     display: Option<ToolDisplay>,
 ) -> Result<(proto::ToolDisplay, Option<Full>)> {
-    let (display, shown_whole) = match display {
+    let (display, carried_whole) = match display {
         Some(display) => {
             let omits_input = !display.shows_all_input;
             let (title, title_cut) = cut_line(&display.title, TITLE_MAX_CHARS);
@@ -881,33 +890,28 @@ pub(crate) fn call_display(
                 Some(body) => (Some(display_body(put, body)?), title_cut),
                 None => (title_body(put, &display.title, title_cut)?, false),
             };
-            let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
                 kind: display.kind,
                 title,
                 detail,
                 body,
             };
-            (
-                display,
-                !(omits_input || title_cut || detail_cut || body_cut),
-            )
+            (display, !(omits_input || title_cut || detail_cut))
         }
         None => {
             let (text, whole) = generic_text(input);
             let (title, title_cut) = cut_line(&text, TITLE_MAX_CHARS);
             let body = title_body(put, &text, title_cut)?;
-            let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
                 kind: ToolKind::Other,
                 title,
                 detail: None,
                 body,
             };
-            (display, whole && !body_cut)
+            (display, whole)
         }
     };
-    let blob = if shown_whole {
+    let blob = if carried_whole {
         None
     } else {
         Some(input_blob(put, input)?)
