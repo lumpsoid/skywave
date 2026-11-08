@@ -1322,6 +1322,16 @@ fn next_when(when: RunWhen) -> RunWhen {
     }
 }
 
+/// Where a session's info page is scrolled to.
+#[derive(Debug, Clone, Default)]
+pub struct InfoUi {
+    /// The first line shown; `j`/`k` scroll.
+    pub top: usize,
+    /// The highest [`top`](Self::top) the last frame could use, as
+    /// [`UiState::help_end`] is for the help.
+    pub end: Cell<usize>,
+}
+
 /// What the usage screen shows.
 #[derive(Debug, Clone, Default)]
 pub struct UsageUi {
@@ -1401,6 +1411,8 @@ pub struct UiState {
     pub session: Option<SessionUi>,
     /// The usage screen's span, grouping and scroll; kept while away.
     pub usage: UsageUi,
+    /// The session info page's scroll; back to the top on opening.
+    pub info: InfoUi,
     /// The storage screen's list and scroll; kept while away.
     pub storage: StorageUi,
     /// The workdir screen's selection, scroll and read blob text.
@@ -1466,6 +1478,7 @@ impl App {
                 confirm: None,
                 session: None,
                 usage: UsageUi::default(),
+                info: InfoUi::default(),
                 storage: StorageUi::default(),
                 workdir: WorkdirUi::default(),
                 crop: CropUi::default(),
@@ -2206,6 +2219,23 @@ impl App {
                 KeyCode::Char('r') => Some(Action::RefreshUsageLimits),
                 _ => None,
             },
+            Screen::SessionInfo(_) => {
+                let info = &mut self.ui.info;
+                match key.code {
+                    KeyCode::Char('q') => return self.quit(),
+                    KeyCode::Esc => return Some(Action::Back),
+                    KeyCode::Char('r') => return Some(Action::RefreshUsageLimits),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        info.top = (info.top + 1).min(info.end.get());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        info.top = info.top.min(info.end.get()).saturating_sub(1);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => info.top = 0,
+                    _ => {}
+                }
+                None
+            }
             Screen::Storage(view) => {
                 let rows = storage_rows(view, self.ui.storage.grouping);
                 let storage = &mut self.ui.storage;
@@ -2704,7 +2734,12 @@ impl App {
                 KeyCode::Char('w') => Some(Action::OpenWorkdir {
                     session_id: view.id,
                 }),
-                KeyCode::Char('L') => Some(Action::Navigate(Route::UsageLimits)),
+                KeyCode::Char('I') => {
+                    self.ui.info.top = 0;
+                    Some(Action::OpenSessionInfo {
+                        session_id: view.id,
+                    })
+                }
                 _ => None,
             },
             Focus::Timeline => match key.code {
@@ -2804,7 +2839,12 @@ impl App {
                 KeyCode::Char('w') => Some(Action::OpenWorkdir {
                     session_id: view.id,
                 }),
-                KeyCode::Char('L') => Some(Action::Navigate(Route::UsageLimits)),
+                KeyCode::Char('I') => {
+                    self.ui.info.top = 0;
+                    Some(Action::OpenSessionInfo {
+                        session_id: view.id,
+                    })
+                }
                 // Shifted, so a stray key does not end the agent's run.
                 // In a subagent's view it stops that subagent's task instead,
                 // always asking: it ends one thing, not the run. A foreground

@@ -206,13 +206,16 @@ pub fn tokens(n: u64) -> String {
 /// the fill is not (D46: after a context starts or is switched to, or a turn
 /// that reported none). Never added to a subagent's figures.
 pub fn context_label(fill: Option<ContextFill>) -> String {
-    let Some(ContextFill {
+    format!("ctx {}", fill.map_or_else(|| "?".to_owned(), context_fill))
+}
+
+/// How full a context is, without the `ctx` of [`context_label`]:
+/// `19.3k/1M · 2%`, or `19.3k` when the window is not known.
+pub fn context_fill(fill: ContextFill) -> String {
+    let ContextFill {
         tokens: used,
         window,
-    }) = fill
-    else {
-        return "ctx ?".to_owned();
-    };
+    } = fill;
     match window.filter(|&w| w > 0) {
         Some(window) => {
             let percent = (used.saturating_mul(100) + window / 2) / window;
@@ -221,9 +224,9 @@ pub fn context_label(fill: Option<ContextFill>) -> String {
             } else {
                 format!("{percent}%")
             };
-            format!("ctx {}/{} · {percent}", tokens(used), window_size(window))
+            format!("{}/{} · {percent}", tokens(used), window_size(window))
         }
-        None => format!("ctx {}", tokens(used)),
+        None => tokens(used),
     }
 }
 
@@ -400,7 +403,7 @@ pub fn offered_modes(bypass: bool) -> Vec<PermissionMode> {
         .collect()
 }
 
-fn count(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 

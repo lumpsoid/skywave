@@ -1098,9 +1098,25 @@ logs) an event that no longer decodes rather than failing.
   scope, percent, bar fill, warning, `resets in 2 h 13 min`), when the
   limits were read and why there is nothing to list; a figure the agent
   did not report is left out. The TUI opens it with `L` (session list,
-  session timeline, usage screen); the GUI from the session's usage
-  summary on its status line, the session's More menu and the usage
-  page.
+  usage screen); the GUI from the usage page. From a session the limits
+  show on its info page instead.
+- **Session info page** (`Action::OpenSessionInfo { session_id }`,
+  `Screen::SessionInfo(SessionInfoView)`): one session's particulars, all
+  from the replica but the limits: its title and full workdir, the usage
+  limits (`UsageLimitsView`, asked for on opening and refreshed exactly as
+  on the usage limits page; `RefreshUsageLimits` works on either page),
+  its `SessionUsage` (tokens in and out summed, the context fill, cost,
+  time), its `TurnRecord`s (summed by model), the agent's model, effort
+  and mode (`AgentView`), and every subagent it ran, in any context and
+  nested ones too, in launch order, as `SubagentHeader`s folded from the
+  timeline. The page keeps the session's events loaded as the session
+  view does (`Model::loaded_session`: opened over the session it reuses
+  them, else it loads them), so a subagent launched while it is on screen
+  joins the list. Back returns to the session. `skywave_present::session_info`
+  words the sections (Session, Usage, Agent, Models) and a row per
+  subagent with its timeline status (`finished · 14 steps · 4.3s · ctx
+  12k`). The TUI opens it with `I` on a session; the GUI from the usage
+  summary on the status line and the session's More menu.
 - **Crop screen** (`Action::OpenCrop { blob, session, holds, title }`,
   `Screen::Crop(CropView)`): chooses which lines of a tool's or shell
   run's output to keep. The head opening it names the blob as `CropBlob`

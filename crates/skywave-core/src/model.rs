@@ -43,12 +43,12 @@ use crate::view::{
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
     LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, Pause,
     PendingApprovalRef, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
-    SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow,
-    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
-    ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
-    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
-    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
-    WorkdirView,
+    SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionInfoView, SessionListView, SessionRef,
+    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun,
+    ShellRunState, ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader,
+    SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView,
+    UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody,
+    WorkdirPane, WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -106,6 +106,8 @@ enum Place {
     /// back returns there.
     UsageLimits(Option<SessionId>),
     Session(SessionId),
+    /// The session's info page; its events stay loaded, as the session's.
+    SessionInfo(SessionId),
     /// The session's workdir, on [`Model::workdir_pane`].
     Workdir(SessionId),
     /// The crop page, [`Model::crop`].
@@ -384,10 +386,19 @@ impl Model {
         }
     }
 
+    /// The session whose events the screen shows: the open one, or the
+    /// one whose info page is on screen.
+    pub(crate) fn loaded_session(&self) -> Option<SessionId> {
+        match self.place {
+            Place::Session(id) | Place::SessionInfo(id) => Some(id),
+            _ => None,
+        }
+    }
+
     /// The session on screen when its events are not loaded: one
     /// [`Model::apply_batch`] opened for a [`Action::CreateSessionLike`].
     pub(crate) fn unloaded_session(&self) -> Option<SessionId> {
-        self.open_session()
+        self.loaded_session()
             .filter(|id| self.open.as_ref().is_none_or(|open| open.id != *id))
     }
 
@@ -501,7 +512,9 @@ impl Model {
                     .collect()
             }
             Action::RefreshUsageLimits => {
-                if self.device().is_none() || !matches!(self.place, Place::UsageLimits(_)) {
+                if self.device().is_none()
+                    || !matches!(self.place, Place::UsageLimits(_) | Place::SessionInfo(_))
+                {
                     return Vec::new();
                 }
                 let online = self.online();
@@ -761,6 +774,25 @@ impl Model {
                 self.last_dir = String::new();
                 self.show_workdir(session_id, WorkdirPane::Changes)
             }
+            Action::OpenSessionInfo { session_id } => {
+                if self.device().is_none() || self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.place = Place::SessionInfo(session_id);
+                self.viewing = None;
+                self.subagent = None;
+                self.completer.end();
+                self.conversations.end();
+                let online = self.online();
+                let asked = self.usage_limits.open(online).map(Effect::Request);
+                // The session's events, if loaded, are the page's too.
+                let loaded = self.open.as_ref().is_some_and(|open| open.id == session_id);
+                if !loaded {
+                    self.open = None;
+                }
+                let load = (!loaded).then_some(Effect::LoadSession(session_id));
+                load.into_iter().chain(asked).collect()
+            }
             Action::ShowWorkdir(pane) => match self.shown_workdir() {
                 Some(id) => self.show_workdir(id, pane),
                 None => Vec::new(),
@@ -958,6 +990,10 @@ impl Model {
                     Some(id) => Action::OpenSession(id),
                     None => Action::Navigate(Route::SessionList),
                 });
+            }
+            Place::SessionInfo(id) => {
+                self.summary(id)?;
+                return Some(Action::OpenSession(id));
             }
             Place::Session(id) => {
                 if self.archived(self.summary(id)?) {
@@ -1544,7 +1580,7 @@ impl Model {
     }
 
     pub(crate) fn session_loaded(&mut self, id: SessionId, events: Vec<(Seq, Event)>) {
-        if self.place == Place::Session(id) {
+        if self.loaded_session() == Some(id) {
             let read = self.read_marks.get(&id).map_or(Seq::ZERO, |m| m.seq);
             let mut unseen = events.iter().filter(|(seq, _)| *seq > read);
             let first = self.first_unseen(unseen.clone());
@@ -1664,7 +1700,8 @@ impl Model {
         }
         self.workdirs.forget(id);
         self.forget_resolved_alerts();
-        if self.place == Place::Session(id) || self.place == Place::Workdir(id) {
+        if matches!(self.place, Place::Session(s) | Place::SessionInfo(s) | Place::Workdir(s) if s == id)
+        {
             self.place = Place::Archived;
             self.open = None;
             self.viewing = None;
@@ -1979,6 +2016,10 @@ impl Model {
                 Some(view) => Screen::Session(Box::new(view)),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
             },
+            Place::SessionInfo(id) => match self.session_info_view(id) {
+                Some(view) => Screen::SessionInfo(Box::new(view)),
+                None => Screen::SessionList(self.session_list(ListKind::Active)),
+            },
             Place::Workdir(id) => match self.workdir_view(id) {
                 Some(view) => Screen::Workdir(view),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
@@ -2220,6 +2261,41 @@ impl Model {
                 .collect(),
             deleted: self.deleted.len(),
         }
+    }
+
+    fn session_info_view(&self, id: SessionId) -> Option<SessionInfoView> {
+        let summary = self.summary(id)?;
+        let events = self
+            .open
+            .as_ref()
+            .filter(|open| open.id == id)
+            .map_or(&[][..], |open| open.events.as_slice());
+        let (timeline, _) = self.timeline(id, events);
+        let subagents = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged {
+                    entry: Entry::Tool(view),
+                    ..
+                } if view.kind == ToolKind::Subagent => subagent_header(&timeline, view.call),
+                _ => None,
+            })
+            .collect();
+        Some(SessionInfoView {
+            id,
+            title: self.title(summary).text,
+            workdir: summary.workdir.clone(),
+            usage: summary.usage.clone(),
+            turns: self
+                .turns
+                .iter()
+                .filter(|t| t.session_id == id)
+                .cloned()
+                .collect(),
+            agent: self.agent_view(summary),
+            subagents,
+            limits: self.usage_limits.view(),
+        })
     }
 
     fn storage_view(&self) -> StorageView {
@@ -9499,6 +9575,7 @@ mod tests {
             Screen::Usage(_) => "usage",
             Screen::Storage(_) => "storage",
             Screen::UsageLimits(_) => "usage limits",
+            Screen::SessionInfo(_) => "session info",
             Screen::Workdir(_) => "workdir",
             Screen::Crop(_) => "crop",
             Screen::Session(v) if v.archived => "archived session",
@@ -10633,6 +10710,77 @@ mod tests {
                 _ => None,
             })
             .expect("a subagent's call")
+    }
+
+    fn session_info(f: &Fixture) -> SessionInfoView {
+        match f.model.view().screen {
+            Screen::SessionInfo(view) => *view,
+            other => panic!("expected the session info page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_session_info_page_lists_every_subagent_and_follows_the_log() {
+        use crate::view::UsageLimitsStatus;
+
+        let mut f = Fixture::paired();
+        let n = nested(&mut f);
+        let turn = crate::TurnUsage {
+            tokens_in: Some(1_200),
+            model: Some("opus".into()),
+            ..crate::TurnUsage::default()
+        };
+        f.log(n.sid, vec![EventKind::TurnUsage(turn.clone())]);
+
+        // Opened over the session: its events stay loaded, and the limits
+        // are asked for while none are stored.
+        let effects = f.dispatch(Action::OpenSessionInfo { session_id: n.sid });
+        assert_eq!(usage_limits_req(&effects).map(|_| ()), Some(()));
+        let view = session_info(&f);
+        assert_eq!(view.workdir.as_deref(), Some("/srv/a"));
+        assert_eq!(view.usage.as_ref().unwrap().last_turn, turn);
+        assert_eq!(view.turns.len(), 1);
+        assert_eq!(view.limits.status, UsageLimitsStatus::Loading);
+        let calls = |view: &SessionInfoView| -> Vec<(CallId, String)> {
+            view.subagents
+                .iter()
+                .map(|s| (s.call, s.title.clone()))
+                .collect()
+        };
+        assert_eq!(
+            calls(&view),
+            [(n.a, "outer".to_owned()), (n.b, "inner".to_owned())]
+        );
+        assert_eq!(view.subagents[1].trail, [(n.a, "outer".to_owned())]);
+
+        // A subagent launched while the page is on screen joins the list.
+        let late = CallId::new();
+        f.log(
+            n.sid,
+            vec![tool_call(Some(late), ToolKind::Subagent, "late")],
+        );
+        assert_eq!(calls(&session_info(&f)).len(), 3);
+        assert_eq!(
+            usage_limits_req(&f.dispatch(Action::RefreshUsageLimits)).map(|_| ()),
+            Some(())
+        );
+
+        // Back returns to the session; from elsewhere the page loads the
+        // session's events itself.
+        assert_eq!(f.model.back(), Some(Action::OpenSession(n.sid)));
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(
+            f.dispatch(Action::OpenSessionInfo { session_id: n.sid })
+                .first(),
+            Some(&Effect::LoadSession(n.sid))
+        );
+        assert_eq!(f.model.loaded_session(), Some(n.sid));
+        assert!(
+            f.dispatch(Action::OpenSessionInfo {
+                session_id: SessionId::new()
+            })
+            .is_empty()
+        );
     }
 
     #[test]

@@ -127,14 +127,21 @@ pub enum ScreenView {
     /// The usage limits of the account the server's agent runs as: the
     /// stored ones, asked for on opening only when none are stored.
     UsageLimits {
-        /// Asking, offline or failed; `None` otherwise.
-        status_label: Option<String>,
-        /// `Read 12 min ago`; `None` without limits to list.
-        read_label: Option<String>,
-        /// In the agent's order.
-        rows: Vec<LimitRowView>,
-        /// Why there is nothing to list; `None` when there are rows.
-        empty_label: Option<String>,
+        limits: LimitsView,
+    },
+    /// A session's particulars: what it is, the account's usage limits
+    /// (as the usage limits page's), what its turns took, its agent's
+    /// settings, its models and every subagent it ran.
+    SessionInfo {
+        session_id: String,
+        /// The session, its usage, its agent and its models (left out
+        /// while no turn reported usage), in that order.
+        sections: Vec<InfoSectionView>,
+        limits: LimitsView,
+        /// In the order they were launched, nested ones included.
+        subagents: Vec<SubagentRowView>,
+        /// What an empty subagent list says; `None` when it has rows.
+        subagents_empty_label: Option<String>,
     },
     /// A session's workdir, read on request and kept for offline reading.
     Workdir {
@@ -190,6 +197,49 @@ pub struct StorageRowView {
     /// The blob a blob or shell run row stands for, and what may be done
     /// to it; `None` for a session row and a run kept as no blob.
     pub target: Option<BlobTargetView>,
+}
+
+/// The usage limits as listed, on their page and a session's info page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct LimitsView {
+    /// Asking, offline or failed; `None` otherwise.
+    pub status_label: Option<String>,
+    /// `Read 12 min ago`; `None` without limits to list.
+    pub read_label: Option<String>,
+    /// In the agent's order.
+    pub rows: Vec<LimitRowView>,
+    /// Why there is nothing to list; `None` when there are rows.
+    pub empty_label: Option<String>,
+}
+
+/// A titled group of a session info page's figures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct InfoSectionView {
+    /// `Session`, `Usage`, `Agent`, `Models`.
+    pub title: String,
+    pub fields: Vec<InfoFieldView>,
+}
+
+/// One labelled figure: `Tokens in` `153k`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct InfoFieldView {
+    pub label: String,
+    pub value: String,
+}
+
+/// A subagent on a session's info page, as its row in the timeline reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct SubagentRowView {
+    pub title: String,
+    /// The kind of subagent (e.g. `Explore`).
+    pub detail: Option<String>,
+    /// The subagents it ran under, outermost first: `outer › inner`; empty
+    /// for one the main agent launched.
+    pub trail: String,
+    /// `finished · 14 steps · 4.3s · ctx 12k`.
+    pub status_label: String,
+    /// Still at work.
+    pub live: bool,
 }
 
 /// One limit of the usage limits page.
