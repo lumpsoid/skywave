@@ -3842,6 +3842,40 @@ fn a_failed_blob_keeps_its_reason_over_a_reopen() {
     assert_eq!(rows(&conn), 0, "the failure went with the blob's row");
 }
 
+/// A stopped download keeps its progress and partial file over a reopen,
+/// apart from both `NotDownloaded` and `Downloading`; a failure or a
+/// plain `NotDownloaded` written over it clears them.
+#[test]
+fn a_stopped_download_keeps_its_progress_over_a_reopen() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let stopped = BlobStatus::Stopped {
+        got: 3,
+        path: "blobs/x.part".into(),
+    };
+    store.set_blob_status(log.blob.id, &stopped).unwrap();
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, stopped);
+    assert_eq!(store.load().unwrap().blobs[0].status, stopped);
+    let failed = BlobStatus::Failed {
+        reason: "gone".into(),
+    };
+    store.set_blob_status(log.blob.id, &failed).unwrap();
+    assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, failed);
+    store.set_blob_status(log.blob.id, &stopped).unwrap();
+    store
+        .set_blob_status(log.blob.id, &BlobStatus::NotDownloaded)
+        .unwrap();
+    assert_eq!(
+        store.blob(log.blob.id).unwrap().unwrap().status,
+        BlobStatus::NotDownloaded
+    );
+}
+
 /// The failures migration adds its table and trigger to a populated
 /// replica, whose blobs read as before and can fail from then on.
 #[test]

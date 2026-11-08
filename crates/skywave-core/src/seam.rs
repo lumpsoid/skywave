@@ -660,6 +660,29 @@ impl Seam {
         })
     }
 
+    /// The blob queue dropped `id`, a download nobody asked for, as the
+    /// policy is `OnDemand`: a blob left `Downloading` becomes
+    /// [`BlobStatus::Stopped`] with the progress it recorded, its `.part`
+    /// kept; any other status stays. No lease: no worker holds the blob
+    /// (the queue calls this as its worker lets go, or for a blob nobody
+    /// held), and a row purged and registered again meanwhile is not
+    /// `Downloading`.
+    pub(crate) fn blob_stopped(&self, id: BlobId) -> Result<(), CoreError> {
+        self.update(|state| {
+            let Some(BlobRecord {
+                status: BlobStatus::Downloading { got, path },
+                ..
+            }) = state.store.blob(id)?
+            else {
+                return Ok(((), Vec::new()));
+            };
+            let status = BlobStatus::Stopped { got, path };
+            state.store.set_blob_status(id, &status)?;
+            state.model.blob_status(id, status);
+            Ok(((), Vec::new()))
+        })
+    }
+
     /// The blob queue paused every download on a full device disk, or
     /// resumed them; the views say so. Nothing is stored: a restart
     /// resumes.

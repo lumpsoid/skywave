@@ -750,7 +750,9 @@ impl Model {
                     // A download already running shows its progress instead.
                     if matches!(
                         status,
-                        BlobStatus::NotDownloaded | BlobStatus::Failed { .. }
+                        BlobStatus::NotDownloaded
+                            | BlobStatus::Stopped { .. }
+                            | BlobStatus::Failed { .. }
                     ) {
                         self.wanted.insert(id);
                     }
@@ -1010,7 +1012,11 @@ impl Model {
     fn want_shown_blob(&mut self) -> Option<Request> {
         let id = self.shown_blob()?.id;
         let record = self.blobs.get(&id)?;
-        if record.status != BlobStatus::NotDownloaded || self.wanted.contains(&id) {
+        let not_here = matches!(
+            record.status,
+            BlobStatus::NotDownloaded | BlobStatus::Stopped { .. }
+        );
+        if !not_here || self.wanted.contains(&id) {
             return None;
         }
         self.wanted.insert(id);
@@ -1815,7 +1821,11 @@ impl Model {
     }
 
     pub(crate) fn blob_status(&mut self, id: BlobId, status: BlobStatus) {
-        self.wanted.remove(&id);
+        // A request the queue has not seen yet may overtake a stop: it
+        // still shows as requested.
+        if !matches!(status, BlobStatus::Stopped { .. }) {
+            self.wanted.remove(&id);
+        }
         if let Some(blob) = self.blobs.get_mut(&id) {
             blob.status = status;
         }
@@ -3360,12 +3370,16 @@ impl Model {
         };
         let size = record.size;
         let state = match &record.status {
-            BlobStatus::NotDownloaded | BlobStatus::Failed { .. }
+            BlobStatus::NotDownloaded | BlobStatus::Stopped { .. } | BlobStatus::Failed { .. }
                 if self.wanted.contains(&blob.id) =>
             {
                 BlobState::Requested { size }
             }
-            BlobStatus::NotDownloaded => BlobState::NotDownloaded { size },
+            // A stopped download is no download under way: nothing moves
+            // until it is asked for, which resumes from its kept bytes.
+            BlobStatus::NotDownloaded | BlobStatus::Stopped { .. } => {
+                BlobState::NotDownloaded { size }
+            }
             BlobStatus::Failed { reason } => BlobState::Failed {
                 size,
                 reason: reason.clone(),
