@@ -2266,6 +2266,36 @@ fn expanding_an_edit_downloads_its_output() {
 }
 
 #[test]
+fn expanding_downloads_every_blob_the_item_needs_at_once() {
+    use skywave_proto::{BlobId, BlobRef, Full};
+    let mut rig = Rig::new();
+    let (mut kinds, output) = an_edit();
+    let body = BlobId::new();
+    let EventKind::ToolCall(call) = &mut kinds[0] else {
+        panic!("an edit starts with its call");
+    };
+    call.display.body.as_mut().unwrap().full = Some(Full::Blob(BlobRef {
+        id: body,
+        size: 90,
+        sha256: skywave_proto::ContentHash::of(b""),
+    }));
+    rig.log(kinds);
+    rig.actions.clear();
+    let key = rig.rows().last().unwrap().key.clone();
+    // The intent alone, with no view after it: the tap yields both.
+    rig.intent(GuiIntent::ExpandItem { key });
+    let asked: Vec<_> = rig
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::DownloadBlob(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked, [body, output], "dispatched {:?}", rig.actions);
+}
+
+#[test]
 fn an_edit_expanded_before_its_result_downloads_the_output_when_it_comes() {
     let mut rig = Rig::new();
     let (mut kinds, output) = an_edit();

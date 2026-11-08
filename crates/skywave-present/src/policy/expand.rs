@@ -5,13 +5,15 @@
 
 use std::collections::HashSet;
 
-use skywave_core::{Action, BlobId, BlobState, Entry, Seq, SessionView, TimelineItem};
+use skywave_core::{Action, BlobId, Entry, Seq, SessionView, TimelineItem};
 
-use crate::sections::wanted_blob;
+use crate::sections::unasked_blobs;
 
-/// Asks for the [`wanted_blob`] of every expanded item, once per blob: not
-/// again on every snapshot while its request is in flight, and not again
-/// after a failure, which waits for an explicit retry. The blob policy
+/// Asks for the [`unasked_blobs`] of every expanded item, once per blob:
+/// not again on every snapshot while its request is in flight, and not
+/// again after a failure, which waits for an explicit retry. A failed blob
+/// holds back none of the item's others (a call's failed body, its output
+/// still fetched). The blob policy
 /// needs no check: under `Eager` the core has queued every blob already, so
 /// none is still not downloaded. Which items are expanded is the head's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,12 +27,18 @@ impl ExpandFetch {
         ExpandFetch::default()
     }
 
-    /// The user expanded `entry`: the download it needs, asked again even
-    /// if it was asked for before.
+    /// The user expanded `entry`: the first download it needs, asked again
+    /// even if it was asked for before. Its other blobs are asked again by
+    /// the next [`ExpandFetch::due`], which the head runs once `entry` is
+    /// in its expanded set: a key or tap yields one action.
     pub fn expand(&mut self, entry: &Entry) -> Option<Action> {
-        let id = wanted(entry)?;
-        self.asked.insert(id);
-        Some(Action::DownloadBlob(id))
+        let mut ids = unasked_blobs(entry).into_iter().map(|b| b.id);
+        let first = ids.next()?;
+        for id in ids {
+            self.asked.remove(&id);
+        }
+        self.asked.insert(first);
+        Some(Action::DownloadBlob(first))
     }
 
     /// After each snapshot: the downloads the items in `expanded` need that
@@ -38,30 +46,115 @@ impl ExpandFetch {
     pub fn due(&mut self, view: &SessionView, expanded: &HashSet<Seq>) -> Vec<Action> {
         view.timeline
             .iter()
-            .filter_map(|item| match item {
-                TimelineItem::Logged { seq, entry, .. } if expanded.contains(seq) => wanted(entry),
-                _ => None,
+            .flat_map(|item| match item {
+                TimelineItem::Logged { seq, entry, .. } if expanded.contains(seq) => {
+                    unasked_blobs(entry)
+                }
+                _ => Vec::new(),
             })
+            .map(|blob| blob.id)
             .filter(|id| self.asked.insert(*id))
             .map(Action::DownloadBlob)
             .collect()
     }
 }
 
-/// The blob expanding `entry` downloads: present's [`wanted_blob`] while
-/// nobody asked for it; a failed one waits for an explicit retry.
-fn wanted(entry: &Entry) -> Option<BlobId> {
-    wanted_blob(entry)
-        .filter(|b| matches!(b.state, BlobState::NotDownloaded { .. }))
-        .map(|b| b.id)
-}
-
 #[cfg(test)]
 mod tests {
-    use skywave_core::{BlobView, FullView};
+    use skywave_core::{
+        BlobState, BlobView, BodyFormat, BodyView, CallId, FullView, ToolKind, ToolOutcome,
+        ToolView,
+    };
 
     use super::*;
     use crate::policy::tests::{logged, message, session};
+    use crate::sections::wanted_blob;
+
+    fn blob(id: BlobId, state: BlobState) -> FullView {
+        FullView::Blob(BlobView {
+            id,
+            state,
+            change: None,
+            pending: None,
+        })
+    }
+
+    fn failed() -> BlobState {
+        BlobState::Failed {
+            size: 10,
+            reason: "hash mismatch".into(),
+        }
+    }
+
+    /// A finished write whose body blob is `body` and output blob `output`.
+    fn write(body: FullView, output: FullView) -> Entry {
+        Entry::Tool(Box::new(ToolView {
+            call: CallId::new(),
+            name: "Write".into(),
+            kind: ToolKind::FileWrite,
+            title: "a.txt".into(),
+            detail: None,
+            body: Some(BodyView {
+                format: BodyFormat::Text,
+                preview: "x".into(),
+                lines: 40,
+                full: Some(body),
+            }),
+            input: None,
+            approval: None,
+            outcome: ToolOutcome::Done {
+                is_error: false,
+                status: None,
+                preview: "out".into(),
+                lines: 40,
+                output: Some(output),
+                took: std::time::Duration::from_secs(1),
+            },
+            subagent: None,
+        }))
+    }
+
+    #[test]
+    fn a_failed_blob_holds_back_none_of_its_items_others() {
+        let (body, output) = (BlobId::new(), BlobId::new());
+        let entry = write(
+            blob(body, failed()),
+            blob(output, BlobState::NotDownloaded { size: 10 }),
+        );
+        let mut fetch = ExpandFetch::new();
+        assert_eq!(fetch.expand(&entry), Some(Action::DownloadBlob(output)));
+        let view = session(vec![logged(1, entry.clone())]);
+        assert_eq!(fetch.due(&view, &expanded(&[1])), vec![], "asked already");
+        // The open item's output, under a snapshot, is due too.
+        let mut fresh = ExpandFetch::new();
+        assert_eq!(
+            fresh.due(&view, &expanded(&[1])),
+            vec![Action::DownloadBlob(output)]
+        );
+        // An explicit download takes the output first, then retries the
+        // body once nothing else is left to ask for.
+        assert_eq!(wanted_blob(&entry).map(|b| b.id), Some(output));
+        let tried = write(
+            blob(body, failed()),
+            blob(output, BlobState::Requested { size: 10 }),
+        );
+        assert_eq!(wanted_blob(&tried).map(|b| b.id), Some(body));
+    }
+
+    #[test]
+    fn expanding_asks_for_every_blob_the_item_needs() {
+        let (body, output) = (BlobId::new(), BlobId::new());
+        let state = BlobState::NotDownloaded { size: 10 };
+        let entry = write(blob(body, state.clone()), blob(output, state));
+        let view = session(vec![logged(1, entry.clone())]);
+        let open = expanded(&[1]);
+        let mut fetch = ExpandFetch::new();
+        assert_eq!(fetch.due(&view, &open).len(), 2, "both, first time");
+        // Expanding again asks the first at once, the rest on the next due.
+        assert_eq!(fetch.expand(&entry), Some(Action::DownloadBlob(body)));
+        assert_eq!(fetch.due(&view, &open), vec![Action::DownloadBlob(output)]);
+        assert_eq!(fetch.due(&view, &open), vec![]);
+    }
 
     fn result(id: BlobId, state: BlobState) -> Entry {
         Entry::ToolResult {

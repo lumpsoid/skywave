@@ -883,10 +883,12 @@ impl Head {
                     return Ok(());
                 };
                 session.expanded.insert(seq);
-                // Expanding again asks again.
+                // Expanding again asks again: the first blob here, the
+                // item's others through `fetch_expanded`.
                 if let Some(fetch) = session.fetch.expand(&entry) {
                     self.dispatch_user(fetch, Purpose::Plain, clock, out);
                 }
+                self.fetch_expanded(clock, out);
             }
             GuiIntent::CollapseItem { key } => {
                 if let (Some(seq), Some(session)) = (logged(parse_key(&key)?), &mut self.session) {
