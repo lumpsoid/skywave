@@ -4,7 +4,7 @@
 //!
 //! Both are queued like any command ([`skywave_core::Action::DeleteBlob`],
 //! [`skywave_core::Action::CropBlob`]) and can't be undone once the server
-//! takes them, so a head asks first ([`DELETE_CONFIRMATION`],
+//! takes them, so a head asks first ([`delete_confirmation`],
 //! [`crop_confirmation`]).
 
 use skywave_core::{
@@ -13,6 +13,7 @@ use skywave_core::{
 };
 
 use crate::format;
+use crate::storage::holds_label;
 
 /// One thing a device may do to a blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,9 +142,14 @@ pub fn run_target(run: &ShellRun, session: SessionId) -> Option<BlobTarget> {
     )
 }
 
-/// What a head asks before it deletes a blob.
-pub const DELETE_CONFIRMATION: &str =
-    "Delete this output from the server and from every device? This can't be undone.";
+/// What a head asks before it deletes a blob holding `holds`, naming it as
+/// its storage row does ([`holds_label`]).
+pub fn delete_confirmation(holds: BlobUse) -> String {
+    format!(
+        "Delete this {} from the server and from every device? This can't be undone.",
+        holds_label(holds)
+    )
+}
 
 /// What a head asks before it crops a blob of `of` lines to `kept`.
 pub fn crop_confirmation(kept: u32, of: u32) -> String {
@@ -276,10 +282,20 @@ mod tests {
 
     #[test]
     fn the_confirmations_say_it_cannot_be_undone() {
-        assert_eq!(
-            DELETE_CONFIRMATION,
-            "Delete this output from the server and from every device? This can't be undone."
-        );
+        let question = |what: &str| {
+            format!(
+                "Delete this {what} from the server and from every device? This can't be undone."
+            )
+        };
+        for (holds, what) in [
+            (BlobUse::ToolInput, "tool input"),
+            (BlobUse::ToolBody, "tool diff or body"),
+            (BlobUse::ToolOutput, "tool output"),
+            (BlobUse::ApprovalInput, "approval input"),
+            (BlobUse::ShellOutput, "shell output"),
+        ] {
+            assert_eq!(delete_confirmation(holds), question(what), "{holds:?}");
+        }
         assert_eq!(
             crop_confirmation(3, 120),
             "Keep 3 of 120 lines? Every device keeps only these. This can't be undone."

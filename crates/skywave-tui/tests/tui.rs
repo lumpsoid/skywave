@@ -9227,7 +9227,7 @@ fn shift_d_on_an_output_asks_and_only_y_deletes_it() {
     assert_eq!(h.key(KeyCode::Char('D')), None);
     assert_eq!(
         footer(&h),
-        "Delete this output from the server and from every device? This can't be undone. y/N"
+        "Delete this tool output from the server and from every device? This can't be undone. y/N"
     );
     assert_eq!(h.key(KeyCode::Esc), None, "Esc answers no");
     assert!(matches!(h.app.view().screen, Screen::Session(_)));
@@ -9459,7 +9459,7 @@ fn storage_rows_move_with_j_k_and_act_on_their_blob() {
     assert_eq!(h.key(KeyCode::Char('K')), None);
     let before = outbox_len(&h);
     assert_eq!(h.key(KeyCode::Char('D')), None);
-    assert_contains(&footer(&h), "Delete this output from the server");
+    assert_contains(&footer(&h), "Delete this tool output from the server");
     assert_eq!(h.key(KeyCode::Esc), None);
     assert!(matches!(h.app.view().screen, Screen::Storage(_)));
     assert_eq!(outbox_len(&h), before, "nothing sent");
@@ -9471,6 +9471,7 @@ fn storage_rows_move_with_j_k_and_act_on_their_blob() {
     h.key(KeyCode::Tab);
     assert_contains(&line_with(&h.screen(), "> "), "$ make all");
     h.key(KeyCode::Char('D'));
+    assert_contains(&footer(&h), "Delete this shell output from the server");
     assert_eq!(
         h.key(KeyCode::Char('y')),
         Some(Action::DeleteBlob(run_output))

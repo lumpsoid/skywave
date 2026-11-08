@@ -13,7 +13,7 @@ use skywave_core::{
     BlobId, BlobUse, BlobView, CropContent, CropView, LineIndex, LineSpan, SessionId, ShellRun,
 };
 use skywave_present::blob_actions::{
-    BlobAction, BlobTarget, DELETE_CONFIRMATION, crop_confirmation, pending_note, run_target,
+    BlobAction, BlobTarget, crop_confirmation, delete_confirmation, pending_note, run_target,
 };
 use skywave_present::crop::{crop_enabled, keeps_label, kept, presets};
 use skywave_present::format::{blob_size, bytes};
@@ -35,7 +35,7 @@ pub fn target_view(target: &BlobTarget) -> BlobTargetView {
     BlobTargetView {
         blob_id: target.blob.0.to_string(),
         can_crop: offered(BlobAction::Crop),
-        delete_question: offered(BlobAction::Delete).then(|| DELETE_CONFIRMATION.to_owned()),
+        delete_question: offered(BlobAction::Delete).then(|| delete_confirmation(target.holds)),
         pending_note: target.pending.as_ref().map(pending_note),
         discard_id: target
             .pending
