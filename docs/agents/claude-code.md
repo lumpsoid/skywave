@@ -255,8 +255,80 @@ interrupted at an approval while the message holding the `tool_use` was still
 streaming (`aborted_streaming`, §4.2). A turn interrupted while a tool runs
 (`interrupt_spares_tasks`, `aborted_tools`) reports its figures normally.
 
-Not observed: a turn on two models. Summing `costUSD` per model is the
-reading of the field's shape, not a capture.
+A turn on two models (`subagent_context.ndjson`, opus with a sonnet
+subagent) has one `model_usage_since_last_result` entry per model, and their
+`costUSD` add up to the turn's cost: 0.0592086 + 0.0126994 = 0.071908, the
+first `total_cost_usd`; the next turn's two entries add up to the difference
+of the totals. A background subagent's spend lands in the `result` of the
+next turn to end, a turn the CLI starts itself included.
+
+### 2.6 How full the context is (recorded 2026-11-08)
+
+`usage` in `result` sums the turn's requests (§2.5), so it counts the same
+context once per request and says nothing about how full the context is.
+The fixtures `context_fill`, `context_autocompact` and `subagent_context`
+record what does. Each checks every figure below against the CLI's own
+count, written raw after every turn: the control request
+`{"subtype":"get_context_usage"}` (what `/context` shows) answers
+`{totalTokens, maxTokens, rawMaxTokens, percentage, autocompactSource,
+model, categories, …}`.
+
+- **The fill.** `result.usage.iterations` holds exactly **one** entry, the
+  turn's last request, on every `result` of every fixture. Its `input_tokens
+  + cache_read_input_tokens + cache_creation_input_tokens + output_tokens` is
+  the context as the next request will read it. It agrees with
+  `get_context_usage.totalTokens` within tens of tokens. The main thread's
+  `assistant` lines also carry their request's `usage`, but each line is
+  written as its block streams, so its `output_tokens` runs low (by up to
+  ~500 in `interrupt_kills_tasks`). A subagent's requests never appear in
+  the main `result`'s `iterations`.
+- **No fill.** A turn interrupted while text streamed (`aborted_streaming`)
+  and `/compact`'s turn have an empty `iterations`. An `aborted_tools` turn
+  has its one entry.
+- **The window.** `model_usage_since_last_result.<model>.contextWindow`, and
+  `modelUsage` likewise: 1000000 for `claude-opus-5-5`, `claude-sonnet-5-5`
+  and `claude-haiku-5-5`; 200000 for `claude-haiku-4-5`, and for opus with
+  `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` (probes). Look it up under the model of
+  the turn's `system/init`. The entry holds a subagent's model too, so
+  taking the first entry is wrong. The iteration itself names no model.
+- **The effective limit can be lower.** `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+  (or the `autoCompactWindow` setting) moves the point where the CLI
+  compacts. `get_context_usage.maxTokens` follows it
+  (`autocompactSource: "env"`; a value of 30000 became 100000, which looks
+  like a floor), but `contextWindow` does not. A `set_model` changes
+  `maxTokens` at once, and `contextWindow` only in the next `result`
+  (probes, 2026-11-08). `get_context_usage` answers mid-turn too. Its first
+  call in a process took 0.6–1.1 s; later ones took ~10 ms.
+- **Compaction** sends `system/status` `"compacting"`, then
+  `system/compact_boundary` `{compact_metadata: {trigger, pre_tokens,
+  post_tokens, cumulative_dropped_tokens, duration_ms, preserved_segment,
+  preserved_messages}}` and the summary as a `user` line.
+  - `/compact`, sent as a message: `trigger: "manual"`, `pre_tokens` equal
+    to the last fill, then a `result` with `num_turns: 0` and no
+    `iterations`.
+  - Auto-compact: `trigger: "auto"`, **inside the turn of the message that
+    crosses the threshold**, after its `system/init` and before its first
+    request. `pre_tokens` counts the new message too (30 over the last
+    fill). The turn then goes on, and its `result` already reports the fill
+    after the compaction. Recorded with `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=3`
+    (percent of the window), so not near a real 1M. Compacting in the
+    middle of a turn's tool loop was not seen.
+  - `post_tokens` (about 3k in both) leaves out the system prompt and
+    tools: the next fill was about 19k. It is not the fill.
+- **A subagent's own figures**, when it ends:
+  - Every completed `local_agent` task's `system/task_notification` carries
+    `usage: {total_tokens, tool_uses, duration_ms}`, foreground or
+    background, and each of two parallel subagents gets its own. A
+    `stopped` one carries no `usage`, nor does a `local_bash` task's
+    (every fixture).
+  - `total_tokens` is the subagent's context at its end, not what it spent:
+    `subagent_foreground` made 6 tool calls and ends at 13097. It runs a few
+    tens over the Agent result's `totalTokens` (11850 vs 11832).
+  - A foreground Agent call's `tool_use_result` also has `totalTokens` (the
+    fill of its own `usage.iterations`), `totalDurationMs`,
+    `totalToolUseCount`, `toolStats` and `resolvedModel`. A background
+    call's result (`status: "async_launched"`) has only `resolvedModel`.
+  - `system/task_progress` carries the same `usage` shape while it runs.
 
 ## 3. Permission prompts
 
