@@ -519,7 +519,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
   file (capped by `output_max`), reported as a tail at 2, 5, 10, 30 s,
   then every minute up to 10 min, every 5 min up to 1 h and every 15 min
   after (D39), only when the tail changed, and becomes a blob unless the
-  preview holds all of it;
+  preview holds all of it: the file is hashed in place and renamed into
+  `blobs/`, not copied (copied only if `shell/` is on another file system);
   output that cannot become a blob is logged `truncated` without one.
   On start, runs left running are finished `Lost` and queued ones run; if
   the runner fails, `serve` stops rather than accept runs nothing would

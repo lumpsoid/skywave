@@ -3,8 +3,10 @@
 //!
 //! A blob exists once its row exists. Files are written to a temp file in
 //! `blobs/`, synced and renamed into place before the row is inserted, so a
-//! row never points at a partial file. A crash between rename and insert can
-//! leave an orphan file, which is never served.
+//! row never points at a partial file. A file already complete elsewhere on
+//! the same file system (a shell run's output) is instead hashed in place,
+//! synced and renamed in ([`BlobStore::adopt`]). A crash between rename and
+//! insert can leave an orphan file, which is never served.
 //!
 //! **Deleting.** The row first, in a transaction, then the file once it
 //! commits: a workdir blob when it becomes unnamed (`workdir.rs`,
@@ -192,6 +194,77 @@ impl BlobStore {
         let value = fill(&mut out)?;
         let (size, sha256) = self.persist(out, &self.path(id))?;
         Ok((BlobMeta { id, size, sha256 }, value))
+    }
+
+    /// [`write`](BlobStore::write) for content already in a file at `path`
+    /// that nothing writes any more: the file itself becomes the new blob,
+    /// hashed in place, synced and renamed into the store, so no second copy
+    /// takes space. Only where `path` is on another file system (`EXDEV`) is
+    /// it copied, and the original left for the caller to remove. On error
+    /// the file stays at `path`. Follow with [`record`](BlobStore::record).
+    pub fn adopt(&self, path: &Path) -> Result<BlobMeta> {
+        self.adopt_with(path, |from, to| std::fs::rename(from, to))
+    }
+
+    /// [`adopt`](BlobStore::adopt) with the rename injected, for tests.
+    fn adopt_with(
+        &self,
+        path: &Path,
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<BlobMeta> {
+        let id = BlobId::new();
+        let to = self.path(id);
+        let (size, sha256) = self
+            .adopt_file(path, &to, rename)
+            .context(|| format!("adopting {} as blob {}", path.display(), to.display()))?;
+        Ok(BlobMeta { id, size, sha256 })
+    }
+
+    fn adopt_file(
+        &self,
+        path: &Path,
+        to: &Path,
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<(u64, ContentHash)> {
+        let mut file = File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            hasher.update(&buf[..n]);
+            size += n as u64;
+        }
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Private as a blob the store writes itself (tempfile's 0600).
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        match rename(path, to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                file.seek(SeekFrom::Start(0))?;
+                let copied = self.write_atomically(to, &mut file)?;
+                return Ok(copied);
+            }
+            Err(e) => return Err(e),
+        }
+        #[cfg(unix)]
+        if let Err(e) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+            // Put it back rather than lose it: the caller still owns it.
+            if std::fs::rename(to, path).is_err() {
+                let _ = std::fs::remove_file(to);
+            }
+            return Err(e);
+        }
+        Ok((size, ContentHash::from_digest(hasher.finalize().into())))
     }
 
     fn write_atomically(
@@ -385,6 +458,85 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, [meta.id.0.to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_renames_the_file_into_the_store() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let path = storage.dir.shell_dir().join("run.out");
+        let content = b"output of a finished run\n";
+        std::fs::write(&path, content).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let meta = storage.blobs.adopt(&path).unwrap();
+        storage.blobs.record(storage.db.conn(), &meta).unwrap();
+        assert!(!path.exists(), "the file moved, it was not copied");
+        let blob = storage.dir.blobs_dir().join(meta.id.0.to_string());
+        let stat = std::fs::metadata(&blob).unwrap();
+        assert_eq!(stat.ino(), inode, "the blob is the same file");
+        assert_eq!(stat.permissions().mode() & 0o777, 0o600);
+        assert_eq!(meta.size, content.len() as u64);
+        assert_eq!(meta.sha256, ContentHash::of(content));
+        let mut all = Vec::new();
+        storage
+            .blobs
+            .open(storage.db.conn(), meta.id)
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut all)
+            .unwrap();
+        assert_eq!(all, content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_across_file_systems_copies() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let path = storage.dir.shell_dir().join("run.out");
+        let content = b"output on another mount\n";
+        std::fs::write(&path, content).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let meta = storage
+            .blobs
+            .adopt_with(&path, |_, _| {
+                Err(io::Error::from(io::ErrorKind::CrossesDevices))
+            })
+            .unwrap();
+        storage.blobs.record(storage.db.conn(), &meta).unwrap();
+        assert_eq!(meta.size, content.len() as u64);
+        assert_eq!(meta.sha256, ContentHash::of(content));
+        let blob = storage.dir.blobs_dir().join(meta.id.0.to_string());
+        assert_eq!(std::fs::read(&blob).unwrap(), content);
+        assert_ne!(std::fs::metadata(&blob).unwrap().ino(), inode, "a copy");
+        assert!(path.exists(), "the original is the caller's to remove");
+        let names: Vec<String> = std::fs::read_dir(storage.dir.blobs_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, [meta.id.0.to_string()], "no temp file is left");
+    }
+
+    #[test]
+    fn adopt_fails_on_another_rename_error_and_keeps_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let path = storage.dir.shell_dir().join("run.out");
+        std::fs::write(&path, b"kept").unwrap();
+        let adopted = storage.blobs.adopt_with(&path, |_, _| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(adopted.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+        assert_eq!(
+            std::fs::read_dir(storage.dir.blobs_dir()).unwrap().count(),
+            0
+        );
     }
 
     #[test]
