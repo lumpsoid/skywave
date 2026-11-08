@@ -11,6 +11,7 @@
 //! ids), never on what the model writes. When the model does something
 //! else than asked, the scenario stops as inconclusive rather than failing.
 
+mod context;
 mod controls;
 mod conversations;
 mod subagents;
@@ -287,5 +288,23 @@ pub const ALL: &[Scenario] = &[
         tier: Tier::Full,
         about: "/loop, a tick, a resume: the job is listed and ticks again (~3min)",
         run: tasks::loop_resume,
+    },
+    Scenario {
+        name: "context_fill",
+        tier: Tier::Full,
+        about: "on opus: the last request's fill and the window in each result, then /compact",
+        run: context::context_fill,
+    },
+    Scenario {
+        name: "context_autocompact",
+        tier: Tier::Full,
+        about: "on opus, threshold lowered: the CLI compacts inside a turn, before its first request",
+        run: context::context_autocompact,
+    },
+    Scenario {
+        name: "subagent_context",
+        tier: Tier::Full,
+        about: "opus with sonnet subagents: a foreground one's figures, two background ones' at once",
+        run: context::subagent_context,
     },
 ];

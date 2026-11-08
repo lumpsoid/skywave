@@ -68,6 +68,8 @@ pub struct Setup {
     /// project` if they name `--setting-sources` again: the CLI takes the
     /// last).
     pub args: Vec<String>,
+    /// Variables added to the CLI's environment: name, value.
+    pub env: Vec<(&'static str, &'static str)>,
     /// Files to create in the scratch workdir: path, content.
     pub files: Vec<(&'static str, &'static str)>,
     /// The conversation the process takes up; a new one by default.
@@ -229,6 +231,7 @@ impl Session {
         let mut command = Command::new(claude);
         command
             .args(&args)
+            .envs(setup.env.iter().copied())
             .current_dir(workdir.cwd())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -273,7 +276,8 @@ impl Session {
             next_raw: 0,
             workdir,
         };
-        session.note(&format!("argv: claude {}", args.join(" ")));
+        let env: String = setup.env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
+        session.note(&format!("argv: {env}claude {}", args.join(" ")));
         let mut start = session.protocol.start();
         if let Some(change) = setup.initialize {
             start.writes.iter_mut().for_each(change);
