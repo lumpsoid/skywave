@@ -417,6 +417,24 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX event_blobs_seq ON event_blobs (seq);
     "#,
+    // v21: a long message's blob (protocol v24, `BlobUse::Message`). SQLite
+    // cannot change a CHECK in place, so the table is made again, its rows
+    // copied as they are.
+    r#"
+    CREATE TABLE event_blobs_v21 (
+        blob_id    TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        holds      TEXT NOT NULL CHECK (holds IN
+            ('tool_input', 'tool_body', 'tool_output', 'approval_input', 'shell_output',
+             'message'))
+    ) STRICT;
+    INSERT INTO event_blobs_v21 (blob_id, session_id, seq, holds)
+        SELECT blob_id, session_id, seq, holds FROM event_blobs;
+    DROP TABLE event_blobs;
+    ALTER TABLE event_blobs_v21 RENAME TO event_blobs;
+    CREATE INDEX event_blobs_seq ON event_blobs (seq);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -440,6 +458,12 @@ const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usiz
 /// - `Full::Inline` (a small tool output carried in its event): new, so no
 ///   v23 event has one; v23's `Full::Blob` and `Full::Lost` read unchanged
 ///   and its small output blobs stay blobs.
+/// - `full` on `AgentMessage` and on an imported `UserMessage` or
+///   `AgentMessage` (a long message's whole text as a blob): a new
+///   optional field, which v23 JSON lacks and reads as `None`, so no event
+///   is rewritten; v23's long messages stay whole in their events. Its
+///   `BlobUse::Message` came with schema migration v21, which lets
+///   `event_blobs.holds` say `message`.
 fn v23_to_v24(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
@@ -931,6 +955,107 @@ mod tests {
             .collect();
         assert!(matches!(outputs[0], Some(Full::Blob(ref b)) if b.size == 48213));
         assert_eq!(outputs[1..], [Some(Full::Lost), None]);
+    }
+
+    /// The messages a v23 build wrote (its wire snapshot's) read as whole
+    /// messages once v24's step ran, and the v20 schema it ran on keeps its
+    /// blob rows while v21 lets a message's blob have one.
+    #[test]
+    fn v24_reads_the_messages_v23_wrote() {
+        use skywave_proto::{EventKind, ImportedItem};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v23 = [
+            r#"{"type":"agent_message","text":"Running cargo test.","parent":null}"#,
+            r#"{"type":"agent_message","text":"Found three call sites.","parent":"01920000-0000-7000-8000-000000000007"}"#,
+            r#"{"type":"imported","at":null,"item":{"type":"user_message","text":"Where is the event log?"}}"#,
+            r#"{"type":"imported","at":null,"item":{"type":"agent_message","text":"In crates/skywaved/src/event_log.rs."}}"#,
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..20] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 20).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 23)",
+                [],
+            )
+            .unwrap();
+            for (seq, kind) in (1i64..).zip(v23) {
+                conn.execute(
+                    "INSERT INTO events (seq, session_id, at, context, kind)
+                     VALUES (?1, 's', 't', 'c', ?2)",
+                    rusqlite::params![seq, kind],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('b1', 's', 1, 'tool_output')",
+                [],
+            )
+            .unwrap();
+            // v20 refuses a message's blob.
+            assert!(
+                conn.execute(
+                    "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                     VALUES ('b2', 's', 1, 'message')",
+                    [],
+                )
+                .is_err()
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), 24);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let kinds: Vec<EventKind> = db
+            .conn()
+            .prepare("SELECT kind FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|kind| serde_json::from_str(&kind.unwrap()).unwrap())
+            .collect();
+        let texts: Vec<(&str, bool)> = kinds
+            .iter()
+            .map(|kind| match kind {
+                EventKind::AgentMessage { text, full, .. }
+                | EventKind::Imported {
+                    item:
+                        ImportedItem::UserMessage { text, full }
+                        | ImportedItem::AgentMessage { text, full },
+                    ..
+                } => (text.as_str(), full.is_none()),
+                other => panic!("not a message: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("Running cargo test.", true),
+                ("Found three call sites.", true),
+                ("Where is the event log?", true),
+                ("In crates/skywaved/src/event_log.rs.", true),
+            ]
+        );
+        let holds: Vec<(String, String)> = db
+            .conn()
+            .prepare("SELECT blob_id, holds FROM event_blobs ORDER BY blob_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(holds, [("b1".to_owned(), "tool_output".to_owned())]);
+        db.conn()
+            .execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('b2', 's', 1, 'message')",
+                [],
+            )
+            .unwrap();
     }
 
     /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records

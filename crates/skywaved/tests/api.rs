@@ -217,6 +217,7 @@ impl Fixture {
                 EventKind::AgentMessage {
                     parent: None,
                     text: text.into(),
+                    full: None,
                 },
             )
             .unwrap()
@@ -892,7 +893,8 @@ async fn long_poll_returns_when_an_event_is_appended() {
         batch.events[0].kind,
         EventKind::AgentMessage {
             parent: None,
-            text: "news".into()
+            text: "news".into(),
+            full: None,
         }
     );
 }

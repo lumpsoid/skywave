@@ -155,7 +155,8 @@
         "kind": {
           "type": "agent_message",
           "text": "Running cargo test.",
-          "parent": null
+          "parent": null,
+          "full": null
         }
       },
       {
@@ -166,7 +167,38 @@
         "kind": {
           "type": "agent_message",
           "text": "Found three call sites.",
-          "parent": "01920000-0000-7000-8000-000000000007"
+          "parent": "01920000-0000-7000-8000-000000000007",
+          "full": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "agent_message",
+          "text": "# Report\n\nThe event log keeps",
+          "parent": null,
+          "full": {
+            "blob": {
+              "id": "01920000-0000-7000-8000-000000000005",
+              "size": 48213,
+              "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+            }
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "agent_message",
+          "text": "# Report\n\nThe event log keeps",
+          "parent": null,
+          "full": "lost"
         }
       },
       {
@@ -1100,7 +1132,29 @@
           "at": null,
           "item": {
             "type": "user_message",
-            "text": "Where is the event log?"
+            "text": "Where is the event log?",
+            "full": null
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "imported",
+          "at": "2026-10-29T12:00:00Z",
+          "item": {
+            "type": "user_message",
+            "text": "Review this log:",
+            "full": {
+              "blob": {
+                "id": "01920000-0000-7000-8000-000000000005",
+                "size": 48213,
+                "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+              }
+            }
           }
         }
       },
@@ -1114,7 +1168,29 @@
           "at": "2026-10-29T12:00:00Z",
           "item": {
             "type": "agent_message",
-            "text": "In crates/skywaved/src/event_log.rs."
+            "text": "In crates/skywaved/src/event_log.rs.",
+            "full": null
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "imported",
+          "at": "2026-10-29T12:00:00Z",
+          "item": {
+            "type": "agent_message",
+            "text": "# Report",
+            "full": {
+              "blob": {
+                "id": "01920000-0000-7000-8000-000000000005",
+                "size": 48213,
+                "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+              }
+            }
           }
         }
       },
@@ -1926,6 +2002,13 @@
         "session": "01920000-0000-7000-8000-000000000001",
         "seq": 17,
         "holds": "shell_output"
+      },
+      {
+        "id": "01920000-0000-7000-8000-000000000005",
+        "size": 2000000,
+        "session": "01920000-0000-7000-8000-000000000001",
+        "seq": 17,
+        "holds": "message"
       }
     ],
     "shell_runs": [

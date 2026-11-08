@@ -91,10 +91,22 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::AgentMessage {
             parent: None,
             text: "Running cargo test.".into(),
+            full: None,
         },
         EventKind::AgentMessage {
             parent: Some(call()),
             text: "Found three call sites.".into(),
+            full: None,
+        },
+        EventKind::AgentMessage {
+            parent: None,
+            text: "# Report\n\nThe event log keeps".into(),
+            full: Some(Full::Blob(blob())),
+        },
+        EventKind::AgentMessage {
+            parent: None,
+            text: "# Report\n\nThe event log keeps".into(),
+            full: Some(Full::Lost),
         },
         EventKind::ToolCall(ToolCall {
             parent: None,
@@ -491,9 +503,19 @@ fn all_imported_items() -> Vec<ImportedItem> {
     vec![
         ImportedItem::UserMessage {
             text: "Where is the event log?".into(),
+            full: None,
+        },
+        ImportedItem::UserMessage {
+            text: "Review this log:".into(),
+            full: Some(Full::Blob(blob())),
         },
         ImportedItem::AgentMessage {
             text: "In crates/skywaved/src/event_log.rs.".into(),
+            full: None,
+        },
+        ImportedItem::AgentMessage {
+            text: "# Report".into(),
+            full: Some(Full::Blob(blob())),
         },
         ImportedItem::ToolCall(ToolCall {
             call: Some(call()),
@@ -584,6 +606,7 @@ fn storage_report() -> StorageReport {
             BlobUse::ToolOutput,
             BlobUse::ApprovalInput,
             BlobUse::ShellOutput,
+            BlobUse::Message,
         ]
         .into_iter()
         .map(|holds| BlobStorage {
@@ -1471,6 +1494,8 @@ fn display_caps() {
     assert_eq!(limits::PREVIEW_MAX_LINES, 8);
     assert_eq!(limits::PREVIEW_MAX_BYTES, 512);
     assert_eq!(limits::INLINE_MAX_BYTES, 4096);
+    assert_eq!(limits::MESSAGE_WHOLE_MAX_BYTES, 16 * 1024);
+    assert_eq!(limits::MESSAGE_PREVIEW_MAX_BYTES, 2048);
     assert_eq!(limits::RULE_LABEL_MAX_CHARS, 120);
     assert_eq!(limits::RULE_SUGGESTIONS_MAX, 8);
     assert_eq!(limits::TASKS_MAX, 32);
@@ -1512,6 +1537,7 @@ fn agent_work_keeps_the_last_set_of_each() {
         EventKind::AgentMessage {
             parent: None,
             text: "x".into(),
+            full: None,
         },
     ] {
         work.apply(&kind);
@@ -1602,6 +1628,7 @@ fn batch_assigns_contiguous_seqs() {
             event(EventKind::AgentMessage {
                 parent: None,
                 text: "ok".into(),
+                full: None,
             }),
         ],
     };

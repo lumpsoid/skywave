@@ -921,6 +921,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
                         EventKind::AgentMessage {
                             parent: None,
                             text: "hi".into(),
+                            full: None,
                         },
                     ),
                 ],
@@ -1165,6 +1166,7 @@ fn notable_count_is_projected_and_backfilled() {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "ok".into(),
+                    full: None,
                 },
             ),
             event(
@@ -1405,6 +1407,68 @@ fn v24_reads_the_tool_results_a_v23_replica_holds() {
         .collect();
     assert!(matches!(&outputs[0], Some(Full::Blob(b)) if b.size == 48213));
     assert_eq!(outputs[1..], [Some(Full::Lost), None]);
+}
+
+/// The messages a v23 replica holds (its wire snapshot's, without `full`)
+/// read as whole messages once v24's step ran.
+#[test]
+fn v24_reads_the_messages_a_v23_replica_holds() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let session = "01920000-0000-7000-8000-000000000001";
+    let event = |kind: &str| {
+        format!(
+            r#"{{"session_id":"{session}","at":"2026-10-29T12:00:00Z","command_id":null,"context":"{session}","kind":{kind}}}"#
+        )
+    };
+    let v23 = [
+        event(r#"{"type":"agent_message","text":"Running cargo test.","parent":null}"#),
+        event(
+            r#"{"type":"imported","at":null,"item":{"type":"user_message","text":"Where is the event log?"}}"#,
+        ),
+        event(
+            r#"{"type":"imported","at":null,"item":{"type":"agent_message","text":"In crates/skywaved/src/event_log.rs."}}"#,
+        ),
+    ];
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    for (seq, json) in (1i64..).zip(&v23) {
+        conn.execute(
+            "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
+            rusqlite::params![seq, session, json],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE protocol_stamp SET version = 23", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![24]);
+    let id = SessionId(session.parse().unwrap());
+    let texts: Vec<(String, bool)> =
+        store
+            .session_events(id)
+            .unwrap()
+            .into_iter()
+            .map(|(_, event)| match event.kind {
+                EventKind::AgentMessage { text, full, .. }
+                | EventKind::Imported {
+                    item:
+                        ImportedItem::UserMessage { text, full }
+                        | ImportedItem::AgentMessage { text, full },
+                    ..
+                } => (text, full.is_none()),
+                other => panic!("not a message: {other:?}"),
+            })
+            .collect();
+    assert_eq!(
+        texts,
+        [
+            ("Running cargo test.".to_owned(), true),
+            ("Where is the event log?".to_owned(), true),
+            ("In crates/skywaved/src/event_log.rs.".to_owned(), true),
+        ]
+    );
 }
 
 #[test]
@@ -2147,6 +2211,7 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
                         EventKind::AgentMessage {
                             parent: None,
                             text: "ok".into(),
+                            full: None,
                         },
                     ),
                 ],
@@ -2293,6 +2358,7 @@ fn a_v8_replica_moves_into_first_contexts() {
                     EventKind::AgentMessage {
                         parent: None,
                         text: "hi".into(),
+                        full: None,
                     },
                 ),
             ],
@@ -3166,6 +3232,7 @@ fn adopted_log(session: SessionId, output: &BlobRef) -> Vec<Event> {
                 at: None,
                 item: ImportedItem::UserMessage {
                     text: "fix the build".into(),
+                    full: None,
                 },
             },
         ),

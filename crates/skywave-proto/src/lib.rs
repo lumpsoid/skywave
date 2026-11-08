@@ -140,6 +140,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v24: [`Full::Inline`]: a tool result's whole output of at most
 /// [`limits::INLINE_MAX_BYTES`] travels in the event instead of a blob.
+/// Long messages: `full` on `EventKind::AgentMessage` and on
+/// `ImportedItem::UserMessage` and `ImportedItem::AgentMessage`, the whole
+/// text as a [`BlobUse::Message`] blob of a message longer than
+/// [`limits::MESSAGE_WHOLE_MAX_BYTES`], whose `text` is then its first
+/// [`limits::MESSAGE_PREVIEW_MAX_BYTES`].
 pub const PROTOCOL_VERSION: u32 = 24;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
@@ -379,11 +384,17 @@ pub enum EventKind {
         device_id: DeviceId,
         text: String,
     },
+    /// `text` is the whole message unless `full` is set: then it is the
+    /// message's head ([`limits::MESSAGE_PREVIEW_MAX_BYTES`]) and `full`
+    /// the whole, a [`BlobUse::Message`] blob (or [`Full::Lost`]).
     AgentMessage {
         text: String,
         /// The `Agent` call that started the subagent speaking; `None` for
         /// the main agent.
         parent: Option<CallId>,
+        /// The whole message, when it is longer than
+        /// [`limits::MESSAGE_WHOLE_MAX_BYTES`]. Never [`Full::Inline`].
+        full: Option<Full>,
     },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
@@ -672,11 +683,15 @@ pub struct LineSpan {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImportedItem {
+    /// `text` and `full` as on `EventKind::AgentMessage`.
     UserMessage {
         text: String,
+        full: Option<Full>,
     },
+    /// `text` and `full` as on `EventKind::AgentMessage`.
     AgentMessage {
         text: String,
+        full: Option<Full>,
     },
     ToolCall(ToolCall),
     /// Links by `call` to an imported `ToolCall`.
@@ -894,9 +909,9 @@ impl EventKind {
 
     /// The blobs the event references, with what each holds: a tool call's
     /// input and the whole of its display body, a result's output, an
-    /// approval's input, a finished shell run's whole output; the same for
-    /// an imported call or result. A [`Full::Inline`] or [`Full::Lost`]
-    /// references none. A
+    /// approval's input, a finished shell run's whole output, a long
+    /// message's whole text; the same for an imported call, result or
+    /// message. A [`Full::Inline`] or [`Full::Lost`] references none. A
     /// `BlobCropped` yields its `into`, the blob it made, with what it holds.
     pub fn blobs(&self) -> impl Iterator<Item = (BlobUse, &BlobRef)> {
         fn full(holds: BlobUse, full: &Option<Full>) -> Option<(BlobUse, &BlobRef)> {
@@ -924,9 +939,15 @@ impl EventKind {
                 (output.as_ref().map(|b| (BlobUse::ShellOutput, b)), None)
             }
             EventKind::BlobCropped { holds, into, .. } => (Some((*holds, into)), None),
+            EventKind::AgentMessage { full: whole, .. }
+            | EventKind::Imported {
+                item:
+                    ImportedItem::UserMessage { full: whole, .. }
+                    | ImportedItem::AgentMessage { full: whole, .. },
+                ..
+            } => (full(BlobUse::Message, whole), None),
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
-            | EventKind::AgentMessage { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::ApprovalCancelled { .. }
             | EventKind::TurnInterrupted
@@ -960,11 +981,7 @@ impl EventKind {
             | EventKind::ShellOutput { .. }
             | EventKind::ImportFinished { .. }
             // It names a blob it deleted; it references none.
-            | EventKind::BlobDeleted { .. }
-            | EventKind::Imported {
-                item: ImportedItem::UserMessage { .. } | ImportedItem::AgentMessage { .. },
-                ..
-            } => (None, None),
+            | EventKind::BlobDeleted { .. } => (None, None),
         };
         first.into_iter().chain(second)
     }
@@ -984,6 +1001,10 @@ pub enum BlobUse {
     ApprovalInput,
     /// A finished shell run's whole output.
     ShellOutput,
+    /// A long message's whole text (`full` on `EventKind::AgentMessage`
+    /// and on an imported message). Not croppable: a message cut to some of
+    /// its lines says something else.
+    Message,
 }
 
 /// Size caps on the bounded text in tool events. Producers (the server)
@@ -1010,6 +1031,22 @@ pub mod limits {
     /// read, a grep's file list) while capping what every device pulls per
     /// result at eight previews' worth.
     pub const INLINE_MAX_BYTES: usize = 4096;
+    /// Longest message (`EventKind::AgentMessage`, an imported message)
+    /// whose text travels whole in its event, in UTF-8 bytes. Messages are
+    /// the conversation every head shows unasked, so they get four times a
+    /// tool output's [`INLINE_MAX_BYTES`]: 16 KiB is several screens, which
+    /// holds nearly every reply whole. Past it is a report or a dump, which
+    /// would otherwise reach every device as event data however rarely it
+    /// is read; it travels as a [`MESSAGE_PREVIEW_MAX_BYTES`] head and a
+    /// blob. A typed `SendMessage` is bounded by [`MESSAGE_MAX_BYTES`]
+    /// instead, and its `UserMessage` stays whole: the server hands that
+    /// text to the agent.
+    pub const MESSAGE_WHOLE_MAX_BYTES: usize = 16 * 1024;
+    /// Most UTF-8 bytes of a long message's head, its `text` beside the
+    /// blob that holds it whole: about a screen, enough to tell what the
+    /// message is about. Cut at the last line break in it, if any, else on
+    /// a char boundary.
+    pub const MESSAGE_PREVIEW_MAX_BYTES: usize = 2048;
     /// Longest session name (`RenameSession`, `SessionRenamed`), in chars.
     pub const SESSION_NAME_MAX_CHARS: usize = 80;
     /// Longest context name (`SessionCreated::context_name`,
@@ -2515,6 +2552,38 @@ mod tests {
     }
 
     #[test]
+    fn a_long_messages_blob_holds_a_message() {
+        let blob = BlobRef {
+            id: BlobId::new(),
+            size: 40_000,
+            sha256: ContentHash::of(b""),
+        };
+        let agent = |full| EventKind::AgentMessage {
+            text: "# Report".into(),
+            parent: None,
+            full,
+        };
+        let imported = |item| EventKind::Imported { at: None, item };
+        for kind in [
+            agent(Some(Full::Blob(blob.clone()))),
+            imported(ImportedItem::UserMessage {
+                text: "log:".into(),
+                full: Some(Full::Blob(blob.clone())),
+            }),
+            imported(ImportedItem::AgentMessage {
+                text: "# Report".into(),
+                full: Some(Full::Blob(blob.clone())),
+            }),
+        ] {
+            let uses: Vec<_> = kind.blobs().collect();
+            assert_eq!(uses, [(BlobUse::Message, &blob)], "{kind:?}");
+        }
+        // A whole or lost message references none.
+        assert_eq!(agent(None).blobs().count(), 0);
+        assert_eq!(agent(Some(Full::Lost)).blobs().count(), 0);
+    }
+
+    #[test]
     fn archived_effect_sets_on_archive_and_clears_on_a_message() {
         let by = DeviceId::new();
         for archived in [true, false] {
@@ -2532,6 +2601,7 @@ mod tests {
             EventKind::AgentMessage {
                 parent: None,
                 text: "x".into(),
+                full: None,
             },
             EventKind::SessionStopped,
             EventKind::SessionRenamed {
@@ -2558,7 +2628,10 @@ mod tests {
     fn imported_history_is_the_daemons_and_its_end_the_commands() {
         let imported = EventKind::Imported {
             at: None,
-            item: ImportedItem::UserMessage { text: "hi".into() },
+            item: ImportedItem::UserMessage {
+                text: "hi".into(),
+                full: None,
+            },
         };
         let finished = EventKind::ImportFinished {
             outcome: ImportOutcome::Imported { items: 1 },
@@ -2868,7 +2941,8 @@ mod tests {
         assert!(
             !EventKind::AgentMessage {
                 parent: None,
-                text: "x".into()
+                text: "x".into(),
+                full: None,
             }
             .logged_by_command()
         );

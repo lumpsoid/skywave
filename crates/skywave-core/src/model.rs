@@ -2732,7 +2732,7 @@ impl Model {
                     Some(text)
                 }
                 EventKind::Imported {
-                    item: ImportedItem::UserMessage { text },
+                    item: ImportedItem::UserMessage { text, .. },
                     ..
                 } => Some(text),
                 _ => None,
@@ -2878,9 +2878,10 @@ impl Model {
                         delivery: sent.and_then(|e| Delivery::of(e)),
                     }
                 }),
-                EventKind::AgentMessage { text, .. } => {
-                    Some(Entry::AgentMessage { text: text.clone() })
-                }
+                EventKind::AgentMessage { text, full, .. } => Some(Entry::AgentMessage {
+                    text: text.clone(),
+                    full: full.as_ref().map(|full| self.full_view(full)),
+                }),
                 EventKind::ToolCall(
                     tool @ ToolCall {
                         call: Some(call), ..
@@ -3246,12 +3247,14 @@ impl Model {
         item: &ImportedItem,
     ) -> Option<ImportedEntry> {
         match item {
-            ImportedItem::UserMessage { text } => {
-                Some(ImportedEntry::UserMessage { text: text.clone() })
-            }
-            ImportedItem::AgentMessage { text } => {
-                Some(ImportedEntry::AgentMessage { text: text.clone() })
-            }
+            ImportedItem::UserMessage { text, full } => Some(ImportedEntry::UserMessage {
+                text: text.clone(),
+                full: full.as_ref().map(|full| self.full_view(full)),
+            }),
+            ImportedItem::AgentMessage { text, full } => Some(ImportedEntry::AgentMessage {
+                text: text.clone(),
+                full: full.as_ref().map(|full| self.full_view(full)),
+            }),
             // The server gives every imported call a fresh id, so neither
             // a missing nor a repeated one occurs; such a call is not shown.
             ImportedItem::ToolCall(tool) => {
@@ -3613,6 +3616,7 @@ impl ToolIndex {
             EventKind::AgentMessage {
                 parent: Some(parent),
                 text,
+                ..
             } => {
                 if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
                     self.steps.entry(*parent).or_default().last = Some(line.to_owned());
@@ -4237,6 +4241,7 @@ mod tests {
                     EventKind::AgentMessage {
                         parent: None,
                         text: "hi".into(),
+                        full: None,
                     },
                 ),
             ],
@@ -4265,7 +4270,10 @@ mod tests {
                     outgoing: Some(Outgoing::Accepted(Seq(2))),
                     delivery: Some(done),
                 },
-                &Entry::AgentMessage { text: "hi".into() },
+                &Entry::AgentMessage {
+                    text: "hi".into(),
+                    full: None,
+                },
             ]
         );
     }
@@ -6555,9 +6563,9 @@ mod tests {
     fn imported_text(user: bool, text: &str) -> ImportedItem {
         let text = text.to_owned();
         if user {
-            ImportedItem::UserMessage { text }
+            ImportedItem::UserMessage { text, full: None }
         } else {
-            ImportedItem::AgentMessage { text }
+            ImportedItem::AgentMessage { text, full: None }
         }
     }
 
@@ -6647,14 +6655,16 @@ mod tests {
                 &Entry::Imported {
                     at: at(0),
                     entry: ImportedEntry::UserMessage {
-                        text: "fix the build".into()
+                        text: "fix the build".into(),
+                        full: None,
                     },
                 },
                 // No time recorded: when the server logged it.
                 &Entry::Imported {
                     at: logged[2].1,
                     entry: ImportedEntry::AgentMessage {
-                        text: "looking".into()
+                        text: "looking".into(),
+                        full: None,
                     },
                 },
                 // The call and its result are one row, timed by the agent.
@@ -6688,7 +6698,8 @@ mod tests {
                 },
                 shown[6],
                 &Entry::AgentMessage {
-                    text: "on it".into()
+                    text: "on it".into(),
+                    full: None,
                 },
             ]
         );
@@ -7645,6 +7656,7 @@ mod tests {
         EventKind::AgentMessage {
             parent: None,
             text: text.into(),
+            full: None,
         }
     }
 
@@ -9837,6 +9849,7 @@ mod tests {
         EventKind::AgentMessage {
             parent: Some(parent),
             text: text.into(),
+            full: None,
         }
     }
 
@@ -9851,7 +9864,7 @@ mod tests {
             .into_iter()
             .map(|entry| match entry {
                 Entry::Tool(view) => view.title,
-                Entry::AgentMessage { text } => text,
+                Entry::AgentMessage { text, .. } => text,
                 Entry::ToolResult { summary, .. } => format!("result {summary}"),
                 Entry::Approval { summary, .. } => format!("approval {summary}"),
                 other => format!("{other:?}"),
@@ -10011,7 +10024,7 @@ mod tests {
                 .into_iter()
                 .map(|hit| match &view.timeline[hit.index] {
                     TimelineItem::Logged {
-                        entry: Entry::AgentMessage { text },
+                        entry: Entry::AgentMessage { text, .. },
                         ..
                     } => text.clone(),
                     other => panic!("hit {other:?}"),
@@ -11000,6 +11013,98 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        /// A long message's whole text shows as its blob, live or imported,
+        /// and as deleted once the server deleted it; a whole message has
+        /// none.
+        #[test]
+        fn a_long_messages_blob_shows_and_its_delete_too() {
+            let live = Live::new();
+            let other = DeviceId::new();
+            let (agent, imported) = (blob(40_000), blob(30_000));
+            let event = |kind| Event {
+                session_id: live.session,
+                at: Utc::now(),
+                command_id: None,
+                context: ContextId::first_of(live.session),
+                kind,
+            };
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(2),
+                    events: vec![
+                        event(EventKind::Imported {
+                            at: None,
+                            item: ImportedItem::UserMessage {
+                                text: "log:".into(),
+                                full: Some(Full::Blob(imported.clone())),
+                            },
+                        }),
+                        event(EventKind::AgentMessage {
+                            text: "# Report".into(),
+                            parent: None,
+                            full: Some(Full::Blob(agent.clone())),
+                        }),
+                        event(EventKind::AgentMessage {
+                            text: "short".into(),
+                            parent: None,
+                            full: None,
+                        }),
+                    ],
+                })
+                .unwrap();
+            live.core
+                .dispatch(Action::OpenSession(live.session))
+                .unwrap();
+            let fulls = |view: crate::ViewState| -> Vec<Option<FullView>> {
+                let Screen::Session(session) = view.screen else {
+                    panic!("expected the session screen");
+                };
+                session
+                    .timeline
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        TimelineItem::Logged {
+                            entry:
+                                Entry::AgentMessage { full, .. }
+                                | Entry::Imported {
+                                    entry: ImportedEntry::UserMessage { full, .. },
+                                    ..
+                                },
+                            ..
+                        } => Some(full),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let shown = fulls(live.core.view());
+            assert!(
+                matches!(&shown[..], [
+                    Some(FullView::Blob(i)),
+                    Some(FullView::Blob(a)),
+                    None,
+                ] if i.id == imported.id && a.id == agent.id
+                    && a.state == BlobState::NotDownloaded { size: 40_000 }),
+                "{shown:?}"
+            );
+
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(5),
+                    events: vec![event(EventKind::BlobDeleted {
+                        blob: agent.id,
+                        holds: BlobUse::Message,
+                        by: other,
+                    })],
+                })
+                .unwrap();
+            let shown = fulls(live.core.view());
+            assert!(
+                matches!(&shown[1], Some(FullView::Deleted { by }) if by.id == other),
+                "{shown:?}"
+            );
+            assert!(matches!(&shown[0], Some(FullView::Blob(_))), "{shown:?}");
         }
 
         /// A server delete or crop purges the old blob in the update that

@@ -1816,6 +1816,7 @@ fn every_timeline_entry_renders_distinctly() {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "Looking.\nSecond line".into(),
+                    full: None,
                 },
             ),
             event(
@@ -2106,6 +2107,65 @@ fn an_inline_output_expands_to_all_of_it_without_a_download() {
     let screen = h.screen();
     assert_contains(&screen, "│ file-011 ");
     assert!(!screen.contains("+11 lines"), "expanded: {screen}");
+}
+
+/// A long message shows its head and where its whole stands; expanding
+/// fetches the whole and shows it beneath the head; `y` copies the whole.
+#[test]
+fn a_long_message_shows_its_head_and_expands_to_its_whole() {
+    let (blob_id, whole) = blob(40_000);
+    let long = |full| EventKind::AgentMessage {
+        parent: None,
+        text: "# Report\nhead line\n".into(),
+        full: Some(full),
+    };
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, long(Full::Blob(whole)))]);
+    let screen = h.screen();
+    assert_contains(&screen, "agent: # Report");
+    assert_contains(&screen, "head line");
+    assert_contains(&screen, "│ … full 39.1 KiB · not downloaded ");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    // `y` takes the whole, never the head alone.
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+    assert_eq!(h.key(KeyCode::Enter), None, "already asked for");
+    let dir = tempfile::tempdir().unwrap();
+    downloaded(
+        &mut h,
+        &dir,
+        "m",
+        blob_id,
+        b"# Report\nhead line\nthe deep finding\n",
+    );
+    assert_contains(&h.screen(), "│ the deep finding ");
+    h.key(KeyCode::Char('y'));
+    assert!(
+        matches!(clip(&h), Some(Clip::File { .. })),
+        "{:?}",
+        clip(&h)
+    );
+    // Collapsed again: the head, and that the whole is here.
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    assert!(!screen.contains("the deep finding"), "{screen}");
+    assert_contains(&screen, "│ … downloaded ");
+
+    // Lost: the head is all there is, and it says so.
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, long(Full::Lost))]);
+    assert_contains(&h.screen(), "│ … the server could not store the rest");
+
+    // Control: a whole message says nothing more.
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, agent("# Report\nhead line\n"))]);
+    let screen = h.screen();
+    assert_contains(&screen, "head line");
+    assert!(!screen.contains("│ …"), "{screen}");
 }
 
 #[test]
@@ -2757,6 +2817,7 @@ fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionI
                 10,
                 ImportedItem::UserMessage {
                     text: "why is the build red".into(),
+                    full: None,
                 },
             ),
             imported(
@@ -2775,6 +2836,7 @@ fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionI
                 14,
                 ImportedItem::AgentMessage {
                     text: "it builds now".into(),
+                    full: None,
                 },
             ),
             event(id, 1, EventKind::ImportFinished { outcome }),
@@ -3007,6 +3069,7 @@ fn movable_context() -> (Harness, SessionId, DeviceId) {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "alpha answer".into(),
+                    full: None,
                 },
             ),
             Event {
@@ -3472,6 +3535,7 @@ fn timeline_follows_new_items_until_scrolled_back() {
                     EventKind::AgentMessage {
                         parent: None,
                         text: format!("message {i:02}"),
+                        full: None,
                     },
                 )
             })
@@ -3539,6 +3603,7 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
             EventKind::AgentMessage {
                 parent: None,
                 text: format!("chatter {i}"),
+                full: None,
             },
         )
     }));
@@ -4403,6 +4468,7 @@ fn agent(text: &str) -> EventKind {
     EventKind::AgentMessage {
         parent: None,
         text: text.into(),
+        full: None,
     }
 }
 
@@ -7808,6 +7874,7 @@ fn moving_the_current_context_warns_but_another_does_not() {
                 EventKind::AgentMessage {
                     parent: None,
                     text: "alpha answer".into(),
+                    full: None,
                 },
             ),
             event(

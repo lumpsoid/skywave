@@ -59,6 +59,7 @@ fn blob_use_view(holds: BlobUse) -> BlobUseView {
         BlobUse::ToolOutput => BlobUseView::ToolOutput,
         BlobUse::ApprovalInput => BlobUseView::ApprovalInput,
         BlobUse::ShellOutput => BlobUseView::ShellOutput,
+        BlobUse::Message => BlobUseView::Message,
     }
 }
 

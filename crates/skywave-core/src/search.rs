@@ -214,9 +214,16 @@ pub fn find(
 
 /// The blobs whose content an entry shows, in the order it shows them: a
 /// call's body and output, and its whole input only when it has neither
-/// nor an inline output (the input is then all there is to see).
+/// nor an inline output (the input is then all there is to see); a long
+/// message's whole text.
 pub fn blobs(entry: &Entry) -> Vec<&BlobView> {
     match entry {
+        Entry::AgentMessage { full, .. }
+        | Entry::Imported {
+            entry:
+                ImportedEntry::UserMessage { full, .. } | ImportedEntry::AgentMessage { full, .. },
+            ..
+        } => full.as_ref().and_then(FullView::blob).into_iter().collect(),
         Entry::Tool(view)
         | Entry::Imported {
             entry: ImportedEntry::Tool(view),
@@ -295,12 +302,12 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         TimelineItem::Logged { entry, .. } => entry,
     };
     match entry {
-        Entry::UserMessage { text, .. } | Entry::AgentMessage { text } => vec![text],
+        Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => vec![text],
         Entry::AgentErrored { message } => vec![message],
         Entry::AgentVersionUnconfirmed { version, .. } => vec![version],
         Entry::Tool(view) => tool_texts(view),
         Entry::Imported { entry, .. } => match entry {
-            ImportedEntry::UserMessage { text } | ImportedEntry::AgentMessage { text } => {
+            ImportedEntry::UserMessage { text, .. } | ImportedEntry::AgentMessage { text, .. } => {
                 vec![text]
             }
             ImportedEntry::Tool(view) => tool_texts(view),
@@ -419,7 +426,16 @@ mod tests {
     fn an_empty_query_matches_nothing() {
         let query = Query::new("");
         assert!(query.ranges("anything").is_empty());
-        assert!(indices(&[logged(Entry::AgentMessage { text: "x".into() })], &query).is_empty());
+        assert!(
+            indices(
+                &[logged(Entry::AgentMessage {
+                    text: "x".into(),
+                    full: None,
+                })],
+                &query
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -456,6 +472,7 @@ mod tests {
             }),
             logged(Entry::AgentMessage {
                 text: "an agent reply".into(),
+                full: None,
             }),
             logged(Entry::AgentErrored {
                 message: "rate limited".into(),
@@ -600,6 +617,52 @@ mod tests {
         );
         let found = find(&timeline, &Query::new("note"), &mut |_| None);
         assert_eq!((found.not_downloaded, found.cut), (0, 0));
+    }
+
+    #[test]
+    fn a_long_messages_whole_text_is_searched_once_here() {
+        let here = blob(BlobState::Available {
+            path: "/data/blobs/m".into(),
+        });
+        let away = blob(BlobState::NotDownloaded { size: 40_000 });
+        let timeline = vec![
+            logged(Entry::AgentMessage {
+                text: "# Report".into(),
+                full: Some(FullView::Blob(here.clone())),
+            }),
+            logged(Entry::Imported {
+                at: DateTime::UNIX_EPOCH,
+                entry: ImportedEntry::UserMessage {
+                    text: "log:".into(),
+                    full: Some(FullView::Blob(away)),
+                },
+            }),
+            // Control: a whole message without the words.
+            logged(Entry::AgentMessage {
+                text: "nothing".into(),
+                full: None,
+            }),
+        ];
+        let mut asked = Vec::new();
+        let found = find(&timeline, &Query::new("deep finding"), &mut |view| {
+            asked.push(view.id);
+            Some(BlobText {
+                text: "# Report\n\nthe deep finding\n".into(),
+                cut: false,
+            })
+        });
+        assert_eq!(asked, [here.id]);
+        assert_eq!(found.not_downloaded, 1);
+        assert_eq!(
+            found.hits,
+            [Hit {
+                index: 0,
+                blob: Some(BlobLine {
+                    id: here.id,
+                    line: 2
+                }),
+            }]
+        );
     }
 
     #[test]

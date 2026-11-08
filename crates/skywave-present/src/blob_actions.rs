@@ -102,9 +102,28 @@ impl BlobTarget {
 
 /// The output of a timeline entry of `session`: a tool call's, grouped or
 /// not, live or imported, titled as the call or by the result's first
-/// line. `None` for any other entry, or one whose output is no blob.
+/// line; or a long message's whole text (deleted, never cropped), titled
+/// by its first line. `None` for any other entry, or one whose output is
+/// no blob.
 pub fn entry_target(entry: &Entry, session: SessionId) -> Option<BlobTarget> {
+    let first_line = |text: &str| text.lines().next().unwrap_or_default().to_owned();
     let (full, title) = match entry {
+        Entry::AgentMessage {
+            text,
+            full: Some(full),
+        }
+        | Entry::Imported {
+            entry:
+                ImportedEntry::UserMessage {
+                    text,
+                    full: Some(full),
+                }
+                | ImportedEntry::AgentMessage {
+                    text,
+                    full: Some(full),
+                },
+            ..
+        } => return BlobTarget::of(full, BlobUse::Message, session, first_line(text)),
         Entry::Tool(view)
         | Entry::Imported {
             entry: ImportedEntry::Tool(view),
@@ -126,7 +145,7 @@ pub fn entry_target(entry: &Entry, session: SessionId) -> Option<BlobTarget> {
                     output: Some(full),
                 },
             ..
-        } => (full, summary.lines().next().unwrap_or_default().to_owned()),
+        } => (full, first_line(summary)),
         _ => return None,
     };
     BlobTarget::of(full, BlobUse::ToolOutput, session, title)
@@ -178,12 +197,13 @@ mod tests {
 
     use super::*;
 
-    const EVERY_USE: [BlobUse; 5] = [
+    const EVERY_USE: [BlobUse; 6] = [
         BlobUse::ToolInput,
         BlobUse::ToolBody,
         BlobUse::ToolOutput,
         BlobUse::ApprovalInput,
         BlobUse::ShellOutput,
+        BlobUse::Message,
     ];
 
     fn me() -> DeviceRef {
@@ -224,6 +244,37 @@ mod tests {
             item_offers(&kept(None), BlobUse::ShellOutput),
             vec![BlobAction::Crop, BlobAction::Delete]
         );
+    }
+
+    #[test]
+    fn a_long_messages_blob_may_be_deleted_but_not_cropped() {
+        let session = SessionId::new();
+        let full = kept(None);
+        let id = full.blob().unwrap().id;
+        let agent = Entry::AgentMessage {
+            text: "# Report\nmore".into(),
+            full: Some(full.clone()),
+        };
+        let imported = Entry::Imported {
+            at: chrono::Utc::now(),
+            entry: ImportedEntry::AgentMessage {
+                text: "# Report\nmore".into(),
+                full: Some(full),
+            },
+        };
+        for entry in [agent, imported] {
+            let target = entry_target(&entry, session).expect("a target");
+            assert_eq!(target.blob, id);
+            assert_eq!(target.holds, BlobUse::Message);
+            assert_eq!(target.offers, [BlobAction::Delete]);
+            assert_eq!(target.title, "# Report");
+        }
+        // Control: a whole message has nothing to act on.
+        let whole = Entry::AgentMessage {
+            text: "short".into(),
+            full: None,
+        };
+        assert_eq!(entry_target(&whole, session), None);
     }
 
     #[test]

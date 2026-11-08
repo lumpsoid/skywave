@@ -1386,8 +1386,11 @@ pub enum Entry {
         /// How it went out, when this device sent it.
         delivery: Option<Delivery>,
     },
+    /// `text` is the whole message unless `full` is set: then it is the
+    /// message's head, and `full` the whole of it.
     AgentMessage {
         text: String,
+        full: Option<FullView>,
     },
     /// One tool call with its approval and result folded in, placed at the
     /// call's seq.
@@ -1422,16 +1425,10 @@ pub enum Entry {
     Stopped,
     /// A device cleared the session's context: the context `name` started
     /// afresh and became current.
-    ContextStarted {
-        name: String,
-        by: DeviceRef,
-    },
+    ContextStarted { name: String, by: DeviceRef },
     /// A device made the earlier context `name` current again. A switch to
     /// the context already current has no entry.
-    ContextSwitched {
-        name: String,
-        by: DeviceRef,
-    },
+    ContextSwitched { name: String, by: DeviceRef },
     /// A device moved the context `name` into the session `to`, where it
     /// goes on; here it is never current again.
     ContextMoved {
@@ -1441,17 +1438,12 @@ pub enum Entry {
     },
     /// The session's first item when it was made by moving the context
     /// `name` out of `from`: its conversation goes on here.
-    MovedFrom {
-        from: SessionRef,
-        name: String,
-    },
+    MovedFrom { from: SessionRef, name: String },
     /// The session's first item when it was made by adopting the agent's
     /// outside conversation `conversation`. What the server could read of
     /// that conversation follows as [`Entry::Imported`] items, then one
     /// [`Entry::ImportFinished`]; the session's own entries come after.
-    Adopted {
-        conversation: String,
-    },
+    Adopted { conversation: String },
     /// One item of an adopted conversation's history, as the agent kept it
     /// outside Skywave: a record, never unread news and never running.
     /// `at` is when the agent recorded it, or when the server logged it if
@@ -1463,30 +1455,17 @@ pub enum Entry {
     /// Where an adopted conversation's imported history ends and the
     /// session's own begins, and how the import went. Not shown when the
     /// timeline is narrowed to one context.
-    ImportFinished {
-        outcome: ImportOutcome,
-    },
+    ImportFinished { outcome: ImportOutcome },
     /// The session was renamed; `None` restored its default title.
-    Renamed {
-        name: Option<String>,
-        by: DeviceRef,
-    },
+    Renamed { name: Option<String>, by: DeviceRef },
     /// The session was archived (`true`) or brought back from the archive.
     /// A message brings it back too, without an entry of its own.
-    Archived {
-        archived: bool,
-        by: DeviceRef,
-    },
+    Archived { archived: bool, by: DeviceRef },
     /// The agent reported an error.
-    AgentErrored {
-        message: String,
-    },
+    AgentErrored { message: String },
     /// The agent started as `version`, not `confirmed`, the version the
     /// server was checked against: a warning that its turns may misbehave.
-    AgentVersionUnconfirmed {
-        version: String,
-        confirmed: String,
-    },
+    AgentVersionUnconfirmed { version: String, confirmed: String },
     /// A turn ended and its agent reported what it took. A figure the agent
     /// does not report is `None`.
     TurnUsage(TurnUsage),
@@ -1505,11 +1484,14 @@ pub enum Entry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportedEntry {
     /// A prompt the user gave the agent outside Skywave; no device sent it.
+    /// `text` and `full` as on [`Entry::AgentMessage`].
     UserMessage {
         text: String,
+        full: Option<FullView>,
     },
     AgentMessage {
         text: String,
+        full: Option<FullView>,
     },
     /// An imported call with its imported result folded in. Without a
     /// result its outcome is [`ToolOutcome::NoResult`], never `Running`:
@@ -1758,7 +1740,13 @@ mod tests {
             state: SessionState::Idle,
             timeline: vec![
                 message(1, "first", true),
-                logged(2, Entry::AgentMessage { text: "ok".into() }),
+                logged(
+                    2,
+                    Entry::AgentMessage {
+                        text: "ok".into(),
+                        full: None,
+                    },
+                ),
                 message(3, "again", false),
                 message(4, "again", true),
                 logged(5, Entry::Interrupted),

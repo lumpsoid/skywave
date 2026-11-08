@@ -87,7 +87,8 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 - **Ordering:** concurrent sends from several devices are ordered by server
   acceptance.
 - **Payloads:** event metadata is small; large content (tool outputs, file
-  contents, logs) is a blob referenced by id and fetched separately. The
+  contents, logs, long agent messages) is a blob referenced by id and
+  fetched separately. The
   reference (`BlobRef`) carries the content's size and SHA-256, which the
   server computes as it stores the blob; a device accepts no bytes that do
   not hash to it.
@@ -508,6 +509,22 @@ the daemon's appends, which would otherwise stop `serve` (below).
   preview and whole `lines` count, the turn goes on, and every head says
   the rest is gone (`skywave_present::sections`), up front in an approval
   prompt, since the user decides on the summary.
+  Agent text travels whole in its `AgentMessage` up to
+  `limits::MESSAGE_WHOLE_MAX_BYTES` (16 KiB, several screens: nearly
+  every reply); a longer one (a report, a dump) is its first
+  `limits::MESSAGE_PREVIEW_MAX_BYTES` (2 KiB, cut after its last line
+  break) with `full`, a `BlobUse::Message` blob of the whole (or `Lost`),
+  so it does not reach every device as event data. An import bounds its
+  user and agent messages the same way. A typed `UserMessage` stays whole:
+  `SendMessage` caps it at `limits::MESSAGE_MAX_BYTES`, and the supervisor
+  hands the event's text to the agent. Heads show a long message's head
+  as the message and its whole as a section beneath it
+  (`Section::message`): collapsed it shows only where the blob stands
+  (download state, deleted, not stored); expanded it fetches the blob and
+  shows its head (capped like any blob's), so the head shows twice. A
+  copy takes the whole once here, a search looks through it, and its blob
+  may be deleted like any other but not cropped (a message cut to some of
+  its lines says something else).
 - **Shell runner** (D35): a sibling of the supervisor that follows the log on
   its own thread and connection. One FIFO per session, one run at a time,
   sessions in parallel. A run is `<program> -c <wrapper>` in the session's

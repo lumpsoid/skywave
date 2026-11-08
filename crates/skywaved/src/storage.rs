@@ -53,6 +53,7 @@ pub(crate) fn holds_to_sql(holds: BlobUse) -> &'static str {
         BlobUse::ToolOutput => "tool_output",
         BlobUse::ApprovalInput => "approval_input",
         BlobUse::ShellOutput => "shell_output",
+        BlobUse::Message => "message",
     }
 }
 
@@ -64,6 +65,7 @@ pub(crate) fn holds_from_sql(text: &str) -> Result<BlobUse> {
         "tool_output" => BlobUse::ToolOutput,
         "approval_input" => BlobUse::ApprovalInput,
         "shell_output" => BlobUse::ShellOutput,
+        "message" => BlobUse::Message,
         other => return Err(Error::Corrupt(format!("event_blobs.holds {other:?}"))),
     })
 }
@@ -380,6 +382,7 @@ mod tests {
             BlobUse::ToolOutput,
             BlobUse::ApprovalInput,
             BlobUse::ShellOutput,
+            BlobUse::Message,
         ] {
             assert_eq!(holds_from_sql(holds_to_sql(holds)).unwrap(), holds);
             // The column's CHECK names the wire's own words.
