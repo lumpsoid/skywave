@@ -6,10 +6,22 @@
 //! front. With [`BlobPolicy::Eager`], every blob a pulled batch registers
 //! goes to the back, as does every blob neither available nor failed when
 //! the policy switches to `Eager` (on startup too); switching back to `OnDemand` drops the waiting
-//! blobs nobody asked for (a download in progress finishes, but is not
-//! queued again if the downloader stops first). On startup a blob left
-//! `Downloading` in the replica is queued again, under either policy: the
-//! restart resumes what the store says was under way.
+//! blobs nobody asked for, and stops those a worker holds: a download in
+//! progress at its next chunk (or as its request waits), one backing off
+//! at once. Bytes are dear over a bad network, so a dropped blob keeps
+//! what it got: its `.part` file stays and its row goes from `Downloading`
+//! to `BlobStatus::Stopped` with the recorded progress, which the views
+//! show as not downloaded (no download under way). Asking for it, or
+//! `Eager` again, resumes from those bytes. On startup a blob left
+//! `Downloading` in the replica is queued again under either policy: the
+//! restart resumes what the store says was under way. The store does not
+//! say who started it, so the policy decides: under `OnDemand` it resumes
+//! as asked for (only a request could have started it, bar a kill
+//! between a switch and its stop), under `Eager` as a background download
+//! (a workdir blob's always as asked for), which a later switch to
+//! `OnDemand` stops; a user who asked before the restart asks again. A
+//! `Stopped` one is queued only by `Eager`, so a restart under `OnDemand`
+//! does not resume a download nobody asked for.
 //! Workdir blobs (named by a stored workdir answer, `BlobRecord::workdir`)
 //! are never fetched eagerly, whatever the policy: only a request for one
 //! queues it, so a Changes refresh never starts megabytes of diffs.
@@ -252,6 +264,14 @@ impl Queue {
         self.active.contains(&id) || self.waiting.iter().any(|q| q.id == id)
     }
 
+    /// Whether a worker holding `item` lets it go now: the policy is
+    /// `OnDemand`, and nobody asked for it (nor is it a local crop).
+    fn drops(&self, item: &Queued) -> bool {
+        self.policy == BlobPolicy::OnDemand
+            && !item.kept_on_demand()
+            && !self.again.contains(&item.id)
+    }
+
     fn push_back(&mut self, id: BlobId) {
         if !self.holds(id) {
             self.waiting.push_back(Queued::eager(id));
@@ -310,9 +330,10 @@ pub(crate) struct BlobQueue {
 
 impl BlobQueue {
     /// The queue as the replica leaves it: pending local crops first, in
-    /// log order, then blobs left `Downloading` (workdir ones too: the user
-    /// asked for them), then, with `Eager`, every event blob not downloaded
-    /// yet. It reports a disk-full pause to `seam`'s views.
+    /// log order, then blobs left `Downloading` (as asked for under
+    /// `OnDemand`, and workdir ones always; under `Eager` an event blob's
+    /// as the background's), then, with `Eager`, every event blob not
+    /// downloaded yet. It reports a disk-full pause to `seam`'s views.
     pub(crate) fn restore(seam: &Seam) -> BlobQueue {
         let this = BlobQueue {
             view: Some(seam.clone()),
@@ -330,9 +351,21 @@ impl BlobQueue {
         };
         {
             let mut queue = lock(&this.queue);
+            // The store does not say who started a download. Under
+            // `OnDemand` only a request could have (bar a kill between a
+            // switch and its stop); under `Eager` an event blob's may be
+            // the background's, so it resumes as one and a later switch to
+            // `OnDemand` stops it, `Stopped` with its bytes: a user who
+            // asked before the restart asks again. A workdir blob is never
+            // fetched in the background: asked for.
+            let on_demand = settings.blob_policy == BlobPolicy::OnDemand;
             for blob in &blobs {
                 if matches!(blob.status, BlobStatus::Downloading { .. }) {
-                    queue.waiting.push_back(Queued::wanted(blob.id));
+                    queue.waiting.push_back(if on_demand || blob.workdir {
+                        Queued::wanted(blob.id)
+                    } else {
+                        Queued::eager(blob.id)
+                    });
                 }
             }
             queue.push_crops(&crops);
@@ -364,19 +397,42 @@ impl BlobQueue {
         self.wake.notify_waiters();
     }
 
-    /// The policy changed; `blobs` is every blob the replica knows.
+    /// The policy changed; `blobs` is every blob the replica knows. With
+    /// `OnDemand`, the waiting blobs nobody asked for go, a download one
+    /// had started becoming `Stopped`; workers holding one let it go
+    /// ([`BlobQueue::dropped`], [`BlobQueue::back_off`]).
     pub(crate) fn set_policy(&self, policy: BlobPolicy, blobs: &[BlobRecord]) {
         let mut queue = lock(&self.queue);
         queue.policy = policy;
         match policy {
-            BlobPolicy::OnDemand => queue.waiting.retain(Queued::kept_on_demand),
+            BlobPolicy::OnDemand => {
+                let mut dropped = Vec::new();
+                queue.waiting.retain(|q| {
+                    let kept = q.kept_on_demand();
+                    if !kept {
+                        dropped.push(q.id);
+                    }
+                    kept
+                });
+                // Every dropped one, whatever `blobs` says: that snapshot
+                // was read before this lock, and a worker may have recorded
+                // progress and let the blob go since (or the read failed
+                // and `blobs` is empty). `stop` reads the row itself. Under
+                // the queue's lock, so a request made meanwhile resumes
+                // from the stopped row, never races its stop.
+                for id in dropped {
+                    self.stop(id);
+                }
+            }
             BlobPolicy::Eager => {
                 // Newest first: ids are time-ordered. Workdir blobs only
                 // download when asked for, as does a blob that failed.
                 for blob in blobs.iter().rev() {
                     let eager = matches!(
                         blob.status,
-                        BlobStatus::NotDownloaded | BlobStatus::Downloading { .. }
+                        BlobStatus::NotDownloaded
+                            | BlobStatus::Stopped { .. }
+                            | BlobStatus::Downloading { .. }
                     );
                     if !blob.workdir && eager {
                         queue.push_back(blob.id);
@@ -423,6 +479,33 @@ impl BlobQueue {
         }
         if let Some(view) = &self.view {
             view.blobs_disk_full(full);
+        }
+    }
+
+    /// Marks `id`, dropped under `OnDemand` with nobody holding it,
+    /// `Stopped` if its download had started ([`Seam::blob_stopped`]).
+    /// Called under the queue's lock (queue, then state, as
+    /// [`BlobQueue::set_disk_full`]), so a request for it waits until the
+    /// row says what it kept.
+    fn stop(&self, id: BlobId) {
+        let Some(view) = &self.view else { return };
+        match view.blob_stopped(id) {
+            Ok(()) | Err(CoreError::Superseded) => {}
+            Err(error) => tracing::warn!(?id, %error, "cannot mark the blob's download stopped"),
+        }
+    }
+
+    /// Resolves once a worker holding `item` must let it go under
+    /// `OnDemand` ([`Queue::drops`]); never for a blob asked for.
+    async fn dropped(&self, item: &Queued) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lock(&self.queue).drops(item) {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -507,7 +590,9 @@ impl BlobQueue {
     /// same critical section, so one idle period takes one blob, and that
     /// worker takes it before anything else. A local crop waiting takes
     /// the worker too: the blob is let go, queued again behind the crops,
-    /// so a crop (which needs no network) never waits on a link down.
+    /// so a crop (which needs no network) never waits on a link down. A
+    /// blob nobody asked for, once the policy is `OnDemand`, is let go
+    /// for good ([`Queue::drops`]).
     async fn back_off<'a>(&'a self, mut claim: Claim<'a>, delay: Duration) -> Option<Claim<'a>> {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
@@ -520,6 +605,14 @@ impl BlobQueue {
                 if queue.disk_full {
                     // Paused meanwhile: the blob waits at the front, as
                     // the one whose write found the disk full does.
+                    claim.let_go(&mut queue, LetGo::Unfinished);
+                    drop(queue);
+                    self.wake.notify_waiters();
+                    return None;
+                }
+                if queue.drops(&claim.item) {
+                    // `OnDemand` now and nobody asked: no more tries. The
+                    // blob goes, stopped with what it got (`let_go`).
                     claim.let_go(&mut queue, LetGo::Unfinished);
                     drop(queue);
                     self.wake.notify_waiters();
@@ -582,7 +675,8 @@ struct Claim<'a> {
 #[derive(Debug, Clone, Copy)]
 enum LetGo {
     Finished,
-    /// The downloader stopped.
+    /// The downloader stopped, the disk is full, or (under `OnDemand`,
+    /// nobody asking) the blob is dropped.
     Unfinished,
     /// To the Wanted worker; see [`BlobQueue::back_off`].
     HandedOver,
@@ -599,6 +693,13 @@ impl Claim<'_> {
     /// Lets go of a local crop that must wait for the blob it reads; it
     /// waits in the queue, as it would have unclaimed.
     fn wait(self) {
+        self.release(LetGo::Unfinished);
+    }
+
+    /// Lets go of a blob whose try stopped as it was dropped
+    /// ([`BlobQueue::dropped`]): it goes, `Stopped`, unless asked for or
+    /// `Eager` again meanwhile, when it waits at the front.
+    fn stopped(self) {
         self.release(LetGo::Unfinished);
     }
 
@@ -636,7 +737,7 @@ impl Claim<'_> {
                     },
                 );
             }
-            LetGo::Yielded => {}
+            LetGo::Yielded => self.queue.stop(id),
             // A local crop not yet tried keeps its source.
             _ if again => queue.waiting.push_front(Queued {
                 wanted: true,
@@ -651,7 +752,9 @@ impl Claim<'_> {
             {
                 queue.waiting.push_front(self.item);
             }
-            LetGo::Unfinished | LetGo::Finished => {}
+            // Dropped under `OnDemand`: what it got stays, `Stopped`.
+            LetGo::Unfinished => self.queue.stop(id),
+            LetGo::Finished => {}
         }
     }
 }
@@ -734,8 +837,13 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
         loop {
             let mut progressed = false;
             let mut lease = None;
-            let error = match fetch(ctx, transport, id, &mut lease, &mut progressed).await {
+            let tried = fetch(ctx, transport, &claim.item, &mut lease, &mut progressed).await;
+            let error = match tried {
                 Ok(()) => break claim.finish(),
+                Err(FetchError::Stopped) => {
+                    tracing::debug!(?id, "blob download stopped: nobody asked for it");
+                    break claim.stopped();
+                }
                 Err(error) => error,
             };
             if error.is_purged() {
@@ -800,6 +908,10 @@ enum FetchError {
         expected: ContentHash,
         actual: ContentHash,
     },
+    /// Nobody wants the blob any more ([`BlobQueue::dropped`]): no
+    /// failure, and no retry.
+    #[error("blob download stopped: nobody asked for it")]
+    Stopped,
 }
 
 impl FetchError {
@@ -839,7 +951,8 @@ impl FetchError {
             FetchError::File(_)
             | FetchError::Size { .. }
             | FetchError::Offset { .. }
-            | FetchError::Hash { .. } => false,
+            | FetchError::Hash { .. }
+            | FetchError::Stopped => false,
         }
     }
 }
@@ -966,16 +1079,20 @@ async fn make_crop(ctx: &BlobCtx, crop: PendingCrop) -> Result<(), FetchError> {
     complete(ctx, crop.into, lease, &part, &done, &record).await
 }
 
-/// One try at a blob: resume its `.part` file and finish it. `lease` is
-/// set once the record is read; every report holds it. `progressed` is set
-/// once some bytes arrived.
+/// One try at `item`, a blob its worker holds: resume its `.part` file and
+/// finish it. `lease` is set once the record is read; every report holds
+/// it. `progressed` is set once some bytes arrived. Once nobody wants it
+/// ([`BlobQueue::dropped`]), a request waiting or a body under way ends
+/// the try with [`FetchError::Stopped`], a body after recording what it
+/// got; checking and completing a whole file is never cut short.
 async fn fetch(
     ctx: &BlobCtx,
     transport: &OnceCell<Arc<dyn Transport>>,
-    id: BlobId,
+    item: &Queued,
     lease_out: &mut Option<BlobLease>,
     progressed: &mut bool,
 ) -> Result<(), FetchError> {
+    let id = item.id;
     let Some((record, lease)) = ctx.seam.leased_blob(id)? else {
         tracing::warn!(?id, "asked to download an unknown blob");
         return Ok(());
@@ -996,7 +1113,7 @@ async fn fetch(
     // last report) and, after a power loss, hold a kept length over lost
     // data; the excess is truncated below.
     let recorded = match &record.status {
-        BlobStatus::Downloading { got, .. } => *got,
+        BlobStatus::Downloading { got, .. } | BlobStatus::Stopped { got, .. } => *got,
         BlobStatus::NotDownloaded | BlobStatus::Failed { .. } | BlobStatus::Available { .. } => 0,
     };
     let from = match tokio::fs::metadata(&part).await {
@@ -1029,7 +1146,14 @@ async fn fetch(
             )
         })
         .await?;
-    let mut download = match transport.blob(id, from).await {
+    // Dropped first, here and below: a blob dropped meanwhile takes no
+    // more bytes, however fast they come.
+    let asked = tokio::select! {
+        biased;
+        () = ctx.queue.dropped(item) => return Err(FetchError::Stopped),
+        asked = transport.blob(id, from) => asked,
+    };
+    let mut download = match asked {
         Ok(download) => download,
         Err(TransportError::RangeNotSatisfiable { size: actual }) => {
             return Err(FetchError::Size {
@@ -1085,6 +1209,14 @@ async fn fetch(
             let mut next = download.body.next_chunk();
             loop {
                 tokio::select! {
+                    biased;
+                    () = ctx.queue.dropped(item) => {
+                        // Keep what it paid for: the blob stops from here.
+                        if got > recorded {
+                            report(&mut file, got).await?;
+                        }
+                        return Err(FetchError::Stopped);
+                    }
                     chunk = &mut next => break chunk,
                     () = tokio::time::sleep_until(reported + PROGRESS_EVERY), if got > recorded => {
                         report(&mut file, got).await?;
@@ -3015,5 +3147,255 @@ mod tests {
             waiting(&queue),
             [(diff_blob.id, true), (event_blob.id, false)]
         );
+    }
+
+    impl Fixture {
+        /// The blob is `Stopped` and no worker holds it.
+        fn stopped_idle(&self) -> bool {
+            matches!(self.status(), BlobStatus::Stopped { .. })
+                && lock(&self.queue.queue).active.is_empty()
+        }
+
+        /// Switches the queue to `OnDemand` before the first response's
+        /// second chunk, as the engine does on the setting.
+        fn on_demand_mid_body(&self) {
+            let queue = self.queue.clone();
+            *self.server.mid_body.lock().unwrap() = Some(Box::new(move || {
+                queue.set_policy(BlobPolicy::OnDemand, &[])
+            }));
+        }
+    }
+
+    /// An eager download in flight when the policy turns `OnDemand` stops
+    /// at its next chunk, keeping what it got (`.part` and progress,
+    /// `Stopped`), and shows as not downloaded. A restart under `OnDemand`
+    /// leaves it; asking for it resumes from the kept bytes.
+    #[tokio::test]
+    async fn an_eager_download_in_flight_stops_when_the_policy_turns_on_demand() {
+        let bytes = content(5000);
+        let f = Fixture::new(5000, bytes.clone(), 5000);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        f.on_demand_mid_body();
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("stopped", || f.stopped_idle()).await;
+        let stopped = BlobStatus::Stopped {
+            got: 2000,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), stopped, "the two chunks it took are kept");
+        assert_eq!(std::fs::metadata(f.part()).unwrap().len(), 2000);
+        assert!(waiting(&f.queue).is_empty(), "not queued again");
+        assert!(f.takes_nothing().await);
+        assert_eq!(f.shown(), BlobState::NotDownloaded { size: 5000 });
+        downloader.abort();
+        let _ = downloader.await;
+
+        // The store keeps `OnDemand`: a restart resumes nothing.
+        let f = f.restarted();
+        assert_eq!(f.status(), stopped);
+        assert!(waiting(&f.queue).is_empty());
+        assert!(f.takes_nothing().await);
+
+        f.queue.want(f.blob.id);
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000], "resumed");
+        let BlobStatus::Available { path } = f.status() else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    /// Positive control: a download the user asked for keeps going when
+    /// the policy turns `OnDemand` mid-body.
+    #[tokio::test]
+    async fn a_download_asked_for_keeps_going_when_the_policy_turns_on_demand() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        f.queue.want(f.blob.id);
+        f.on_demand_mid_body();
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0], "one try, whole");
+    }
+
+    /// An eager worker retrying a blob while the link is down lets it go
+    /// once the policy turns `OnDemand`, keeping the bytes an earlier try
+    /// got; asking for it resumes from them.
+    #[tokio::test]
+    async fn an_eager_worker_retrying_offline_drops_its_blob_on_demand() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        // The first try gets two chunks, then the link goes down.
+        *f.server.break_after.lock().unwrap() = Some(2);
+        let server = f.server.clone();
+        let id = f.blob.id;
+        *f.server.mid_body.lock().unwrap() = Some(Box::new(move || {
+            server.held.lock().unwrap().insert(id, Hold::Offline);
+        }));
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("retrying offline", || {
+            f.server.calls.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+        assert!(lock(&f.queue.queue).active.contains(&id), "still held");
+
+        f.queue
+            .set_policy(BlobPolicy::OnDemand, &f.seam.blobs().unwrap());
+        until("stopped", || f.stopped_idle()).await;
+        assert_eq!(
+            f.status(),
+            BlobStatus::Stopped {
+                got: 2000,
+                path: f.part()
+            }
+        );
+        assert!(waiting(&f.queue).is_empty());
+        assert!(f.takes_nothing().await);
+        downloader.abort();
+        let _ = downloader.await;
+
+        f.server.held.lock().unwrap().clear();
+        f.queue.want(id);
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000], "resumed");
+    }
+
+    /// The backoff itself: under `OnDemand`, an eager worker lets a blob
+    /// nobody asked for go at once and for good; one asked for it keeps
+    /// (the Wanted worker busy) and waits out its backoff.
+    #[tokio::test(start_paused = true)]
+    async fn backing_off_under_on_demand_drops_only_a_blob_nobody_asked_for() {
+        let queue = BlobQueue::default();
+        let (busy, eager, asked) = (ProtoBlobId::new(), ProtoBlobId::new(), ProtoBlobId::new());
+        let hour = Duration::from_secs(3600);
+        queue.want(busy);
+        let _busy = ready_now(queue.next(Slot::Wanted))
+            .await
+            .expect("asked for");
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[eager, asked]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        let asked_claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!((claim.item.id, asked_claim.item.id), (eager, asked));
+        queue.want(asked);
+        queue.set_policy(BlobPolicy::OnDemand, &[]);
+
+        let start = tokio::time::Instant::now();
+        assert!(queue.back_off(claim, hour).await.is_none(), "dropped");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(!lock(&queue.queue).holds(eager), "for good");
+
+        let start = tokio::time::Instant::now();
+        assert!(queue.back_off(asked_claim, hour).await.is_some(), "kept");
+        assert_eq!(start.elapsed(), hour);
+    }
+
+    /// A waiting blob the switch to `OnDemand` drops is `Stopped` if its
+    /// download had started (here: let go when a downloader stopped under
+    /// `Eager`); a restart under `OnDemand` leaves it, `Eager` queues it.
+    #[tokio::test]
+    async fn a_waiting_started_download_dropped_on_demand_is_stopped() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        let started = BlobStatus::Downloading {
+            got: 1000,
+            path: f.part(),
+        };
+        f.seam.blob_status(f.blob.id, started).unwrap();
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        assert_eq!(waiting(&f.queue), [(f.blob.id, false)]);
+
+        f.queue
+            .set_policy(BlobPolicy::OnDemand, &f.seam.blobs().unwrap());
+        assert!(waiting(&f.queue).is_empty());
+        let stopped = BlobStatus::Stopped {
+            got: 1000,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), stopped);
+        assert_eq!(f.shown(), BlobState::NotDownloaded { size: 5000 });
+        // Asked for, it shows requested until a worker reports.
+        f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
+        assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
+
+        let f = f.restarted();
+        assert!(waiting(&f.queue).is_empty(), "not resumed under OnDemand");
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        assert_eq!(waiting(&f.queue), [(f.blob.id, false)], "Eager takes it");
+    }
+
+    /// The engine reads the blobs before the queue's lock: a blob whose
+    /// worker recorded progress and let it go after that read (a yield to
+    /// a crop, a full disk) is still stopped, as is every dropped blob
+    /// when the read failed and the list is empty.
+    #[tokio::test]
+    async fn the_switch_to_on_demand_stops_what_a_stale_snapshot_missed() {
+        for empty in [false, true] {
+            let f = Fixture::new(5000, content(5000), 5000);
+            let before = f.seam.blobs().unwrap();
+            f.queue.set_policy(BlobPolicy::Eager, &before);
+            assert_eq!(waiting(&f.queue), [(f.blob.id, false)]);
+            let started = BlobStatus::Downloading {
+                got: 1000,
+                path: f.part(),
+            };
+            f.seam.blob_status(f.blob.id, started).unwrap();
+
+            let snapshot: &[BlobRecord] = if empty { &[] } else { &before };
+            assert_eq!(
+                snapshot.first().map(|b| &b.status),
+                (!empty).then_some(&BlobStatus::NotDownloaded),
+                "stale"
+            );
+            f.queue.set_policy(BlobPolicy::OnDemand, snapshot);
+            assert!(waiting(&f.queue).is_empty());
+            assert_eq!(
+                f.status(),
+                BlobStatus::Stopped {
+                    got: 1000,
+                    path: f.part()
+                },
+                "empty snapshot: {empty}"
+            );
+        }
+    }
+
+    /// A restart under `Eager` resumes an event blob's download as a
+    /// background one, which a switch to `OnDemand` then stops, keeping
+    /// its bytes; under `OnDemand` it resumes as asked for and is kept.
+    #[tokio::test]
+    async fn a_download_resumed_under_eager_stops_on_demand() {
+        for policy in [BlobPolicy::Eager, BlobPolicy::OnDemand] {
+            let f = Fixture::new(5000, content(5000), 5000);
+            f.core.dispatch(Action::SetBlobPolicy(policy)).unwrap();
+            let started = BlobStatus::Downloading {
+                got: 1000,
+                path: f.part(),
+            };
+            f.seam.blob_status(f.blob.id, started.clone()).unwrap();
+
+            let f = f.restarted();
+            let asked = policy == BlobPolicy::OnDemand;
+            assert_eq!(waiting(&f.queue), [(f.blob.id, asked)], "{policy:?}");
+            f.queue
+                .set_policy(BlobPolicy::OnDemand, &f.seam.blobs().unwrap());
+            if asked {
+                assert_eq!(waiting(&f.queue), [(f.blob.id, true)], "kept");
+                assert_eq!(f.status(), started);
+            } else {
+                assert!(waiting(&f.queue).is_empty(), "dropped");
+                let stopped = BlobStatus::Stopped {
+                    got: 1000,
+                    path: f.part(),
+                };
+                assert_eq!(f.status(), stopped);
+            }
+        }
     }
 }

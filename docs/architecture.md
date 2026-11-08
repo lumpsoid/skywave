@@ -846,7 +846,22 @@ logs) an event that no longer decodes rather than failing.
   pause to the views under its lock: `BlobState::Downloading { paused:
   Some(Pause::DiskFull) }` (over `Offline`) and
   `SettingsView::blobs_disk_full`. `Link` ignores them
-  (synced metadata counts as synced). Workdir blobs (diffs and file contents a
+  (synced metadata counts as synced). Switching to `OnDemand` drops every
+  download nobody asked for: waiting ones leave the queue, one in progress
+  stops at its next chunk (or while its request waits), one backing off
+  at once. Bytes over a bad network are dear, so a dropped blob keeps its
+  `.part` and recorded progress as `BlobStatus::Stopped` (stored as
+  `not_downloaded` with `got` and `path` set), which the views show as
+  `NotDownloaded`; asking for it, or `Eager` again, resumes from there. A
+  restart queues `Downloading` rows but not `Stopped` ones, so it never
+  resumes under `OnDemand` what nobody asked for; only a kill between the
+  switch and the stop leaves a row `Downloading`. The store keeps no
+  "asked for" mark, so the restored policy decides how a `Downloading`
+  row resumes: as asked for under `OnDemand` (only a request starts one
+  there), as a background download under `Eager` (workdir blobs always as
+  asked for), which a later switch to `OnDemand` stops; a user who asked
+  before the restart asks again. A download the user asked for keeps
+  going. Workdir blobs (diffs and file contents a
   stored workdir answer names) are never fetched eagerly, whatever the
   policy: only asking for one downloads it. Their ids recur (the server
   names content by hash), so a refresh can purge a blob a download holds

@@ -682,6 +682,17 @@ pub enum BlobStatus {
         got: u64,
         path: PathBuf,
     },
+    /// Not downloaded, nor downloading: a download nobody asked for,
+    /// stopped when the policy went back to `OnDemand`. The `got` bytes it
+    /// paid for stay in the partial file at `path`, so asking for the blob
+    /// (or `Eager`) resumes from them; a restart under `OnDemand` leaves
+    /// it (`crate::blobs`, "What gets downloaded"). Stored as
+    /// `not_downloaded` with `got` and `path` set, which no other status
+    /// writes, so the `blobs` CHECK and the schema stay.
+    Stopped {
+        got: u64,
+        path: PathBuf,
+    },
     /// Complete content is at `path`.
     Available {
         path: PathBuf,
@@ -1590,6 +1601,11 @@ impl Store {
             BlobStatus::Downloading { got, path } => {
                 ("downloading", Some(u64_sql(*got)?), Some(path_sql(path)?))
             }
+            BlobStatus::Stopped { got, path } => (
+                "not_downloaded",
+                Some(u64_sql(*got)?),
+                Some(path_sql(path)?),
+            ),
             BlobStatus::Available { path } => ("available", None, Some(path_sql(path)?)),
         };
         let id_sql = id.0.to_string();
@@ -2515,6 +2531,11 @@ fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
     let path: Option<String> = row.get(4)?;
     let failed: Option<String> = row.get(7)?;
     let status = match (state.as_str(), got, path) {
+        // A failure clears `got` and `path`, so the two never meet.
+        ("not_downloaded", Some(got), Some(path)) if failed.is_none() => BlobStatus::Stopped {
+            got: u64::try_from(got).map_err(|e| bad_value(3, Type::Integer, e))?,
+            path: path.into(),
+        },
         ("not_downloaded", _, _) => match failed {
             Some(reason) => BlobStatus::Failed { reason },
             None => BlobStatus::NotDownloaded,
