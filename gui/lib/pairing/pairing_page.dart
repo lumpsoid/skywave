@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/pairing/qr_scan.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
@@ -169,7 +170,7 @@ class _PairingPageState extends State<PairingPage> {
                     enabled: !busy,
                     textInputAction: TextInputAction.done,
                     autocorrect: false,
-                    style: const TextStyle(fontFamily: 'monospace'),
+                    style: monoText,
                     decoration: const InputDecoration(labelText: 'Fingerprint'),
                     onSubmitted: (_) => _submit(),
                   ),

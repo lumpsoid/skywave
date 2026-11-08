@@ -99,7 +99,7 @@ class SessionRow extends StatelessWidget {
                   workdir,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: muted?.copyWith(fontFamily: 'monospace'),
+                  style: muted?.merge(monoText),
                 ),
               Wrap(
                 spacing: 12,

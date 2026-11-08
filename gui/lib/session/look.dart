@@ -1,9 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The monospace family for code, output and file content.
-const monoFamily = 'monospace';
-const monoFallback = ['DejaVu Sans Mono', 'Menlo', 'Consolas', 'Roboto Mono'];
+/// The monospace family for code, output and file content: bundled (see
+/// pubspec.yaml), so it does not depend on what the platform calls
+/// "monospace". The fallbacks cover glyphs it lacks.
+const monoFamily = 'JetBrains Mono';
+const monoFallback = [
+  'monospace',
+  'DejaVu Sans Mono',
+  'Menlo',
+  'Consolas',
+  'Roboto Mono',
+];
+
+/// A bare monospace style, for an id or a path among proportional text.
+const monoText = TextStyle(
+  fontFamily: monoFamily,
+  fontFamilyFallback: monoFallback,
+);
 
 /// The height of one line of [style] at the context's text scale.
 double lineHeightOf(BuildContext context, TextStyle style) =>

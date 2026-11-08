@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
@@ -144,7 +145,7 @@ class _CreateDialogState extends State<CreateDialog> {
                   controller: _input,
                   autofocus: true,
                   autocorrect: false,
-                  style: const TextStyle(fontFamily: 'monospace'),
+                  style: monoText,
                   decoration: InputDecoration(
                     labelText: 'Workdir on the server',
                     suffixIcon: IconButton(
@@ -204,7 +205,7 @@ class _CreateDialogState extends State<CreateDialog> {
                 child: TextField(
                   key: const Key('create-conversation'),
                   autocorrect: false,
-                  style: const TextStyle(fontFamily: 'monospace'),
+                  style: monoText,
                   decoration: const InputDecoration(
                     labelText: 'Continue a Claude Code session (paste its id)',
                     hintText: 'leave empty for a new conversation',
@@ -264,7 +265,7 @@ class _CandidateTile extends StatelessWidget {
       title: Text(
         candidate.path,
         overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontFamily: 'monospace'),
+        style: monoText,
       ),
       trailing: candidate.recent
           ? Text(
