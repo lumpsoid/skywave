@@ -1214,6 +1214,15 @@ skywave-core                 all logic, sync, replica
   `BlobTargetView` (present's `BlobTarget`, worded), so Dart's delete and
   crop menu decides nothing; every delete or crop goes through an
   `AlertDialog` with present's question first.
+- **Agent messages are markdown** (D48). The hub parses an agent message's
+  text, live or imported, into flat blocks (present's `markdown::blocks`)
+  sent as `TimelineRow.markdown` beside the raw `text`; an expanded long
+  message's whole comes the same way on its section
+  (`SectionView.markdown`). Dart lays the blocks out and decides nothing:
+  a row or section with search marks shows its raw text, where the marks'
+  ranges point. Copy takes the raw text. Only `http`, `https` and `mailto`
+  links are tappable, and open (`url_launcher`) after a dialog showing the
+  URL; images are never fetched.
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.
