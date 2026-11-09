@@ -307,10 +307,14 @@ async fn serve(
             Arc::new(NoAgentLogin)
         }
     };
+    // What the session processes say of the agent's login: the supervisor
+    // learns it, `hello` reports it.
+    let login_state = LoginState::new();
     let options = ServerOptions {
         outside,
         usage_limits,
         login,
+        login_state: login_state.clone(),
         log_file: config.log_file.clone(),
         ..ServerOptions::default()
     };
@@ -330,14 +334,12 @@ async fn serve(
     // Before the supervisor, shell runner and API can write blobs.
     storage.collect_blobs()?;
     let adapter = ClaudeCodeAdapter::new(config.agent.clone());
-    // What the session processes say of the agent's login.
-    let login = LoginState::new();
     let mut supervisor = Supervisor::start(
         adapter,
         config.data_dir.clone(),
         log.clone(),
         SupervisorConfig {
-            login: login.clone(),
+            login: login_state,
             ..SupervisorConfig::default()
         },
     )

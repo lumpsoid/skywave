@@ -103,6 +103,12 @@ impl AgentLogin for ClaudeLogin {
         let text = std::fs::read_to_string(&self.credentials).ok()?;
         login_expires(&serde_json::from_str(&text).ok()?)
     }
+
+    /// A login made from a device would be stored in the credentials file,
+    /// which the CLI ignores while the environment gives it another way in.
+    fn offered(&self) -> bool {
+        !self.other_login
+    }
 }
 
 #[cfg(test)]
@@ -168,5 +174,12 @@ mod tests {
         );
 
         assert_eq!(ClaudeLogin::new(file, true).expires(), None);
+    }
+
+    #[test]
+    fn a_device_login_is_offered_unless_the_environment_logs_in() {
+        let file = PathBuf::from("/nonexistent/.credentials.json");
+        assert!(ClaudeLogin::new(file.clone(), false).offered());
+        assert!(!ClaudeLogin::new(file, true).offered());
     }
 }

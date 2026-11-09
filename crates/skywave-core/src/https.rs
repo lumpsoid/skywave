@@ -1014,6 +1014,8 @@ mod tests {
             shell: false,
             bypass: false,
             login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
         })
         .unwrap()
     }

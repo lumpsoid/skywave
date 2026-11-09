@@ -1,7 +1,7 @@
 {
-  "protocol_version": 28,
+  "protocol_version": 29,
   "hello": {
-    "protocol_version": 28,
+    "protocol_version": 29,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -21,7 +21,9 @@
     ],
     "shell": true,
     "bypass": true,
-    "login_expires": "2026-10-29T12:00:00Z"
+    "login_expires": "2026-10-29T12:00:00Z",
+    "agent_login_offered": true,
+    "agent_logged_out": true
   },
   "hello_query": {
     "since": "01920000-0000-7000-8000-0000000000a3"
@@ -2171,6 +2173,44 @@
     {
       "result": "failed",
       "reason": "not logged in"
+    }
+  ],
+  "login_start": [
+    {
+      "result": "open",
+      "flow": "5a1e9c3b-77d2-4f08-a6b1-0c4de2f39a71",
+      "url": "https://example.com/oauth/authorize?code=true&state=abc"
+    },
+    {
+      "result": "busy"
+    },
+    {
+      "result": "unavailable"
+    },
+    {
+      "result": "failed",
+      "reason": "login exited early"
+    }
+  ],
+  "login_finish": {
+    "flow": "5a1e9c3b-77d2-4f08-a6b1-0c4de2f39a71",
+    "code": "pasted-code#state"
+  },
+  "login_finish_results": [
+    {
+      "result": "logged_in",
+      "expires": "2026-10-29T12:00:00Z"
+    },
+    {
+      "result": "logged_in",
+      "expires": null
+    },
+    {
+      "result": "no_flow"
+    },
+    {
+      "result": "failed",
+      "reason": "invalid code"
     }
   ]
 }

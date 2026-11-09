@@ -418,8 +418,9 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// bump moves its log. Every bump adds one, a no-op saying so if nothing
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
-const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
-    [v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28];
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
+    v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29,
+];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
 /// what is stored, and how each is moved:
@@ -473,6 +474,15 @@ fn v26_to_v27(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// v27 replica wrote: a missing key reads as no expiry until the next
 /// `hello` says one, and nothing stored changes.
 fn v27_to_v28(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v28 to v29, as the server's step of the same name. v29 added
+/// `agent_login_offered` and `agent_logged_out` to `hello`, each kept under
+/// its own `settings` key that no v28 replica wrote: a missing key reads as
+/// `false` until the next `hello` says otherwise. The agent login's URL and
+/// code are never stored. Nothing stored changes.
+fn v28_to_v29(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -617,6 +627,12 @@ pub struct Settings {
     /// When the agent's login expires, as the server's last `hello` said
     /// ([`Store::set_login_expires`]); `None` until one said so.
     pub login_expires: Option<DateTime<Utc>>,
+    /// Whether a device may log the server's agent in, as its last `hello`
+    /// said ([`Store::set_agent_login_offered`]); `false` until one said so.
+    pub agent_login_offered: bool,
+    /// Whether the server's agent is logged out, as its last `hello` said
+    /// ([`Store::set_agent_logged_out`]); `false` until one said so.
+    pub agent_logged_out: bool,
 }
 
 impl Settings {
@@ -642,6 +658,10 @@ impl Settings {
             }
             KEY_SHELL_ENABLED => self.shell_enabled = flag(&value, "shell")?,
             KEY_BYPASS_ALLOWED => self.bypass_allowed = flag(&value, "bypass")?,
+            KEY_AGENT_LOGIN_OFFERED => {
+                self.agent_login_offered = flag(&value, "agent login offered")?;
+            }
+            KEY_AGENT_LOGGED_OUT => self.agent_logged_out = flag(&value, "agent logged out")?,
             KEY_LOGIN_EXPIRES => {
                 let at = DateTime::parse_from_rfc3339(&value)
                     .map_err(|_| bad_value(1, Type::Text, format!("login expiry {value:?}")))?;
@@ -1418,8 +1438,14 @@ impl Store {
         // says nothing of the new, and its other addresses lead to it, not
         // to the new one.
         tx.execute(
-            "DELETE FROM settings WHERE key IN (?1, ?2, ?3)",
-            [KEY_SHELL_ENABLED, KEY_LOGIN_EXPIRES, KEY_OTHER_ADDRESSES],
+            "DELETE FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5)",
+            [
+                KEY_SHELL_ENABLED,
+                KEY_LOGIN_EXPIRES,
+                KEY_AGENT_LOGIN_OFFERED,
+                KEY_AGENT_LOGGED_OUT,
+                KEY_OTHER_ADDRESSES,
+            ],
         )?;
         tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -2144,6 +2170,19 @@ impl Store {
         self.put_setting(KEY_BYPASS_ALLOWED, Some(value))
     }
 
+    /// Keeps whether a device may log the server's agent in, as its
+    /// `hello` said.
+    pub fn set_agent_login_offered(&self, offered: bool) -> Result<(), StoreError> {
+        let value = if offered { "true" } else { "false" };
+        self.put_setting(KEY_AGENT_LOGIN_OFFERED, Some(value))
+    }
+
+    /// Keeps whether the server's agent is logged out, as its `hello` said.
+    pub fn set_agent_logged_out(&self, logged_out: bool) -> Result<(), StoreError> {
+        let value = if logged_out { "true" } else { "false" };
+        self.put_setting(KEY_AGENT_LOGGED_OUT, Some(value))
+    }
+
     /// Keeps when the agent's login expires, as the server's `hello` said;
     /// `None` forgets it.
     pub fn set_login_expires(&self, at: Option<DateTime<Utc>>) -> Result<(), StoreError> {
@@ -2173,9 +2212,11 @@ const KEY_OTHER_ADDRESSES: &str = "other_server_addresses";
 const KEY_SHELL_ENABLED: &str = "shell_enabled";
 const KEY_BYPASS_ALLOWED: &str = "bypass_allowed";
 const KEY_LOGIN_EXPIRES: &str = "login_expires";
+const KEY_AGENT_LOGIN_OFFERED: &str = "agent_login_offered";
+const KEY_AGENT_LOGGED_OUT: &str = "agent_logged_out";
 
-/// A server flag setting as [`Store::set_shell_enabled`] and
-/// [`Store::set_bypass_allowed`] write it.
+/// A server flag setting as [`Store::set_shell_enabled`],
+/// [`Store::set_bypass_allowed`] and the agent login's setters write it.
 fn flag(value: &str, what: &str) -> Result<bool, StoreError> {
     match value {
         "true" => Ok(true),

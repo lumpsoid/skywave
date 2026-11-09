@@ -1689,6 +1689,13 @@ impl Model {
         self.settings.login_expires = at;
     }
 
+    /// The server said whether a device may log its agent in, and whether
+    /// the agent is logged out (already stored).
+    pub(crate) fn agent_login(&mut self, offered: bool, logged_out: bool) {
+        self.settings.agent_login_offered = offered;
+        self.settings.agent_logged_out = logged_out;
+    }
+
     /// Devices the events name that this device knows no name for.
     pub(crate) fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
         batch
@@ -1990,6 +1997,8 @@ impl Model {
             can_go_back: self.shown_subagent().is_some() || self.back().is_some(),
             snippets: self.snippets.list().to_vec(),
             login_expires: self.settings.login_expires,
+            agent_login_offered: self.settings.agent_login_offered,
+            agent_logged_out: self.settings.agent_logged_out,
         }
     }
 

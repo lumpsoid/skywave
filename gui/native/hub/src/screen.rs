@@ -1089,6 +1089,8 @@ mod tests {
                 can_go_back: true,
                 snippets: Vec::new(),
                 login_expires,
+                agent_login_offered: false,
+                agent_logged_out: false,
             };
             match settings_view(&settings, &view, None, now.timestamp_millis()) {
                 ScreenView::Settings { agent_login, .. } => agent_login,
@@ -1129,6 +1131,8 @@ mod tests {
             can_go_back: true,
             snippets: Vec::new(),
             login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
         };
         let form = PairForm::default();
         let ui = Ui {

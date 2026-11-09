@@ -848,15 +848,25 @@ pub trait AgentLogin: Send + Sync + 'static {
     /// When the login expires, read now; `None` when it does not expire or
     /// cannot be told. Quick and blocking: a small file read at most.
     fn expires(&self) -> Option<DateTime<Utc>>;
+
+    /// Whether a device may log the agent in (`agent_login_offered`):
+    /// false when the agent has no login a device can run, or one the
+    /// environment gives it takes precedence over any it would make.
+    fn offered(&self) -> bool;
 }
 
-/// A login for an agent that says nothing of its expiry.
+/// A login for an agent that says nothing of its expiry and has no login a
+/// device can run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoAgentLogin;
 
 impl AgentLogin for NoAgentLogin {
     fn expires(&self) -> Option<DateTime<Utc>> {
         None
+    }
+
+    fn offered(&self) -> bool {
+        false
     }
 }
 
