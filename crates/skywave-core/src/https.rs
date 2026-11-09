@@ -41,8 +41,9 @@ use serde::de::DeserializeOwned;
 use skywave_proto::encoding::{DECODED_LENGTH_HEADER, ZSTD};
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, RUN_HEADER, RunId,
-    StorageReport, UsageLimitsResult, WorkdirQuery, path,
+    EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
+    LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport, UsageLimitsResult,
+    WorkdirQuery, path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -784,6 +785,41 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `POST /v1/agent-login/start`, which takes no body.
+    async fn login_start(&self) -> Result<LoginStartResult, TransportError> {
+        let reply = self
+            .http
+            .request(
+                Method::POST,
+                path::AGENT_LOGIN_START,
+                &self.run_header(),
+                Bytes::new(),
+                self.http.request_timeout(),
+            )
+            .await?;
+        ok_json(reply)
+    }
+
+    /// `POST /v1/agent-login/finish` with `finish` as its JSON body.
+    async fn login_finish(
+        &self,
+        finish: &LoginFinish,
+    ) -> Result<LoginFinishResult, TransportError> {
+        let body = serde_json::to_vec(finish)
+            .map_err(|e| TransportError::Decode(format!("encoding a login finish: {e}")))?;
+        let reply = self
+            .http
+            .request(
+                Method::POST,
+                path::AGENT_LOGIN_FINISH,
+                &self.run_header(),
+                body.into(),
+                self.http.request_timeout(),
+            )
+            .await?;
+        ok_json(reply)
+    }
+
     /// `GET <endpoint>?session=<id>&path=<path>`, bounded by
     /// [`WORKDIR_TIMEOUT`] rather than the request timeout: the server may
     /// take its full 20 s.
@@ -955,6 +991,17 @@ impl Transport for HttpsTransport {
 
     fn usage_limits(&self) -> BoxFuture<'_, Result<UsageLimitsResult, TransportError>> {
         Box::pin(HttpsTransport::usage_limits(self))
+    }
+
+    fn login_start(&self) -> BoxFuture<'_, Result<LoginStartResult, TransportError>> {
+        Box::pin(HttpsTransport::login_start(self))
+    }
+
+    fn login_finish<'a>(
+        &'a self,
+        finish: &'a LoginFinish,
+    ) -> BoxFuture<'a, Result<LoginFinishResult, TransportError>> {
+        Box::pin(HttpsTransport::login_finish(self, finish))
     }
 
     fn workdir_changes<'a>(

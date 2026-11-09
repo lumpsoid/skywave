@@ -1190,6 +1190,36 @@ logs) an event that no longer decodes rather than failing.
   warning to the link banner; the GUI's `LinkUpdate` carries it as
   `login_label`, shown below the link's label even while online with
   nothing else to say.
+- **Logging the agent in from a device** (`SettingsView::login`, a
+  `LoginView`: `offered`, `logged_out` and `expires` as the last `hello`
+  said, plus the `flow`): on the settings screen, `StartAgentLogin` posts
+  `/v1/agent-login/start` and `FinishAgentLogin { code }` posts the
+  pasted code with the flow the start opened, each on the side transport
+  within `LOGIN_TIMEOUT` (25 s, above the server's 20 s). `login.rs` holds
+  the flow, shaped like the usage limits: only the latest request's
+  answer is taken. The flow id, its URL and the code live in model memory
+  only, never in the store, a draft or the outbox, and the code never in
+  a `Debug` (`LoginCode`, `LoginFinish`); a restart, `DismissAgentLogin`
+  or pairing with another server forgets them. `LoginFlowView` is `Idle`,
+  `Starting`, `Open { url, refused }`, `Finishing { url }`,
+  `NoAnswer { url, why }` or `Done(LoggedIn | Busy | Unavailable | NoFlow
+  | Offline | Failed)`. A finish that gets no answer (offline, or a
+  retryable transport error: the server's 503, the timeout, a broken
+  connection) is `NoAnswer` and keeps the flow and code: `RetryAgentLogin`
+  resends both unchanged, and the server answers a repeated finish with
+  the first one's outcome. A finish refused for good (a 4xx, an
+  unreadable answer) is `Done(Failed)`. So is a `Failed` answer: the
+  server sends it both for a mis-shaped code (its flow stays open) and
+  for a code the agent refused (its flow is done, and every later finish
+  gets the same `Failed`), and the wire does not tell them apart; the way
+  on is `StartAgentLogin`, which joins a flow still open or opens a new
+  one. `FinishAgentLogin` with no open flow sends nothing; a blank code
+  or one over `LOGIN_CODE_MAX_BYTES` once trimmed is not sent and the
+  flow stays `Open { refused: Some(LoginCodeRefused) }`. A start that gets no
+  answer is `Done(Failed)`; starting again joins whatever the server
+  opened. `Seam::login_finished` stores a `LoggedIn` as a `hello` would
+  (`agent_logged_out` false, `login_expires` its `expires`) and shows it
+  at once.
 - **Session info page** (`Action::OpenSessionInfo { session_id }`,
   `Screen::SessionInfo(SessionInfoView)`): one session's particulars, all
   from the replica but the limits: its title and full workdir, the usage
