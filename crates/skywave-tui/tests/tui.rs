@@ -1017,7 +1017,8 @@ fn sessions_created_elsewhere_appear_live_and_keep_the_selection() {
     assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/a"));
     assert!(!line_with(&screen, "/srv/b").contains("> "));
 
-    // Activity reorders the rows; the selection follows the session.
+    // The agent's activity leaves the rows in place; a message reorders
+    // them, and the selection follows the session.
     h.key(KeyCode::Up);
     assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
     pull(
@@ -1026,6 +1027,19 @@ fn sessions_created_elsewhere_appear_live_and_keep_the_selection() {
             a,
             9,
             EventKind::SessionStateChanged(LogState::AgentWorking),
+        )],
+    );
+    let screen = h.screen();
+    assert!(screen.find("/srv/b").unwrap() < screen.find("/srv/a").unwrap());
+    pull(
+        &mut h,
+        vec![event(
+            a,
+            10,
+            EventKind::UserMessage {
+                device_id: DeviceId::new(),
+                text: "from the phone".into(),
+            },
         )],
     );
     let screen = h.screen();

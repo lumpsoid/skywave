@@ -390,6 +390,16 @@ CREATE TABLE IF NOT EXISTS usage_limits (
     result TEXT NOT NULL CHECK (json_valid(result))
 );
 "#,
+    r#"
+-- `SessionSummary::last_message_seq`, the session list's order, backfilled
+-- from the stored log: the session's newest message, else its first event.
+ALTER TABLE sessions ADD COLUMN last_message_seq INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET last_message_seq = COALESCE(
+    (SELECT MAX(seq) FROM events WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'user_message'),
+    (SELECT MIN(seq) FROM events WHERE session_id = sessions.id),
+    last_seq);
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -1261,10 +1271,10 @@ impl Store {
         })
     }
 
-    /// All session summaries, most recently active first.
+    /// All session summaries, most recently written to first.
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY last_seq DESC"
+            "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY last_message_seq DESC"
         ))?;
         let rows = stmt.query_map([], session_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -2480,7 +2490,8 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted";
+    stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted, \
+    last_message_seq";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -2495,7 +2506,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
         ),
         params![
             summary.id.0.to_string(),
@@ -2515,6 +2526,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             to_json(&summary.work)?,
             summary.importing,
             summary.adopted,
+            seq_sql(summary.last_message_seq)?,
         ],
     )?;
     Ok(())
@@ -2539,6 +2551,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         work: opt_json_col(row, 14)?.unwrap_or_default(),
         importing: row.get(15)?,
         adopted: row.get(16)?,
+        last_message_seq: seq_col(row, 17)?,
     })
 }
 
