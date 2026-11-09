@@ -2219,6 +2219,11 @@ impl App {
                 KeyCode::Char('r') => Some(Action::RefreshUsageLimits),
                 _ => None,
             },
+            Screen::ServerAddresses(_) => match key.code {
+                KeyCode::Char('q') => self.quit(),
+                KeyCode::Esc => Some(Action::Back),
+                _ => None,
+            },
             Screen::SessionInfo(_) => {
                 let info = &mut self.ui.info;
                 match key.code {
