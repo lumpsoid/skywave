@@ -80,8 +80,11 @@ cargo test --workspace
 
 ## Commits
 
-- Imperative, sentence-case subject with no type prefix ("Retry the link after
-  a protocol mismatch"). Put the why and any gotchas in the body.
+- Conventional Commits: `type(scope): subject`, with the subject imperative
+  and lower-case ("fix(skywave-core): retry the link after a protocol
+  mismatch"). Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`. The
+  scope is the crate or area changed (`skywaved`, `skywave-core`, `gui`,
+  `claude-code`, ...). Put the why and any gotchas in the body.
 - No `Co-Authored-By` or other AI attribution trailer.
 - Stage by explicit path. Never `git add -A` or `git add .`.
 - Resolve conflicts in the commit itself, not in a merge commit: rebase
