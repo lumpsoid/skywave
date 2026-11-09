@@ -2,15 +2,15 @@
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
 use skywave_core::{
-    Action, BlobPolicy, BlobUse, Decision, Effort, LineSpan, PermissionMode, QuestionAnswer, Route,
-    ServerAddress, TaskId, WorkdirPane,
+    Action, BlobPolicy, BlobUse, Decision, Effort, LineSpan, LoginCode, PermissionMode,
+    QuestionAnswer, Route, ServerAddress, TaskId, WorkdirPane,
 };
 use skywave_present::crop::normalise;
 use uuid::Uuid;
 
 use crate::signals::{
     ActionIntent, BlobPolicyChoice, BlobUseView, DecisionView, EffortView, LineSpanView,
-    PermissionModeView, QuestionAnswerView, RouteView, WorkdirPaneKind,
+    PastedCode, PermissionModeView, QuestionAnswerView, RouteView, WorkdirPaneKind,
 };
 
 /// `intent` as a core action, or why it is not one.
@@ -203,6 +203,14 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             RouteView::UsageLimits => Route::UsageLimits,
         }),
         ActionIntent::Back => Action::Back,
+        ActionIntent::StartAgentLogin => Action::StartAgentLogin,
+        ActionIntent::FinishAgentLogin {
+            code: PastedCode { text },
+        } => Action::FinishAgentLogin {
+            code: LoginCode::new(text),
+        },
+        ActionIntent::RetryAgentLogin => Action::RetryAgentLogin,
+        ActionIntent::DismissAgentLogin => Action::DismissAgentLogin,
     })
 }
 

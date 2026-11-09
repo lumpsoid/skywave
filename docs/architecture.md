@@ -1189,7 +1189,18 @@ logs) an event that no longer decodes rather than failing.
   counting as a day, as the agent's own terminal counts. The TUI adds the
   warning to the link banner; the GUI's `LinkUpdate` carries it as
   `login_label`, shown below the link's label even while online with
-  nothing else to say.
+  nothing else to say. The GUI says where to log in again
+  (`login::expiry_warning_for`: `from settings` where the server offers a
+  login from a device, `on the server` where not), and while the agent
+  is logged out its `logged_out_label` (`login::logged_out_warning`:
+  `agent not logged in · log in from settings`, or `… on the server`)
+  shows the same way, ahead of `login_label`. The GUI's settings carry
+  the login from a device as `login` (`AgentLoginView`: `can_log_in`
+  whenever offered, so a login can be renewed early, the flow's state,
+  its URL, `login::flow_lines` and what each login intent would do).
+  `FinishAgentLogin`'s pasted code travels in a `PastedCode` whose
+  `Debug` is redacted, as core's `LoginCode` is, since the hub logs
+  intents and actions with `Debug`.
 - **Logging the agent in from a device** (`SettingsView::login`, a
   `LoginView`: `offered`, `logged_out` and `expires` as the last `hello`
   said, plus the `flow`): on the settings screen, `StartAgentLogin` posts

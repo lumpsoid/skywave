@@ -1419,7 +1419,11 @@ impl Head {
             &view.link,
             view.queued,
             view.attention.elsewhere,
-            view.login_expires,
+            link::AgentLogin {
+                expires: view.login_expires,
+                offered: view.agent_login_offered,
+                logged_out: view.agent_logged_out,
+            },
             clock.wall_ms,
         );
         if self.sent.link.as_ref() != Some(&banner) {

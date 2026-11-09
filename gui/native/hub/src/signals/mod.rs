@@ -36,20 +36,20 @@ pub use crop::{
 };
 pub use effects::PlatformEffect;
 pub use intents::{
-    ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, QuestionAnswerView,
-    RouteView,
+    ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, PastedCode,
+    QuestionAnswerView, RouteView,
 };
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
-    AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
-    CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView, InfoSectionView,
-    LimitRowView, LimitsView, ListKindView, ModeOption, ModelOption, PairForm, PairingState,
-    PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView, RenamePrompt,
-    RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    ShellPromptView, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
-    StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, UsageGroupingView,
-    UsageRowView, UsageSpanView,
+    AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView,
+    CompletionPopup, ComposerModeView, ComposerView, ContextRow, ConversationRowView,
+    ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView,
+    InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState, ModeOption,
+    ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
+    QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
+    SessionRowView, SessionScreen, ShellPromptView, SnippetView, StopHeadings, StorageGroupingView,
+    StorageRowView, StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow,
+    UsageGroupingView, UsageRowView, UsageSpanView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};

@@ -8,7 +8,8 @@ use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
-    ActionIntent, ListKindView, RouteView, RowKind, ScreenView, ShellPromptView, ToolState,
+    ActionIntent, ListKindView, LoginFlowState, PastedCode, RouteView, RowKind, ScreenView,
+    ShellPromptView, ToolState,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -1855,6 +1856,92 @@ fn the_usage_limits_page_shows_each_limit_with_its_bar() {
         action: ActionIntent::RefreshUsageLimits,
     });
     assert_eq!(rig.actions.last(), Some(&Action::RefreshUsageLimits));
+}
+
+#[test]
+fn the_login_intents_reach_the_core() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::Settings,
+        },
+    });
+    rig.results();
+    let act = |rig: &mut Rig, action| {
+        rig.intent(GuiIntent::Act { action });
+        rig.results();
+        rig.view();
+        rig.actions.last().cloned()
+    };
+    assert_eq!(
+        act(&mut rig, ActionIntent::StartAgentLogin),
+        Some(Action::StartAgentLogin)
+    );
+    // The core asked the server, and the tile Dart got says so.
+    let tile = match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::Settings { login, .. } => login.clone().unwrap(),
+        other => panic!("not settings: {other:?}"),
+    };
+    assert_eq!(tile.state, LoginFlowState::Starting);
+    assert_eq!(tile.lines, ["starting the login…"]);
+    assert_eq!(
+        act(
+            &mut rig,
+            ActionIntent::FinishAgentLogin {
+                code: PastedCode {
+                    text: " the-code ".into()
+                }
+            }
+        ),
+        Some(Action::FinishAgentLogin {
+            code: skywave_core::LoginCode::new(" the-code ")
+        })
+    );
+    assert_eq!(
+        act(&mut rig, ActionIntent::RetryAgentLogin),
+        Some(Action::RetryAgentLogin)
+    );
+    assert_eq!(
+        act(&mut rig, ActionIntent::DismissAgentLogin),
+        Some(Action::DismissAgentLogin)
+    );
+}
+
+/// The hub logs a dropped intent and every dispatched action with their
+/// `Debug`: neither may print a pasted login code.
+#[test]
+fn a_pasted_login_code_never_shows_in_a_debug() {
+    let secret = "sk-secret-code-4711";
+    let intent = GuiIntent::Act {
+        action: ActionIntent::FinishAgentLogin {
+            code: PastedCode {
+                text: secret.into(),
+            },
+        },
+    };
+    assert!(!format!("{intent:?}").contains(secret), "{intent:?}");
+    assert!(format!("{intent:?}").contains("FinishAgentLogin"));
+    let GuiIntent::Act { action } = intent else {
+        unreachable!()
+    };
+    let action = crate::intents::action(action).unwrap();
+    // The code itself reaches the core whole.
+    let Action::FinishAgentLogin { code } = &action else {
+        panic!("not a finish: {action:?}")
+    };
+    assert_eq!(code.as_str(), secret);
+    assert!(!format!("{action:?}").contains(secret), "{action:?}");
+
+    let mut rig = Rig::new();
+    let outs = rig.intent(GuiIntent::Act {
+        action: ActionIntent::FinishAgentLogin {
+            code: PastedCode {
+                text: secret.into(),
+            },
+        },
+    });
+    assert!(rig.actions.contains(&action), "dispatched");
+    assert!(!format!("{outs:?}").contains(secret));
 }
 
 #[test]

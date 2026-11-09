@@ -1,3 +1,5 @@
+use std::fmt;
+
 use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
@@ -444,6 +446,32 @@ pub enum ActionIntent {
         route: RouteView,
     },
     Back,
+    // New variants go last: Dart encodes a variant by its index.
+    /// Log the server's agent in from this device (the settings screen's
+    /// login, while it `can_start`).
+    StartAgentLogin,
+    /// Send the code the login page showed, as pasted; the core trims and
+    /// checks it.
+    FinishAgentLogin {
+        code: PastedCode,
+    },
+    /// Send the unanswered code again (`can_retry`).
+    RetryAgentLogin,
+    /// Forget this device's login, the code included.
+    DismissAgentLogin,
+}
+
+/// A login code as pasted. A secret: `Debug` prints `<redacted>`, so an
+/// intent logged whole (`run.rs` logs a dropped one) does not leak it.
+#[derive(Clone, PartialEq, Eq, Deserialize, SignalPiece)]
+pub struct PastedCode {
+    pub text: String,
+}
+
+impl fmt::Debug for PastedCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PastedCode(<redacted>)")
+    }
 }
 
 /// One question's answer: the options picked, by index, and text of the

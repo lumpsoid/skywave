@@ -9,14 +9,27 @@ use skywave_present::{link, login};
 
 use crate::signals::{LinkState, LinkUpdate};
 
+/// The agent's login as the server's last `hello` said it, for the
+/// banner's login warnings ([`skywave_core::ViewState`]'s fields).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentLogin {
+    /// As `ViewState::login_expires`.
+    pub expires: Option<DateTime<Utc>>,
+    /// As `ViewState::agent_login_offered`: the warnings say to log in
+    /// from settings rather than on the server.
+    pub offered: bool,
+    /// As `ViewState::agent_logged_out`.
+    pub logged_out: bool,
+}
+
 /// The banner for `link` at `wall_ms` (ms since the Unix epoch): the
 /// retry countdown runs from it to the link's `retry_at`, and the login
-/// warning from it to `login_expires`.
+/// warning from it to `login.expires`.
 pub fn update(
     link: &Link,
     queued: usize,
     elsewhere: usize,
-    login_expires: Option<DateTime<Utc>>,
+    login: AgentLogin,
     wall_ms: i64,
 ) -> LinkUpdate {
     let queued_part = match queued {
@@ -105,8 +118,11 @@ pub fn update(
             1 => Some("1 approval elsewhere".to_owned()),
             n => Some(format!("{n} approvals elsewhere")),
         },
+        logged_out_label: login
+            .logged_out
+            .then(|| login::logged_out_warning(login.offered)),
         login_label: DateTime::from_timestamp_millis(wall_ms)
-            .and_then(|now| login::expiry_warning(login_expires, now)),
+            .and_then(|now| login::expiry_warning_for(login.expires, now, login.offered)),
     }
 }
 
@@ -233,7 +249,7 @@ mod tests {
             ),
         ];
         for (link, label) in cases {
-            let banner = update(&link, 2, 0, None, now);
+            let banner = update(&link, 2, 0, AgentLogin::default(), now);
             assert_eq!(banner.label, label, "{link:?}");
             let lost = matches!(link, Link::Rejected(LinkRejection::HistoryLost { .. }));
             assert_eq!(banner.can_reset_replica, lost, "{link:?}");
@@ -241,13 +257,17 @@ mod tests {
             assert_eq!(banner.state == LinkState::RepairNeeded, repair, "{link:?}");
         }
         let online = Link::Online { latency_ms: 12 };
-        assert_eq!(update(&online, 0, 0, None, now).label, "", "nothing to say");
         assert_eq!(
-            update(&online, 0, 1, None, now).label,
+            update(&online, 0, 0, AgentLogin::default(), now).label,
+            "",
+            "nothing to say"
+        );
+        assert_eq!(
+            update(&online, 0, 1, AgentLogin::default(), now).label,
             "online",
             "a button to show"
         );
-        let banner = update(&reconnecting, 0, 1, None, now);
+        let banner = update(&reconnecting, 0, 1, AgentLogin::default(), now);
         assert_eq!(
             banner.connection_label,
             "Offline · server unreachable · retry in 07s"
@@ -263,7 +283,13 @@ mod tests {
             next_change(&reconnecting, now),
             Some(Duration::from_millis(500))
         );
-        let due = update(&reconnecting, 0, 0, None, at.timestamp_millis() + 10);
+        let due = update(
+            &reconnecting,
+            0,
+            0,
+            AgentLogin::default(),
+            at.timestamp_millis() + 10,
+        );
         assert_eq!(due.retry_in_s, Some(0));
         assert!(due.label.ends_with("\nattempt 3 · retrying…"));
         assert_eq!(
@@ -314,18 +340,18 @@ mod tests {
                 )
             );
             assert_eq!(
-                update(&link, 0, 0, None, 0).can_retry_now,
+                update(&link, 0, 0, AgentLogin::default(), 0).can_retry_now,
                 retry,
                 "{link:?}"
             );
             // Said whatever is queued, and even while the banner hides.
             assert_eq!(
-                update(&link, 0, 0, None, 0).connection_label,
+                update(&link, 0, 0, AgentLogin::default(), 0).connection_label,
                 label,
                 "{link:?}"
             );
             assert_eq!(
-                update(&link, 2, 1, None, 0).connection_label,
+                update(&link, 2, 1, AgentLogin::default(), 0).connection_label,
                 label,
                 "{link:?}"
             );
@@ -336,15 +362,57 @@ mod tests {
     fn the_login_warning_shows_within_three_days_of_its_expiry_whatever_the_link() {
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let online = Link::Online { latency_ms: 12 };
-        let in_days = |days| Some(now + chrono::TimeDelta::days(days));
+        let in_days = |days| AgentLogin {
+            expires: Some(now + chrono::TimeDelta::days(days)),
+            ..AgentLogin::default()
+        };
         let banner = update(&online, 0, 0, in_days(2), now.timestamp_millis());
         assert_eq!(banner.label, "", "the link has nothing to say");
         assert_eq!(
             banner.login_label.as_deref(),
             Some("agent login expires in 2 days · log in again on the server")
         );
+        let offered = AgentLogin {
+            offered: true,
+            ..in_days(2)
+        };
+        assert_eq!(
+            update(&online, 0, 0, offered, now.timestamp_millis())
+                .login_label
+                .as_deref(),
+            Some("agent login expires in 2 days · log in again from settings")
+        );
         let later = update(&online, 0, 0, in_days(4), now.timestamp_millis());
         assert_eq!(later.login_label, None);
-        assert_eq!(update(&online, 0, 0, None, 0).login_label, None);
+        assert_eq!(
+            update(&online, 0, 0, AgentLogin::default(), 0).login_label,
+            None
+        );
+    }
+
+    #[test]
+    fn the_logged_out_warning_shows_whatever_the_link_even_online() {
+        let online = Link::Online { latency_ms: 12 };
+        let login = |offered, logged_out| AgentLogin {
+            expires: None,
+            offered,
+            logged_out,
+        };
+        let banner = update(&online, 0, 0, login(true, true), 0);
+        assert_eq!(banner.label, "", "the link has nothing to say");
+        assert_eq!(
+            banner.logged_out_label.as_deref(),
+            Some("agent not logged in · log in from settings")
+        );
+        assert_eq!(
+            update(&Link::Connecting, 0, 0, login(false, true), 0)
+                .logged_out_label
+                .as_deref(),
+            Some("agent not logged in · log in on the server")
+        );
+        assert_eq!(
+            update(&online, 0, 0, login(true, false), 0).logged_out_label,
+            None
+        );
     }
 }

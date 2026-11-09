@@ -6,10 +6,10 @@ use chrono::{DateTime, Local, Utc};
 use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
-    Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, QuestionPrompt,
-    RuleSuggestion, Screen, SessionId, SessionInfoView, SessionListView, SessionRow, SessionState,
-    SessionView, SettingsView, Snippet, StorageView, SubagentHeader, TimelineItem, UsageLimitsView,
-    UsageView, ViewState,
+    LoginFlowView, LoginOutcome, LoginView, Outgoing, PairingStatus, PairingView, PendingSession,
+    PermissionMode, QuestionPrompt, RuleSuggestion, Screen, SessionId, SessionInfoView,
+    SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet, StorageView,
+    SubagentHeader, TimelineItem, UsageLimitsView, UsageView, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -35,15 +35,15 @@ use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 
 use crate::link::count;
 use crate::signals::{
-    AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
-    CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView, InfoSectionView,
-    LimitRowView, LimitsView, ListKindView, ModeOption, ModelOption, PairForm, PairingState,
-    PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView, RenamePrompt,
-    RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    SnippetView, StopHeadings, StorageGroupingView, StorageRowView, StorageTotalView,
-    SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView,
-    UsageSpanView,
+    AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView,
+    CompletionPopup, ComposerModeView, ComposerView, ContextRow, ConversationRowView,
+    ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView,
+    InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState, ModeOption,
+    ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
+    QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
+    SessionRowView, SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
+    StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView,
+    UsageGroupingView, UsageRowView, UsageSpanView,
 };
 use skywave_present::text::{clean, clean_line};
 
@@ -875,7 +875,42 @@ fn settings_view(
         agent_login: settings
             .device_id
             .map(|_| login::expiry_label(view.login_expires, now)),
+        login: settings
+            .device_id
+            .map(|_| agent_login_view(&settings.login, now)),
         stay_connected,
+    }
+}
+
+/// Logging the agent in from this device, for the settings screen.
+fn agent_login_view(login: &LoginView, now: DateTime<Utc>) -> AgentLoginView {
+    let (state, url) = match &login.flow {
+        LoginFlowView::Idle => (LoginFlowState::Idle, None),
+        LoginFlowView::Starting => (LoginFlowState::Starting, None),
+        LoginFlowView::Open { url, .. } => (LoginFlowState::Open, Some(url)),
+        LoginFlowView::Finishing { url } => (LoginFlowState::Finishing, Some(url)),
+        LoginFlowView::NoAnswer { url, .. } => (LoginFlowState::NoAnswer, Some(url)),
+        LoginFlowView::Done(LoginOutcome::LoggedIn) => (LoginFlowState::LoggedIn, None),
+        LoginFlowView::Done(_) => (LoginFlowState::Failed, None),
+    };
+    AgentLoginView {
+        can_log_in: login.offered,
+        logged_out: login.logged_out,
+        state,
+        url: url.map(|url| clean_line(url)),
+        // Server text among them (a failure's words): its breaks become
+        // spaces, so each stays one line and keeps its advice at the end.
+        lines: login::flow_lines(login, now)
+            .iter()
+            .map(|line| clean(&line.replace(['\r', '\n'], " ")))
+            .collect(),
+        // A start while one is on its way, or while a code is, would only
+        // drop that answer.
+        can_start: login.offered
+            && !matches!(state, LoginFlowState::Starting | LoginFlowState::Finishing),
+        can_finish: state == LoginFlowState::Open,
+        can_retry: state == LoginFlowState::NoAnswer,
+        can_dismiss: state != LoginFlowState::Idle,
     }
 }
 
@@ -1114,6 +1149,157 @@ mod tests {
             Some("no expiry reported")
         );
         assert_eq!(settings(None, None), None, "unpaired: no server to ask");
+    }
+
+    /// The settings' login tile, for `login`, paired or not.
+    fn login_tile(login: LoginView, paired: bool) -> Option<AgentLoginView> {
+        let settings = SettingsView {
+            blob_policy: BlobPolicy::OnDemand,
+            blobs_disk_full: false,
+            server_address: None,
+            other_addresses: Vec::new(),
+            device_id: paired.then(skywave_core::DeviceId::new),
+            server_fingerprint: None,
+            login,
+        };
+        let view = ViewState {
+            link: Link::Online { latency_ms: 1 },
+            queued: 0,
+            attention: Attention::default(),
+            screen: Screen::Settings(settings.clone()),
+            can_go_back: true,
+            snippets: Vec::new(),
+            login_expires: settings.login.expires,
+            agent_login_offered: settings.login.offered,
+            agent_logged_out: settings.login.logged_out,
+        };
+        let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
+        match settings_view(&settings, &view, None, now.timestamp_millis()) {
+            ScreenView::Settings { login, .. } => login,
+            other => panic!("not settings: {other:?}"),
+        }
+    }
+
+    fn idle(offered: bool) -> LoginView {
+        LoginView {
+            offered,
+            logged_out: true,
+            expires: None,
+            flow: LoginFlowView::Idle,
+        }
+    }
+
+    #[test]
+    fn the_settings_offer_log_in_only_where_the_server_does() {
+        let offered = login_tile(idle(true), true).unwrap();
+        assert!(offered.can_log_in && offered.can_start);
+        assert!(offered.logged_out);
+        assert_eq!(offered.lines, ["agent not logged in"]);
+        let not = login_tile(idle(false), true).unwrap();
+        assert!(!not.can_log_in && !not.can_start);
+        // Offered whatever the login: a user may renew early.
+        let logged_in = LoginView {
+            logged_out: false,
+            ..idle(true)
+        };
+        assert!(login_tile(logged_in, true).unwrap().can_log_in);
+        assert_eq!(login_tile(idle(true), false), None, "unpaired");
+    }
+
+    #[test]
+    fn every_login_flow_state_maps_to_the_tile() {
+        let url = "https://example.test/login";
+        let flow = |flow| login_tile(LoginView { flow, ..idle(true) }, true).unwrap();
+        // (view, state, url, [start, finish, retry, dismiss], first line)
+        let cases = [
+            (
+                LoginFlowView::Idle,
+                LoginFlowState::Idle,
+                None,
+                [true, false, false, false],
+                "agent not logged in",
+            ),
+            (
+                LoginFlowView::Starting,
+                LoginFlowState::Starting,
+                None,
+                [false, false, false, true],
+                "starting the login…",
+            ),
+            (
+                LoginFlowView::Open {
+                    url: url.into(),
+                    refused: Some(skywave_core::LoginCodeRefused::Blank),
+                },
+                LoginFlowState::Open,
+                Some(url),
+                [true, true, false, true],
+                "open this URL, sign in, paste the code shown",
+            ),
+            (
+                LoginFlowView::Finishing { url: url.into() },
+                LoginFlowState::Finishing,
+                Some(url),
+                [false, false, false, true],
+                "sending the code…",
+            ),
+            (
+                LoginFlowView::NoAnswer {
+                    url: url.into(),
+                    why: skywave_core::LoginNoAnswer::Offline,
+                },
+                LoginFlowState::NoAnswer,
+                Some(url),
+                [true, false, true, true],
+                "offline · the code was not sent · retry once connected",
+            ),
+            (
+                LoginFlowView::Done(LoginOutcome::LoggedIn),
+                LoginFlowState::LoggedIn,
+                None,
+                [true, false, false, true],
+                "agent logged in",
+            ),
+            (
+                LoginFlowView::Done(LoginOutcome::Failed("refused\nsecond line".into())),
+                LoginFlowState::Failed,
+                None,
+                [true, false, false, true],
+                "login failed: refused second line · start again",
+            ),
+            (
+                LoginFlowView::Done(LoginOutcome::Busy),
+                LoginFlowState::Failed,
+                None,
+                [true, false, false, true],
+                "another login is under way on the server · start again",
+            ),
+        ];
+        for (view, state, want_url, [start, finish, retry, dismiss], first) in cases {
+            let tile = flow(view.clone());
+            assert_eq!(tile.state, state, "{view:?}");
+            assert_eq!(tile.url.as_deref(), want_url, "{view:?}");
+            assert_eq!(
+                [
+                    tile.can_start,
+                    tile.can_finish,
+                    tile.can_retry,
+                    tile.can_dismiss
+                ],
+                [start, finish, retry, dismiss],
+                "{view:?}"
+            );
+            assert_eq!(
+                tile.lines.first().map(String::as_str),
+                Some(first),
+                "{view:?}"
+            );
+        }
+        let refused = flow(LoginFlowView::Open {
+            url: url.into(),
+            refused: Some(skywave_core::LoginCodeRefused::Blank),
+        });
+        assert_eq!(refused.lines[1], "no code pasted · paste the code shown");
     }
 
     fn task(id: &str, parent: Option<&str>, ambient: bool) -> BackgroundTask {
