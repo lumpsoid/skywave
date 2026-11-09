@@ -27,6 +27,10 @@ pub struct SessionSummary {
     pub last_activity: DateTime<Utc>,
     /// Seq of the session's newest event.
     pub last_seq: Seq,
+    /// Seq of the session's newest `UserMessage`, else of its first seen
+    /// event: the session list's order. The agent's own activity does not
+    /// move it, so a session moves up only when someone writes to it.
+    pub last_message_seq: Seq,
     /// The agent was stopped on request and no message has come since.
     pub stopped: bool,
     /// How many of the session's events are [notable](is_notable): what
@@ -182,6 +186,7 @@ impl SessionSummary {
             pending_approvals: Vec::new(),
             last_activity: event.at,
             last_seq: seq,
+            last_message_seq: seq,
             stopped: false,
             notable: 0,
             name: None,
@@ -206,10 +211,9 @@ impl SessionSummary {
     /// switched only the current context, and the models an agent offers
     /// or a context moved away nothing here, imported history only an unset
     /// `first_prompt`, a deleted or cropped blob nothing here: none is
-    /// activity, so
-    /// they move
-    /// neither `last_seq` nor `last_activity` and the session keeps its
-    /// place in the list.
+    /// activity, so they move neither `last_seq` nor `last_activity`. Only
+    /// a `UserMessage` moves `last_message_seq`, the session's place in the
+    /// list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
         if let Some(archived) = event.kind.archived_effect() {
@@ -296,6 +300,7 @@ impl SessionSummary {
             }
             // The next message starts the agent again.
             EventKind::UserMessage { text, .. } => {
+                self.last_message_seq = seq;
                 self.stopped = false;
                 if self.first_prompt.is_none() {
                     self.first_prompt = first_line(text, FIRST_PROMPT_MAX_CHARS);
