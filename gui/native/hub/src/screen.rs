@@ -23,6 +23,7 @@ use skywave_present::format::{
     viewing_hint, work_summary,
 };
 use skywave_present::limits;
+use skywave_present::login;
 use skywave_present::policy::{CompletionSettle, dismissable, question_unanswered, unanswered};
 use skywave_present::question::reply_text;
 use skywave_present::sections::{
@@ -96,7 +97,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Session(session) => ScreenView::Session {
             session: session_view(session, view, ui),
         },
-        Screen::Settings(settings) => settings_view(settings, ui.stay_connected),
+        Screen::Settings(settings) => settings_view(settings, view, ui.stay_connected, ui.wall_ms),
         Screen::ServerAddresses(view) => ScreenView::ServerAddresses {
             current: view.current.clone().unwrap_or_default(),
             others: view.others.clone(),
@@ -840,7 +841,13 @@ fn question_panel(prompt: &QuestionPrompt, session: &SessionView) -> QuestionPan
     }
 }
 
-fn settings_view(settings: &SettingsView, stay_connected: Option<bool>) -> ScreenView {
+fn settings_view(
+    settings: &SettingsView,
+    view: &ViewState,
+    stay_connected: Option<bool>,
+    wall_ms: i64,
+) -> ScreenView {
+    let now = DateTime::from_timestamp_millis(wall_ms).unwrap_or_default();
     let (blob_policy, blob_policy_label) = match settings.blob_policy {
         BlobPolicy::Eager => (
             BlobPolicyView::Eager,
@@ -865,6 +872,9 @@ fn settings_view(settings: &SettingsView, stay_connected: Option<bool>) -> Scree
             .device_id
             .map_or_else(|| "not paired".to_owned(), |id| id.0.to_string()),
         fingerprint: settings.server_fingerprint.map(|f| f.to_string()),
+        agent_login: settings
+            .device_id
+            .map(|_| login::expiry_label(view.login_expires, now)),
         stay_connected,
     }
 }
@@ -1057,6 +1067,47 @@ mod tests {
         assert_eq!(server_addresses_label(3), "3 other addresses");
     }
 
+    /// Settings say when the agent's login expires however far off, once
+    /// paired.
+    #[test]
+    fn settings_show_the_agent_login_expiry_once_paired() {
+        let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
+        let settings = |device_id, login_expires| {
+            let settings = SettingsView {
+                blob_policy: BlobPolicy::OnDemand,
+                blobs_disk_full: false,
+                server_address: None,
+                other_addresses: Vec::new(),
+                device_id,
+                server_fingerprint: None,
+            };
+            let view = ViewState {
+                link: Link::Online { latency_ms: 1 },
+                queued: 0,
+                attention: Attention::default(),
+                screen: Screen::Settings(settings.clone()),
+                can_go_back: true,
+                snippets: Vec::new(),
+                login_expires,
+            };
+            match settings_view(&settings, &view, None, now.timestamp_millis()) {
+                ScreenView::Settings { agent_login, .. } => agent_login,
+                other => panic!("not settings: {other:?}"),
+            }
+        };
+        let paired = Some(skywave_core::DeviceId::new());
+        let expires = now + chrono::TimeDelta::days(40);
+        assert_eq!(
+            settings(paired, Some(expires)).as_deref(),
+            Some("expires in 40 days · 2026-12-16")
+        );
+        assert_eq!(
+            settings(paired, None).as_deref(),
+            Some("no expiry reported")
+        );
+        assert_eq!(settings(None, None), None, "unpaired: no server to ask");
+    }
+
     fn task(id: &str, parent: Option<&str>, ambient: bool) -> BackgroundTask {
         BackgroundTask {
             call: None,
@@ -1077,6 +1128,7 @@ mod tests {
             screen: Screen::Session(Box::new(session)),
             can_go_back: true,
             snippets: Vec::new(),
+            login_expires: None,
         };
         let form = PairForm::default();
         let ui = Ui {

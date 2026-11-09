@@ -43,6 +43,7 @@ use skywave_present::format::{
     scope_label,
 };
 use skywave_present::link::{self, RepairNotice};
+use skywave_present::login;
 use skywave_present::sections::{discardable, wanted_blob};
 use skywave_present::text::clean;
 
@@ -70,6 +71,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             &view.link,
             view.queued,
             view.attention.elsewhere,
+            login::expiry_warning(view.login_expires, DateTime::from(wall)).as_deref(),
             wall_ms(wall),
         ))
         .style(banner_style(&view.link)),
@@ -91,7 +93,9 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
                     session::render(frame, body, app, session, ui, wall);
                 }
             }
-            Screen::Settings(settings) => render_settings(frame, body, app, settings),
+            Screen::Settings(settings) => {
+                render_settings(frame, body, app, settings, DateTime::from(wall));
+            }
             Screen::ServerAddresses(view) => render_server_addresses(frame, body, view),
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
             Screen::Storage(view) => storage::render(frame, body, app, view),
@@ -123,14 +127,27 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
 }
 
 /// The link banner's text, then how many approvals wait outside the open
-/// session (`elsewhere`). `wall_ms` is the wall clock in unix-epoch millis;
-/// the retry countdown runs from it to the link's `retry_at`.
-pub fn banner_text(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> String {
+/// session (`elsewhere`), then the agent's `login` warning, if any. `wall_ms`
+/// is the wall clock in unix-epoch millis; the retry countdown runs from it
+/// to the link's `retry_at`.
+pub fn banner_text(
+    link: &Link,
+    queued: usize,
+    elsewhere: usize,
+    login: Option<&str>,
+    wall_ms: i64,
+) -> String {
     let mut text = link_text(link, queued, wall_ms);
     match elsewhere {
         0 => {}
         1 => text.push_str(" · 1 approval elsewhere (^G)"),
         n => text.push_str(&format!(" · {n} approvals elsewhere (^G)")),
+    }
+    if let Some(login) = login {
+        if !text.is_empty() {
+            text.push_str(" · ");
+        }
+        text.push_str(login);
     }
     text
 }
@@ -675,7 +692,13 @@ fn render_server_addresses(frame: &mut Frame, area: Rect, view: &ServerAddresses
     );
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &SettingsView) {
+fn render_settings(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    settings: &SettingsView,
+    now: DateTime<Utc>,
+) {
     let prompt = app.ui().prompt.as_ref();
     let [area, prompt_area] = Layout::vertical([
         Constraint::Min(3),
@@ -728,6 +751,10 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &Settings
         )));
     }
     if settings.device_id.is_some() {
+        lines.push(Line::from(format!(
+            "Agent login: {}",
+            login::expiry_label(app.view().login_expires, now)
+        )));
         lines.push(Line::from(""));
         lines.push(
             Line::from("  Press a to change the server address (same server, no re-pairing).")

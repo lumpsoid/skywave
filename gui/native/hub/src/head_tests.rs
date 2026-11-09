@@ -3273,6 +3273,7 @@ impl Rig {
                 devices: Vec::new(),
                 shell,
                 bypass,
+                login_expires: None,
             })
             .unwrap();
         self.view();

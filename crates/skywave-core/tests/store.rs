@@ -160,6 +160,7 @@ fn fresh_store_is_empty_with_defaults() {
             other_addresses: Vec::new(),
             shell_enabled: false,
             bypass_allowed: false,
+            login_expires: None,
         }
     );
 }
@@ -1668,6 +1669,45 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     assert_eq!(store.usage_limits().unwrap(), Some(read));
 }
 
+/// A v27 replica opens as v28 with its settings and log as they were and
+/// no login expiry: v27 never stored one.
+#[test]
+fn v28_opens_a_v27_replica_without_a_login_expiry() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/x".into(),
+        context_name: "start".into(),
+        from: None,
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![event(id, 0, created.clone())],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    store.set_bypass_allowed(true).unwrap();
+    drop(store);
+    // What v27 left: stamped 27, no `login_expires` setting.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 27", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let settings = store.settings().unwrap();
+    assert!(settings.bypass_allowed);
+    assert_eq!(settings.login_expires, None);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events, [created]);
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
@@ -2388,6 +2428,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     store.set_draft(log.a, AGENT, Some(&draft)).unwrap();
     store.set_composer_mode(log.a, ComposerMode::Shell).unwrap();
     store.set_shell_enabled(true).unwrap();
+    store.set_login_expires(Some(at(9))).unwrap();
     store.switch_server_address("vpn.example:7443").unwrap();
     store.switch_server_address("old.example:7443").unwrap();
     assert_eq!(
@@ -2429,9 +2470,10 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
             other_addresses: Vec::new(),
             shell_enabled: false,
             bypass_allowed: false,
+            login_expires: None,
         },
-        "the blob policy is this device's; the shell flag and the other \
-         addresses were the old server's"
+        "the blob policy is this device's; the shell flag, the login expiry \
+         and the other addresses were the old server's"
     );
     assert!(!blob_file.exists(), "blob files go with their rows");
 
@@ -3171,6 +3213,23 @@ fn the_bypass_flag_is_kept_in_the_settings_apart_from_the_shell_flag() {
     assert!(!settings.shell_enabled);
     store.set_bypass_allowed(false).unwrap();
     assert!(!store.settings().unwrap().bypass_allowed);
+}
+
+#[test]
+fn the_login_expiry_is_kept_in_the_settings_until_a_hello_says_none() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.settings().unwrap().login_expires,
+        None,
+        "none until a hello"
+    );
+    store.set_login_expires(Some(at(7))).unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.load().unwrap().settings.login_expires, Some(at(7)));
+    store.set_login_expires(None).unwrap();
+    assert_eq!(store.settings().unwrap().login_expires, None);
 }
 
 /// Name, type, `NOT NULL`, default and primary key position of each column.

@@ -684,6 +684,25 @@ impl UsageLimitsSource for NoUsageLimits {
     }
 }
 
+/// The login the agent runs as, read when a device says `hello`
+/// (`login_expires`). Like the usage limits it belongs to the account, not
+/// to a session.
+pub trait AgentLogin: Send + Sync + 'static {
+    /// When the login expires, read now; `None` when it does not expire or
+    /// cannot be told. Quick and blocking: a small file read at most.
+    fn expires(&self) -> Option<DateTime<Utc>>;
+}
+
+/// A login for an agent that says nothing of its expiry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoAgentLogin;
+
+impl AgentLogin for NoAgentLogin {
+    fn expires(&self) -> Option<DateTime<Utc>> {
+        None
+    }
+}
+
 /// One step of a conversation's history, as [`OutsideConversations::history`]
 /// reads it. `at` is when the agent recorded it, if it did.
 #[derive(Debug, Clone, PartialEq)]

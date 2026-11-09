@@ -1684,6 +1684,11 @@ impl Model {
         self.settings.bypass_allowed = allowed;
     }
 
+    /// The server said when its agent's login expires (already stored).
+    pub(crate) fn login_expires(&mut self, at: Option<DateTime<Utc>>) {
+        self.settings.login_expires = at;
+    }
+
     /// Devices the events name that this device knows no name for.
     pub(crate) fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
         batch
@@ -1984,6 +1989,7 @@ impl Model {
             screen: self.screen(),
             can_go_back: self.shown_subagent().is_some() || self.back().is_some(),
             snippets: self.snippets.list().to_vec(),
+            login_expires: self.settings.login_expires,
         }
     }
 

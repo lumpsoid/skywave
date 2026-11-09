@@ -1145,6 +1145,29 @@ left out (the compat check watches for new ones); `rate_limits_available:
 false` reads as no limits. An error answer, or an exit before the answer,
 is `Failed` with the CLI's words.
 
+### 3.16 Login expiry: not on the wire
+
+Probed with 2.1.310 (haiku): the terminal UI warns "⚠ Your login expires
+in N days · run /login to renew", but a stream-json process never says
+so: init, assistant, `rate_limit_event` and result only, stderr empty.
+The UI works it out locally (notification `oauth-expiry`): for a
+first-party OAuth login only, it reads `claudeAiOauth.refreshTokenExpiresAt`
+(milliseconds since the epoch) from `.credentials.json` in the config dir
+(`$CLAUDE_CONFIG_DIR`, else `~/.claude`), and warns while
+`0 < refreshTokenExpiresAt - now <= 3 days`, with
+`days = ceil(remaining / 1 day)`. It skips the warning when `expiresAt`
+(the access token's) is more than 3 days past `refreshTokenExpiresAt`. A
+second toast (`oauth-expiry-warning`) fires only at one day or less.
+
+How skywaved uses it (`agent/claude_code/login.rs`): every `hello` reads
+the file and reports `refreshTokenExpiresAt` as `login_expires`, or
+nothing under the same skip rule, without a file, or when the environment
+the CLI inherits logs it in another way (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`). Heads count the
+days themselves (`skywave_present::login`). A login kept outside the file
+(a keychain) reads as no expiry.
+
 ## 4. Interrupt
 
 Request **[C]**:

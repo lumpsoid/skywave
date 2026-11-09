@@ -115,6 +115,7 @@
 pub mod display;
 pub mod limits;
 mod lines;
+pub mod login;
 pub mod protocol;
 pub mod rules;
 pub mod transcripts;

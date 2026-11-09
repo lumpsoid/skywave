@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper::header::{self, HeaderMap, HeaderValue};
@@ -27,7 +27,7 @@ use skywave_proto::{
     path,
 };
 use skywaved::agent::fake::Gate;
-use skywaved::agent::{LimitsError, UsageLimitsSource};
+use skywaved::agent::{AgentLogin, LimitsError, UsageLimitsSource};
 use skywaved::blobs::BlobStore;
 use skywaved::crop::CropHook;
 use skywaved::disk::{Disk, FreeSpace};
@@ -447,6 +447,7 @@ async fn hello_names_the_caller_and_records_last_seen() {
             }],
             shell: false,
             bypass: false,
+            login_expires: None,
         }
     );
     let device = devices::get(f.storage.db.conn(), creds.id)
@@ -1218,6 +1219,37 @@ async fn conversations_are_unavailable_without_a_source() {
         reply.json::<ConversationsResult>(),
         ConversationsResult::Unavailable
     );
+}
+
+/// A login whose expiry tests change between hellos.
+struct SetLogin(std::sync::Mutex<Option<DateTime<Utc>>>);
+
+impl AgentLogin for SetLogin {
+    fn expires(&self) -> Option<DateTime<Utc>> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// Each `hello` reads the agent's login anew, so a login renewed on the
+/// server shows at the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn hello_says_when_the_agent_login_expires_as_of_each_hello() {
+    let expires = Utc::now() + chrono::TimeDelta::days(2);
+    let login = Arc::new(SetLogin(std::sync::Mutex::new(Some(expires))));
+    let options = ServerOptions {
+        login: login.clone(),
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_configured(|log| log, options).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let hello: HelloResponse = device.get(path::HELLO).await.json();
+    assert_eq!(hello.login_expires, Some(expires));
+
+    let renewed = expires + chrono::TimeDelta::days(30);
+    *login.0.lock().unwrap() = Some(renewed);
+    let hello: HelloResponse = device.get(path::HELLO).await.json();
+    assert_eq!(hello.login_expires, Some(renewed));
 }
 
 /// Answers each usage limits read with the next of `answers`.

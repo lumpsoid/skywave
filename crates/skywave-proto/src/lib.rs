@@ -160,7 +160,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v27: the agent's usage limits. `GET` [`path::USAGE_LIMITS`] answering
 /// [`UsageLimitsResult`] (with [`UsageLimit`], [`LimitWindow`] and
 /// [`LimitSeverity`]).
-pub const PROTOCOL_VERSION: u32 = 27;
+///
+/// v28: `login_expires` on [`HelloResponse`]: when the agent's login
+/// expires, so heads warn before the agent stops starting.
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2285,6 +2288,11 @@ pub struct HelloResponse {
     /// Whether the server's operator allows [`PermissionMode::Bypass`];
     /// when not, a `SetPermissionMode` asking for it is `BypassDisabled`.
     pub bypass: bool,
+    /// When the login the agent runs as expires, read as the `hello` is
+    /// answered; `None` when the agent's login does not expire or the
+    /// server cannot tell. Past it the agent cannot start until someone
+    /// logs it in again on the server.
+    pub login_expires: Option<DateTime<Utc>>,
 }
 
 /// Query string of `GET /v1/hello`.

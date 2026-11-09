@@ -1786,6 +1786,7 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
             ],
             shell: false,
             bypass: false,
+            login_expires: None,
         })
         .unwrap();
     h.sync();
@@ -7075,6 +7076,59 @@ fn open_id(h: &Harness) -> Option<SessionId> {
 }
 
 #[test]
+fn the_agent_login_expiry_shows_in_settings_and_warns_in_the_banner_within_three_days() {
+    let mut h = Harness::paired();
+    h.seam.set_link(Link::Online { latency_ms: 5 });
+    let hello = |h: &mut Harness, expires| {
+        h.seam
+            .hello_received(&HelloResponse {
+                protocol_version: skywave_proto::PROTOCOL_VERSION,
+                server_id: skywave_proto::ServerId::new(),
+                device_id: DeviceId::new(),
+                head: Seq::ZERO,
+                log: any_log(),
+                devices: Vec::new(),
+                shell: false,
+                bypass: false,
+                login_expires: expires,
+            })
+            .unwrap();
+        h.sync();
+    };
+    let now = mockup_now();
+    hello(&mut h, Some(now + chrono::TimeDelta::days(4)));
+    assert_eq!(h.banner(), "online · 5 ms");
+    hello(&mut h, Some(now + chrono::TimeDelta::hours(30)));
+    assert_eq!(
+        h.banner(),
+        "online · 5 ms · agent login expires in 2 days · log in again on the server"
+    );
+    // The same expiry, read later: the count runs on the wall clock.
+    assert_eq!(
+        h.banner_at(now + chrono::TimeDelta::hours(31)),
+        "online · 5 ms · agent login expired · log in again on the server"
+    );
+
+    // Settings say it however far off.
+    h.key(KeyCode::Char('s'));
+    let date = (now + chrono::TimeDelta::hours(30)).format("%Y-%m-%d");
+    assert_contains(
+        &h.screen(),
+        &format!("Agent login: expires in 2 days · {date}"),
+    );
+    let later = now + chrono::TimeDelta::days(40);
+    hello(&mut h, Some(later));
+    let date = later.format("%Y-%m-%d");
+    assert_contains(
+        &h.screen(),
+        &format!("Agent login: expires in 40 days · {date}"),
+    );
+    hello(&mut h, None);
+    assert_eq!(h.banner(), "online · 5 ms");
+    assert_contains(&h.screen(), "Agent login: no expiry reported");
+}
+
+#[test]
 fn ctrl_g_opens_approvals_elsewhere_counted_in_the_banner() {
     use skywave_tui::app::Focus;
     let mut h = Harness::paired();
@@ -8505,6 +8559,7 @@ fn hello_with(h: &mut Harness, me: DeviceId, shell: bool, bypass: bool) {
             devices: Vec::new(),
             shell,
             bypass,
+            login_expires: None,
         })
         .unwrap();
     h.sync();
