@@ -1247,6 +1247,22 @@ failed with `Not logged in` (its next two turns answered OK). A process
 started afterwards reports the full `account`. So a login never needs a
 restart.
 
+How skywaved uses it (`agent/claude_code/protocol.rs`,
+`account_logged_out`): an `initialize` answer whose `account` has
+`tokenSource: "none"`, no `apiKeySource` and `apiProvider: "firstParty"`
+says logged out; an `account` with an `email` or an `apiKeySource` says
+logged in. Anything else (no `account`, another `apiProvider` such as
+bedrock, a failed `initialize`, a shape not seen) says nothing. A
+top-level assistant message (no `parent_tool_use_id`) with top-level
+`error: "authentication_failed"` says logged out too; its turn still
+fails with the `result`'s text, as any `is_error` result does. A turn
+that completes says nothing. The `account` is never logged. The
+supervisor drops a "logged out" from an `initialize` answer when a login
+succeeded after it began that process's start, and one from a refused
+turn when a login succeeded after it handed over that turn's message
+(architecture.md, "The agent's login"): §3.17's step 4 shows a running
+process picks the new login up, but it may have answered first.
+
 From the source, not yet probed: the flow refuses to start when managed
 settings forbid it (`forceLoginMethod` of the other kind, or an
 `allowedProviders` without first-party).

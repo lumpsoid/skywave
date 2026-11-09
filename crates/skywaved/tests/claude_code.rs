@@ -28,9 +28,9 @@ use skywaved::agent::claude_code::{
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
     AgentSchedule, AgentSession, AgentTask, BodyFormat, CONVERSATION_GONE, Conversation,
-    DisplayBody, Effort, Grants, INTERRUPT_UNANSWERED, ModelChoice, PermissionMode, QuestionAnswer,
-    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, SubagentFigures,
-    ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    DisplayBody, Effort, Grants, INTERRUPT_UNANSWERED, LoginSource, ModelChoice, PermissionMode,
+    QuestionAnswer, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec,
+    SubagentFigures, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::agent::{LimitSeverity, LimitWindow, LimitsError, UsageLimitsSource};
 use skywaved::config::AgentConfig;
@@ -442,6 +442,9 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                 format!("effort refused {effort:?}: {}", cut(reason))
             }
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
+            AdapterEvent::LoggedIn { logged_in, source } => {
+                format!("logged in: {logged_in} ({source:?})")
+            }
             AdapterEvent::VersionUnconfirmed { version, confirmed } => {
                 format!("version {version}, confirmed {confirmed}")
             }
@@ -505,8 +508,8 @@ fn call_tag(task: &AgentTask) -> String {
         .unwrap_or_default()
 }
 
-/// What the agent reports unasked about its mode and model, and the empty
-/// task set it reports once ready.
+/// What the agent reports unasked about its mode and model, and its login
+/// at start, and the empty task set it reports once ready.
 fn observes_settings(event: &AdapterEvent) -> bool {
     matches!(
         event,
@@ -514,6 +517,10 @@ fn observes_settings(event: &AdapterEvent) -> bool {
             | AdapterEvent::Model(_)
             | AdapterEvent::Effort(_)
             | AdapterEvent::ModelsOffered(_)
+            | AdapterEvent::LoggedIn {
+                source: LoginSource::Start,
+                ..
+            }
     ) || matches!(event, AdapterEvent::BackgroundTasks(tasks) if tasks.is_empty())
 }
 
@@ -542,6 +549,10 @@ fn settings(events: &[AdapterEvent]) -> Vec<String> {
                     | AdapterEvent::EffortSet(_)
                     | AdapterEvent::EffortRefused { .. }
                     | AdapterEvent::ModelsOffered(_)
+                    | AdapterEvent::LoggedIn {
+                        source: LoginSource::Start,
+                        ..
+                    }
             )
         })
         .cloned()
@@ -553,6 +564,7 @@ fn settings(events: &[AdapterEvent]) -> Vec<String> {
             AdapterEvent::Model(model) => format!("model: {model}"),
             AdapterEvent::Effort(effort) => format!("effort: {effort:?}"),
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
+            AdapterEvent::LoggedIn { logged_in, .. } => format!("logged in: {logged_in}"),
             other => describe(std::slice::from_ref(other)).remove(0),
         })
         .collect()
@@ -1661,6 +1673,7 @@ fn replay_mode_switches_answer_requests_and_report_the_mode() {
         strings(&[
             "mode: Ask",
             "models offered: 13",
+            "logged in: true",
             "effort: Some(Medium)",
             // default: Write
             haiku,
@@ -1705,6 +1718,7 @@ fn replay_an_approved_plan_reports_the_mode_before_it() {
         strings(&[
             "mode: Ask",
             "models offered: 13",
+            "logged in: true",
             "effort: Some(Medium)",
             "mode set: Plan",
             haiku,
@@ -1729,6 +1743,7 @@ fn replay_refused_modes_and_models_keep_what_the_agent_had() {
         strings(&[
             "mode: Ask",
             "models offered: 13",
+            "logged in: true",
             "mode set: Plan",
             "mode refused Bypass: Cannot set permission mode to bypassPermissions ",
         ])
@@ -1740,6 +1755,7 @@ fn replay_refused_modes_and_models_keep_what_the_agent_had() {
         strings(&[
             "mode: Ask",
             "models offered: 13",
+            "logged in: true",
             // Set answers with the model the CLI resolved.
             "model set: claude-sonnet-5-5",
             "model set: claude-opus-4-7",
@@ -3755,9 +3771,13 @@ async fn with_bypass_allowed_the_cli_is_launched_to_switch_to_it_later() {
         .await
         .unwrap();
     assert_eq!(
-        take_raw(&mut events, 3).await,
+        take_raw(&mut events, 4).await,
         [
             AdapterEvent::PermissionMode(PermissionMode::Ask),
+            AdapterEvent::LoggedIn {
+                logged_in: true,
+                source: LoginSource::Start,
+            },
             AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::Effort(Some(Effort::Medium)),
         ]
@@ -3794,9 +3814,13 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     // handshake, answered like any request. The handshake and the model
     // switch each read the effort back.
     assert_eq!(
-        take_raw(&mut events, 5).await,
+        take_raw(&mut events, 6).await,
         [
             AdapterEvent::PermissionModeSet(PermissionMode::Plan),
+            AdapterEvent::LoggedIn {
+                logged_in: true,
+                source: LoginSource::Start,
+            },
             AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::Effort(Some(Effort::Medium)),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
@@ -4256,6 +4280,10 @@ fn replay_effort_switches_settle_from_get_settings() {
     let [
         AdapterEvent::PermissionMode(PermissionMode::Ask),
         AdapterEvent::ModelsOffered(_),
+        AdapterEvent::LoggedIn {
+            logged_in: true,
+            source: LoginSource::Start,
+        },
         AdapterEvent::BackgroundTasks(none),
         rest @ ..,
     ] = events.as_slice()
@@ -4308,9 +4336,13 @@ async fn a_session_starts_with_and_switches_its_effort() {
     // The looks after the handshake and the model switch are answered while
     // the start's effort chain runs, so they report nothing.
     assert_eq!(
-        take_raw(&mut events, 4).await,
+        take_raw(&mut events, 5).await,
         [
             AdapterEvent::PermissionMode(PermissionMode::Ask),
+            AdapterEvent::LoggedIn {
+                logged_in: true,
+                source: LoginSource::Start,
+            },
             AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
             AdapterEvent::EffortSet(Some(Effort::High)),

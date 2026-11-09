@@ -24,7 +24,10 @@ use skywaved::agent::fake::{
     REFUSE_REASON, Step, schedule, task,
 };
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
-use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED};
+use skywaved::agent::{
+    AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED, LoginSource,
+    LoginState, LoginStatus,
+};
 use skywaved::config::AgentConfig;
 use skywaved::control::{Confirm, Control, Reply, Stop, Work};
 use skywaved::disk::{Disk, FreeSpace};
@@ -1680,6 +1683,7 @@ async fn idle_agent_is_shut_down_and_resumed_on_next_message() {
     let agent = FakeAgent::new(FakeScript::new());
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -1761,7 +1765,10 @@ async fn a_turn_the_agent_starts_itself_is_not_cut_by_the_idle_timer() {
         ),
         Step::text("scheduled"),
     ]));
-    let config = SupervisorConfig { idle_timeout: IDLE };
+    let config = SupervisorConfig {
+        idle_timeout: IDLE,
+        ..SupervisorConfig::default()
+    };
     let supervisor = f.start_with(&agent, config).await;
 
     f.send("loop");
@@ -1835,6 +1842,7 @@ async fn a_live_background_task_keeps_the_agent_until_it_ends() {
     ]));
     let config = SupervisorConfig {
         idle_timeout: TASK_IDLE,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -1875,6 +1883,7 @@ async fn ambient_tasks_do_not_keep_the_agent() {
     ]));
     let config = SupervisorConfig {
         idle_timeout: TASK_IDLE,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -1902,6 +1911,7 @@ async fn schedules_do_not_keep_the_agent() {
     ]));
     let config = SupervisorConfig {
         idle_timeout: TASK_IDLE,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -1937,6 +1947,7 @@ async fn a_repeated_report_of_no_tasks_does_not_push_the_deadline_back() {
     )]));
     let config = SupervisorConfig {
         idle_timeout: TASK_IDLE,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -1961,6 +1972,7 @@ async fn a_busy_task_past_the_log_cap_still_keeps_the_agent() {
     let agent = FakeAgent::new(FakeScript::new().turn([Step::tasks(tasks)]));
     let config = SupervisorConfig {
         idle_timeout: TASK_IDLE,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -3194,6 +3206,7 @@ async fn a_resumed_agent_gets_its_mode_and_model_back() {
     let agent = FakeAgent::new(FakeScript::new());
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -3397,6 +3410,7 @@ async fn a_restarted_agent_is_asked_for_the_effort_the_log_wants() {
     );
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     // Accepted while down: the start carries the open request out.
     let high = f.set_effort(Effort::High);
@@ -3549,6 +3563,7 @@ async fn offered_models_are_logged_only_when_they_change() {
     let agent = FakeAgent::new(FakeScript::new().offer_models(models.clone()));
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config.clone()).await;
     f.send("one");
@@ -3611,6 +3626,247 @@ async fn a_blank_model_is_refused() {
             reason: RejectReason::UnknownSession
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// The agent's login, as session processes say it
+
+/// The fake CLI with its login read from `<f.root>/login` (`--fake-login-dir`),
+/// under a supervisor keeping it in `login`; the dir, to put markers in.
+async fn start_claude_login(f: &Fixture, login: &LoginState) -> (SupervisorHandle, PathBuf) {
+    let dir = f.root.join("login");
+    std::fs::create_dir_all(&dir).unwrap();
+    let adapter = ClaudeCodeAdapter::new(AgentConfig {
+        command: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-claude.sh"),
+        args: vec!["--fake-login-dir".into(), dir.to_str().unwrap().into()],
+        allow_bypass: false,
+    })
+    .with_grace_period(Duration::from_secs(5));
+    let config = SupervisorConfig {
+        login: login.clone(),
+        ..SupervisorConfig::default()
+    };
+    let supervisor = Supervisor::start(adapter, &f.data, f.log.clone(), config)
+        .await
+        .unwrap();
+    (supervisor, dir)
+}
+
+/// The effort the agent reported once its handshake was answered: what
+/// that answer said came before it.
+fn is_effort_changed(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::EffortChanged { .. })
+}
+
+const NOT_LOGGED_IN: &str = "Not logged in · Please run /login";
+
+#[tokio::test]
+async fn a_session_process_says_whether_the_agent_is_logged_in() {
+    let mut f = Fixture::new();
+    let login = LoginState::new();
+    let (supervisor, dir) = start_claude_login(&f, &login).await;
+    std::fs::write(dir.join("logged-out"), "").unwrap();
+    // Nothing is started just to ask.
+    assert_eq!(login.status(), LoginStatus::Unknown);
+
+    // A setting request starts the agent without a turn: the initialize
+    // answer alone says it.
+    f.set_mode(PermissionMode::Plan);
+    f.wait_count("the handshake", 1, is_effort_changed).await;
+    assert_eq!(login.status(), LoginStatus::LoggedOut);
+
+    // Logged in since: the next process says so.
+    std::fs::remove_file(dir.join("logged-out")).unwrap();
+    accepted(f.stop());
+    f.send("hello");
+    f.wait_count("the turn", 1, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_api_key_reads_as_logged_in() {
+    let mut f = Fixture::new();
+    let login = LoginState::new();
+    let (supervisor, dir) = start_claude_login(&f, &login).await;
+    std::fs::write(dir.join("api-key"), "").unwrap();
+    f.set_mode(PermissionMode::Plan);
+    f.wait_count("the handshake", 1, is_effort_changed).await;
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn another_provider_says_nothing_of_the_login() {
+    let mut f = Fixture::new();
+    let login = LoginState::new();
+    let (supervisor, dir) = start_claude_login(&f, &login).await;
+    std::fs::write(dir.join("other-provider"), "").unwrap();
+    // Unknown, so either answer would show; the completed turn after the
+    // handshake changes nothing either.
+    f.send("hello");
+    f.wait_count("the turn", 1, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::Unknown);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_turn_refused_for_want_of_a_login_says_logged_out_until_one_is_made() {
+    let mut f = Fixture::new();
+    let login = LoginState::new();
+    let (supervisor, dir) = start_claude_login(&f, &login).await;
+    f.send("hello");
+    f.wait_count("the first turn", 1, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+
+    // The same process, logged out under it: its handshake said logged in,
+    // so the refused turn alone says otherwise.
+    std::fs::write(dir.join("logged-out"), "").unwrap();
+    f.send("again");
+    let kinds = f.wait_count("the refused turn", 1, is_errored).await;
+    assert_eq!(login.status(), LoginStatus::LoggedOut);
+    assert_eq!(
+        kinds.last(),
+        Some(&state(SessionState::Errored {
+            message: NOT_LOGGED_IN.into()
+        }))
+    );
+
+    // A turn that completes says nothing of the login.
+    std::fs::remove_file(dir.join("logged-out")).unwrap();
+    f.send("third");
+    f.wait_count("the third turn", 2, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedOut);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A logout the agent says, as `source` says it.
+fn logged_out(source: LoginSource) -> Step {
+    Step::Emit(AdapterEvent::LoggedIn {
+        logged_in: false,
+        source,
+    })
+}
+
+/// A supervisor over `agent` keeping the login in `login`.
+async fn start_login(f: &Fixture, agent: &FakeAgent, login: &LoginState) -> SupervisorHandle {
+    let config = SupervisorConfig {
+        login: login.clone(),
+        ..SupervisorConfig::default()
+    };
+    f.start_with(agent, config).await
+}
+
+fn is_working(kind: &EventKind) -> bool {
+    *kind == state(SessionState::AgentWorking)
+}
+
+#[tokio::test]
+async fn a_logout_reported_at_start_from_before_a_login_is_dropped() {
+    let mut f = Fixture::new();
+    let answer = Gate::new();
+    // The answer the process read at start, reported late.
+    let agent = FakeAgent::new(
+        FakeScript::new().turn([Step::Wait(answer.clone()), logged_out(LoginSource::Start)]),
+    );
+    let login = LoginState::new();
+    let supervisor = start_login(&f, &agent, &login).await;
+    f.send("one");
+    f.wait_count("the first turn", 1, is_working).await;
+    // The process runs: a login succeeds before it answers.
+    login.login_succeeded();
+    answer.open();
+    f.wait_count("the first turn's end", 1, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_process_started_after_a_login_can_say_logged_out() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([logged_out(LoginSource::Start)]));
+    let login = LoginState::new();
+    login.login_succeeded();
+    let supervisor = start_login(&f, &agent, &login).await;
+    f.send("one");
+    f.wait_count("the turn", 1, is_idle).await;
+    // It started knowing of the login, so its answer is fresh.
+    assert_eq!(login.status(), LoginStatus::LoggedOut);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_login_while_the_process_comes_up_drops_its_logout_at_start() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([logged_out(LoginSource::Start)]));
+    let up = Gate::new();
+    agent.hold_start(f.session_id, up.clone());
+    let login = LoginState::new();
+    let supervisor = start_login(&f, &agent, &login).await;
+    f.send("one");
+    // The start has begun and is not done: the process may have read its
+    // login already.
+    wait_inputs(&agent, f.session_id, "the start", |inputs| {
+        inputs
+            .iter()
+            .any(|input| matches!(input, FakeInput::Started { .. }))
+    })
+    .await;
+    login.login_succeeded();
+    up.open();
+    f.wait_count("the turn", 1, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_turn_counts_from_when_its_message_was_handed_over() {
+    let mut f = Fixture::new();
+    let refusal = Gate::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            // Refused, but heard only after a login succeeded.
+            .turn([Step::Wait(refusal.clone()), logged_out(LoginSource::Turn)])
+            // Refused for a message handed over after that login.
+            .turn([logged_out(LoginSource::Turn)]),
+    );
+    let login = LoginState::new();
+    let supervisor = start_login(&f, &agent, &login).await;
+    f.send("one");
+    f.wait_count("the first turn", 1, is_working).await;
+    login.login_succeeded();
+    refusal.open();
+    f.wait_count("the first turn's end", 1, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+
+    f.send("two");
+    f.wait_count("the second turn's end", 2, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedOut);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn what_an_agent_says_of_its_login_while_it_stops_counts() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new().report_on_shutdown([AdapterEvent::LoggedIn {
+            logged_in: false,
+            source: LoginSource::Turn,
+        }]),
+    );
+    let login = LoginState::new();
+    let supervisor = start_login(&f, &agent, &login).await;
+    f.send("one");
+    f.wait_count("the first turn", 1, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::Unknown);
+    // Stopping hands the agent's events to the stop, not the running loop.
+    accepted(f.stop());
+    // A message after the stop waits for it, so its turn ends after the
+    // stop was recorded.
+    f.send("two");
+    f.wait_count("the second turn", 2, is_idle).await;
+    assert_eq!(login.status(), LoginStatus::LoggedOut);
+    supervisor.shutdown().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -3985,6 +4241,7 @@ async fn a_context_started_for_a_setting_leaves_no_handle_and_starts_fresh_for_i
     let agent = FakeAgent::new(FakeScript::new());
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
     f.send("in a");
@@ -4230,6 +4487,7 @@ async fn a_new_session_started_for_a_setting_forks_again_for_its_message() {
     let agent = FakeAgent::new(FakeScript::new());
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
     f.send("one");
@@ -4503,6 +4761,7 @@ async fn an_adopted_session_started_for_a_setting_adopts_again_for_its_message()
     let agent = FakeAgent::new(FakeScript::new()).with_outside_conversation("ext-1");
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 
@@ -5543,6 +5802,7 @@ async fn a_message_during_an_idle_shutdown_resumes_the_agent_after_it() {
     let agent = FakeAgent::new(FakeScript::new());
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
+        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
     let stopped = Gate::new();

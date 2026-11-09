@@ -100,6 +100,14 @@
 //! `system/task_started` (`background_tasks_changed` does not name it),
 //! which often comes after the set listing the task: a mapping new to a
 //! task in the last reported set reports the set again with it.
+//!
+//! **Login** (docs/agents/claude-code.md §3.17). The initialize answer's
+//! `account` says whether the CLI is logged in ([`account_logged_out`]),
+//! reported as `LoggedIn` from the start; the account itself is never
+//! logged. A turn the CLI refuses for want of a login is a synthetic
+//! top-level assistant message with `error: "authentication_failed"`,
+//! reported as `LoggedIn` from a turn, before its text; its `result` fails
+//! the turn as any error does.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -110,9 +118,9 @@ use uuid::Uuid;
 use super::{display, rules, usage};
 use crate::agent::mapper::cut_line;
 use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, ModelChoice,
-    PermissionMode, Question, QuestionAnswer, QuestionOption, ResumeHandle, SubagentFigures,
-    TaskKind, TurnOutcome,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, LoginSource,
+    ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, ResumeHandle,
+    SubagentFigures, TaskKind, TurnOutcome,
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -315,6 +323,22 @@ pub fn offered_models(models: Option<&Value>) -> Vec<ModelChoice> {
             })
         })
         .collect()
+}
+
+/// Whether the `account` of an initialize answer says the CLI is logged
+/// out (docs/agents/claude-code.md §3.17): `Some(true)` for a first-party
+/// account with `tokenSource: "none"` and no `apiKeySource`, `Some(false)`
+/// for one with an `email` or an `apiKeySource`, `None` for anything else
+/// (no account, another provider, a shape not seen), which says nothing.
+pub fn account_logged_out(account: Option<&Value>) -> Option<bool> {
+    let account = account?.as_object()?;
+    let has = |key| account.get(key).is_some_and(|v| !v.is_null());
+    if has("email") || has("apiKeySource") {
+        return Some(false);
+    }
+    let field = |key| account.get(key).and_then(Value::as_str);
+    (field("tokenSource") == Some("none") && field("apiProvider") == Some("firstParty"))
+        .then_some(true)
 }
 
 /// The request that stops background task `task_id`.
@@ -1182,6 +1206,14 @@ impl Protocol {
 
     fn on_assistant(&mut self, message: &Value, out: &mut Output) {
         let parent = subagent_parent(message);
+        // The synthetic turn of a CLI with no login (§3.17); its `result`
+        // still fails the turn with the same words.
+        if parent.is_none() && str_field(message, "error") == "authentication_failed" {
+            out.events.push(AdapterEvent::LoggedIn {
+                logged_in: false,
+                source: LoginSource::Turn,
+            });
+        }
         let tools = if parent.is_some() {
             &mut self.sub_tools
         } else {
@@ -1562,6 +1594,12 @@ impl Protocol {
             if !models.is_empty() {
                 out.events.push(AdapterEvent::ModelsOffered(models));
             }
+            if let Some(logged_out) = account_logged_out(body.get("account")) {
+                out.events.push(AdapterEvent::LoggedIn {
+                    logged_in: !logged_out,
+                    source: LoginSource::Start,
+                });
+            }
             self.ready = true;
             // Startup noise does not explain a later exit.
             self.stray_output = None;
@@ -1796,4 +1834,106 @@ fn subagent_parent(message: &Value) -> Option<AgentCallId> {
         .get("parent_tool_use_id")
         .and_then(Value::as_str)
         .map(AgentCallId::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn an_account_says_whether_the_cli_is_logged_out() {
+        let cases = [
+            // Probed logged out (§3.17).
+            (
+                json!({"tokenSource": "none", "apiProvider": "firstParty"}),
+                Some(true),
+            ),
+            // An API key in the environment: not logged out.
+            (
+                json!({"tokenSource": "none", "apiKeySource": "ANTHROPIC_API_KEY", "apiProvider": "firstParty"}),
+                Some(false),
+            ),
+            // Another provider says nothing of a first-party login.
+            (
+                json!({"tokenSource": "none", "apiProvider": "bedrock"}),
+                None,
+            ),
+            // Logged in, as the login fixture records it.
+            (
+                json!({"email": "user@example.com", "organization": "<scrubbed-organization>", "subscriptionType": "Claude Max", "apiProvider": "firstParty"}),
+                Some(false),
+            ),
+            // No `tokenSource` and no email: a shape not seen.
+            (json!({"apiProvider": "firstParty"}), None),
+            (json!("none"), None),
+            (Value::Null, None),
+        ];
+        for (account, expected) in cases {
+            assert_eq!(account_logged_out(Some(&account)), expected, "{account}");
+        }
+        assert_eq!(account_logged_out(None), None);
+    }
+
+    fn login_events(out: &Output) -> Vec<&AdapterEvent> {
+        (out.events.iter())
+            .filter(|e| matches!(e, AdapterEvent::LoggedIn { .. }))
+            .collect()
+    }
+
+    fn initialized(account: Value) -> Output {
+        let mut protocol = Protocol::new(Uuid::new_v4(), false);
+        let id = protocol.start().writes[0]["request_id"].clone();
+        protocol.on_message(&json!({
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": id, "response": {"account": account}},
+        }))
+    }
+
+    #[test]
+    fn the_initialize_answer_reports_the_login_from_the_start() {
+        let out = initialized(json!({"tokenSource": "none", "apiProvider": "firstParty"}));
+        assert_eq!(
+            login_events(&out),
+            [&AdapterEvent::LoggedIn {
+                logged_in: false,
+                source: LoginSource::Start
+            }]
+        );
+        let out = initialized(json!({"email": "user@example.com"}));
+        assert_eq!(
+            login_events(&out),
+            [&AdapterEvent::LoggedIn {
+                logged_in: true,
+                source: LoginSource::Start
+            }]
+        );
+        let out = initialized(json!({"tokenSource": "none", "apiProvider": "bedrock"}));
+        assert!(login_events(&out).is_empty());
+    }
+
+    #[test]
+    fn only_a_top_level_authentication_failure_reports_a_logout() {
+        let refused = |parent: Value| {
+            json!({
+                "type": "assistant",
+                "message": {"id": "msg_1", "model": "<synthetic>", "role": "assistant",
+                    "content": [{"type": "text", "text": "Not logged in · Please run /login"}]},
+                "parent_tool_use_id": parent,
+                "error": "authentication_failed",
+            })
+        };
+        let mut protocol = Protocol::new(Uuid::new_v4(), false);
+        let out = protocol.on_message(&refused(Value::Null));
+        assert_eq!(
+            login_events(&out),
+            [&AdapterEvent::LoggedIn {
+                logged_in: false,
+                source: LoginSource::Turn
+            }]
+        );
+        let out = protocol.on_message(&refused(json!("toolu_1")));
+        assert!(login_events(&out).is_empty());
+    }
 }

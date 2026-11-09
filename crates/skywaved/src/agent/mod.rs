@@ -84,6 +84,10 @@
 //! - Wakeups the agent scheduled for itself are reported as
 //!   [`AdapterEvent::Schedules`], the whole set, whenever the agent says;
 //!   they are information only and never keep the agent running.
+//! - Whether the agent is logged in is reported as
+//!   [`AdapterEvent::LoggedIn`], whenever the agent says (at start, or a
+//!   turn it refused for want of a login), naming which of the two. The
+//!   supervisor keeps it in the shared [`LoginState`]; it is not logged.
 //! - The stream ends with [`AdapterEvent::Exited`] when the agent stops, on
 //!   [`AgentSession::shutdown`] or on its own.
 //!
@@ -105,9 +109,10 @@ pub mod fake;
 pub mod import;
 pub(crate) mod mapper;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -428,6 +433,13 @@ pub enum AdapterEvent {
     EffortRefused { effort: Effort, reason: String },
     /// The models the agent offers, uncut.
     ModelsOffered(Vec<ModelChoice>),
+    /// The agent said whether it is logged in, and how it said it
+    /// (`source`). Not logged: the supervisor applies it to its
+    /// [`LoginState`].
+    LoggedIn {
+        logged_in: bool,
+        source: LoginSource,
+    },
     /// The agent runs `version`, not `confirmed`, the version the adapter
     /// was checked against; uncut. At most once per process.
     VersionUnconfirmed { version: String, confirmed: String },
@@ -453,6 +465,151 @@ pub enum AdapterEvent {
         error: Option<String>,
         unsent: usize,
     },
+}
+
+/// How an agent said whether it is logged in ([`AdapterEvent::LoggedIn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginSource {
+    /// What the agent reported as it started. It may be older than a login
+    /// made since the process started.
+    Start,
+    /// A turn the agent refused for want of a login. It may be older than a
+    /// login made since the turn's message was handed over.
+    Turn,
+}
+
+/// Whether the agent is logged in, as far as skywaved knows
+/// ([`LoginState::status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoginStatus {
+    /// No session process has said yet, and no login was made.
+    #[default]
+    Unknown,
+    LoggedIn,
+    LoggedOut,
+}
+
+/// The agent's login as skywaved last learned it, shared by the supervisor
+/// (which learns it from session processes) and whoever reports it. Cheap
+/// to clone; every clone is the same cell. Nothing starts a process just
+/// to find out: it stays [`LoginStatus::Unknown`] until one says.
+///
+/// It also counts the login successes ([`LoginState::login_succeeded`]),
+/// so that a "logged out" older than a success is told apart from a fresh
+/// one by position, not by timing. The supervisor keeps a [`LoginSeen`]
+/// per process: the count when it began the process's start, and when it
+/// handed over each message. A "logged out" the process reported at start
+/// ([`LoginSource::Start`]) counts from the start's count; one from a
+/// refused turn ([`LoginSource::Turn`]) from the count when that turn's
+/// message was handed over (for a turn the agent started on its own, the
+/// latest message handed over, else the start). [`LoginState::apply`]
+/// drops it when a login succeeded since: the process may have answered
+/// before it saw the login. "Logged in" never needs the check.
+#[derive(Debug, Clone, Default)]
+pub struct LoginState(Arc<Mutex<LoginCell>>);
+
+#[derive(Debug, Default)]
+struct LoginCell {
+    status: LoginStatus,
+    successes: u64,
+}
+
+impl LoginState {
+    pub fn new() -> LoginState {
+        LoginState::default()
+    }
+
+    /// Whether the agent is logged in, as last learned.
+    pub fn status(&self) -> LoginStatus {
+        self.cell().status
+    }
+
+    /// The login successes so far.
+    pub fn successes(&self) -> u64 {
+        self.cell().successes
+    }
+
+    /// A login succeeded: the agent is logged in, and every process
+    /// started before now reported at start what it no longer is.
+    pub fn login_succeeded(&self) {
+        let mut cell = self.cell();
+        cell.status = LoginStatus::LoggedIn;
+        cell.successes += 1;
+    }
+
+    /// Applies what a session process said (`logged_in`, said as
+    /// `source`), with what it had `seen` of the successes. A "logged out"
+    /// is dropped when a login succeeded after what it answers (its start,
+    /// or its turn's message); whether it was applied.
+    pub fn apply(&self, logged_in: bool, source: LoginSource, seen: &LoginSeen) -> bool {
+        let mut cell = self.cell();
+        let answers = match source {
+            LoginSource::Start => seen.start,
+            LoginSource::Turn => seen.turn,
+        };
+        if !logged_in && answers < cell.successes {
+            return false;
+        }
+        cell.status = if logged_in {
+            LoginStatus::LoggedIn
+        } else {
+            LoginStatus::LoggedOut
+        };
+        true
+    }
+
+    fn cell(&self) -> std::sync::MutexGuard<'_, LoginCell> {
+        // Every write leaves the cell whole, so a panic elsewhere while it
+        // was held spoils nothing.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The [`LoginState::successes`] one session process may have seen, kept
+/// by the supervisor as it starts the process and hands it messages, and
+/// as the process starts their turns ([`LoginSeen::observe`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginSeen {
+    /// When its start began.
+    start: u64,
+    /// When each message handed over whose turn has not started was.
+    handed: VecDeque<u64>,
+    /// When the latest message was handed over, else `start`.
+    latest: u64,
+    /// What the current (or last) turn answers: its message's count, or
+    /// for a turn the agent started on its own, `latest` then.
+    turn: u64,
+}
+
+impl LoginSeen {
+    /// A process whose start began at `successes`.
+    pub fn started(successes: u64) -> LoginSeen {
+        LoginSeen {
+            start: successes,
+            handed: VecDeque::new(),
+            latest: successes,
+            turn: successes,
+        }
+    }
+
+    /// A message was handed over at `successes`.
+    pub fn handed(&mut self, successes: u64) {
+        self.handed.push_back(successes);
+        self.latest = successes;
+    }
+
+    /// Follows the process's `event`, before it is applied: a turn started
+    /// for a message (in order, one per message handed over) answers that
+    /// message; one it started on its own, the latest message.
+    pub fn observe(&mut self, event: &AdapterEvent) {
+        match event {
+            AdapterEvent::TurnStarted { message: true } => {
+                self.turn = self.handed.pop_front().unwrap_or(self.latest);
+            }
+            AdapterEvent::TurnStarted { message: false } => self.turn = self.latest,
+            _ => {}
+        }
+    }
 }
 
 /// Receiving end of an agent session's [`AdapterEvent`] stream.

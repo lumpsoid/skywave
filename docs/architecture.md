@@ -533,6 +533,20 @@ the daemon's appends, which would otherwise stop `serve` (below).
   refresh token's expiry from the CLI's `.credentials.json` each time,
   and says nothing when the environment logs the CLI in another way
   (docs/agents/claude-code.md §3.16). Nothing is stored on the server.
+  Whether the agent is logged in at all is kept in memory, in one
+  `LoginState` (`Unknown`, `LoggedIn` or `LoggedOut`) the supervisor
+  fills from what its session processes say (`AdapterEvent::LoggedIn`):
+  a process's handshake, and a turn it refused for want of a login. It
+  starts `Unknown`, and no process is started just to find out. The cell
+  counts login successes too; the supervisor notes the count when it
+  begins a process's start and when it hands the process each message
+  (`LoginSeen`). A "logged out" from the start is dropped once a login
+  has succeeded since the start began; one from a refused turn, once a
+  login has succeeded since that turn's message was handed over (a turn
+  the agent started on its own counts from the latest message, else the
+  start). Either may have been answered before the process saw the
+  login; a refusal of a message handed over after it is fresh. For
+  Claude Code the rule is in docs/agents/claude-code.md §3.17.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
