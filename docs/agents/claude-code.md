@@ -1178,7 +1178,19 @@ reach.
 
 **Logged out is visible at start.** The `initialize` answer carries
 `account: {"tokenSource": "none", "apiProvider": "firstParty"}` (no
-`email`) when no login exists, before any turn runs.
+`email`) when no login exists, before any turn runs. A logged-in
+`account` has no `tokenSource` at all (`{apiProvider, email, organization,
+subscriptionType}`). **`tokenSource: "none"` alone is not "logged out"**:
+with `ANTHROPIC_API_KEY` set the answer is `{"tokenSource": "none",
+"apiKeySource": "ANTHROPIC_API_KEY", "apiProvider": "firstParty"}`, so
+logged out is `tokenSource: "none"` with no `apiKeySource`.
+
+**A turn while logged out** fails at once (about 60 ms, no API call):
+`system/init` (`apiKeySource: "none"`), a synthetic assistant message
+(`model: "<synthetic>"`, top-level `error: "authentication_failed"`, text
+`Not logged in · Please run /login`), then a `result` with `subtype:
+"success"` but `is_error: true`, the same text as `result`, and
+`terminal_reason: "api_error"`. The process stays usable.
 
 **1. Start the flow:**
 
@@ -1192,7 +1204,8 @@ answered at once with two authorize URLs on
 `{"manualUrl": "…&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback…", "automaticUrl": "…&redirect_uri=http%3A%2F%2Flocalhost%3A<port>%2Fcallback…"}`.
 The CLI opens no browser here. `loginWithClaudeAi: false` asks for a
 Console login instead. A second `claude_authenticate` while a flow is open
-joins it and answers the same URLs.
+joins it and answers the same URLs. It needs no `initialize` first: a
+process sent only `claude_authenticate` answers both URLs.
 
 **2. The user signs in** at `manualUrl`. The page shows one string,
 `<code>#<state>`, to copy.
@@ -1215,20 +1228,33 @@ appear: `usage-credits`, `extra-usage`, `schedule`), then the success:
 {"account":{"email":"…","organization":"…","subscriptionType":"Claude Max","apiProvider":"firstParty"}}
 ```
 
-An exchange that fails answers an error with the CLI's words.
-`claude_oauth_wait_for_completion` (no fields) waits for the same outcome
-without passing a code; it is for the localhost redirect and of no use
-here. Either one without an open flow is the error `No active
-claude_authenticate flow`.
+An exchange that fails answers an error with the CLI's words, and **ends
+the flow**: a wrong `state` and a bogus code each answered `Request failed
+with status code 400` (the token endpoint's refusal; the state is not
+checked locally first), and the next `claude_authenticate` started a new
+flow with new URLs. A success ends it too: the same code sent again
+answers `No active claude_authenticate flow`, as does either callback
+without an open flow. `claude_oauth_wait_for_completion` (no fields) waits
+for the same outcome without passing a code; it is for the localhost
+redirect and of no use here.
 
-**4. The process is logged in.** The next user message ran a normal turn
-(`system/init`, OK, `result/success`) without a restart, and closing
-stdin ended the process with exit 0.
+**4. Every process is logged in.** The next user message in the process
+that logged in ran a normal turn (`system/init`, OK, `result/success`)
+without a restart, and closing stdin ended it with exit 0. So did
+processes that were **already running, logged out**, when another
+process logged in: one that had run no turn, and one whose turn had
+failed with `Not logged in` (its next two turns answered OK). A process
+started afterwards reports the full `account`. So a login never needs a
+restart.
 
 From the source, not yet probed: the flow refuses to start when managed
 settings forbid it (`forceLoginMethod` of the other kind, or an
-`allowedProviders` without first-party), and a pasted state that does not
-match the flow's fails the exchange.
+`allowedProviders` without first-party).
+
+Probed 2026-11-09 with 2.1.310 (haiku), fresh `CLAUDE_CONFIG_DIR`, by a
+driver running six processes side by side (wrong state, bogus code, the
+real code, the same code again, turns before and after). It was not kept
+as a fixture: it holds several live flows' states.
 
 ## 4. Interrupt
 
