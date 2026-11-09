@@ -13,12 +13,13 @@ use serde_json::json;
 use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
     AgentWork, ApprovalId, CallId, Command, CommandId, CommandKind, CommandResult, ContextId,
-    Decision, DeviceId, Effort, Event, EventKind, Full, ModelChoice, PermissionMode, Question,
-    QuestionAnswer, QuestionOption, RejectReason, RuleScope, RuleSuggestion, Schedule, ScheduleId,
-    Seq, SessionId, SessionOrigin, SessionState, TaskId, ToolCall, ToolDisplay, ToolKind,
-    ToolResult,
+    Decision, DeviceId, Effort, Event, EventKind, Full, LoginFinishResult, LoginStartResult,
+    ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
+    ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
+use skywaved::agent::claude_code::login::ClaudeLogin;
 use skywaved::agent::fake::{
     FakeAgent, FakeConversation, FakeInput, FakeOutside, FakeScript, Gate, INTERRUPT_REASON,
     REFUSE_REASON, Step, schedule, task,
@@ -31,6 +32,7 @@ use skywaved::agent::{
 use skywaved::config::AgentConfig;
 use skywaved::control::{Confirm, Control, Reply, Stop, Work};
 use skywaved::disk::{Disk, FreeSpace};
+use skywaved::login::{LOGIN_FLOW_MAX, LoginFlows};
 use skywaved::supervisor::{
     AGENT_NOT_RUNNING, BYPASS_NOT_ALLOWED, DAEMON_RESTARTED, MESSAGE_LOST, TURN_LOST,
 };
@@ -3737,6 +3739,59 @@ async fn a_turn_refused_for_want_of_a_login_says_logged_out_until_one_is_made() 
     f.send("third");
     f.wait_count("the third turn", 2, is_idle).await;
     assert_eq!(login.status(), LoginStatus::LoggedOut);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A session process running logged out picks up a login a device makes
+/// through the login flows, without a restart (docs/agents/claude-code.md
+/// §3.17, step 4): the same process, no SIGTERM, and its next message runs.
+#[tokio::test]
+async fn a_login_from_a_device_reaches_a_running_session_without_a_restart() {
+    let mut f = Fixture::new();
+    let login = LoginState::new();
+    let (supervisor, dir) = start_claude_login(&f, &login).await;
+    std::fs::write(dir.join("logged-out"), "").unwrap();
+    f.send("hello");
+    f.wait_count("the refused turn", 1, is_errored).await;
+    assert_eq!(login.status(), LoginStatus::LoggedOut);
+    let pid = fake_cli_pid(&f);
+
+    // The login process runs elsewhere, on the same login.
+    let work = f.root.join("login-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let adapter = ClaudeCodeAdapter::new(AgentConfig {
+        command: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-claude.sh"),
+        args: vec!["--fake-login-dir".into(), dir.to_str().unwrap().into()],
+        allow_bypass: false,
+    })
+    .with_grace_period(Duration::from_secs(5));
+    let claude = ClaudeLogin::new(dir.join(".credentials.json"), false, adapter, work);
+    let flows = LoginFlows::new(Arc::new(claude), login.clone(), LOGIN_FLOW_MAX, None);
+    let LoginStartResult::Open { flow, .. } = flows.start(std::time::Instant::now() + WAIT).await
+    else {
+        panic!("the login did not open");
+    };
+    assert!(matches!(
+        flows.finish(flow, "good#fake-state".into()).await,
+        LoginFinishResult::LoggedIn { expires: Some(_) }
+    ));
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+
+    f.send("again");
+    let kinds = f.wait_count("the next turn", 1, is_idle).await;
+    // The fake answers a message it runs with the text "echo".
+    assert_eq!(
+        kinds.last_chunk::<2>().map(|[text, _]| text),
+        Some(&EventKind::AgentMessage {
+            parent: None,
+            text: "echo".into(),
+            full: None,
+        }),
+        "{kinds:#?}"
+    );
+    assert_eq!(login.status(), LoginStatus::LoggedIn);
+    assert_eq!(fake_cli_pid(&f), pid);
+    assert!(!f.root.join("project/term.txt").exists());
     supervisor.shutdown().await.unwrap();
 }
 

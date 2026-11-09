@@ -56,6 +56,19 @@
 //! [`USAGE_LIMITS_TIMEOUT`] is the outer bound, a 503. A scope is cut to
 //! one line of the wire limit. Nothing is stored.
 //!
+//! **The agent's login** (`POST /v1/agent-login/start` and `/finish`,
+//! D49): a device logs the agent in over request/response through
+//! [`LoginFlows`] (one flow at a time; racing starts join, a finish is
+//! idempotent per flow), every outcome a 200 but a code over
+//! `LOGIN_CODE_MAX_BYTES` (a 400). The agent gets [`LOGIN_START_DEADLINE`]
+//! to answer a start, past which it answers `Failed`;
+//! [`LOGIN_START_TIMEOUT`] is the outer bound, a 503. A finish waits for
+//! the agent at most the server's login finish timeout
+//! ([`LOGIN_FINISH_TIMEOUT`] by default), then answers 503; the finish goes
+//! on, and a retry naming the same flow gets its outcome. A reason is cut
+//! to one line of `REFUSAL_MAX_CHARS`. Neither the URL nor the code is
+//! logged or stored. Each `hello` drops a flow left open too long.
+//!
 //! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/list` and
 //! `/v1/workdir/file`, D36): reads of a session's workdir, every outcome a
 //! 200 [`ChangesResult`](skywave_proto::ChangesResult),
@@ -125,8 +138,9 @@ use rustls_pki_types::CertificateDer;
 use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
     DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery, HelloResponse, ImportOutcome,
-    LineSpan, PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, UsageLimit, UsageLimitsResult,
-    WorkdirQuery, check_conversation_id, limits, path,
+    LineSpan, LoginFinish, LoginFinishResult, LoginStartResult, PROTOCOL_VERSION, RUN_HEADER,
+    RunId, ServerId, UsageLimit, UsageLimitsResult, WorkdirQuery, check_conversation_id, limits,
+    path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -147,6 +161,7 @@ use crate::dirs;
 use crate::encoding;
 use crate::error::{Error, Result};
 use crate::event_log::{self, DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
+use crate::login::LoginFlows;
 use crate::server::{JoinedHook, ServerOptions};
 use crate::storage::{self, StorageReader};
 use crate::workdir::{self, Snapshot, WorkdirReader};
@@ -176,6 +191,16 @@ pub const USAGE_LIMITS_DEADLINE: Duration = Duration::from_secs(15);
 /// Longest a usage limits read may take before the reply gives up with a
 /// 503; longer than [`USAGE_LIMITS_DEADLINE`], which stops the read itself.
 pub const USAGE_LIMITS_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the agent gets to answer a login start with a URL before the
+/// answer is `Failed`.
+pub const LOGIN_START_DEADLINE: Duration = Duration::from_secs(15);
+/// Longest a login start may take before the reply gives up with a 503;
+/// longer than [`LOGIN_START_DEADLINE`], which stops the start itself.
+pub const LOGIN_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest a login finish waits for the agent's answer before the reply is
+/// a 503 (the default of `ServerOptions::login_finish_timeout`). The finish
+/// itself has no deadline and goes on: a retry collects its outcome.
+pub const LOGIN_FINISH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Blocking file-system work (dirs, conversations, workdir reads and
 /// storage reports) that may run at once; see the module docs, "Blocking
 /// file-system work".
@@ -215,6 +240,9 @@ pub(crate) struct Api {
     login: Arc<dyn AgentLogin>,
     /// What a `hello` reads whether the agent is logged out from.
     login_state: LoginState,
+    /// The device login flow the login endpoints drive.
+    login_flows: LoginFlows,
+    login_finish_timeout: Duration,
     import_deadline: Duration,
     conversations_timeout: Duration,
     crop_deadline: Duration,
@@ -244,6 +272,12 @@ impl Api {
         options: ServerOptions,
     ) -> Result<Api> {
         let blobs = BlobStore::new(dir.blobs_dir());
+        let login_flows = LoginFlows::new(
+            options.login.clone(),
+            options.login_state.clone(),
+            options.login_flow_max,
+            options.joined_hook.clone(),
+        );
         Ok(Api {
             db: Mutex::new(Db::open(&dir.db_path())?),
             workdir: WorkdirReader::new(
@@ -263,6 +297,8 @@ impl Api {
             usage_limits: options.usage_limits,
             login: options.login,
             login_state: options.login_state,
+            login_flows,
+            login_finish_timeout: options.login_finish_timeout,
             import_deadline: options.import_deadline,
             conversations_timeout: options.conversations_timeout,
             crop_deadline: options.crop_deadline,
@@ -323,6 +359,8 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::CONVERSATIONS, get(list_conversations))
         .route(path::STORAGE, get(storage_report))
         .route(path::USAGE_LIMITS, get(usage_limits))
+        .route(path::AGENT_LOGIN_START, post(agent_login_start))
+        .route(path::AGENT_LOGIN_FINISH, post(agent_login_finish))
         .route(path::WORKDIR_CHANGES, get(workdir_changes))
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
@@ -410,6 +448,9 @@ async fn hello(
             // the commit, so it may lag an event a pull already got.
             let head = head_in(db.conn())?;
             let log = api.log.run(db, query.since)?;
+            // A device that started a login and never finished it: its
+            // flow goes once it is old enough.
+            api.login_flows.touch();
             // Read on every hello, so a login renewed on the server shows
             // at the device's next connection.
             Ok((devices, head, log, api.login.expires()))
@@ -824,6 +865,59 @@ async fn usage_limits(State(api): State<Arc<Api>>) -> Response {
         }
         Err(_) => {
             tracing::warn!("usage limits read timed out");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    Json(result).into_response()
+}
+
+/// Starts logging the agent in, or joins the login starting or open.
+async fn agent_login_start(State(api): State<Arc<Api>>) -> Response {
+    let start = api.login_flows.start(Instant::now() + LOGIN_START_DEADLINE);
+    let result = match tokio::time::timeout(LOGIN_START_TIMEOUT, start).await {
+        Ok(LoginStartResult::Failed { reason }) => {
+            tracing::warn!(%reason, "login start failed");
+            LoginStartResult::Failed {
+                reason: cut_line(&reason, limits::REFUSAL_MAX_CHARS).0,
+            }
+        }
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(reason = "timed out", "login start failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    Json(result).into_response()
+}
+
+/// Finishes the login a start opened with the pasted code, or answers what
+/// its first finish came to.
+async fn agent_login_finish(
+    State(api): State<Arc<Api>>,
+    body: std::result::Result<Json<LoginFinish>, JsonRejection>,
+) -> Response {
+    let finish = match body {
+        Ok(Json(finish)) => finish,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if finish.code.len() > limits::LOGIN_CODE_MAX_BYTES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let finishing = api.login_flows.finish(finish.flow, finish.code);
+    let result = match tokio::time::timeout(api.login_finish_timeout, finishing).await {
+        Ok(LoginFinishResult::Failed { reason }) => {
+            tracing::warn!(%reason, "login finish failed");
+            LoginFinishResult::Failed {
+                reason: cut_line(&reason, limits::REFUSAL_MAX_CHARS).0,
+            }
+        }
+        Ok(result) => result,
+        // The finish goes on; a retry naming the flow gets its outcome.
+        Err(_) => {
+            tracing::warn!(reason = "timed out", "login finish failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
