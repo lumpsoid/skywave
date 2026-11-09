@@ -49,6 +49,18 @@
 # workdir holding ./usage-refused gets a refusal instead, one holding
 # ./usage-silent no answer at all, and one holding ./usage-crash an exit 3
 # with a stderr line.
+# `--fake-login-dir <dir>` names a directory whose markers set the login
+# (§3.17), read again at each request, so a test can change them while the
+# CLI runs; without it the CLI is logged in, as a user@example.com. The
+# initialize answer's `account` is the probed logged-out one when <dir>
+# holds `logged-out`, an API key's (`apiKeySource`) when it holds
+# `api-key`, another provider's (bedrock, no email) when it holds
+# `other-provider`, and the email one otherwise. While `logged-out` is
+# there, a user message gets the probed refusal instead of its turn:
+# `system/init`, the synthetic assistant message with top-level
+# `error: "authentication_failed"` and the text
+# "Not logged in · Please run /login", and a `result` with `subtype:
+# "success"` but `is_error: true`, `terminal_reason: "api_error"`.
 
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
@@ -64,6 +76,7 @@ resume=""
 fork=""
 allow_bypass=""
 version="2.1.310"
+login_dir=""
 prev=""
 for arg in "$@"; do
   case "$prev" in
@@ -71,6 +84,7 @@ for arg in "$@"; do
     --resume) resume="$arg" ;;
     --permission-mode) mode="$arg" ;;
     --fake-version) version="$arg" ;;
+    --fake-login-dir) login_dir="$arg" ;;
   esac
   case "$arg" in
     --fork-session) fork=1 ;;
@@ -108,6 +122,21 @@ result_aborted() {
 lifecycle() {
   printf '{"type":"command_lifecycle","command_uuid":"%s","state":"%s","uuid":"00000000-0000-4000-8000-000000000000","session_id":"%s"}\n' "$1" "$2" "$sid"
 }
+# Whether the login dir holds marker $1.
+login_marker() {
+  [ -n "$login_dir" ] && [ -e "$login_dir/$1" ]
+}
+account() {
+  if login_marker logged-out; then
+    printf '{"tokenSource":"none","apiProvider":"firstParty"}'
+  elif login_marker api-key; then
+    printf '{"tokenSource":"none","apiKeySource":"ANTHROPIC_API_KEY","apiProvider":"firstParty"}'
+  elif login_marker other-provider; then
+    printf '{"tokenSource":"none","apiProvider":"bedrock"}'
+  else
+    printf '{"email":"user@example.com"}'
+  fi
+}
 tool_result() {
   printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"%s","is_error":%s}]},"session_id":"%s"}\n' "$1" "$2" "$sid"
 }
@@ -125,7 +154,7 @@ while IFS= read -r line; do
       fi
       ;;
     *'"subtype":"initialize"'*)
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"%s","account":{"email":"user@example.com"},"current_permission_mode":"%s","session_state":"idle"}}}\n' "$(reqid "$line")" "$version" "$mode"
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"%s","account":%s,"current_permission_mode":"%s","session_state":"idle"}}}\n' "$(reqid "$line")" "$version" "$(account)" "$mode"
       ;;
     *'"subtype":"interrupt"'*)
       ack "$line"
@@ -168,6 +197,12 @@ while IFS= read -r line; do
         printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"%s","model":"%s","permissionMode":"%s"}\n' "$PWD" "$sid" "$version" "$model" "$mode"
       else
         printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"%s","permissionMode":"%s"}\n' "$PWD" "$sid" "$version" "$mode"
+      fi
+      if login_marker logged-out; then
+        # The probed refusal (§3.17): no API call, the process stays usable.
+        printf '{"type":"assistant","message":{"id":"msg_1","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"parent_tool_use_id":null,"session_id":"%s","error":"authentication_failed"}\n' "$sid"
+        printf '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","terminal_reason":"api_error","session_id":"%s"}\n' "$sid"
+        continue
       fi
       case "$line" in
         *stubborn*)

@@ -137,6 +137,19 @@
 //! logged as `ModelsOffered` only when they differ from the newest list in
 //! the whole log.
 //!
+//! **Login.** What an agent says of its login (`AdapterEvent::LoggedIn`) is
+//! not logged: it goes to the [`LoginState`] in the config, shared with
+//! whoever reports it. No agent is ever started just to ask. A process
+//! reads its login once, as it starts, so the supervisor notes the login
+//! successes counted when it begins each start and when it hands over each
+//! message (`LoginSeen`). A "logged out" the process reported from its
+//! start is dropped once a login has succeeded since the start began; one
+//! from a turn it refused, once a login has succeeded since that turn's
+//! message was handed over (a turn it started on its own counts from the
+//! latest message, else the start). The process may have answered before
+//! it saw the login; a refusal of a message handed over after it is fresh.
+//! What an agent said while it stopped counts the same way.
+//!
 //! Everything the agent reports goes through the session's [`EventMapper`].
 //! An agent that exits on its own (crash) is logged by the mapper (`Errored`
 //! when it was mid-turn, its approvals cancelled) and dropped; the next
@@ -327,7 +340,8 @@ use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation, EventMapper,
-    StartSpec, bounded_models, load_grants, load_origin, load_resume_handle, unsent_notice,
+    LoginSeen, LoginSource, LoginState, StartSpec, bounded_models, load_grants, load_origin,
+    load_resume_handle, unsent_notice,
 };
 use crate::db::Db;
 use crate::disk::Disk;
@@ -360,12 +374,16 @@ pub struct SupervisorConfig {
     /// How long an agent session with no work is kept before it is shut
     /// down. The next message resumes it.
     pub idle_timeout: Duration,
+    /// Where the supervisor keeps what its agents say of their login
+    /// (see **Login** in the module docs); shared with whoever reports it.
+    pub login: LoginState,
 }
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
         SupervisorConfig {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            login: LoginState::new(),
         }
     }
 }
@@ -560,6 +578,8 @@ struct Starting {
     trigger: Queued,
     mapper: EventMapper,
     asked: HashSet<Option<CommandId>>,
+    /// [`LoginState::successes`] when the start began.
+    logins: u64,
 }
 
 /// A log event the supervisor handles.
@@ -600,6 +620,9 @@ struct Running<S> {
     idle_since: Option<Instant>,
     /// The setting requests this agent was asked for, by command.
     asked: HashSet<Option<CommandId>>,
+    /// The login successes the agent may have seen, at its start and at
+    /// each message handed over ([`LoginState::apply`]).
+    login_seen: LoginSeen,
 }
 
 impl<S> Running<S> {
@@ -1438,8 +1461,12 @@ impl<A: AgentAdapter> Supervisor<A> {
         let Some(running) = self.running.get_mut(&session_id) else {
             return Err(Error::Supervisor("no agent to hand a message to".into()));
         };
+        // Read before the agent gets it: a login that succeeds from here
+        // on may come after the agent read its own for this message.
+        let logins = self.config.login.successes();
         let error = match running.session.send_message(text).await {
             Ok(()) => {
+                running.login_seen.handed(logins);
                 running.owed_turns += 1;
                 running.settle_idle();
                 return Ok(());
@@ -1621,6 +1648,9 @@ impl<A: AgentAdapter> Supervisor<A> {
                 mapper,
                 asked,
             }) => {
+                // Read before the process starts: a login that succeeds
+                // from here on may come after the process read its own.
+                let logins = self.config.login.successes();
                 let adapter = Arc::clone(&self.adapter);
                 self.starts
                     .spawn(async move { (session_id, adapter.start(spec).await) });
@@ -1629,6 +1659,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                     trigger,
                     mapper,
                     asked,
+                    logins,
                 };
                 let held = self.hold(session_id, Op::Starting(Box::new(start)));
                 held.handled = held.handled.min(before(seq));
@@ -1754,6 +1785,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             trigger,
             mapper,
             asked,
+            logins,
         } = *start;
         match started {
             Ok((session, events)) => {
@@ -1768,6 +1800,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                     busy_tasks: 0,
                     idle_since: None,
                     asked,
+                    login_seen: LoginSeen::started(logins),
                 };
                 // Nothing to do until a message comes, if one does.
                 running.settle_idle();
@@ -1842,6 +1875,17 @@ impl<A: AgentAdapter> Supervisor<A> {
         let message_turn = matches!(event, AdapterEvent::TurnStarted { message: true });
         let exited = matches!(event, AdapterEvent::Exited { .. });
         let ended = exited || matches!(event, AdapterEvent::TurnEnded(_));
+        running.login_seen.observe(&event);
+        if let AdapterEvent::LoggedIn { logged_in, source } = event {
+            hear_login(
+                &self.config.login,
+                id,
+                logged_in,
+                source,
+                &running.login_seen,
+            );
+            return Ok(());
+        }
         if let AdapterEvent::ModelsOffered(models) = event {
             let context = running.context();
             return offer_models(
@@ -1884,6 +1928,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         let Halted {
             mut mapper,
             mut events,
+            mut login_seen,
         } = halted;
         if !map_exit {
             events.pop();
@@ -1892,7 +1937,10 @@ impl<A: AgentAdapter> Supervisor<A> {
         // in hand. The reading only lets a low disk pause the others.
         self.log.disk().refresh();
         for event in events {
-            if let AdapterEvent::ModelsOffered(models) = event {
+            login_seen.observe(&event);
+            if let AdapterEvent::LoggedIn { logged_in, source } = event {
+                hear_login(&self.config.login, id, logged_in, source, &login_seen);
+            } else if let AdapterEvent::ModelsOffered(models) = event {
                 let context = mapper.context();
                 offer_models(
                     &self.log,
@@ -2125,11 +2173,29 @@ fn offer_models(
     Ok(())
 }
 
+/// Applies what session `id`'s agent said of its login to `login`; `seen`
+/// is [`Running::login_seen`].
+fn hear_login(
+    login: &LoginState,
+    id: SessionId,
+    logged_in: bool,
+    source: LoginSource,
+    seen: &LoginSeen,
+) {
+    if login.apply(logged_in, source, seen) {
+        tracing::debug!(session = %id.0, logged_in, ?source, "agent login heard");
+    } else {
+        tracing::info!(session = %id.0, ?source, "agent reported a logout from before a login; dropped");
+    }
+}
+
 /// A stopped agent's mapper and what it reported while stopping, ending
 /// with `Exited`.
 struct Halted {
     mapper: EventMapper,
     events: Vec<AdapterEvent>,
+    /// [`Running::login_seen`].
+    login_seen: LoginSeen,
 }
 
 /// Shuts session `id`'s agent down. Needs nothing of the supervisor, so
@@ -2139,6 +2205,7 @@ async fn halt<S: AgentSession>(id: SessionId, running: Running<S>) -> Halted {
         session,
         mut events,
         mapper,
+        login_seen,
         ..
     } = running;
     // Drain while it stops: an agent may block on a full event channel.
@@ -2166,6 +2233,7 @@ async fn halt<S: AgentSession>(id: SessionId, running: Running<S>) -> Halted {
     Halted {
         mapper,
         events: reported,
+        login_seen,
     }
 }
 

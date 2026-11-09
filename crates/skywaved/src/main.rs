@@ -8,7 +8,9 @@ use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::limits::ClaudeUsageLimits;
 use skywaved::agent::claude_code::login::ClaudeLogin;
 use skywaved::agent::claude_code::transcripts::{self, ClaudeTranscripts};
-use skywaved::agent::{AgentLogin, NoAgentLogin, NoOutsideConversations, OutsideConversations};
+use skywaved::agent::{
+    AgentLogin, LoginState, NoAgentLogin, NoOutsideConversations, OutsideConversations,
+};
 use skywaved::config::{Config, ProcessEnv};
 #[cfg(unix)]
 use skywaved::control::{Client, Confirm, Control, Reply, Request, When};
@@ -328,11 +330,16 @@ async fn serve(
     // Before the supervisor, shell runner and API can write blobs.
     storage.collect_blobs()?;
     let adapter = ClaudeCodeAdapter::new(config.agent.clone());
+    // What the session processes say of the agent's login.
+    let login = LoginState::new();
     let mut supervisor = Supervisor::start(
         adapter,
         config.data_dir.clone(),
         log.clone(),
-        SupervisorConfig::default(),
+        SupervisorConfig {
+            login: login.clone(),
+            ..SupervisorConfig::default()
+        },
     )
     .await?;
     #[cfg(unix)]

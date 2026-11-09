@@ -55,6 +55,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
 /// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
 /// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
+/// | `LoggedIn` | nothing: the supervisor keeps it in its `LoginState` |
 /// | `VersionUnconfirmed` | `AgentVersionUnconfirmed`, each version cut to its cap |
 /// | `TaskStopAnswered` | nothing: retires the oldest stop asked (the task leaving the set is the outcome) |
 /// | `TaskStopRefused` | `TaskStopRefused` answering the oldest stop asked |
@@ -593,6 +594,9 @@ impl EventMapper {
             }
             AdapterEvent::ModelsOffered(_) => {
                 tracing::debug!("models offered reach the log through the supervisor");
+            }
+            AdapterEvent::LoggedIn { .. } => {
+                tracing::debug!("the agent's login is kept by the supervisor, not logged");
             }
             AdapterEvent::VersionUnconfirmed { version, confirmed } => {
                 let kind = EventKind::AgentVersionUnconfirmed {

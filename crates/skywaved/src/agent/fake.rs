@@ -143,6 +143,7 @@ pub struct FakeScript {
     refuse_stops: bool,
     shutdown_barrier: Option<Arc<Barrier>>,
     end_turns_on_shutdown: bool,
+    shutdown_reports: Vec<AdapterEvent>,
 }
 
 impl FakeScript {
@@ -186,6 +187,17 @@ impl FakeScript {
     /// it. Messages queued behind it still never run.
     pub fn end_turns_on_shutdown(mut self) -> FakeScript {
         self.end_turns_on_shutdown = true;
+        self
+    }
+
+    /// Reports `events` as a session is shut down, before its `Exited` (after
+    /// the turn's end, with [`FakeScript::end_turns_on_shutdown`]): what an
+    /// agent says while it stops.
+    pub fn report_on_shutdown(
+        mut self,
+        events: impl IntoIterator<Item = AdapterEvent>,
+    ) -> FakeScript {
+        self.shutdown_reports = events.into_iter().collect();
         self
     }
 
@@ -1018,7 +1030,10 @@ impl Runner {
                         ) => {
                             continue;
                         }
-                        Some(FakeInput::Shutdown) | None => break None,
+                        Some(FakeInput::Shutdown) | None => {
+                            self.report_shutdown().await;
+                            break None;
+                        }
                     }
                 }
             };
@@ -1061,7 +1076,15 @@ impl Runner {
             let ended = AdapterEvent::TurnEnded(TurnOutcome::Interrupted);
             self.emit(ended).await;
         }
+        self.report_shutdown().await;
         None
+    }
+
+    /// Reports what the script says a shutdown reports.
+    async fn report_shutdown(&mut self) {
+        for event in self.script.shutdown_reports.clone() {
+            self.emit(event).await;
+        }
     }
 
     /// The earliest wakeup that is due, if one is; of those due at once,
