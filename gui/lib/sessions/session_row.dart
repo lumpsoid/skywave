@@ -30,8 +30,9 @@ class StateBadge extends StatelessWidget {
   }
 }
 
-/// One session on the list. A tap opens it; its menu renames, archives or
-/// unarchives, and deletes an archived one from this device after asking.
+/// One session on the list. A tap opens it; its menu starts a new session
+/// in its workdir, renames, archives or unarchives, and deletes an archived
+/// one from this device after asking.
 /// On a phone the state is a dot, the title takes two lines, the workdir
 /// is its last component and the menu is a sheet.
 class SessionRow extends StatelessWidget {
@@ -268,6 +269,13 @@ class _RowMenu extends StatelessWidget {
       ),
     );
     final actions = [
+      if (row.workdir != null)
+        _RowAction(
+          icon: Icons.add,
+          title: 'New session here',
+          onTap: () =>
+              send.act(ActionIntentCreateSessionLike(sessionId: row.sessionId)),
+        ),
       _RowAction(
         icon: Icons.edit,
         title: 'Rename',
