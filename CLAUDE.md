@@ -84,6 +84,10 @@ cargo test --workspace
   a protocol mismatch"). Put the why and any gotchas in the body.
 - No `Co-Authored-By` or other AI attribution trailer.
 - Stage by explicit path. Never `git add -A` or `git add .`.
+- Resolve conflicts in the commit itself, not in a merge commit: rebase
+  the branch onto its target, fix each conflict as the rebase stops, then
+  merge. A merge commit that carries its own conflict fixes hides code
+  that no single commit explains.
 
 ## Working as an agent here
 
