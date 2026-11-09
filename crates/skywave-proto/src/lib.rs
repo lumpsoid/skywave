@@ -163,7 +163,14 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v28: `login_expires` on [`HelloResponse`]: when the agent's login
 /// expires, so heads warn before the agent stops starting.
-pub const PROTOCOL_VERSION: u32 = 28;
+///
+/// v29: logging the agent in from a device. `agent_login_offered` and
+/// `agent_logged_out` on [`HelloResponse`]; `POST` [`path::AGENT_LOGIN_START`]
+/// answering [`LoginStartResult`] (with [`LoginFlowId`]) and `POST`
+/// [`path::AGENT_LOGIN_FINISH`] taking [`LoginFinish`] and answering
+/// [`LoginFinishResult`]; [`limits::LOGIN_URL_MAX_BYTES`] and
+/// [`limits::LOGIN_CODE_MAX_BYTES`].
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -1181,6 +1188,14 @@ pub mod limits {
     /// command ids can write per request, which the HTTP body limit (2 MB)
     /// alone leaves near 2 MB.
     pub const MESSAGE_MAX_BYTES: usize = 256 * 1024;
+    /// Longest [`LoginStartResult::Open`](crate::LoginStartResult::Open)
+    /// URL, in UTF-8 bytes. The server answers a longer one as `Failed`
+    /// rather than cut it, as a cut URL opens nothing. Real ones are a few
+    /// hundred bytes.
+    pub const LOGIN_URL_MAX_BYTES: usize = 4 * 1024;
+    /// Longest [`LoginFinish::code`](crate::LoginFinish::code), in UTF-8
+    /// bytes; the server refuses a longer one with a 400.
+    pub const LOGIN_CODE_MAX_BYTES: usize = 1024;
     /// Most [`ChangedFile`](crate::ChangedFile)s in one
     /// [`ChangeSet`](crate::ChangeSet); the rest are only counted in
     /// [`ChangeSet::total`](crate::ChangeSet::total).
@@ -2293,6 +2308,14 @@ pub struct HelloResponse {
     /// server cannot tell. Past it the agent cannot start until someone
     /// logs it in again on the server.
     pub login_expires: Option<DateTime<Utc>>,
+    /// Whether a device may log the agent in ([`path::AGENT_LOGIN_START`]);
+    /// false when the agent has no login a device can run, or a login the
+    /// server's environment sets takes precedence over one it would make.
+    pub agent_login_offered: bool,
+    /// Whether the server's latest definite word from the agent is "not
+    /// logged in"; false when it is logged in or the server does not know
+    /// yet. Reported even when [`Self::agent_login_offered`] is false.
+    pub agent_logged_out: bool,
 }
 
 /// Query string of `GET /v1/hello`.
@@ -2511,6 +2534,75 @@ pub struct ShellRunStorage {
     /// That blob, the one a `DeleteBlob` names; `None` when it has none
     /// or the blob was deleted.
     pub output_blob: Option<BlobId>,
+}
+
+/// Identifies one login a device started ([`LoginStartResult::Open`]); a
+/// [`LoginFinish`] names it. Random (UUIDv4), not time-ordered: it is the
+/// only thing tying a finish to its start, so it must not be guessable.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct LoginFlowId(pub Uuid);
+
+impl LoginFlowId {
+    /// A fresh random id.
+    pub fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Response to `POST /v1/agent-login/start` (no body), always 200: every
+/// outcome is a domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum LoginStartResult {
+    /// The user opens `url`, logs in there and pastes the code it shows
+    /// back with a [`LoginFinish`] naming `flow`. The URL is at most
+    /// [`limits::LOGIN_URL_MAX_BYTES`].
+    Open { flow: LoginFlowId, url: String },
+    /// Another login is being started or finished; try again after it.
+    Busy,
+    /// The server's agent has no login a device can run
+    /// ([`HelloResponse::agent_login_offered`] is false).
+    Unavailable,
+    /// Starting the login failed; `reason` is bounded text
+    /// ([`limits::REFUSAL_MAX_CHARS`]).
+    Failed { reason: String },
+}
+
+/// Body of `POST /v1/agent-login/finish`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LoginFinish {
+    /// The flow [`LoginStartResult::Open`] named.
+    pub flow: LoginFlowId,
+    /// The code the login page showed, at most
+    /// [`limits::LOGIN_CODE_MAX_BYTES`]. A secret: never logged, so
+    /// `Debug` prints `<redacted>` in its place.
+    pub code: String,
+}
+
+impl std::fmt::Debug for LoginFinish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginFinish")
+            .field("flow", &self.flow)
+            .field("code", &format_args!("<redacted>"))
+            .finish()
+    }
+}
+
+/// Response to `POST /v1/agent-login/finish`, always 200: every outcome is
+/// a domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum LoginFinishResult {
+    /// The agent is logged in. `expires` is when that login expires, as
+    /// [`HelloResponse::login_expires`] would report it now.
+    LoggedIn { expires: Option<DateTime<Utc>> },
+    /// The server has no login under that flow: never started, already
+    /// finished, or given up on.
+    NoFlow,
+    /// Finishing the login failed; `reason` is bounded text
+    /// ([`limits::REFUSAL_MAX_CHARS`]).
+    Failed { reason: String },
 }
 
 /// Response to `GET /v1/usage-limits` (no query), always 200: every outcome
@@ -2766,6 +2858,11 @@ pub mod path {
     pub const STORAGE: &str = "/v1/storage";
     /// The agent's usage limits: [`crate::UsageLimitsResult`].
     pub const USAGE_LIMITS: &str = "/v1/usage-limits";
+    /// Start logging the agent in: [`crate::LoginStartResult`].
+    pub const AGENT_LOGIN_START: &str = "/v1/agent-login/start";
+    /// Finish a login with the code the user pasted:
+    /// [`crate::LoginFinish`] answering [`crate::LoginFinishResult`].
+    pub const AGENT_LOGIN_FINISH: &str = "/v1/agent-login/finish";
     /// What changed in a session's workdir: [`crate::ChangesResult`].
     pub const WORKDIR_CHANGES: &str = "/v1/workdir/changes";
     /// One directory of a session's workdir: [`crate::ListResult`].

@@ -157,7 +157,7 @@ every version.
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
-| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, whether it allows bypass mode (`agent.allow_bypass`, D38), and when the agent's login expires (`login_expires`; see "The agent's login"). |
+| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, whether it allows bypass mode (`agent.allow_bypass`, D38), when the agent's login expires (`login_expires`), whether a device may log the agent in (`agent_login_offered`) and whether the agent is logged out (`agent_logged_out`, true only for a definite "not logged in"); see "The agent's login". Since v29. |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
@@ -546,7 +546,12 @@ the daemon's appends, which would otherwise stop `serve` (below).
   the agent started on its own counts from the latest message, else the
   start). Either may have been answered before the process saw the
   login; a refusal of a message handed over after it is fresh. For
-  Claude Code the rule is in docs/agents/claude-code.md §3.17.
+  Claude Code the rule is in docs/agents/claude-code.md §3.17. Each
+  `hello` reports the cell as `agent_logged_out` (true only for
+  `LoggedOut`), and `AgentLogin::offered` as `agent_login_offered`: false
+  for `NoAgentLogin`, and for Claude Code when the environment logs the
+  CLI in another way, which a login made from a device would not
+  override. `agent_logged_out` is reported either way.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
@@ -783,9 +788,11 @@ logs) an event that no longer decodes rather than failing.
   replica (unknown, deleted here, or from before a re-pair) is dropped.
   `usage_limits` keeps the latest answer to the usage limits read.
   `settings` also keeps what the last `hello` said of the server: whether
-  it runs shell commands, whether it allows bypass mode, and when its
-  agent's login expires (`login_expires`, gone with a re-pair to another
-  server), so each shows offline too.
+  it runs shell commands, whether it allows bypass mode, when its agent's
+  login expires (`login_expires`), whether a device may log the agent in
+  (`agent_login_offered`) and whether the agent is logged out
+  (`agent_logged_out`); the last three are gone with a re-pair to another
+  server. Each shows offline too.
 - **Session list order**: newest first by `SessionSummary::last_message_seq`,
   the seq of the session's newest `UserMessage` (its creation until it has
   one). Only a message someone writes moves a session up. The agent's

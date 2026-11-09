@@ -52,6 +52,13 @@ pub struct ViewState {
     /// Present on every screen: heads warn as it nears
     /// (`skywave_present::login`).
     pub login_expires: Option<DateTime<Utc>>,
+    /// Whether this device may log the server's agent in, as the server's
+    /// last `hello` said; `false` until one said so.
+    pub agent_login_offered: bool,
+    /// Whether the server's agent is logged out, as the server's last
+    /// `hello` said: its latest definite word, `false` when logged in or
+    /// not known. Present on every screen, offered or not.
+    pub agent_logged_out: bool,
 }
 
 /// Approvals some agent is blocked on (D8), so a head can point at them

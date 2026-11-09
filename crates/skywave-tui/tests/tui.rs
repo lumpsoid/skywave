@@ -1787,6 +1787,8 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
             shell: false,
             bypass: false,
             login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
         })
         .unwrap();
     h.sync();
@@ -7091,6 +7093,8 @@ fn the_agent_login_expiry_shows_in_settings_and_warns_in_the_banner_within_three
                 shell: false,
                 bypass: false,
                 login_expires: expires,
+                agent_login_offered: false,
+                agent_logged_out: false,
             })
             .unwrap();
         h.sync();
@@ -8560,6 +8564,8 @@ fn hello_with(h: &mut Harness, me: DeviceId, shell: bool, bypass: bool) {
             shell,
             bypass,
             login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
         })
         .unwrap();
     h.sync();

@@ -732,6 +732,44 @@ fn all_usage_limits_results() -> Vec<UsageLimitsResult> {
     ]
 }
 
+fn login_flow() -> LoginFlowId {
+    LoginFlowId(Uuid::from_u128(0x5a1e_9c3b_77d2_4f08_a6b1_0c4d_e2f3_9a71))
+}
+
+fn all_login_start_results() -> Vec<LoginStartResult> {
+    vec![
+        LoginStartResult::Open {
+            flow: login_flow(),
+            url: "https://example.com/oauth/authorize?code=true&state=abc".into(),
+        },
+        LoginStartResult::Busy,
+        LoginStartResult::Unavailable,
+        LoginStartResult::Failed {
+            reason: "login exited early".into(),
+        },
+    ]
+}
+
+fn login_finish() -> LoginFinish {
+    LoginFinish {
+        flow: login_flow(),
+        code: "pasted-code#state".into(),
+    }
+}
+
+fn all_login_finish_results() -> Vec<LoginFinishResult> {
+    vec![
+        LoginFinishResult::LoggedIn {
+            expires: Some(at()),
+        },
+        LoginFinishResult::LoggedIn { expires: None },
+        LoginFinishResult::NoFlow,
+        LoginFinishResult::Failed {
+            reason: "invalid code".into(),
+        },
+    ]
+}
+
 fn all_shell_ends() -> Vec<ShellEnd> {
     vec![
         ShellEnd::Exited { code: 0 },
@@ -971,6 +1009,8 @@ fn hello() -> HelloResponse {
         shell: true,
         bypass: true,
         login_expires: Some(at()),
+        agent_login_offered: true,
+        agent_logged_out: true,
     }
 }
 
@@ -1543,6 +1583,39 @@ fn every_usage_limits_result_round_trips() {
 }
 
 #[test]
+fn every_login_result_round_trips() {
+    for result in all_login_start_results() {
+        round_trip(&result);
+    }
+    round_trip(&login_finish());
+    for result in all_login_finish_results() {
+        round_trip(&result);
+    }
+}
+
+#[test]
+fn a_login_finish_never_prints_its_code() {
+    let printed = format!("{:?}", login_finish());
+    assert!(printed.contains("<redacted>"), "{printed}");
+    assert!(!printed.contains("pasted-code"), "{printed}");
+    // The flow still prints, so a log line can tell flows apart.
+    assert!(printed.contains("5a1e9c3b"), "{printed}");
+}
+
+#[test]
+fn a_fresh_login_flow_is_random() {
+    let flow = LoginFlowId::random();
+    assert_eq!(flow.0.get_version_num(), 4);
+    assert_ne!(flow, LoginFlowId::random());
+}
+
+#[test]
+fn login_caps() {
+    assert_eq!(limits::LOGIN_URL_MAX_BYTES, 4096);
+    assert_eq!(limits::LOGIN_CODE_MAX_BYTES, 1024);
+}
+
+#[test]
 fn every_conversations_result_round_trips() {
     for result in all_conversations_results() {
         round_trip(&result);
@@ -1576,8 +1649,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v28() {
-    assert_eq!(PROTOCOL_VERSION, 28);
+fn protocol_is_v29() {
+    assert_eq!(PROTOCOL_VERSION, 29);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1812,6 +1885,8 @@ fn api_paths() {
     assert_eq!(path::CONVERSATIONS, "/v1/conversations");
     assert_eq!(path::STORAGE, "/v1/storage");
     assert_eq!(path::USAGE_LIMITS, "/v1/usage-limits");
+    assert_eq!(path::AGENT_LOGIN_START, "/v1/agent-login/start");
+    assert_eq!(path::AGENT_LOGIN_FINISH, "/v1/agent-login/finish");
     assert_eq!(path::WORKDIR_CHANGES, "/v1/workdir/changes");
     assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
@@ -1862,6 +1937,9 @@ fn wire_format_snapshot() {
         conversations: Vec<ConversationsResult>,
         storage: StorageReport,
         usage_limits: Vec<UsageLimitsResult>,
+        login_start: Vec<LoginStartResult>,
+        login_finish: LoginFinish,
+        login_finish_results: Vec<LoginFinishResult>,
     }
     let actual = serde_json::to_string_pretty(&Snapshot {
         protocol_version: PROTOCOL_VERSION,
@@ -1895,6 +1973,9 @@ fn wire_format_snapshot() {
         conversations: all_conversations_results(),
         storage: storage_report(),
         usage_limits: all_usage_limits_results(),
+        login_start: all_login_start_results(),
+        login_finish: login_finish(),
+        login_finish_results: all_login_finish_results(),
     })
     .unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/wire.json");

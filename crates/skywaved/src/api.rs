@@ -134,7 +134,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use crate::agent::import::{self, Prepared};
 use crate::agent::mapper::cut_line;
 use crate::agent::{
-    self, AgentLogin, LimitsError, OutsideConversations, SourceError, UsageLimitsSource,
+    self, AgentLogin, LimitsError, LoginState, LoginStatus, OutsideConversations, SourceError,
+    UsageLimitsSource,
 };
 use crate::blobs::BlobStore;
 use crate::commands::Preparation;
@@ -209,8 +210,11 @@ pub(crate) struct Api {
     /// What an adopting `CreateSession` imports from.
     outside: Arc<dyn OutsideConversations>,
     usage_limits: Arc<dyn UsageLimitsSource>,
-    /// What a `hello` reads the agent's login expiry from.
+    /// What a `hello` reads the agent's login expiry, and whether a device
+    /// may log it in, from.
     login: Arc<dyn AgentLogin>,
+    /// What a `hello` reads whether the agent is logged out from.
+    login_state: LoginState,
     import_deadline: Duration,
     conversations_timeout: Duration,
     crop_deadline: Duration,
@@ -258,6 +262,7 @@ impl Api {
             outside: options.outside,
             usage_limits: options.usage_limits,
             login: options.login,
+            login_state: options.login_state,
             import_deadline: options.import_deadline,
             conversations_timeout: options.conversations_timeout,
             crop_deadline: options.crop_deadline,
@@ -421,6 +426,9 @@ async fn hello(
             shell: api.log.shell_enabled(),
             bypass: api.log.bypass_allowed(),
             login_expires,
+            agent_login_offered: api.login.offered(),
+            // Only a definite "not logged in": not knowing yet is not it.
+            agent_logged_out: api.login_state.status() == LoginStatus::LoggedOut,
         })
         .into_response(),
         Err(status) => status.into_response(),

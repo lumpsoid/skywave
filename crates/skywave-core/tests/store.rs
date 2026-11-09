@@ -161,6 +161,8 @@ fn fresh_store_is_empty_with_defaults() {
             shell_enabled: false,
             bypass_allowed: false,
             login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
         }
     );
 }
@@ -1708,6 +1710,59 @@ fn v28_opens_a_v27_replica_without_a_login_expiry() {
     assert_eq!(events, [created]);
 }
 
+/// A v28 replica opens as v29 with its settings and log as they were, and
+/// reads the agent's login as offered to no one and not logged out: v28
+/// never stored either. The next `hello` says both.
+#[test]
+fn v29_opens_a_v28_replica_without_the_agent_login_flags() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/x".into(),
+        context_name: "start".into(),
+        from: None,
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![event(id, 0, created.clone())],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    store.set_bypass_allowed(true).unwrap();
+    store.set_login_expires(Some(at(9))).unwrap();
+    drop(store);
+    // What v28 left: stamped 28, neither agent login setting.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 28", [])
+        .unwrap();
+    let keys: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM settings
+             WHERE key IN ('agent_login_offered', 'agent_logged_out')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(keys, 0);
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let settings = store.settings().unwrap();
+    assert!(settings.bypass_allowed);
+    assert_eq!(settings.login_expires, Some(at(9)));
+    assert!(!settings.agent_login_offered && !settings.agent_logged_out);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events, [created]);
+    store.set_agent_logged_out(true).unwrap();
+    assert!(store.settings().unwrap().agent_logged_out);
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
@@ -2429,6 +2484,8 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     store.set_composer_mode(log.a, ComposerMode::Shell).unwrap();
     store.set_shell_enabled(true).unwrap();
     store.set_login_expires(Some(at(9))).unwrap();
+    store.set_agent_login_offered(true).unwrap();
+    store.set_agent_logged_out(true).unwrap();
     store.switch_server_address("vpn.example:7443").unwrap();
     store.switch_server_address("old.example:7443").unwrap();
     assert_eq!(
@@ -2445,6 +2502,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
         .unwrap();
     store.set_blob_policy(BlobPolicy::Eager).unwrap();
     let before = store.load().unwrap();
+    assert!(before.settings.agent_login_offered && before.settings.agent_logged_out);
     let rows = server_rows(&dir);
     assert!(rows.iter().all(|(_, n)| *n > 0), "{rows:?}");
 
@@ -2471,8 +2529,10 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
             shell_enabled: false,
             bypass_allowed: false,
             login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
         },
-        "the blob policy is this device's; the shell flag, the login expiry \
+        "the blob policy is this device's; the shell flag, the agent's login \
          and the other addresses were the old server's"
     );
     assert!(!blob_file.exists(), "blob files go with their rows");
@@ -3195,6 +3255,88 @@ fn the_shell_flag_is_kept_in_the_settings() {
     assert!(store.load().unwrap().settings.shell_enabled);
     store.set_shell_enabled(false).unwrap();
     assert!(!store.settings().unwrap().shell_enabled);
+}
+
+/// A server's `hello` with the agent's login as it says it.
+fn hello_with_agent_login(offered: bool, logged_out: bool) -> skywave_proto::HelloResponse {
+    skywave_proto::HelloResponse {
+        protocol_version: skywave_proto::PROTOCOL_VERSION,
+        server_id: skywave_proto::ServerId::new(),
+        device_id: DeviceId::new(),
+        head: Seq::ZERO,
+        log: skywave_proto::LogRun {
+            log: skywave_proto::LogId::new(),
+            run: skywave_proto::RunId::new(),
+            since: None,
+        },
+        devices: Vec::new(),
+        shell: false,
+        bypass: false,
+        login_expires: None,
+        agent_login_offered: offered,
+        agent_logged_out: logged_out,
+    }
+}
+
+/// A `hello` keeps whether a device may log the agent in and whether it is
+/// logged out, in the replica and the view, each on its own; pairing with
+/// another server forgets both.
+#[test]
+fn a_hello_keeps_the_agent_login_until_another_server_is_paired() {
+    let (_tmp, dir) = data_dir();
+    let core = Core::open_detached(&dir).unwrap();
+    let seam = core.seam();
+    seam.pairing_succeeded("old.example:7443", paired_with(&ca_pem()))
+        .unwrap();
+    let kept = |offered: bool, logged_out: bool| {
+        let settings = Store::open(&dir).unwrap().settings().unwrap();
+        assert_eq!(
+            (settings.agent_login_offered, settings.agent_logged_out),
+            (offered, logged_out),
+            "stored"
+        );
+        let view = core.view();
+        assert_eq!(
+            (view.agent_login_offered, view.agent_logged_out),
+            (offered, logged_out),
+            "shown"
+        );
+    };
+    kept(false, false);
+    seam.hello_received(&hello_with_agent_login(true, false))
+        .unwrap();
+    kept(true, false);
+    seam.hello_received(&hello_with_agent_login(false, true))
+        .unwrap();
+    kept(false, true);
+    seam.hello_received(&hello_with_agent_login(true, true))
+        .unwrap();
+    kept(true, true);
+
+    seam.pairing_succeeded("new.example:7443", paired_with(&ca_pem()))
+        .unwrap();
+    kept(false, false);
+}
+
+#[test]
+fn the_agent_login_flags_are_kept_in_the_settings_until_a_hello_changes_them() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    let settings = store.settings().unwrap();
+    assert!(
+        !settings.agent_login_offered && !settings.agent_logged_out,
+        "off until a hello"
+    );
+    store.set_agent_login_offered(true).unwrap();
+    store.set_agent_logged_out(true).unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    let settings = store.load().unwrap().settings;
+    assert!(settings.agent_login_offered && settings.agent_logged_out);
+    assert!(!settings.bypass_allowed && !settings.shell_enabled);
+    store.set_agent_logged_out(false).unwrap();
+    let settings = store.settings().unwrap();
+    assert!(settings.agent_login_offered && !settings.agent_logged_out);
 }
 
 #[test]

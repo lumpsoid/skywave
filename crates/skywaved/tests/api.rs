@@ -26,8 +26,11 @@ use skywave_proto::{
     ShellEnd, ShellRunStorage, StorageReport, ToolResult, UsageLimit, UsageLimitsResult, limits,
     path,
 };
+use skywaved::agent::claude_code::login::ClaudeLogin;
 use skywaved::agent::fake::Gate;
-use skywaved::agent::{AgentLogin, LimitsError, UsageLimitsSource};
+use skywaved::agent::{
+    AgentLogin, LimitsError, LoginSeen, LoginSource, LoginState, NoAgentLogin, UsageLimitsSource,
+};
 use skywaved::blobs::BlobStore;
 use skywaved::crop::CropHook;
 use skywaved::disk::{Disk, FreeSpace};
@@ -448,12 +451,37 @@ async fn hello_names_the_caller_and_records_last_seen() {
             shell: false,
             bypass: false,
             login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
         }
     );
     let device = devices::get(f.storage.db.conn(), creds.id)
         .unwrap()
         .unwrap();
     assert!(device.last_seen.is_some());
+    // Telling a device whether the agent is logged in started no process
+    // of the agent's (which would leave a `pid.txt`): it is learned from
+    // session processes only. The walk does see files (the database).
+    let files = files_under(f._tmp.path());
+    assert!(files.iter().any(|p| p.ends_with("skywave.db")), "{files:?}");
+    assert!(!files.iter().any(|p| p.ends_with("pid.txt")), "{files:?}");
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_owned()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 /// `hello`'s log is the database's: its id stays with the database, and
@@ -1227,6 +1255,54 @@ struct SetLogin(std::sync::Mutex<Option<DateTime<Utc>>>);
 impl AgentLogin for SetLogin {
     fn expires(&self) -> Option<DateTime<Utc>> {
         *self.0.lock().unwrap()
+    }
+
+    fn offered(&self) -> bool {
+        true
+    }
+}
+
+/// `agent_login_offered` follows the agent's login; `agent_logged_out`
+/// follows the supervisor's cell, read on every hello, under any login.
+#[tokio::test(flavor = "multi_thread")]
+async fn hello_says_whether_a_device_may_log_the_agent_in_and_whether_it_is_logged_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let credentials = tmp.path().join(".credentials.json");
+    let logins: [(&str, Arc<dyn AgentLogin>, bool); 3] = [
+        ("no agent login", Arc::new(NoAgentLogin), false),
+        (
+            "environment login",
+            Arc::new(ClaudeLogin::new(credentials.clone(), true)),
+            false,
+        ),
+        (
+            "stored login",
+            Arc::new(ClaudeLogin::new(credentials, false)),
+            true,
+        ),
+    ];
+    for (name, login, offered) in logins {
+        let state = LoginState::new();
+        let options = ServerOptions {
+            login,
+            login_state: state.clone(),
+            ..ServerOptions::default()
+        };
+        let f = Fixture::start_configured(|log| log, options).await;
+        let creds = f.pair().await;
+        let mut device = f.client(&creds).await;
+        let hello: HelloResponse = device.get(path::HELLO).await.json();
+        assert_eq!(hello.agent_login_offered, offered, "{name}");
+        assert!(!hello.agent_logged_out, "{name}: not known yet");
+
+        assert!(state.apply(false, LoginSource::Start, &LoginSeen::started(0)));
+        let hello: HelloResponse = device.get(path::HELLO).await.json();
+        assert!(hello.agent_logged_out, "{name}");
+        assert_eq!(hello.agent_login_offered, offered, "{name}");
+
+        state.login_succeeded();
+        let hello: HelloResponse = device.get(path::HELLO).await.json();
+        assert!(!hello.agent_logged_out, "{name}: logged in");
     }
 }
 
