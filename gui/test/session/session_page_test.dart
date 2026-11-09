@@ -2034,6 +2034,36 @@ void main() {
     expect(sent, [info]);
   });
 
+  testWidgets('the More menu archives an active session and unarchives an '
+      'archived one', (tester) async {
+    final sent = <GuiIntent>[];
+    for (final (label, title, archived) in [
+      (null, 'Archive', true),
+      ('archived · a message brings it back', 'Unarchive', false),
+    ]) {
+      await pumpSession(
+        tester,
+        screen: screenWith(archivedLabel: label),
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(title));
+      await tester.pumpAndSettle();
+      expect(
+        sent.last,
+        GuiIntentAct(
+          action: ActionIntentSetSessionArchived(
+            sessionId: 's1',
+            archived: archived,
+          ),
+        ),
+        reason: title,
+      );
+    }
+  });
+
   testWidgets('header actions and the rename prompt', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -2130,6 +2160,7 @@ void main() {
         'New context',
         'Contexts…',
         'Background work',
+        'Archive',
         'Stop agent',
       ]) {
         expect(find.text(title), findsOneWidget, reason: title);
