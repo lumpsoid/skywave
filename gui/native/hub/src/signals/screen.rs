@@ -91,6 +91,10 @@ pub enum ScreenView {
         /// The pinned server CA fingerprint, to compare with what
         /// `skywaved` prints.
         fingerprint: Option<String>,
+        /// When the agent's login on the server expires, however far off:
+        /// `expires in 12 days · 2026-11-21`, `expired · 2026-11-08`, `no
+        /// expiry reported`; `None` while unpaired.
+        agent_login: Option<String>,
         /// Whether the link stays open with the app in the background
         /// (the head's own preference, not the core's); `None` where it
         /// is not offered: everywhere but Android.

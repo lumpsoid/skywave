@@ -47,6 +47,11 @@ pub struct ViewState {
     pub can_go_back: bool,
     /// This device's saved prompts, the most recently used or saved first.
     pub snippets: Vec<Snippet>,
+    /// When the agent's login on the server expires, as the server's last
+    /// `hello` said; `None` when it does not or the server cannot tell.
+    /// Present on every screen: heads warn as it nears
+    /// (`skywave_present::login`).
+    pub login_expires: Option<DateTime<Utc>>,
 }
 
 /// Approvals some agent is blocked on (D8), so a head can point at them

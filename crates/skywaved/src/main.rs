@@ -6,8 +6,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::limits::ClaudeUsageLimits;
+use skywaved::agent::claude_code::login::ClaudeLogin;
 use skywaved::agent::claude_code::transcripts::{self, ClaudeTranscripts};
-use skywaved::agent::{NoOutsideConversations, OutsideConversations};
+use skywaved::agent::{AgentLogin, NoAgentLogin, NoOutsideConversations, OutsideConversations};
 use skywaved::config::{Config, ProcessEnv};
 #[cfg(unix)]
 use skywaved::control::{Client, Confirm, Control, Reply, Request, When};
@@ -295,9 +296,19 @@ async fn serve(
         ClaudeCodeAdapter::new(config.agent.clone()),
         limits_workdir,
     ));
+    // The agent's login, read from the credentials the CLI the adapter
+    // spawns uses, so devices warn before it expires.
+    let login: Arc<dyn AgentLogin> = match ClaudeLogin::from_env() {
+        Some(login) => Arc::new(login),
+        None => {
+            tracing::warn!("no CLAUDE_CONFIG_DIR or HOME: the agent's login expiry cannot be read");
+            Arc::new(NoAgentLogin)
+        }
+    };
     let options = ServerOptions {
         outside,
         usage_limits,
+        login,
         log_file: config.log_file.clone(),
         ..ServerOptions::default()
     };
