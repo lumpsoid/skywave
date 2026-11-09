@@ -20,7 +20,8 @@
 //!   read, and why there is nothing to list.
 //! - [`link`]: why the link is reconnecting, and the re-pair notice for
 //!   a rejection only pairing again fixes.
-//! - [`login`]: the warning that the agent's login expires soon.
+//! - [`login`]: the warning that the agent's login expires soon or is
+//!   gone, and where a login from this device stands.
 //! - [`markdown`]: an agent message as flat blocks of styled spans, and
 //!   which of its links a head may open.
 //! - [`output`]: where a shell run's whole output is, the download it

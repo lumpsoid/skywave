@@ -95,6 +95,9 @@ pub enum ScreenView {
         /// `expires in 12 days · 2026-11-21`, `expired · 2026-11-08`, `no
         /// expiry reported`; `None` while unpaired.
         agent_login: Option<String>,
+        /// Logging the server's agent in from this device; `None` while
+        /// unpaired.
+        login: Option<AgentLoginView>,
         /// Whether the link stays open with the app in the background
         /// (the head's own preference, not the core's); `None` where it
         /// is not offered: everywhere but Android.
@@ -164,6 +167,52 @@ pub enum ScreenView {
     Crop {
         crop: CropScreen,
     },
+}
+
+/// Logging the server's agent in from this device, on the settings screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct AgentLoginView {
+    /// The server offers a login from a device: the tile shows `Log in`
+    /// (`StartAgentLogin`), always, so the login can be renewed early.
+    pub can_log_in: bool,
+    /// The server says its agent is logged out.
+    pub logged_out: bool,
+    pub state: LoginFlowState,
+    /// The page to log in at, to open or copy, while a login is open, its
+    /// code on its way, or unanswered; `None` otherwise.
+    pub url: Option<String>,
+    /// Where the login stands, in lines: the steps, why a code was not
+    /// sent, why it got no answer, how the login ended. Empty when there is
+    /// nothing to say.
+    pub lines: Vec<String>,
+    /// `StartAgentLogin` would start one: offered, and none is under way
+    /// (idle, ended, or open, which a new start joins).
+    pub can_start: bool,
+    /// `FinishAgentLogin` takes a pasted code: a login is open.
+    pub can_finish: bool,
+    /// `RetryAgentLogin` sends the unanswered code again.
+    pub can_retry: bool,
+    /// `DismissAgentLogin` forgets the login: one is started or ended.
+    pub can_dismiss: bool,
+}
+
+/// Where this device's login of the server's agent stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]
+pub enum LoginFlowState {
+    /// None started, or the last one dismissed.
+    Idle,
+    /// Asked the server to start one.
+    Starting,
+    /// Open at `url`: waiting for the pasted code.
+    Open,
+    /// The pasted code is on its way.
+    Finishing,
+    /// The pasted code got no answer; `RetryAgentLogin` sends it again.
+    NoAnswer,
+    /// The agent is logged in.
+    LoggedIn,
+    /// The login ended without logging in; `lines` say why.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]

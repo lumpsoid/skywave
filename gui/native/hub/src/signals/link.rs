@@ -42,9 +42,16 @@ pub struct LinkUpdate {
     pub elsewhere_label: Option<String>,
     /// `agent login expires in 2 days · log in again on the server`, `agent
     /// login expired · …`, within three days of the agent's login expiring
-    /// on the server; `None` otherwise. The banner shows it whatever the
-    /// link, even while online with nothing else to say.
+    /// on the server; `None` otherwise. Says `from settings` instead of
+    /// `on the server` where the server offers a login from a device. The
+    /// banner shows it whatever the link, even while online with nothing
+    /// else to say.
     pub login_label: Option<String>,
+    /// `agent not logged in · log in from settings` (or `… on the server`
+    /// where the server offers no login from a device) while the server
+    /// says its agent is logged out; `None` otherwise. Shown as
+    /// `login_label` is, ahead of it.
+    pub logged_out_label: Option<String>,
 }
 
 /// The link's state, for the banner's colour and icon.
