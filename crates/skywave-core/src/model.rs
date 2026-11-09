@@ -201,7 +201,8 @@ pub(crate) struct Model {
     place: Place,
     settings: Settings,
     cursor: Seq,
-    /// Most recently active (highest `last_seq`) first, like the store.
+    /// Most recently written to (highest `last_message_seq`) first, like
+    /// the store.
     sessions: Vec<SessionSummary>,
     /// Oldest first, finished entries included.
     outbox: Vec<OutboxEntry>,
@@ -1556,7 +1557,8 @@ impl Model {
                 }
             }
         }
-        self.sessions.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
+        self.sessions
+            .sort_by(|a, b| b.last_message_seq.cmp(&a.last_message_seq));
         self.note_new_approvals()
     }
 
@@ -6156,9 +6158,9 @@ mod tests {
         let old = f.session("/srv/old");
         let mid = f.session("/srv/mid");
         let new = f.session("/srv/new");
-        f.log(old, vec![agent("done")]);
+        f.log(old, vec![message("go"), agent("done")]);
         f.log(new, vec![agent("done")]);
-        assert_eq!(lists(&mut f).0, vec![new, old, mid]);
+        assert_eq!(lists(&mut f).0, vec![old, new, mid]);
         let other = DeviceId::new();
         f.log(old, vec![archived_event(true, other)]);
         f.log(mid, vec![archived_event(true, other)]);
@@ -6167,7 +6169,7 @@ mod tests {
         f.log(old, vec![archived_event(false, other)]);
         assert_eq!(
             lists(&mut f),
-            (vec![new, old], vec![mid]),
+            (vec![old, new], vec![mid]),
             "archiving is not activity"
         );
         assert_eq!(unread(&f, old), 1, "nor news");
@@ -6184,6 +6186,25 @@ mod tests {
         assert_eq!(row(&f, mid).pending_approvals, 1);
         f.dispatch(Action::OpenNextApproval);
         assert_eq!(f.model.open_session(), Some(mid));
+    }
+
+    #[test]
+    fn only_a_user_message_moves_a_session_up_the_list() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        let new = f.session("/srv/new");
+        f.log(
+            old,
+            vec![
+                agent("working"),
+                approval_requested(ApprovalId::new(), None),
+            ],
+        );
+        assert_eq!(lists(&mut f).0, vec![new, old], "the agent's activity");
+        f.log(old, vec![message("go on")]);
+        assert_eq!(lists(&mut f).0, vec![old, new]);
+        f.log(new, vec![agent("done")]);
+        assert_eq!(lists(&mut f).0, vec![old, new]);
     }
 
     fn usage(f: &Fixture) -> UsageView {
