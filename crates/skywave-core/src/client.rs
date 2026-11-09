@@ -371,7 +371,10 @@ impl Core {
                     Effect::Enqueue(command) => state.store.enqueue(&command),
                     Effect::SaveBlobPolicy(policy) => state.store.set_blob_policy(policy),
                     Effect::SaveServerAddress(address) => {
-                        state.store.set_server_address(Some(&address))
+                        state.store.switch_server_address(&address)
+                    }
+                    Effect::ForgetServerAddress(address) => {
+                        state.store.forget_server_address(&address)
                     }
                     Effect::SaveDraft((id, mode), draft) => {
                         state.store.set_draft(id, mode, draft.as_ref())

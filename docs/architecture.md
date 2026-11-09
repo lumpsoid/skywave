@@ -685,6 +685,12 @@ D9. The server owns a CA; every device holds a certificate it signed.
   percent-encoded, `code` without `-`, `fp` as 64 lowercase hex digits.
   The core parses it (`parse_pair_uri`) so heads don't. An address without
   a port means 7443.
+- **Addresses:** a paired device can reach its server at another address
+  (`SetServerAddress`) without re-pairing: the pinned CA still decides
+  whom it trusts. The address it leaves, or the one a re-pair with the
+  same CA replaces, is kept among the server's other addresses
+  (`Settings::other_addresses`, a setting of the replica), to switch back
+  to in one step or forget. Pairing with another server drops them.
 - The device key and certificate live in the core's data directory behind
   the `Identity` trait, so a platform keystore can replace it.
 
@@ -1083,6 +1089,13 @@ logs) an event that no longer decodes rather than failing.
   device's delete pulled while the screen is open, or this device's own
   settled in the log before the refresh it asked for answers. The fate
   decides the row; nothing asks the server again for it.
+- **Server addresses page** (`Route::ServerAddresses`,
+  `Screen::ServerAddresses(ServerAddressesView)`): the address in use and
+  the server's other addresses (see Pairing), from the replica's settings.
+  `SetServerAddress` connects to a typed or listed one and
+  `ForgetServerAddress` drops one. Back returns to the settings. The GUI
+  opens it from the settings' server tile; the TUI changes the address
+  from its settings (`a`) and never opens it.
 - **Usage limits page** (`Route::UsageLimits`): the replica keeps the
   latest answer (`usage_limits`, one row, cleared with the replica), so
   the page reads offline with the time the agent reported it. Opening it

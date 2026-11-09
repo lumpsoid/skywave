@@ -43,12 +43,12 @@ use crate::view::{
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
     LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, Pause,
     PendingApprovalRef, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
-    SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionInfoView, SessionListView, SessionRef,
-    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun,
-    ShellRunState, ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader,
-    SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView,
-    UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody,
-    WorkdirPane, WorkdirView,
+    SHELL_ALERT_AFTER, Screen, Seq, ServerAddressesView, SessionId, SessionInfoView,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage, TimelineItem,
+    ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable, UsageSession,
+    UsageView, ViewState, WorkdirBody, WorkdirPane, WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -59,7 +59,9 @@ pub(crate) enum Effect {
     /// Write the command to the outbox.
     Enqueue(Command),
     SaveBlobPolicy(BlobPolicy),
+    /// Switch to the address ([`Settings::switch_to`](crate::Settings::switch_to)).
     SaveServerAddress(String),
+    ForgetServerAddress(String),
     /// Keep the session's draft in that mode; `None` deletes it.
     SaveDraft((SessionId, ComposerMode), Option<Draft>),
     SaveComposerMode(SessionId, ComposerMode),
@@ -99,6 +101,7 @@ enum Place {
     SessionList,
     Archived,
     Settings,
+    ServerAddresses,
     Pairing,
     Usage,
     Storage,
@@ -151,6 +154,7 @@ impl From<Route> for Place {
             Route::SessionList => Place::SessionList,
             Route::ArchivedSessions => Place::Archived,
             Route::Settings => Place::Settings,
+            Route::ServerAddresses => Place::ServerAddresses,
             Route::Pairing => Place::Pairing,
             Route::Usage => Place::Usage,
             Route::Storage => Place::Storage,
@@ -422,12 +426,19 @@ impl Model {
                 {
                     return Vec::new();
                 }
-                self.settings.server_address = Some(address.to_owned());
+                self.settings.switch_to(address);
                 self.link = Link::Connecting;
                 vec![
                     Effect::SaveServerAddress(address.to_owned()),
                     Effect::Request(Request::Connect),
                 ]
+            }
+            Action::ForgetServerAddress { address } => {
+                let address = address.trim();
+                if !self.settings.forget(address) {
+                    return Vec::new();
+                }
+                vec![Effect::ForgetServerAddress(address.to_owned())]
             }
             Action::CreateSession {
                 workdir,
@@ -985,6 +996,7 @@ impl Model {
             Place::Archived | Place::Settings | Place::Pairing | Place::Usage | Place::Storage => {
                 Route::SessionList
             }
+            Place::ServerAddresses => Route::Settings,
             Place::UsageLimits(from) => {
                 return Some(match from.filter(|id| self.summary(*id).is_some()) {
                     Some(id) => Action::OpenSession(id),
@@ -1865,7 +1877,8 @@ impl Model {
 
     pub(crate) fn paired(&mut self, paired: Paired, address: String) {
         self.paired = Some(paired);
-        self.settings.server_address = Some(address);
+        // Another server's reset already emptied the other addresses.
+        self.settings.switch_to(&address);
         self.pairing = PairingStatus::Idle;
         self.place = Place::SessionList;
         self.open = None;
@@ -2004,8 +2017,13 @@ impl Model {
                 blob_policy: self.settings.blob_policy,
                 blobs_disk_full: self.blobs_disk_full,
                 server_address: self.settings.server_address.clone(),
+                other_addresses: self.settings.other_addresses.clone(),
                 device_id: self.device(),
                 server_fingerprint: self.paired.and_then(|p| p.server),
+            }),
+            Place::ServerAddresses => Screen::ServerAddresses(ServerAddressesView {
+                current: self.settings.server_address.clone(),
+                others: self.settings.other_addresses.clone(),
             }),
             Place::SessionList => Screen::SessionList(self.session_list(ListKind::Active)),
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
@@ -6612,10 +6630,66 @@ mod tests {
         match f.model.view().screen {
             Screen::Settings(settings) => {
                 assert_eq!(settings.server_address.as_deref(), Some("10.0.0.7:7443"));
+                assert_eq!(settings.other_addresses, ["host:7443"]);
                 assert_eq!(settings.device_id, Some(f.me));
             }
             other => panic!("expected settings, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_left_address_is_kept_to_switch_back_to_or_forget() {
+        let mut f = Fixture::paired();
+        f.model.paired(paired_as(f.me), "home:7443".into());
+        f.dispatch(Action::SetServerAddress {
+            address: "vpn:7443".into(),
+        });
+        f.dispatch(Action::SetServerAddress {
+            address: "public:7443".into(),
+        });
+        assert_eq!(f.model.settings.other_addresses, ["home:7443", "vpn:7443"]);
+
+        f.dispatch(Action::SetServerAddress {
+            address: "home:7443".into(),
+        });
+        assert_eq!(
+            f.model.settings.server_address.as_deref(),
+            Some("home:7443")
+        );
+        assert_eq!(
+            f.model.settings.other_addresses,
+            ["vpn:7443", "public:7443"]
+        );
+
+        // Pairing again at a new address keeps the one it leaves.
+        f.model.paired(paired_as(f.me), "lan:7443".into());
+        assert_eq!(
+            f.model.settings.other_addresses,
+            ["vpn:7443", "public:7443", "home:7443"]
+        );
+
+        let forget = |address: &str| Action::ForgetServerAddress {
+            address: address.into(),
+        };
+        assert!(f.dispatch(forget("lan:7443")).is_empty(), "the current one");
+        assert!(f.dispatch(forget("other:7443")).is_empty(), "not kept");
+        assert_eq!(
+            f.dispatch(forget(" vpn:7443 ")),
+            vec![Effect::ForgetServerAddress("vpn:7443".into())]
+        );
+        assert_eq!(
+            f.model.settings.other_addresses,
+            ["public:7443", "home:7443"]
+        );
+
+        f.dispatch(Action::Navigate(Route::ServerAddresses));
+        assert_eq!(
+            f.model.view().screen,
+            Screen::ServerAddresses(ServerAddressesView {
+                current: Some("lan:7443".into()),
+                others: vec!["public:7443".into(), "home:7443".into()],
+            })
+        );
     }
 
     #[test]
@@ -9572,6 +9646,7 @@ mod tests {
         match &view.screen {
             Screen::Pairing(_) => "pairing",
             Screen::Settings(_) => "settings",
+            Screen::ServerAddresses(_) => "server addresses",
             Screen::Usage(_) => "usage",
             Screen::Storage(_) => "storage",
             Screen::UsageLimits(_) => "usage limits",
@@ -9617,6 +9692,12 @@ mod tests {
             "active list",
         );
         assert_back(&mut f, nav(Route::Settings), "settings", "active list");
+        assert_back(
+            &mut f,
+            nav(Route::ServerAddresses),
+            "server addresses",
+            "settings",
+        );
         assert_back(&mut f, nav(Route::Usage), "usage", "active list");
         assert_back(&mut f, nav(Route::Storage), "storage", "active list");
         // Re-pairing a paired device can be cancelled.

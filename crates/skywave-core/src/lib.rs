@@ -88,11 +88,11 @@ pub use view::{
     PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession, PermissionMode,
     QUESTION_TOOL, Question, QuestionAnswer, QuestionOption, QuestionPrompt, Refusal, RejectReason,
     RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId, Screen, Seq,
-    SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    SubagentHeader, SubagentStatus, SubagentUsage, TaskId, TaskKind, TimelineItem, ToolApproval,
-    ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody,
-    WorkdirFetch, WorkdirPane, WorkdirView,
+    ServerAddressesView, SessionId, SessionListView, SessionRef, SessionRow, SessionState,
+    SessionView, SettingChange, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
+    ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus, SubagentUsage, TaskId, TaskKind,
+    TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession,
+    UsageView, ViewState, WorkdirBody, WorkdirFetch, WorkdirPane, WorkdirView,
 };
 pub use view::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,

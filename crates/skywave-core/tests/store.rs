@@ -157,6 +157,7 @@ fn fresh_store_is_empty_with_defaults() {
         Settings {
             blob_policy: BlobPolicy::OnDemand,
             server_address: None,
+            other_addresses: Vec::new(),
             shell_enabled: false,
             bypass_allowed: false,
         }
@@ -415,6 +416,28 @@ fn reopen_restores_state() {
 
     store.set_server_address(None).unwrap();
     assert_eq!(store.settings().unwrap().server_address, None);
+}
+
+#[test]
+fn switching_the_server_address_keeps_the_old_one_until_forgotten() {
+    let (_tmp, dir) = data_dir();
+    {
+        let store = Store::open(&dir).unwrap();
+        store.switch_server_address("home:7443").unwrap();
+        store.switch_server_address("vpn:7443").unwrap();
+        store.switch_server_address("public:7443").unwrap();
+        store.switch_server_address("home:7443").unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    let settings = store.settings().unwrap();
+    assert_eq!(settings.server_address.as_deref(), Some("home:7443"));
+    assert_eq!(settings.other_addresses, ["vpn:7443", "public:7443"]);
+
+    store.forget_server_address("home:7443").unwrap();
+    store.forget_server_address("vpn:7443").unwrap();
+    assert_eq!(store.settings().unwrap().other_addresses, ["public:7443"]);
+    store.forget_server_address("public:7443").unwrap();
+    assert!(store.settings().unwrap().other_addresses.is_empty());
 }
 
 fn send(session_id: SessionId, text: &str) -> Command {
@@ -2288,6 +2311,12 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     store.set_draft(log.a, AGENT, Some(&draft)).unwrap();
     store.set_composer_mode(log.a, ComposerMode::Shell).unwrap();
     store.set_shell_enabled(true).unwrap();
+    store.switch_server_address("vpn.example:7443").unwrap();
+    store.switch_server_address("old.example:7443").unwrap();
+    assert_eq!(
+        store.settings().unwrap().other_addresses,
+        ["vpn.example:7443"]
+    );
     let mark = ReadMark {
         seq: Seq(3),
         notable: 1,
@@ -2320,10 +2349,12 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
         Settings {
             blob_policy: BlobPolicy::Eager,
             server_address: Some("new.example:7443".into()),
+            other_addresses: Vec::new(),
             shell_enabled: false,
             bypass_allowed: false,
         },
-        "the blob policy is this device's; the shell flag was the old server's"
+        "the blob policy is this device's; the shell flag and the other \
+         addresses were the old server's"
     );
     assert!(!blob_file.exists(), "blob files go with their rows");
 

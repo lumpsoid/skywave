@@ -443,6 +443,7 @@ fn screen_kind(update: &ScreenUpdate) -> &'static str {
         ScreenView::SessionList { .. } => "session list",
         ScreenView::Session { .. } => "session",
         ScreenView::Settings { .. } => "settings",
+        ScreenView::ServerAddresses { .. } => "server addresses",
         ScreenView::Usage { .. } => "usage",
         ScreenView::Storage { .. } => "storage",
         ScreenView::UsageLimits { .. } => "usage limits",
