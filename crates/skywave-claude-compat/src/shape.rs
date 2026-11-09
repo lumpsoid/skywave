@@ -21,9 +21,10 @@ pub enum Shape {
     Broken(String),
 }
 
-/// Kinds the adapter knows and ignores: progress signals only, and
+/// Kinds the adapter knows and ignores: progress signals only,
 /// `compact_boundary`, as the next `result` gives the fill after a
-/// compaction (docs/agents/claude-code.md §2.6).
+/// compaction (docs/agents/claude-code.md §2.6), and `commands_changed`,
+/// as the adapter reads no slash-command list (§3.17).
 const IGNORED: &[&str] = &[
     "rate_limit_event",
     "stream_event",
@@ -34,6 +35,7 @@ const IGNORED: &[&str] = &[
     "system/task_notification",
     "system/permission_denied",
     "system/compact_boundary",
+    "system/commands_changed",
 ];
 
 /// Checks one stdout message.

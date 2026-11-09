@@ -1168,6 +1168,68 @@ the CLI inherits logs it in another way (`ANTHROPIC_API_KEY`,
 days themselves (`skywave_present::login`). A login kept outside the file
 (a keychain) reads as no expiry.
 
+### 3.17 Logging in over stream-json [C] (`login.ndjson`)
+
+Recorded 2026-11-09 with 2.1.310 (haiku) by a Python driver, with a fresh
+`CLAUDE_CONFIG_DIR` and none of the variables that log the CLI in another
+way (§3.16). Only the manual-code flow is used: the other redirect goes to
+a listener on the server's localhost, which a device's browser cannot
+reach.
+
+**Logged out is visible at start.** The `initialize` answer carries
+`account: {"tokenSource": "none", "apiProvider": "firstParty"}` (no
+`email`) when no login exists, before any turn runs.
+
+**1. Start the flow:**
+
+```json
+{"type":"control_request","request_id":"…","request":{"subtype":"claude_authenticate","loginWithClaudeAi":true}}
+```
+
+answered at once with two authorize URLs on
+`https://claude.com/cai/oauth/authorize` (a PKCE S256 challenge, a
+`state`, the CLI's `client_id` and scopes):
+`{"manualUrl": "…&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback…", "automaticUrl": "…&redirect_uri=http%3A%2F%2Flocalhost%3A<port>%2Fcallback…"}`.
+The CLI opens no browser here. `loginWithClaudeAi: false` asks for a
+Console login instead. A second `claude_authenticate` while a flow is open
+joins it and answers the same URLs.
+
+**2. The user signs in** at `manualUrl`. The page shows one string,
+`<code>#<state>`, to copy.
+
+**3. Finish it:** split the string at `#` and send both halves:
+
+```json
+{"type":"control_request","request_id":"…","request":{"subtype":"claude_oauth_callback","authorizationCode":"<code>","state":"<state>"}}
+```
+
+The CLI exchanges the code at `https://platform.claude.com/v1/oauth/token`,
+fetches the profile and writes `.credentials.json` (`claudeAiOauth`:
+`accessToken`, `refreshToken`, `expiresAt` 8 h out, `refreshTokenExpiresAt`
+about 30 days out, `scopes`, `subscriptionType`, `subscriptionTypeSource`,
+`rateLimitTier`) before it answers. First comes a
+`system/commands_changed` with the whole command list (the plan's commands
+appear: `usage-credits`, `extra-usage`, `schedule`), then the success:
+
+```json
+{"account":{"email":"…","organization":"…","subscriptionType":"Claude Max","apiProvider":"firstParty"}}
+```
+
+An exchange that fails answers an error with the CLI's words.
+`claude_oauth_wait_for_completion` (no fields) waits for the same outcome
+without passing a code; it is for the localhost redirect and of no use
+here. Either one without an open flow is the error `No active
+claude_authenticate flow`.
+
+**4. The process is logged in.** The next user message ran a normal turn
+(`system/init`, OK, `result/success`) without a restart, and closing
+stdin ended the process with exit 0.
+
+From the source, not yet probed: the flow refuses to start when managed
+settings forbid it (`forceLoginMethod` of the other kind, or an
+`allowedProviders` without first-party), and a pasted state that does not
+match the flow's fails the exchange.
+
 ## 4. Interrupt
 
 Request **[C]**:

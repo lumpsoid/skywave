@@ -5,7 +5,7 @@ own README.)
 
 Real recordings of Claude Code CLI **2.1.310** on haiku, except the three
 `context` rows at the end (2026-11-08, opus with sonnet subagents). All but
-three were made by `skywave-claude-compat --only <name> --record <dir>`, on
+four were made by `skywave-claude-compat --only <name> --record <dir>`, on
 2026-11-05 unless their row says otherwise:
 the scenario of the same name drives the CLI through the adapter's
 `Protocol`, so every stdin line is what skywaved writes, and every `user`
@@ -55,6 +55,7 @@ scrubbing below.
 - The home directory path became `$HOME`.
 - Every thinking-block `signature` (an opaque base64 string) became `<scrubbed-signature>`.
 - Every `get_settings` answer keeps only `response.applied`: its `effective` and `sources` hold the merged settings layers (a real user's `env`, hooks and permission rules).
+- In `login.ndjson` only, by hand: the `claude_oauth_callback`'s `authorizationCode` became `<scrubbed-code>` and its `state` `<scrubbed-state>`, and the authorize URLs' `state` and `code_challenge` parameters became placeholders too. `--scrub` does not do this.
 - Every `get_usage` answer keeps only `rate_limits_available`, `rate_limits.limits` and `behaviors`: the rest names the plan, the spend and how use splits across products, and the process's own `session` cost.
 
 Nothing else was changed. Session ids, message ids and request ids are the real values.
@@ -97,4 +98,5 @@ Nothing else was changed. Session ids, message ids and request ids are the real 
 | `permission_mode_errors.ndjson` | 2026-10-31, control requests only, no user message. `set_permission_mode` `plan` succeeds, then `bypassPermissions` (`bypass_not_launched`) and `bogus` (`invalid_mode`) are rejected; an `initialize` after each reads `current_permission_mode` back. |
 | `model_switch.ndjson` | 2026-10-31, task 34f66d, a Python driver, control requests only, no user message. `set_model` `sonnet` and `claude-opus-4-7` succeed with the resolved model, `bogus-model` is rejected (`not_found`), `default` and a request with no `model` both switch to the account default; an `initialize` between some steps shows it does not report the current model. |
 | `get_usage.ndjson` | 2026-11-08, claude 2.1.310, `skywave-claude-compat --only get_usage`. No `initialize`: the one line written is the `get_usage` (`skip_behaviors: true`) the usage limits read sends, answered within a second with three limits: `session` at 80% (`warning`), `weekly_all` at 22% and `weekly_scoped` of model `Fable` at 0% (`normal`), `behaviors: null`. Closing stdin ends the process (exit 0); no transcript is written for its session id. |
+| `login.ndjson` | 2026-11-09, claude 2.1.310, a Python driver run in a scratch dir under the repo's `.scratch/`, with a fresh `CLAUDE_CONFIG_DIR`, no login variables and no `--settings` (`docs/agents/claude-code.md` §3.17). `initialize` without the Stop hook and with no `get_settings`: its `account` is `{tokenSource: "none"}`. `claude_authenticate` (`loginWithClaudeAi: true`) answers `manualUrl` and `automaticUrl`; a person signed in at `manualUrl` and pasted the `code#state` it showed; `claude_oauth_callback` with both halves gets `system/commands_changed` and then a success naming the account. One turn (OK) then runs on the new login in the same process, and the CLI exits 0 when stdin is closed. |
 | `effort_switch.ndjson` | 2026-10-31, a Python driver, control requests only, no user message, `step:` notes. It writes exactly what the adapter writes, in its order: each `get_settings` goes out only when the answer it follows comes. (1) `initialize`, then an unasked `get_settings` (`medium`). (2, 3) `apply_flag_settings` `high`, `max`, each acked with an empty success and read back. (4) `low` and `medium` as two queued requests: `medium`'s apply waits for `low`'s read. (5) `set_model claude-haiku-4-5-20251001` reads `effort: null`; `high` is acked and still reads `null`. (6) `set_model sonnet` reads `high`: the level outlasted the model that took none. (7) A start: `set_model opus` and the apply `xhigh` pipelined, a read after each answer; both read `xhigh` on opus. |
