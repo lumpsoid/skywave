@@ -302,8 +302,8 @@ pub enum ActionIntent {
         session_id: String,
         task_id: String,
     },
-    /// Start a session in the open session's workdir and open it once
-    /// the server logged it.
+    /// Start a session in the session's workdir, from its page or the
+    /// session list, and open it once the server logged it.
     CreateSessionLike {
         session_id: String,
     },
