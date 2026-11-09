@@ -615,7 +615,7 @@ impl Seam {
             if same_server {
                 // Address first: an address without an identity is
                 // harmless, the device simply stays unpaired.
-                state.store.set_server_address(Some(address))?;
+                state.store.switch_server_address(address)?;
             } else {
                 // The reset commits (with the address) before the new
                 // identity is saved: a crash in between leaves the old

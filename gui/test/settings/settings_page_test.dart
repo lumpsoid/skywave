@@ -22,7 +22,7 @@ void main() {
             blobPolicy: BlobPolicyView.onDemand,
             blobPolicyLabel: "A tool's blob downloads when you expand it.",
             server: 'srv:7443',
-            editableAddress: 'srv:7443',
+            serverAddresses: null,
             device: 'dev-1',
             fingerprint: 'AB:CD',
             stayConnected: null,
@@ -63,15 +63,15 @@ void main() {
 
   Widget settings(
     List<GuiIntent> sent, {
-    String? editableAddress,
+    String? serverAddresses,
     bool? stayConnected,
   }) => MaterialApp(
     home: SettingsPage(
       screen: ScreenViewSettings(
         blobPolicy: BlobPolicyView.onDemand,
         blobPolicyLabel: "A tool's blob downloads when you expand it.",
-        server: editableAddress ?? 'not paired',
-        editableAddress: editableAddress,
+        server: serverAddresses == null ? 'not paired' : 'srv:7443',
+        serverAddresses: serverAddresses,
         device: 'dev-1',
         fingerprint: null,
         stayConnected: stayConnected,
@@ -104,34 +104,23 @@ void main() {
     expect(sent, [const GuiIntentSetStayConnected(on: false)]);
   });
 
-  testWidgets('a paired server address is changed in place', (tester) async {
+  testWidgets('a paired server tile opens its addresses', (tester) async {
     final sent = <GuiIntent>[];
-    await tester.pumpWidget(settings(sent, editableAddress: 'srv:7443'));
-    final edit = find.byKey(const Key('edit-server-address'));
-
-    await tester.tap(edit);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Cancel'));
-    await tester.pumpAndSettle();
-    expect(sent, isEmpty);
-
-    await tester.tap(edit);
-    await tester.pumpAndSettle();
-    final field = find.byKey(const Key('server-address-field'));
-    expect(tester.widget<TextField>(field).controller!.text, 'srv:7443');
-    await tester.enterText(field, '10.0.0.7:7443');
-    await tester.tap(find.text('Save'));
-    await tester.pumpAndSettle();
+    await tester.pumpWidget(
+      settings(sent, serverAddresses: '2 other addresses'),
+    );
+    expect(find.text('srv:7443\n2 other addresses'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('server-addresses')));
     expect(sent, [
       const GuiIntentAct(
-        action: ActionIntentSetServerAddress(address: '10.0.0.7:7443'),
+        action: ActionIntentNavigate(route: RouteView.serverAddresses),
       ),
     ]);
   });
 
   testWidgets('an unpaired device has no address to change', (tester) async {
     await tester.pumpWidget(settings([]));
-    expect(find.byKey(const Key('edit-server-address')), findsNothing);
+    expect(find.byKey(const Key('server-addresses')), findsNothing);
   });
 
   testWidgets('the connection tile follows the link and its latency', (

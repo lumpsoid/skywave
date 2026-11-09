@@ -97,6 +97,10 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
             session: session_view(session, view, ui),
         },
         Screen::Settings(settings) => settings_view(settings, ui.stay_connected),
+        Screen::ServerAddresses(view) => ScreenView::ServerAddresses {
+            current: view.current.clone().unwrap_or_default(),
+            others: view.others.clone(),
+        },
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
         Screen::UsageLimits(view) => ScreenView::UsageLimits {
@@ -854,14 +858,23 @@ fn settings_view(settings: &SettingsView, stay_connected: Option<bool>) -> Scree
             .server_address
             .clone()
             .unwrap_or_else(|| "not paired".to_owned()),
-        editable_address: settings
+        server_addresses: settings
             .device_id
-            .map(|_| settings.server_address.clone().unwrap_or_default()),
+            .map(|_| server_addresses_label(settings.other_addresses.len())),
         device: settings
             .device_id
             .map_or_else(|| "not paired".to_owned(), |id| id.0.to_string()),
         fingerprint: settings.server_fingerprint.map(|f| f.to_string()),
         stay_connected,
+    }
+}
+
+/// What the settings' server tile says of the other addresses it leads to.
+fn server_addresses_label(others: usize) -> String {
+    match others {
+        0 => "Switch or add an address".to_owned(),
+        1 => "1 other address".to_owned(),
+        n => format!("{n} other addresses"),
     }
 }
 
@@ -1036,6 +1049,13 @@ mod tests {
     use skywave_present::sections::INPUT_LOST;
 
     use super::*;
+
+    #[test]
+    fn the_server_tile_counts_the_other_addresses() {
+        assert_eq!(server_addresses_label(0), "Switch or add an address");
+        assert_eq!(server_addresses_label(1), "1 other address");
+        assert_eq!(server_addresses_label(3), "3 other addresses");
+    }
 
     fn task(id: &str, parent: Option<&str>, ambient: bool) -> BackgroundTask {
         BackgroundTask {

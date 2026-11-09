@@ -585,6 +585,11 @@ pub struct Settings {
     pub blob_policy: BlobPolicy,
     /// Address of the paired server, e.g. `host:port`; `None` before pairing.
     pub server_address: Option<String>,
+    /// The paired server's other addresses, left by
+    /// [`switch_to`](Settings::switch_to), to switch back to without
+    /// typing them again. Never holds `server_address`; emptied by pairing
+    /// with another server.
+    pub other_addresses: Vec<String>,
     /// Whether the server runs shell commands, as its last `hello` said
     /// ([`Store::set_shell_enabled`]); `false` until one said so.
     pub shell_enabled: bool,
@@ -610,11 +615,36 @@ impl Settings {
                 }
             }
             KEY_SERVER_ADDRESS => self.server_address = Some(value),
+            KEY_OTHER_ADDRESSES => {
+                self.other_addresses = serde_json::from_str(&value)
+                    .map_err(|_| bad_value(1, Type::Text, format!("server addresses {value:?}")))?;
+            }
             KEY_SHELL_ENABLED => self.shell_enabled = flag(&value, "shell")?,
             KEY_BYPASS_ALLOWED => self.bypass_allowed = flag(&value, "bypass")?,
             _ => {}
         }
         Ok(())
+    }
+
+    /// Makes `address` the server address. The one it replaces joins
+    /// [`other_addresses`](Settings::other_addresses) at the end, and
+    /// `address` leaves them; nothing changes if it is already the one.
+    pub fn switch_to(&mut self, address: &str) {
+        if self.server_address.as_deref() == Some(address) {
+            return;
+        }
+        self.other_addresses.retain(|other| other != address);
+        if let Some(old) = self.server_address.replace(address.to_owned()) {
+            self.other_addresses.push(old);
+        }
+    }
+
+    /// Drops `address` from [`other_addresses`](Settings::other_addresses);
+    /// `false` if it was not there (the server address never is).
+    pub fn forget(&mut self, address: &str) -> bool {
+        let before = self.other_addresses.len();
+        self.other_addresses.retain(|other| other != address);
+        self.other_addresses.len() != before
     }
 
     /// Whether [`read`](Settings::read) takes the row in.
@@ -1338,7 +1368,8 @@ impl Store {
     /// offered models, and so does what this
     /// device kept beside them — drafts, composer modes, read marks, locally
     /// deleted sessions and alerted approvals. Of the settings, the server
-    /// address becomes `address` and the old server's shell flag goes;
+    /// address becomes `address` and the old server's shell flag and other
+    /// addresses go;
     /// the blob policy, a preference of this device, stays, as do keys a
     /// newer build wrote. Snippets, this device's too, stay. Returns the blobs that were known, whose files
     /// the caller removes.
@@ -1357,8 +1388,12 @@ impl Store {
              DELETE FROM deleted_sessions;
              DELETE FROM alerted_approvals;",
         )?;
-        // The old server's word on shell commands says nothing of the new.
-        tx.execute("DELETE FROM settings WHERE key = ?1", [KEY_SHELL_ENABLED])?;
+        // The old server's word on shell commands says nothing of the new,
+        // and its other addresses lead to it, not to the new one.
+        tx.execute(
+            "DELETE FROM settings WHERE key IN (?1, ?2)",
+            [KEY_SHELL_ENABLED, KEY_OTHER_ADDRESSES],
+        )?;
         tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -2040,6 +2075,36 @@ impl Store {
         self.put_setting(KEY_SERVER_ADDRESS, address)
     }
 
+    /// Makes `address` the server address, keeping the one it replaces
+    /// among the others ([`Settings::switch_to`]), in one transaction.
+    pub fn switch_server_address(&self, address: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut settings = self.settings()?;
+        settings.switch_to(address);
+        self.put_setting(KEY_SERVER_ADDRESS, Some(address))?;
+        self.put_other_addresses(&settings.other_addresses)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drops `address` from the server's other addresses
+    /// ([`Settings::forget`]).
+    pub fn forget_server_address(&self, address: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut settings = self.settings()?;
+        if settings.forget(address) {
+            self.put_other_addresses(&settings.other_addresses)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn put_other_addresses(&self, addresses: &[String]) -> Result<(), StoreError> {
+        let value = (!addresses.is_empty())
+            .then(|| serde_json::to_string(addresses).expect("strings serialize"));
+        self.put_setting(KEY_OTHER_ADDRESSES, value.as_deref())
+    }
+
     /// Keeps whether the server runs shell commands, as its `hello` said.
     pub fn set_shell_enabled(&self, enabled: bool) -> Result<(), StoreError> {
         let value = if enabled { "true" } else { "false" };
@@ -2069,6 +2134,8 @@ impl Store {
 
 const KEY_BLOB_POLICY: &str = "blob_policy";
 const KEY_SERVER_ADDRESS: &str = "server_address";
+/// [`Settings::other_addresses`] as a JSON array; absent when empty.
+const KEY_OTHER_ADDRESSES: &str = "other_server_addresses";
 const KEY_SHELL_ENABLED: &str = "shell_enabled";
 const KEY_BYPASS_ALLOWED: &str = "bypass_allowed";
 
