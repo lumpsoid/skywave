@@ -419,7 +419,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
-    [v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27];
+    [v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
 /// what is stored, and how each is moved:
@@ -465,6 +465,14 @@ fn v25_to_v26(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// migration before this step made empty: no v26 row holds one, and
 /// nothing else stored changes.
 fn v26_to_v27(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v27 to v28, as the server's step of the same name. v28 added
+/// `login_expires` to `hello`, kept under its own `settings` key that no
+/// v27 replica wrote: a missing key reads as no expiry until the next
+/// `hello` says one, and nothing stored changes.
+fn v27_to_v28(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -606,6 +614,9 @@ pub struct Settings {
     /// Whether the server allows bypass mode, as its last `hello` said
     /// ([`Store::set_bypass_allowed`]); `false` until one said so.
     pub bypass_allowed: bool,
+    /// When the agent's login expires, as the server's last `hello` said
+    /// ([`Store::set_login_expires`]); `None` until one said so.
+    pub login_expires: Option<DateTime<Utc>>,
 }
 
 impl Settings {
@@ -631,6 +642,11 @@ impl Settings {
             }
             KEY_SHELL_ENABLED => self.shell_enabled = flag(&value, "shell")?,
             KEY_BYPASS_ALLOWED => self.bypass_allowed = flag(&value, "bypass")?,
+            KEY_LOGIN_EXPIRES => {
+                let at = DateTime::parse_from_rfc3339(&value)
+                    .map_err(|_| bad_value(1, Type::Text, format!("login expiry {value:?}")))?;
+                self.login_expires = Some(at.with_timezone(&Utc));
+            }
             _ => {}
         }
         Ok(())
@@ -1398,11 +1414,12 @@ impl Store {
              DELETE FROM deleted_sessions;
              DELETE FROM alerted_approvals;",
         )?;
-        // The old server's word on shell commands says nothing of the new,
-        // and its other addresses lead to it, not to the new one.
+        // The old server's word on shell commands and on its agent's login
+        // says nothing of the new, and its other addresses lead to it, not
+        // to the new one.
         tx.execute(
-            "DELETE FROM settings WHERE key IN (?1, ?2)",
-            [KEY_SHELL_ENABLED, KEY_OTHER_ADDRESSES],
+            "DELETE FROM settings WHERE key IN (?1, ?2, ?3)",
+            [KEY_SHELL_ENABLED, KEY_LOGIN_EXPIRES, KEY_OTHER_ADDRESSES],
         )?;
         tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -2127,6 +2144,13 @@ impl Store {
         self.put_setting(KEY_BYPASS_ALLOWED, Some(value))
     }
 
+    /// Keeps when the agent's login expires, as the server's `hello` said;
+    /// `None` forgets it.
+    pub fn set_login_expires(&self, at: Option<DateTime<Utc>>) -> Result<(), StoreError> {
+        let value = at.map(|at| at.to_rfc3339());
+        self.put_setting(KEY_LOGIN_EXPIRES, value.as_deref())
+    }
+
     fn put_setting(&self, key: &str, value: Option<&str>) -> Result<(), StoreError> {
         match value {
             Some(value) => self.conn.execute(
@@ -2148,6 +2172,7 @@ const KEY_SERVER_ADDRESS: &str = "server_address";
 const KEY_OTHER_ADDRESSES: &str = "other_server_addresses";
 const KEY_SHELL_ENABLED: &str = "shell_enabled";
 const KEY_BYPASS_ALLOWED: &str = "bypass_allowed";
+const KEY_LOGIN_EXPIRES: &str = "login_expires";
 
 /// A server flag setting as [`Store::set_shell_enabled`] and
 /// [`Store::set_bypass_allowed`] write it.

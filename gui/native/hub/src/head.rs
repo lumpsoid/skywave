@@ -1419,6 +1419,7 @@ impl Head {
             &view.link,
             view.queued,
             view.attention.elsewhere,
+            view.login_expires,
             clock.wall_ms,
         );
         if self.sent.link.as_ref() != Some(&banner) {

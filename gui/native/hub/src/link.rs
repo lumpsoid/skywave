@@ -3,14 +3,22 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use skywave_core::{Link, LinkRejection};
-use skywave_present::link;
+use skywave_present::{link, login};
 
 use crate::signals::{LinkState, LinkUpdate};
 
 /// The banner for `link` at `wall_ms` (ms since the Unix epoch): the
-/// retry countdown runs from it to the link's `retry_at`.
-pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> LinkUpdate {
+/// retry countdown runs from it to the link's `retry_at`, and the login
+/// warning from it to `login_expires`.
+pub fn update(
+    link: &Link,
+    queued: usize,
+    elsewhere: usize,
+    login_expires: Option<DateTime<Utc>>,
+    wall_ms: i64,
+) -> LinkUpdate {
     let queued_part = match queued {
         0 => String::new(),
         n => format!(" · {n} queued"),
@@ -97,6 +105,8 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
             1 => Some("1 approval elsewhere".to_owned()),
             n => Some(format!("{n} approvals elsewhere")),
         },
+        login_label: DateTime::from_timestamp_millis(wall_ms)
+            .and_then(|now| login::expiry_warning(login_expires, now)),
     }
 }
 
@@ -223,7 +233,7 @@ mod tests {
             ),
         ];
         for (link, label) in cases {
-            let banner = update(&link, 2, 0, now);
+            let banner = update(&link, 2, 0, None, now);
             assert_eq!(banner.label, label, "{link:?}");
             let lost = matches!(link, Link::Rejected(LinkRejection::HistoryLost { .. }));
             assert_eq!(banner.can_reset_replica, lost, "{link:?}");
@@ -231,13 +241,13 @@ mod tests {
             assert_eq!(banner.state == LinkState::RepairNeeded, repair, "{link:?}");
         }
         let online = Link::Online { latency_ms: 12 };
-        assert_eq!(update(&online, 0, 0, now).label, "", "nothing to say");
+        assert_eq!(update(&online, 0, 0, None, now).label, "", "nothing to say");
         assert_eq!(
-            update(&online, 0, 1, now).label,
+            update(&online, 0, 1, None, now).label,
             "online",
             "a button to show"
         );
-        let banner = update(&reconnecting, 0, 1, now);
+        let banner = update(&reconnecting, 0, 1, None, now);
         assert_eq!(
             banner.connection_label,
             "Offline · server unreachable · retry in 07s"
@@ -253,7 +263,7 @@ mod tests {
             next_change(&reconnecting, now),
             Some(Duration::from_millis(500))
         );
-        let due = update(&reconnecting, 0, 0, at.timestamp_millis() + 10);
+        let due = update(&reconnecting, 0, 0, None, at.timestamp_millis() + 10);
         assert_eq!(due.retry_in_s, Some(0));
         assert!(due.label.ends_with("\nattempt 3 · retrying…"));
         assert_eq!(
@@ -303,10 +313,38 @@ mod tests {
                     LinkRejection::ProtocolMismatch { .. } | LinkRejection::ServerChanged
                 )
             );
-            assert_eq!(update(&link, 0, 0, 0).can_retry_now, retry, "{link:?}");
+            assert_eq!(
+                update(&link, 0, 0, None, 0).can_retry_now,
+                retry,
+                "{link:?}"
+            );
             // Said whatever is queued, and even while the banner hides.
-            assert_eq!(update(&link, 0, 0, 0).connection_label, label, "{link:?}");
-            assert_eq!(update(&link, 2, 1, 0).connection_label, label, "{link:?}");
+            assert_eq!(
+                update(&link, 0, 0, None, 0).connection_label,
+                label,
+                "{link:?}"
+            );
+            assert_eq!(
+                update(&link, 2, 1, None, 0).connection_label,
+                label,
+                "{link:?}"
+            );
         }
+    }
+
+    #[test]
+    fn the_login_warning_shows_within_three_days_of_its_expiry_whatever_the_link() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let online = Link::Online { latency_ms: 12 };
+        let in_days = |days| Some(now + chrono::TimeDelta::days(days));
+        let banner = update(&online, 0, 0, in_days(2), now.timestamp_millis());
+        assert_eq!(banner.label, "", "the link has nothing to say");
+        assert_eq!(
+            banner.login_label.as_deref(),
+            Some("agent login expires in 2 days · log in again on the server")
+        );
+        let later = update(&online, 0, 0, in_days(4), now.timestamp_millis());
+        assert_eq!(later.login_label, None);
+        assert_eq!(update(&online, 0, 0, None, 0).login_label, None);
     }
 }

@@ -53,7 +53,8 @@ use tower::Service;
 use crate::EventLog;
 use crate::agent::import::IMPORT_DEADLINE;
 use crate::agent::{
-    NoOutsideConversations, NoUsageLimits, OutsideConversations, UsageLimitsSource,
+    AgentLogin, NoAgentLogin, NoOutsideConversations, NoUsageLimits, OutsideConversations,
+    UsageLimitsSource,
 };
 use crate::api::{self, Api, CONVERSATIONS_TIMEOUT, PeerCert};
 use crate::crop::{CROP_DEADLINE, CropHook};
@@ -76,7 +77,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// What a server reads besides its data dir. The default runs git from
-/// `PATH`, reads no outside conversations and no usage limits, and imports within
+/// `PATH`, reads no outside conversations, no usage limits and no login
+/// expiry, and imports within
 /// [`IMPORT_DEADLINE`], crops within [`CROP_DEADLINE`], and gives a
 /// conversations listing [`CONVERSATIONS_TIMEOUT`].
 pub struct ServerOptions {
@@ -87,6 +89,8 @@ pub struct ServerOptions {
     pub outside: Arc<dyn OutsideConversations>,
     /// What `GET /v1/usage-limits` reads.
     pub usage_limits: Arc<dyn UsageLimitsSource>,
+    /// What `GET /v1/hello` reads `login_expires` from.
+    pub login: Arc<dyn AgentLogin>,
     /// How long such an import may take; tests shorten it.
     pub import_deadline: Duration,
     /// How long a conversations listing may take before the reply is a
@@ -118,6 +122,7 @@ impl Default for ServerOptions {
             git: Git::default(),
             outside: Arc::new(NoOutsideConversations),
             usage_limits: Arc::new(NoUsageLimits),
+            login: Arc::new(NoAgentLogin),
             import_deadline: IMPORT_DEADLINE,
             conversations_timeout: CONVERSATIONS_TIMEOUT,
             limits: ConnectionLimits::DEFAULT,

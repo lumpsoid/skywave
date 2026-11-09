@@ -8,9 +8,10 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// Settings: the blob policy, Stay connected where offered (Android), and
 /// the server and device this one is
 /// paired as, the link to it with its round trip, the fingerprint to
-/// compare with what `skywaved` prints, and Re-pair. A paired server's
-/// tile opens its addresses ([ServerAddressesPage]), to reach it at
-/// another without re-pairing.
+/// compare with what `skywaved` prints, when the agent's login on the
+/// server expires, and Re-pair. A paired server's tile opens its
+/// addresses ([ServerAddressesPage]), to reach it at another without
+/// re-pairing.
 class SettingsPage extends StatelessWidget {
   const SettingsPage({
     required this.screen,
@@ -140,6 +141,13 @@ class SettingsPage extends StatelessWidget {
                 leading: const Icon(Icons.fingerprint),
                 title: const Text('Server fingerprint'),
                 subtitle: SelectableText(fingerprint, style: monoText),
+              ),
+            if (screen.agentLogin case final login?)
+              ListTile(
+                key: const Key('agent-login'),
+                leading: const Icon(Icons.key),
+                title: const Text('Agent login'),
+                subtitle: Text(login),
               ),
             Padding(
               padding: const EdgeInsets.all(16),

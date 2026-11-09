@@ -9,8 +9,10 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// state's colour, "Retry now" while reconnecting or after a protocol
 /// mismatch (the server may have been updated since), "Reset local data"
 /// (after a confirmation) once the server lost history, and the approvals
-/// waiting in other sessions as a button to the next one. Nothing while
-/// Rust's label is empty: unpaired, or online with nothing waiting.
+/// waiting in other sessions as a button to the next one, and below the
+/// label the warning that the agent's login expires soon. Nothing while
+/// Rust's label is empty and there is no such warning: unpaired, or online
+/// with nothing waiting.
 class LinkBanner extends StatelessWidget {
   const LinkBanner({required this.holder, required this.send, super.key});
 
@@ -23,7 +25,9 @@ class LinkBanner extends StatelessWidget {
       listenable: holder,
       builder: (context, _) {
         final link = holder.link;
-        final shown = link != null && link.label.isNotEmpty;
+        final shown =
+            link != null &&
+            (link.label.isNotEmpty || link.loginLabel != null);
         // Slides in and out where the banner has no top inset to hand over:
         // the screen below takes the inset at once, so a phone's status bar
         // would get it twice for the length of the slide.
@@ -66,7 +70,27 @@ class LinkBanner extends StatelessWidget {
               children: [
                 Icon(icon, size: 18, color: foreground),
                 const SizedBox(width: 8),
-                Expanded(child: _label(link.label, foreground)),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (link.label.isNotEmpty)
+                        _label(link.label, foreground),
+                      if (link.loginLabel case final login?)
+                        Text(
+                          login,
+                          key: const Key('login-label'),
+                          style: TextStyle(
+                            color: foreground,
+                            fontWeight: FontWeight.bold,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 2,
+                        ),
+                    ],
+                  ),
+                ),
                 // Side by side when there is room, stacked on a phone.
                 if (link.canRetryNow ||
                     link.canResetReplica ||

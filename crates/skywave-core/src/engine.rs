@@ -1193,6 +1193,7 @@ mod tests {
                     devices: Vec::new(),
                     shell: false,
                     bypass: false,
+                    login_expires: None,
                 })
             })
         }
@@ -1618,6 +1619,7 @@ mod tests {
                     devices: Vec::new(),
                     shell: false,
                     bypass: false,
+                    login_expires: None,
                 })
             })
         }
@@ -2192,6 +2194,7 @@ mod tests {
                     devices: Vec::new(),
                     shell: false,
                     bypass: false,
+                    login_expires: None,
                 })
             })
         }
@@ -2424,6 +2427,7 @@ mod tests {
                     }],
                     shell: false,
                     bypass: false,
+                    login_expires: None,
                 })
             })
         }

@@ -133,7 +133,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::agent::import::{self, Prepared};
 use crate::agent::mapper::cut_line;
-use crate::agent::{self, LimitsError, OutsideConversations, SourceError, UsageLimitsSource};
+use crate::agent::{
+    self, AgentLogin, LimitsError, OutsideConversations, SourceError, UsageLimitsSource,
+};
 use crate::blobs::BlobStore;
 use crate::commands::Preparation;
 use crate::crop::{self, CropHook};
@@ -207,6 +209,8 @@ pub(crate) struct Api {
     /// What an adopting `CreateSession` imports from.
     outside: Arc<dyn OutsideConversations>,
     usage_limits: Arc<dyn UsageLimitsSource>,
+    /// What a `hello` reads the agent's login expiry from.
+    login: Arc<dyn AgentLogin>,
     import_deadline: Duration,
     conversations_timeout: Duration,
     crop_deadline: Duration,
@@ -253,6 +257,7 @@ impl Api {
             shutdown,
             outside: options.outside,
             usage_limits: options.usage_limits,
+            login: options.login,
             import_deadline: options.import_deadline,
             conversations_timeout: options.conversations_timeout,
             crop_deadline: options.crop_deadline,
@@ -399,11 +404,14 @@ async fn hello(
             // The committed head, not the watch: that is published after
             // the commit, so it may lag an event a pull already got.
             let head = head_in(db.conn())?;
-            Ok((devices, head, api.log.run(db, query.since)?))
+            let log = api.log.run(db, query.since)?;
+            // Read on every hello, so a login renewed on the server shows
+            // at the device's next connection.
+            Ok((devices, head, log, api.login.expires()))
         })
         .await;
     match read {
-        Ok((devices, head, log)) => Json(HelloResponse {
+        Ok((devices, head, log, login_expires)) => Json(HelloResponse {
             protocol_version: PROTOCOL_VERSION,
             server_id: api.server_id,
             device_id: device,
@@ -412,6 +420,7 @@ async fn hello(
             devices,
             shell: api.log.shell_enabled(),
             bypass: api.log.bypass_allowed(),
+            login_expires,
         })
         .into_response(),
         Err(status) => status.into_response(),
