@@ -1263,6 +1263,17 @@ turn when a login succeeded after it handed over that turn's message
 (architecture.md, "The agent's login"): §3.17's step 4 shows a running
 process picks the new login up, but it may have answered first.
 
+A login from a device (`agent/claude_code/login.rs`, `ClaudeLogin::begin`)
+runs this flow in a process of its own: a new `--session-id`, no
+`initialize`, `claude_authenticate` and only its `manualUrl`
+(`automaticUrl` is never read). One task owns the process, reading and
+dropping its stdout (the `commands_changed` lines are large) until the
+pasted code comes; it splits the code at the first `#` (a paste without
+both halves is refused before the CLI sees it), sends
+`claude_oauth_callback`, passes the answer on without a deadline, and
+kills the process after it, as it does when the attempt is dropped. The
+URL, the code and the account answered are never logged.
+
 From the source, not yet probed: the flow refuses to start when managed
 settings forbid it (`forceLoginMethod` of the other kind, or an
 `allowedProviders` without first-party).

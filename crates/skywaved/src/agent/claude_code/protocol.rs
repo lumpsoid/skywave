@@ -246,6 +246,41 @@ pub fn get_settings_request(request_id: &str) -> Value {
     })
 }
 
+/// The request that starts a claude.ai login (docs/agents/claude-code.md
+/// §3.17): the CLI answers with the URLs to sign in at.
+pub fn authenticate_request(request_id: &str) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "claude_authenticate", "loginWithClaudeAi": true },
+    })
+}
+
+/// The request that finishes the open login with the two halves of the
+/// code the sign-in page showed (`<code>#<state>`).
+pub fn oauth_callback_request(request_id: &str, code: &str, state: &str) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "claude_oauth_callback",
+            "authorizationCode": code,
+            "state": state,
+        },
+    })
+}
+
+/// The URL a `claude_authenticate` answer's body gives for signing in by
+/// hand, whose page shows the code to paste back; `None` without one. The
+/// answer's other URL redirects to the CLI's own localhost and is of no use
+/// to a device.
+pub fn manual_url(answer: &Value) -> Option<&str> {
+    answer
+        .get("manualUrl")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+}
+
 /// What the CLI calls `mode`.
 pub fn mode_name(mode: PermissionMode) -> &'static str {
     match mode {
@@ -1841,6 +1876,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_login_requests_ask_for_a_claude_ai_login_and_pass_both_halves() {
+        assert_eq!(
+            authenticate_request("a"),
+            json!({
+                "type": "control_request",
+                "request_id": "a",
+                "request": { "subtype": "claude_authenticate", "loginWithClaudeAi": true },
+            })
+        );
+        assert_eq!(
+            oauth_callback_request("c", "the-code", "the-state"),
+            json!({
+                "type": "control_request",
+                "request_id": "c",
+                "request": {
+                    "subtype": "claude_oauth_callback",
+                    "authorizationCode": "the-code",
+                    "state": "the-state",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn the_manual_url_is_read_and_the_automatic_one_never() {
+        let both =
+            json!({ "manualUrl": "https://m", "automaticUrl": "http://localhost:1/callback" });
+        assert_eq!(manual_url(&both), Some("https://m"));
+        let automatic = json!({ "automaticUrl": "http://localhost:1/callback" });
+        assert_eq!(manual_url(&automatic), None);
+        assert_eq!(manual_url(&json!({ "manualUrl": "" })), None);
+    }
 
     #[test]
     fn an_account_says_whether_the_cli_is_logged_out() {

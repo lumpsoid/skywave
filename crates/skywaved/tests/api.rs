@@ -26,12 +26,15 @@ use skywave_proto::{
     ShellEnd, ShellRunStorage, StorageReport, ToolResult, UsageLimit, UsageLimitsResult, limits,
     path,
 };
+use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
 use skywaved::agent::fake::Gate;
 use skywaved::agent::{
-    AgentLogin, LimitsError, LoginSeen, LoginSource, LoginState, NoAgentLogin, UsageLimitsSource,
+    AgentLogin, LimitsError, LoginAttempt, LoginError, LoginSeen, LoginSource, LoginState,
+    NoAgentLogin, UsageLimitsSource,
 };
 use skywaved::blobs::BlobStore;
+use skywaved::config::AgentConfig;
 use skywaved::crop::CropHook;
 use skywaved::disk::{Disk, FreeSpace};
 use skywaved::identity::ServerIdentity;
@@ -1260,6 +1263,28 @@ impl AgentLogin for SetLogin {
     fn offered(&self) -> bool {
         true
     }
+
+    fn begin(
+        &self,
+        _deadline: Instant,
+    ) -> futures_util::future::BoxFuture<'_, Result<Box<dyn LoginAttempt>, LoginError>> {
+        Box::pin(async { Err(LoginError::Unavailable) })
+    }
+}
+
+/// A Claude login stored in `credentials`, whose CLI is never started.
+fn claude_login(credentials: PathBuf, other_login: bool) -> ClaudeLogin {
+    let adapter = ClaudeCodeAdapter::new(AgentConfig {
+        command: PathBuf::from("claude"),
+        args: Vec::new(),
+        allow_bypass: false,
+    });
+    ClaudeLogin::new(
+        credentials,
+        other_login,
+        adapter,
+        PathBuf::from("/nonexistent"),
+    )
 }
 
 /// `agent_login_offered` follows the agent's login; `agent_logged_out`
@@ -1272,12 +1297,12 @@ async fn hello_says_whether_a_device_may_log_the_agent_in_and_whether_it_is_logg
         ("no agent login", Arc::new(NoAgentLogin), false),
         (
             "environment login",
-            Arc::new(ClaudeLogin::new(credentials.clone(), true)),
+            Arc::new(claude_login(credentials.clone(), true)),
             false,
         ),
         (
             "stored login",
-            Arc::new(ClaudeLogin::new(credentials, false)),
+            Arc::new(claude_login(credentials, false)),
             true,
         ),
     ];

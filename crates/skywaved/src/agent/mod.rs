@@ -853,6 +853,49 @@ pub trait AgentLogin: Send + Sync + 'static {
     /// false when the agent has no login a device can run, or one the
     /// environment gives it takes precedence over any it would make.
     fn offered(&self) -> bool;
+
+    /// Starts one login attempt: a process of the agent's own, asked for a
+    /// URL to sign in at. Gives up at `deadline`, stopping the process.
+    fn begin(
+        &self,
+        deadline: Instant,
+    ) -> BoxFuture<'_, std::result::Result<Box<dyn LoginAttempt>, LoginError>>;
+}
+
+/// One open login attempt, from [`AgentLogin::begin`]: the user signs in at
+/// [`url`](Self::url) and pastes back the code the page shows. Dropping it
+/// stops the agent's process, so an attempt never outlives its holder.
+pub trait LoginAttempt: Send + Sync {
+    /// Where to sign in. Never logged: it carries the attempt's state.
+    fn url(&self) -> &str;
+
+    /// Whether `code` is shaped like an answer at all, without asking the
+    /// agent; the refusal says what to paste. A refusal leaves the attempt
+    /// open.
+    fn check(&self, code: &str) -> std::result::Result<(), String>;
+
+    /// Hands the pasted `code` to the agent and waits for its own answer,
+    /// with no deadline: the answer is the outcome. `Err` carries the
+    /// agent's words. The attempt ends either way.
+    fn finish(self: Box<Self>, code: String)
+    -> BoxFuture<'static, std::result::Result<(), String>>;
+}
+
+/// Leaves the URL out.
+impl std::fmt::Debug for dyn LoginAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoginAttempt")
+    }
+}
+
+/// Why [`AgentLogin::begin`] has no attempt.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LoginError {
+    /// This agent has no login a device can run.
+    #[error("the agent has no login a device can run")]
+    Unavailable,
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// A login for an agent that says nothing of its expiry and has no login a
@@ -867,6 +910,13 @@ impl AgentLogin for NoAgentLogin {
 
     fn offered(&self) -> bool {
         false
+    }
+
+    fn begin(
+        &self,
+        _deadline: Instant,
+    ) -> BoxFuture<'_, std::result::Result<Box<dyn LoginAttempt>, LoginError>> {
+        Box::pin(async { Err(LoginError::Unavailable) })
     }
 }
 

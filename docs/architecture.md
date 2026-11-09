@@ -551,7 +551,12 @@ the daemon's appends, which would otherwise stop `serve` (below).
   `LoggedOut`), and `AgentLogin::offered` as `agent_login_offered`: false
   for `NoAgentLogin`, and for Claude Code when the environment logs the
   CLI in another way, which a login made from a device would not
-  override. `agent_logged_out` is reported either way.
+  override. `agent_logged_out` is reported either way. `AgentLogin::begin`
+  starts a login attempt (`LoginAttempt`): a URL to sign in at, a shape
+  check of the pasted code, and `finish`, which hands the code to the agent
+  and waits, with no deadline, for its answer. Dropping the attempt stops
+  it. The Claude Code one runs the CLI's manual-code login in a process of
+  its own (docs/agents/claude-code.md §3.17). No route calls it yet.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
