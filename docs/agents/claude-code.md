@@ -1295,6 +1295,11 @@ driver running six processes side by side (wrong state, bogus code, the
 real code, the same code again, turns before and after). It was not kept
 as a fixture: it holds several live flows' states.
 
+Checked end to end 2026-11-09 with 2.1.310: the real skywaved, logged in
+from the GUI. Settings showed the new expiry. The CLI wrote nothing to
+stderr during the flow, the login process left no transcript under
+`projects/`, and the server's database held neither the URL nor the code.
+
 ## 4. Interrupt
 
 Request **[C]**:
