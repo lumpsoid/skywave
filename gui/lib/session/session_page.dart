@@ -341,6 +341,7 @@ class _SessionPageState extends State<SessionPage> {
     // Only a stopped agent surely has no process: an idle one stays warm a
     // while, an errored one may have failed a turn and still run.
     final stopped = screen.state == AgentState.stopped;
+    final isArchived = screen.archivedLabel != null;
     final compact = isCompact(context);
     final VoidCallback? openWorkdir = screen.workdir == null
         ? null
@@ -401,6 +402,19 @@ class _SessionPageState extends State<SessionPage> {
         title: 'Background work',
         subtitle: screen.workLabel ?? 'nothing running',
         onTap: () => showBackgroundWork(context, _work, widget.send),
+      ),
+      _MenuItem(
+        icon: isArchived ? Icons.unarchive : Icons.archive,
+        title: isArchived ? 'Unarchive' : 'Archive',
+        subtitle: isArchived
+            ? 'Back to the active list'
+            : 'Move to the archived list',
+        onTap: () => widget.send.act(
+          ActionIntentSetSessionArchived(
+            sessionId: screen.sessionId,
+            archived: !isArchived,
+          ),
+        ),
       ),
       _MenuItem(
         icon: Icons.power_settings_new,
