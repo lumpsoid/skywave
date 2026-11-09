@@ -38,6 +38,7 @@ pub mod identity;
 mod limits;
 mod lines;
 pub mod lock;
+mod login;
 mod model;
 pub mod pairing;
 pub mod projection;
@@ -57,13 +58,15 @@ pub use backoff::{Backoff, Jitter};
 pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
-    CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, MAX_SERVER_ERRORS,
-    STORAGE_TIMEOUT, USAGE_LIMITS_TIMEOUT, WALL_CHECK, WallClock, default_device_name,
+    CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, LOGIN_TIMEOUT,
+    MAX_SERVER_ERRORS, STORAGE_TIMEOUT, USAGE_LIMITS_TIMEOUT, WALL_CHECK, WallClock,
+    default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
 pub use lines::LineIndex;
 pub use lock::LockError;
+pub use login::LoginCode;
 pub use pairing::{
     PairError, PairUri, Paired, normalize_code, pair, pair_and_report, parse_pair_uri,
 };
@@ -106,3 +109,4 @@ pub use view::{
     LimitSeverity, LimitWindow, SessionInfoView, UsageLimit, UsageLimitsResult, UsageLimitsStatus,
     UsageLimitsUnavailable, UsageLimitsView,
 };
+pub use view::{LoginCodeRefused, LoginFlowView, LoginNoAnswer, LoginOutcome, LoginView};

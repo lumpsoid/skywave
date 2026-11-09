@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ConversationsResult, DeviceInfo,
-    DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem, QuestionAnswer,
-    RejectReason, RuleSuggestion, SessionOrigin, SessionState as LogState, TaskId, ToolCall,
-    ToolKind, ToolResult, answers_fit,
+    DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem, LoginFinishResult,
+    LoginStartResult, QuestionAnswer, RejectReason, RuleSuggestion, SessionOrigin,
+    SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, answers_fit,
 };
 
 use crate::action::{Action, Route};
@@ -23,6 +23,7 @@ use crate::completion::Completer;
 use crate::conversations::Conversations;
 use crate::identity::Identity;
 use crate::limits::UsageLimits;
+use crate::login::AgentLogin;
 use crate::projection::{
     BlobFate, FIRST_PROMPT_MAX_CHARS, SessionSummary, TurnRecord, blob_refs, first_line, is_notable,
 };
@@ -41,14 +42,14 @@ use crate::view::{
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
-    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, Pause,
-    PendingApprovalRef, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
-    SHELL_ALERT_AFTER, Screen, Seq, ServerAddressesView, SessionId, SessionInfoView,
-    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage, TimelineItem,
-    ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable, UsageSession,
-    UsageView, ViewState, WorkdirBody, WorkdirPane, WorkdirView,
+    LinkRejection, ListKind, LoginView, ModelChoice, Outgoing, PairedInfo, PairingStatus,
+    PairingView, Pause, PendingApprovalRef, PendingSession, QUESTION_TOOL, Question,
+    QuestionPrompt, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, ServerAddressesView, SessionId,
+    SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
+    SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
+    SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage,
+    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable,
+    UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane, WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -264,6 +265,9 @@ pub(crate) struct Model {
     /// The usage limits page: the stored answer, and the read in flight
     /// or failed (in memory only).
     usage_limits: UsageLimits,
+    /// This device's login of the server's agent: the flow, its URL and
+    /// the code. In memory only, never stored.
+    login: AgentLogin,
     /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
     /// new session is not in the replica yet: its command, and the place
     /// it was asked from, still on screen. In memory only.
@@ -332,6 +336,7 @@ impl Model {
             conversations: Conversations::default(),
             storage: Storage::default(),
             usage_limits: UsageLimits::default(),
+            login: AgentLogin::default(),
             opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
@@ -539,6 +544,43 @@ impl Model {
                     .map(Effect::Request)
                     .into_iter()
                     .collect()
+            }
+            Action::StartAgentLogin => {
+                if self.device().is_none() || self.place != Place::Settings {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.login
+                    .start(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::FinishAgentLogin { code } => {
+                if self.device().is_none() || self.place != Place::Settings {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.login
+                    .finish(code, online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::RetryAgentLogin => {
+                if self.device().is_none() || self.place != Place::Settings {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.login
+                    .retry(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::DismissAgentLogin => {
+                self.login.forget();
+                Vec::new()
             }
             Action::SendMessage { session_id, text } => {
                 let Some(summary) = self.summary(session_id) else {
@@ -1816,6 +1858,42 @@ impl Model {
         self.usage_limits.answered(answer);
     }
 
+    /// Whether `req` is the login request the settings screen waits on
+    /// ([`Seam::login_finished`](crate::Seam::login_finished)).
+    pub(crate) fn login_awaited(&self, req: u64) -> bool {
+        self.login.awaited(req)
+    }
+
+    /// The answer to login start `req`; dropped unless awaited.
+    pub(crate) fn login_started(
+        &mut self,
+        req: u64,
+        result: Result<LoginStartResult, TransportError>,
+    ) {
+        if self.login.awaited(req) {
+            self.login.started(result);
+        }
+    }
+
+    /// The answer to login finish `req`; dropped unless awaited. A
+    /// `LoggedIn` whose hello fields were `stored` shows them as a hello
+    /// would: no longer logged out, expiring at its `expires`.
+    pub(crate) fn login_finished(
+        &mut self,
+        req: u64,
+        result: Result<LoginFinishResult, TransportError>,
+        stored: bool,
+    ) {
+        if !self.login.awaited(req) {
+            return;
+        }
+        if stored && let Ok(LoginFinishResult::LoggedIn { expires }) = &result {
+            self.settings.agent_logged_out = false;
+            self.settings.login_expires = *expires;
+        }
+        self.login.finished(result);
+    }
+
     pub(crate) fn storage_reported(
         &mut self,
         req: u64,
@@ -1888,6 +1966,8 @@ impl Model {
         // the old server cannot match a later request.
         self.conversations.end();
         self.workdirs.reset();
+        // The old server's login flow means nothing to the new one.
+        self.login.forget();
         if had_drafts {
             self.draft_rev += 1;
         }
@@ -2041,6 +2121,12 @@ impl Model {
                 other_addresses: self.settings.other_addresses.clone(),
                 device_id: self.device(),
                 server_fingerprint: self.paired.and_then(|p| p.server),
+                login: LoginView {
+                    offered: self.settings.agent_login_offered,
+                    logged_out: self.settings.agent_logged_out,
+                    expires: self.settings.login_expires,
+                    flow: self.login.view(),
+                },
             }),
             Place::ServerAddresses => Screen::ServerAddresses(ServerAddressesView {
                 current: self.settings.server_address.clone(),
@@ -9321,6 +9407,162 @@ mod tests {
         f.dispatch(Action::Navigate(Route::UsageLimits));
         f.dispatch(Action::Back);
         assert_eq!(f.model.place, Place::SessionList);
+    }
+
+    const LOGIN_URL: &str = "https://login.example/authorize?state=abc";
+
+    fn login_view(f: &Fixture) -> crate::view::LoginView {
+        match f.model.view().screen {
+            Screen::Settings(view) => view.login,
+            other => panic!("expected settings, got {other:?}"),
+        }
+    }
+
+    fn login_start_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::LoginStart { req })] => Some(*req),
+            other => panic!("expected a login start, got {other:?}"),
+        }
+    }
+
+    fn login_finish_req(effects: &[Effect]) -> Option<(u64, skywave_proto::LoginFinish)> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::LoginFinish { req, finish })] => Some((*req, finish.clone())),
+            other => panic!("expected a login finish, got {other:?}"),
+        }
+    }
+
+    fn code(code: &str) -> Action {
+        Action::FinishAgentLogin {
+            code: crate::LoginCode::new(code),
+        }
+    }
+
+    /// A paired fixture on the settings screen with a login open on `flow`.
+    fn login_opened(flow: skywave_proto::LoginFlowId) -> Fixture {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::Settings));
+        let req = login_start_req(&f.dispatch(Action::StartAgentLogin)).unwrap();
+        f.model.login_started(
+            req,
+            Ok(LoginStartResult::Open {
+                flow,
+                url: LOGIN_URL.into(),
+            }),
+        );
+        f
+    }
+
+    #[test]
+    fn a_login_code_is_sent_only_for_an_open_flow_on_the_settings_screen() {
+        use crate::view::LoginFlowView;
+
+        let mut f = Fixture::paired();
+        assert_eq!(
+            login_start_req(&f.dispatch(Action::StartAgentLogin)),
+            None,
+            "not on the settings screen"
+        );
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(login_finish_req(&f.dispatch(code("a#b"))), None, "idle");
+        assert_eq!(login_finish_req(&f.dispatch(Action::RetryAgentLogin)), None);
+        let first = login_start_req(&f.dispatch(Action::StartAgentLogin)).unwrap();
+        assert_eq!(login_view(&f).flow, LoginFlowView::Starting);
+        assert_eq!(
+            login_finish_req(&f.dispatch(code("a#b"))),
+            None,
+            "still starting"
+        );
+
+        // Only the latest start's answer is taken.
+        let second = login_start_req(&f.dispatch(Action::StartAgentLogin)).unwrap();
+        let flow = skywave_proto::LoginFlowId::random();
+        let open = |flow| {
+            Ok(LoginStartResult::Open {
+                flow,
+                url: LOGIN_URL.into(),
+            })
+        };
+        f.model
+            .login_started(first, open(skywave_proto::LoginFlowId::random()));
+        assert_eq!(login_view(&f).flow, LoginFlowView::Starting);
+        f.model.login_started(second, open(flow));
+        assert_eq!(
+            login_view(&f).flow,
+            LoginFlowView::Open {
+                url: LOGIN_URL.into(),
+                refused: None,
+            }
+        );
+
+        // Off the settings screen nothing is sent; back on it, the code goes.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert_eq!(login_finish_req(&f.dispatch(code("a#b"))), None);
+        f.dispatch(Action::Navigate(Route::Settings));
+        let (_, finish) = login_finish_req(&f.dispatch(code("a#b"))).unwrap();
+        assert_eq!(finish.flow, flow);
+        assert_eq!(finish.code, "a#b");
+
+        // Dismissed: forgotten, and nothing is sent for it.
+        assert_eq!(f.dispatch(Action::DismissAgentLogin), vec![]);
+        assert_eq!(login_view(&f).flow, LoginFlowView::Idle);
+        assert_eq!(login_finish_req(&f.dispatch(code("a#b"))), None);
+    }
+
+    #[test]
+    fn a_logged_in_answer_shows_the_agent_logged_in_without_a_hello() {
+        use crate::view::{LoginFlowView, LoginOutcome};
+
+        let flow = skywave_proto::LoginFlowId::random();
+        let mut f = login_opened(flow);
+        f.model.agent_login(true, true);
+        let view = login_view(&f);
+        assert!(view.offered && view.logged_out);
+        assert_eq!(view.expires, None);
+
+        let (stale, _) = login_finish_req(&f.dispatch(code("a#b"))).unwrap();
+        f.model
+            .login_finished(stale, Err(TransportError::Timeout), true);
+        let (req, _) = login_finish_req(&f.dispatch(Action::RetryAgentLogin)).unwrap();
+        let expires: DateTime<Utc> = "2027-01-01T00:00:00Z".parse().unwrap();
+        let logged_in = || {
+            Ok(LoginFinishResult::LoggedIn {
+                expires: Some(expires),
+            })
+        };
+        // The superseded finish's answer changes nothing.
+        f.model.login_finished(stale, logged_in(), true);
+        assert!(login_view(&f).logged_out);
+        f.model.login_finished(req, logged_in(), true);
+        let view = login_view(&f);
+        assert_eq!(view.flow, LoginFlowView::Done(LoginOutcome::LoggedIn));
+        assert!(!view.logged_out);
+        assert_eq!(view.expires, Some(expires));
+        let state = f.model.view();
+        assert!(!state.agent_logged_out);
+        assert_eq!(state.login_expires, Some(expires));
+    }
+
+    #[test]
+    fn pairing_with_another_server_forgets_the_login() {
+        use crate::view::LoginFlowView;
+
+        let mut f = login_opened(skywave_proto::LoginFlowId::random());
+        let (req, _) = login_finish_req(&f.dispatch(code("a#b"))).unwrap();
+        f.model.replica_reset(empty_snapshot());
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(login_view(&f).flow, LoginFlowView::Idle);
+        assert!(
+            !f.model.login_awaited(req),
+            "the old server's answer is dropped"
+        );
+        f.model
+            .login_finished(req, Ok(LoginFinishResult::LoggedIn { expires: None }), true);
+        assert_eq!(login_view(&f).flow, LoginFlowView::Idle);
+        let next = login_start_req(&f.dispatch(Action::StartAgentLogin)).unwrap();
+        assert!(next > req, "request ids are never reused");
     }
 
     fn crop(blob: BlobId) -> Action {

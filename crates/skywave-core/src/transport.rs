@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, RunId, StorageReport, UsageLimitsResult,
-    WorkdirQuery,
+    EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
+    LoginStartResult, RunId, StorageReport, UsageLimitsResult, WorkdirQuery,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -99,6 +99,24 @@ pub trait Transport: Send + Sync {
     /// server's agent runs as, for the usage limits page. Defaults to
     /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
     fn usage_limits(&self) -> BoxFuture<'_, Result<UsageLimitsResult, TransportError>> {
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `POST /v1/agent-login/start`: start logging the server's agent in,
+    /// or join the login it has open. Defaults to
+    /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
+    fn login_start(&self) -> BoxFuture<'_, Result<LoginStartResult, TransportError>> {
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `POST /v1/agent-login/finish`: the code the login page showed, for
+    /// the flow `finish` names. Defaults to [`TransportError::NotFound`]
+    /// like [`list_dirs`](Transport::list_dirs).
+    fn login_finish<'a>(
+        &'a self,
+        finish: &'a LoginFinish,
+    ) -> BoxFuture<'a, Result<LoginFinishResult, TransportError>> {
+        let _ = finish;
         Box::pin(async { Err(TransportError::NotFound) })
     }
 

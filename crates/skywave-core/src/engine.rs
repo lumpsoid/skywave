@@ -27,6 +27,9 @@
 //! - `UsageLimits` asks for the agent's usage limits the same way, within
 //!   [`USAGE_LIMITS_TIMEOUT`], and answers with
 //!   [`Seam::usage_limits_answered`].
+//! - `LoginStart` and `LoginFinish` start and finish logging the server's
+//!   agent in the same way, each within [`LOGIN_TIMEOUT`], and answer with
+//!   [`Seam::login_started`] and [`Seam::login_finished`].
 //! - `Workdir` reads a session's workdir the same way, within
 //!   [`WORKDIR_TIMEOUT`], and answers with [`Seam::workdir_answered`].
 //!
@@ -145,6 +148,11 @@ pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Longest a usage limits read may take, connecting included: above the
 /// server's own 20 s, so its `503` arrives before this gives up.
 pub const USAGE_LIMITS_TIMEOUT: Duration = Duration::from_secs(25);
+/// Longest a login start or finish may take, connecting included: above
+/// the server's own 20 s, so its `503` arrives before this gives up. A
+/// finish cut short keeps going on the server; resending it gets its
+/// outcome.
+pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(25);
 /// Longest the link sleeps in a reconnect wait before it looks at the wall
 /// clock again. The monotonic clock stops while a device sleeps (Android's
 /// deep sleep), so after waking the attempt comes at most this long after
@@ -464,6 +472,33 @@ impl Engine {
                     answer_usage_limits(&seam, req, result);
                 });
             }
+            Request::LoginStart { req } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    seam.login_started(req, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a login start", async move {
+                    let result = tokio::time::timeout(LOGIN_TIMEOUT, transport.login_start())
+                        .await
+                        .unwrap_or(Err(TransportError::Timeout));
+                    seam.login_started(req, result);
+                });
+            }
+            Request::LoginFinish { req, finish } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    answer_login_finish(&seam, req, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a login finish", async move {
+                    let result =
+                        tokio::time::timeout(LOGIN_TIMEOUT, transport.login_finish(&finish))
+                            .await
+                            .unwrap_or(Err(TransportError::Timeout));
+                    answer_login_finish(&seam, req, result);
+                });
+            }
             Request::Workdir { req, ask } => {
                 let seam = self.seam.clone();
                 let Some(transport) = self.side_transport() else {
@@ -624,6 +659,16 @@ fn answer_usage_limits(
 ) {
     if let Err(error) = seam.usage_limits_answered(req, result) {
         tracing::warn!(%error, "cannot keep the usage limits");
+    }
+}
+
+fn answer_login_finish(
+    seam: &Seam,
+    req: u64,
+    result: Result<skywave_proto::LoginFinishResult, TransportError>,
+) {
+    if let Err(error) = seam.login_finished(req, result) {
+        tracing::warn!(%error, "cannot keep the agent's login");
     }
 }
 
@@ -1853,6 +1898,174 @@ mod tests {
             "connected {waited:?} after resume"
         );
         assert_eq!(links.lock().unwrap().first(), Some(&Link::Connecting));
+        engine.abort();
+    }
+
+    /// A server whose link stays up, that opens a login on `flow` and
+    /// answers its finishes from `answers` in turn (`None` never answers),
+    /// noting each finish it gets.
+    struct LoginServer {
+        link: FlakyServer,
+        flow: skywave_proto::LoginFlowId,
+        answers: Mutex<Vec<Option<Result<skywave_proto::LoginFinishResult, TransportError>>>>,
+        finishes: Mutex<Vec<skywave_proto::LoginFinish>>,
+    }
+
+    impl Transport for LoginServer {
+        fn hello(
+            &self,
+            since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            self.link.hello(since)
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            self.link.send_command(command)
+        }
+
+        fn events(&self, query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            self.link.events(query)
+        }
+
+        fn blob(
+            &self,
+            id: ProtoBlobId,
+            from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            self.link.blob(id, from)
+        }
+
+        fn login_start(
+            &self,
+        ) -> BoxFuture<'_, Result<skywave_proto::LoginStartResult, TransportError>> {
+            Box::pin(async move {
+                Ok(skywave_proto::LoginStartResult::Open {
+                    flow: self.flow,
+                    url: "https://login.example/authorize?state=s".into(),
+                })
+            })
+        }
+
+        fn login_finish<'a>(
+            &'a self,
+            finish: &'a skywave_proto::LoginFinish,
+        ) -> BoxFuture<'a, Result<skywave_proto::LoginFinishResult, TransportError>> {
+            Box::pin(async move {
+                self.finishes.lock().unwrap().push(finish.clone());
+                let answer = self.answers.lock().unwrap().remove(0);
+                match answer {
+                    Some(answer) => answer,
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    /// Waits (on the paused clock) until the settings screen's login flow
+    /// is as `want` says, and returns it.
+    async fn login_flow(
+        core: &Core,
+        want: impl Fn(&crate::view::LoginFlowView) -> bool,
+    ) -> crate::view::LoginFlowView {
+        loop {
+            let flow = match core.view().screen {
+                Screen::Settings(settings) => settings.login.flow,
+                other => panic!("expected settings, got {other:?}"),
+            };
+            if want(&flow) {
+                return flow;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A finish the server never answers gives up at `LOGIN_TIMEOUT`, one
+    /// it answers with a `503` gives up at once; either keeps the flow and
+    /// the code, and each retry sends exactly what the first finish sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_login_finish_without_an_answer_is_resent_unchanged() {
+        use crate::Action;
+        use crate::view::{LoginFlowView, LoginNoAnswer, LoginOutcome};
+
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let core = seam.core.clone();
+        let asked = seam.take_requests().unwrap();
+        let flow = skywave_proto::LoginFlowId::random();
+        let server = Arc::new(LoginServer {
+            link: FlakyServer::default(),
+            flow,
+            answers: Mutex::new(vec![
+                None,
+                Some(Err(TransportError::BadStatus(503))),
+                Some(Ok(skywave_proto::LoginFinishResult::LoggedIn {
+                    expires: None,
+                })),
+            ]),
+            finishes: Mutex::new(Vec::new()),
+        });
+        server.link.up.store(true, Ordering::SeqCst);
+        let fake = server.clone();
+        let config = EngineConfig {
+            connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            ..EngineConfig::default()
+        };
+        let (requests, requests_rx) = mpsc::unbounded_channel();
+        let (_suspended, suspended_rx) = watch::channel(false);
+        let engine =
+            tokio::spawn(Engine::new(seam.clone(), config, requests_rx, suspended_rx).run());
+        // What the core asks of the login goes to this engine.
+        let dispatch = |action: Action| {
+            core.dispatch(action).unwrap();
+            for request in asked.try_iter() {
+                if matches!(
+                    request,
+                    Request::LoginStart { .. } | Request::LoginFinish { .. }
+                ) {
+                    requests.send(request).unwrap();
+                }
+            }
+        };
+
+        dispatch(Action::Navigate(crate::Route::Settings));
+        dispatch(Action::StartAgentLogin);
+        login_flow(&core, |f| matches!(f, LoginFlowView::Open { .. })).await;
+
+        let sent = tokio::time::Instant::now();
+        dispatch(Action::FinishAgentLogin {
+            code: crate::LoginCode::new("code#state"),
+        });
+        let stalled = login_flow(&core, |f| matches!(f, LoginFlowView::NoAnswer { .. })).await;
+        assert!(sent.elapsed() >= LOGIN_TIMEOUT, "gave up at the bound");
+        assert!(matches!(
+            stalled,
+            LoginFlowView::NoAnswer {
+                why: LoginNoAnswer::Failed(_),
+                ..
+            }
+        ));
+
+        dispatch(Action::RetryAgentLogin);
+        let refused = login_flow(&core, |f| matches!(f, LoginFlowView::NoAnswer { .. })).await;
+        assert_eq!(
+            refused,
+            LoginFlowView::NoAnswer {
+                url: "https://login.example/authorize?state=s".into(),
+                why: LoginNoAnswer::Failed(TransportError::BadStatus(503).to_string()),
+            }
+        );
+
+        dispatch(Action::RetryAgentLogin);
+        login_flow(&core, |f| *f == LoginFlowView::Done(LoginOutcome::LoggedIn)).await;
+        let finishes = server.finishes.lock().unwrap().clone();
+        let first = skywave_proto::LoginFinish {
+            flow,
+            code: "code#state".into(),
+        };
+        assert_eq!(finishes, vec![first.clone(), first.clone(), first]);
         engine.abort();
     }
 

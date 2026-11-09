@@ -3318,6 +3318,193 @@ fn a_hello_keeps_the_agent_login_until_another_server_is_paired() {
     kept(false, false);
 }
 
+/// Every byte of the replica on disk: the database and its WAL and shared
+/// memory files, whichever exist.
+fn replica_bytes(dir: &Path) -> Vec<u8> {
+    let db = dir.join(skywave_core::store::DB_FILE);
+    let mut bytes = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = db.clone().into_os_string();
+        path.push(suffix);
+        if let Ok(read) = std::fs::read(&path) {
+            bytes.extend(read);
+        }
+    }
+    bytes
+}
+
+fn holds(bytes: &[u8], text: &str) -> bool {
+    bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+}
+
+fn login_flow(core: &Core) -> skywave_core::LoginFlowView {
+    match core.view().screen {
+        skywave_core::Screen::Settings(settings) => settings.login.flow,
+        other => panic!("expected settings, got {other:?}"),
+    }
+}
+
+/// A login run from this device: its `LoggedIn` is stored and shown as a
+/// `hello` saying so would be, while the flow, its URL and the code stay
+/// in memory: no settings key and no byte of the replica holds them.
+#[test]
+fn an_agent_login_stores_its_outcome_and_never_its_url_or_code() {
+    use skywave_core::{Action, LoginCode, LoginFlowView, LoginOutcome, Request, Route};
+    use skywave_proto::{LoginFinishResult, LoginFlowId, LoginStartResult};
+
+    const STATE: &str = "statevalue7f3a91";
+    let url = format!("https://claude.example/oauth/authorize?code=true&state={STATE}");
+    let code = format!("authcode5be2c4#{STATE}");
+    let (_tmp, dir) = data_dir();
+    let core = Core::open_detached(&dir).unwrap();
+    let seam = core.seam();
+    let requests = seam.take_requests().unwrap();
+    seam.pairing_succeeded("srv.example:7443", paired_with(&ca_pem()))
+        .unwrap();
+    seam.hello_received(&hello_with_agent_login(true, true))
+        .unwrap();
+    let asked = || requests.try_iter().collect::<Vec<_>>();
+    asked();
+
+    core.dispatch(Action::Navigate(Route::Settings)).unwrap();
+    core.dispatch(Action::StartAgentLogin).unwrap();
+    let [Request::LoginStart { req }] = asked()[..] else {
+        panic!("expected a login start");
+    };
+    let flow = LoginFlowId::random();
+    seam.login_started(
+        req,
+        Ok(LoginStartResult::Open {
+            flow,
+            url: url.clone(),
+        }),
+    );
+    core.dispatch(Action::FinishAgentLogin {
+        code: LoginCode::new(code.clone()),
+    })
+    .unwrap();
+    let [Request::LoginFinish { req, ref finish }] = asked()[..] else {
+        panic!("expected a login finish");
+    };
+    assert_eq!((finish.flow, finish.code.as_str()), (flow, code.as_str()));
+    let expires = Utc.with_ymd_and_hms(2027, 3, 4, 5, 6, 7).unwrap();
+    seam.login_finished(
+        req,
+        Ok(LoginFinishResult::LoggedIn {
+            expires: Some(expires),
+        }),
+    )
+    .unwrap();
+
+    // Stored and shown at once, no hello needed.
+    assert_eq!(
+        login_flow(&core),
+        LoginFlowView::Done(LoginOutcome::LoggedIn)
+    );
+    let view = core.view();
+    assert!(!view.agent_logged_out);
+    assert_eq!(view.login_expires, Some(expires));
+    let settings = Store::open(&dir).unwrap().settings().unwrap();
+    assert!(!settings.agent_logged_out);
+    assert_eq!(settings.login_expires, Some(expires));
+
+    let secrets = [url.as_str(), code.as_str(), STATE];
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let mut rows = conn.prepare("SELECT key, value FROM settings").unwrap();
+    let settings: Vec<(String, String)> = rows
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for (key, value) in &settings {
+        for secret in secrets {
+            assert!(!value.contains(secret), "settings key {key} holds {secret}");
+        }
+    }
+    drop(rows);
+    drop(conn);
+
+    // Positive control: what the login did store is in the bytes, so a
+    // byte that is not would be found if it were.
+    let stored = expires.to_rfc3339();
+    for (when, bytes) in [
+        ("open", replica_bytes(&dir)),
+        ("closed", {
+            drop((core, seam));
+            replica_bytes(&dir)
+        }),
+    ] {
+        assert!(holds(&bytes, &stored), "{when}: the expiry is stored");
+        for secret in secrets {
+            assert!(!holds(&bytes, secret), "{when}: the replica holds {secret}");
+        }
+    }
+}
+
+/// Pairing with another server forgets the login flow: the settings
+/// screen starts over, and an answer still on its way from the old server
+/// is dropped.
+#[test]
+fn pairing_with_another_server_forgets_the_agent_login() {
+    use skywave_core::{Action, LoginCode, LoginFlowView, Request, Route};
+    use skywave_proto::{LoginFinishResult, LoginFlowId, LoginStartResult};
+
+    let (_tmp, dir) = data_dir();
+    let core = Core::open_detached(&dir).unwrap();
+    let seam = core.seam();
+    let requests = seam.take_requests().unwrap();
+    seam.pairing_succeeded("old.example:7443", paired_with(&ca_pem()))
+        .unwrap();
+    seam.hello_received(&hello_with_agent_login(true, true))
+        .unwrap();
+    let asked = || requests.try_iter().collect::<Vec<_>>();
+    asked();
+    core.dispatch(Action::Navigate(Route::Settings)).unwrap();
+    core.dispatch(Action::StartAgentLogin).unwrap();
+    let [Request::LoginStart { req }] = asked()[..] else {
+        panic!("expected a login start");
+    };
+    seam.login_started(
+        req,
+        Ok(LoginStartResult::Open {
+            flow: LoginFlowId::random(),
+            url: "https://old.example/login".into(),
+        }),
+    );
+    core.dispatch(Action::FinishAgentLogin {
+        code: LoginCode::new("a#b"),
+    })
+    .unwrap();
+    let [Request::LoginFinish { req, .. }] = asked()[..] else {
+        panic!("expected a login finish");
+    };
+    assert!(matches!(login_flow(&core), LoginFlowView::Finishing { .. }));
+
+    seam.pairing_succeeded("new.example:7443", paired_with(&ca_pem()))
+        .unwrap();
+    core.dispatch(Action::Navigate(Route::Settings)).unwrap();
+    assert_eq!(login_flow(&core), LoginFlowView::Idle);
+    seam.login_finished(req, Ok(LoginFinishResult::LoggedIn { expires: None }))
+        .unwrap();
+    assert_eq!(
+        login_flow(&core),
+        LoginFlowView::Idle,
+        "the late answer is dropped"
+    );
+    let settings = Store::open(&dir).unwrap().settings().unwrap();
+    assert!(
+        !settings.agent_logged_out,
+        "reset, and not set by the late answer"
+    );
+    seam.hello_received(&hello_with_agent_login(true, true))
+        .unwrap();
+    seam.login_finished(req, Ok(LoginFinishResult::LoggedIn { expires: None }))
+        .unwrap();
+    assert!(core.view().agent_logged_out, "still dropped after a hello");
+}
+
 #[test]
 fn the_agent_login_flags_are_kept_in_the_settings_until_a_hello_changes_them() {
     let (_tmp, dir) = data_dir();

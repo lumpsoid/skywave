@@ -1080,6 +1080,12 @@ mod tests {
                 other_addresses: Vec::new(),
                 device_id,
                 server_fingerprint: None,
+                login: skywave_core::LoginView {
+                    offered: false,
+                    logged_out: false,
+                    expires: login_expires,
+                    flow: skywave_core::LoginFlowView::Idle,
+                },
             };
             let view = ViewState {
                 link: Link::Online { latency_ms: 1 },

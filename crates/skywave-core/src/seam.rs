@@ -15,7 +15,7 @@ use std::sync::mpsc::Receiver;
 use chrono::Utc;
 use skywave_proto::{
     ChangesResult, CommandResult, ConversationsResult, DirsResult, EventBatch, HelloResponse,
-    StorageReport,
+    LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
 };
 
 use crate::blobs::{remove_all_blob_files, remove_blob_files};
@@ -101,6 +101,20 @@ pub enum Request {
     /// `req`.
     UsageLimits {
         req: u64,
+    },
+    /// Ask the server to start logging its agent in (or join the login it
+    /// has open), within [`LOGIN_TIMEOUT`](crate::LOGIN_TIMEOUT). The
+    /// engine answers with [`Seam::login_started`], naming `req`.
+    LoginStart {
+        req: u64,
+    },
+    /// Send the code the login page showed for the flow `finish` names,
+    /// within [`LOGIN_TIMEOUT`](crate::LOGIN_TIMEOUT). The engine answers
+    /// with [`Seam::login_finished`], naming `req`. The code is a secret:
+    /// [`LoginFinish`]'s `Debug` leaves it out.
+    LoginFinish {
+        req: u64,
+        finish: LoginFinish,
     },
     /// Count the lines of the downloaded blob at `path`, for the crop page,
     /// as a crop counts them ([`skywave_proto::crop::count`]), off the
@@ -585,6 +599,47 @@ impl Seam {
                 return Err(error.into());
             }
             state.model.usage_limits_stored(answer);
+            Ok(((), Vec::new()))
+        })
+    }
+
+    /// The answer to [`Request::LoginStart`] `req`. Kept in memory only;
+    /// an answer to any request but the one the login waits on is ignored.
+    pub fn login_started(&self, req: u64, result: Result<LoginStartResult, TransportError>) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state| {
+                state.model.login_started(req, result);
+                Ok(((), Vec::new()))
+            })
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::LoginFinish`] `req`. An answer to any
+    /// request but the one the login waits on touches neither the replica
+    /// nor the model. A `LoggedIn` is stored as a `hello` saying so would
+    /// be — the agent no longer logged out, its login expiring at
+    /// `expires` — and shown at once. Everything else stays in memory.
+    pub fn login_finished(
+        &self,
+        req: u64,
+        result: Result<LoginFinishResult, TransportError>,
+    ) -> Result<(), CoreError> {
+        self.update(|state| {
+            if !state.model.login_awaited(req) {
+                return Ok(((), Vec::new()));
+            }
+            let stored = match &result {
+                Ok(LoginFinishResult::LoggedIn { expires }) => state
+                    .store
+                    .set_agent_logged_out(false)
+                    .and_then(|()| state.store.set_login_expires(*expires)),
+                _ => Ok(()),
+            };
+            // The login ended either way; a failed write only leaves the
+            // stored hello fields to the next hello.
+            state.model.login_finished(req, result, stored.is_ok());
+            stored?;
             Ok(((), Vec::new()))
         })
     }

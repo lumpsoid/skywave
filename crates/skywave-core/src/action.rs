@@ -1,5 +1,6 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
+use crate::login::LoginCode;
 use crate::store::BlobPolicy;
 use crate::view::{
     ApprovalId, BlobId, BlobUse, CallId, CommandId, ComposerMode, ContextId, Decision, Effort,
@@ -75,6 +76,30 @@ pub enum Action {
     /// new one; offline the page is `Unavailable` at once and nothing is
     /// asked later.
     RefreshUsageLimits,
+    /// Start logging the server's agent in, on the settings screen (paired
+    /// only): the settings view's [`login`](crate::SettingsView::login)
+    /// shows the URL to log in at once the server opens it. Sending it
+    /// again starts over (the server joins the login it has open); an
+    /// older answer is then ignored. Offline the login ends `Offline` at
+    /// once and nothing is asked later.
+    StartAgentLogin,
+    /// Send the code the login page showed, on the settings screen, for
+    /// the login open there, trimmed. Nothing is sent while none is open;
+    /// a blank code or one over the server's cap is not sent either, and
+    /// the login stays open saying why
+    /// ([`LoginCodeRefused`](crate::LoginCodeRefused)). Offline nothing is
+    /// sent: the code waits for [`Action::RetryAgentLogin`]. A code the
+    /// server refuses ends the login; start again.
+    FinishAgentLogin {
+        code: LoginCode,
+    },
+    /// Send the code that got no answer again, with its flow, unchanged
+    /// ([`LoginFlowView::NoAnswer`](crate::LoginFlowView::NoAnswer)); the
+    /// server answers a repeated code with the first one's outcome.
+    RetryAgentLogin,
+    /// Forget this device's login, the code included, sending nothing; an
+    /// answer still on its way is dropped.
+    DismissAgentLogin,
     /// Queue a message, written for the session view's
     /// [`context`](crate::SessionView::context).
     SendMessage {

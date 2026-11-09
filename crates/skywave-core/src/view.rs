@@ -942,6 +942,86 @@ pub enum UsageLimitsUnavailable {
     Failed(String),
 }
 
+/// Logging the server's agent in from this device, on the settings screen:
+/// what the server's last `hello` said (as [`ViewState`]'s fields), and
+/// where this device's login stands ([`crate::Action::StartAgentLogin`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoginView {
+    /// As [`ViewState::agent_login_offered`].
+    pub offered: bool,
+    /// As [`ViewState::agent_logged_out`]; a `LoggedIn` answer clears it at
+    /// once.
+    pub logged_out: bool,
+    /// As [`ViewState::login_expires`]; a `LoggedIn` answer sets it at once.
+    pub expires: Option<DateTime<Utc>>,
+    pub flow: LoginFlowView,
+}
+
+/// Where this device's login of the server's agent stands. In memory only:
+/// a restart, a dismissal or another server starts it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginFlowView {
+    /// No login started, or the last one dismissed.
+    Idle,
+    /// Asked the server to start one.
+    Starting,
+    /// The user opens `url`, logs in there and pastes the code it shows
+    /// ([`crate::Action::FinishAgentLogin`]). `refused` says why this
+    /// device did not send the last code pasted; nothing reached the
+    /// server, so a corrected code can follow.
+    Open {
+        url: String,
+        refused: Option<LoginCodeRefused>,
+    },
+    /// The pasted code is on its way.
+    Finishing { url: String },
+    /// The pasted code got no answer: the device was offline, the request
+    /// failed or the server gave up waiting. The flow and the code are
+    /// kept; [`crate::Action::RetryAgentLogin`] sends them again.
+    NoAnswer { url: String, why: LoginNoAnswer },
+    /// The login ended.
+    Done(LoginOutcome),
+}
+
+/// Why a pasted code got no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginNoAnswer {
+    /// Not connected: nothing was sent.
+    Offline,
+    /// The request failed (a timeout or a `503` included), worded by the
+    /// transport.
+    Failed(String),
+}
+
+/// How a login ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginOutcome {
+    /// The agent is logged in.
+    LoggedIn,
+    /// Another login is being started or finished on the server.
+    Busy,
+    /// The server's agent has no login a device can run.
+    Unavailable,
+    /// The server knows no such login (never started, given up on, or
+    /// replaced): start again.
+    NoFlow,
+    /// Not connected: nothing was asked.
+    Offline,
+    /// The login failed, in the server's words or the transport's: a start
+    /// that got no answer (a `503` included), a code the server refused,
+    /// or a finish refused for good (a `4xx`). Start again.
+    Failed(String),
+}
+
+/// Why this device did not send a pasted code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginCodeRefused {
+    /// Nothing but whitespace.
+    Blank,
+    /// Longer than the server takes, in UTF-8 bytes once trimmed.
+    TooLong { max_bytes: usize },
+}
+
 /// A session as the usage screen names it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSession {
@@ -1832,6 +1912,8 @@ pub struct SettingsView {
     /// The fingerprint of the server CA pinned at pairing, to compare with
     /// what `skywaved` prints; `None` if unknown.
     pub server_fingerprint: Option<Fingerprint>,
+    /// Logging the server's agent in from this device.
+    pub login: LoginView,
 }
 
 #[cfg(test)]
