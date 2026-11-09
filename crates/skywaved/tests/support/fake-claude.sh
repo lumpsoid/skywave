@@ -61,6 +61,30 @@
 # `error: "authentication_failed"` and the text
 # "Not logged in · Please run /login", and a `result` with `subtype:
 # "success"` but `is_error: true`, `terminal_reason: "api_error"`.
+# The manual-code login (§3.17) keeps its files in the login dir (the
+# workdir without `--fake-login-dir`), its markers read at each request.
+# `claude_authenticate` is answered without a handshake: it appends a line
+# to ./authenticates.txt and answers the manualUrl
+# "https://example.invalid/oauth/authorize?state=fake-state" and an
+# automaticUrl on localhost, then opens the flow and writes a
+# `system/commands_changed` line of 128 KiB (more than a pipe holds),
+# then ./commands-sent: that file exists only once a reader took the line.
+# A second authenticate answers the same. With ./auth-refused it answers
+# the error "Claude.ai login is disabled by your organization" instead;
+# with ./auth-crash it exits 3 with the stderr line "OAuth is unavailable";
+# with ./auth-slow it answers only once a line is written to ./auth.fifo
+# (made before the authenticates.txt line).
+# `claude_oauth_callback` appends a line to ./callbacks.txt on every call.
+# With no open flow it answers the error "No active claude_authenticate
+# flow". `authorizationCode` "good" with `state` "fake-state" logs in:
+# ./logged-out is removed, ./.credentials.json written (`claudeAiOauth`,
+# `refreshTokenExpiresAt` 1794445707628, `expiresAt` 8 h before), a
+# one-line `system/commands_changed` written and the account
+# user@example.com answered; any other code gets the error "Request failed
+# with status code 400". Either way the flow ends. With ./callback-crash
+# the callback exits 3 with the stderr line "token exchange crashed"; with
+# ./callback-slow it answers only once a line is written to ./callback.fifo
+# (made before the callbacks.txt line).
 
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
@@ -96,6 +120,9 @@ done
 if [ -z "$fork" ] && [ -n "$resume" ]; then
   sid="$resume"
 fi
+# Where the login's files are; whether a login flow is open.
+login_files="${login_dir:-.}"
+auth_open=""
 
 if [ "$resume" = "00000000-0000-0000-0000-000000000000" ]; then
   # The real CLI names the unknown parent, under the id it would run as.
@@ -152,6 +179,58 @@ while IFS= read -r line; do
       elif [ ! -e usage-silent ]; then
         printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"session":{"total_cost_usd":0},"subscription_type":"max","rate_limits_available":true,"rate_limits":{"limits":[{"kind":"session","group":"session","percent":75,"severity":"warning","resets_at":"2026-11-08T20:20:00.259325+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":0,"severity":"normal","resets_at":"2026-11-15T00:00:00+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]},"behaviors":null}}}\n' "$(reqid "$line")"
       fi
+      ;;
+    *'"subtype":"claude_authenticate"'*)
+      if [ -e "$login_files/auth-slow" ]; then
+        rm -f "$login_files/auth.fifo"
+        mkfifo "$login_files/auth.fifo"
+      fi
+      echo authenticate >> "$login_files/authenticates.txt"
+      if [ -e "$login_files/auth-crash" ]; then
+        echo "OAuth is unavailable" >&2
+        exit 3
+      fi
+      if [ -e "$login_files/auth-slow" ]; then
+        # A child, not `read`: the SIGTERM to the group ends it, and the
+        # trap runs once it has.
+        head -n 1 "$login_files/auth.fifo" > /dev/null
+      fi
+      if [ -e "$login_files/auth-refused" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Claude.ai login is disabled by your organization"}}\n' "$(reqid "$line")"
+      else
+        auth_open=1
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"manualUrl":"https://example.invalid/oauth/authorize?state=fake-state","automaticUrl":"http://localhost:1/callback"}}}\n' "$(reqid "$line")"
+        big=$(head -c 131072 /dev/zero | tr '\0' x)
+        printf '{"type":"system","subtype":"commands_changed","commands":[{"name":"%s"}],"session_id":"%s"}\n' "$big" "$sid"
+        : > "$login_files/commands-sent"
+      fi
+      ;;
+    *'"subtype":"claude_oauth_callback"'*)
+      if [ -e "$login_files/callback-slow" ]; then
+        rm -f "$login_files/callback.fifo"
+        mkfifo "$login_files/callback.fifo"
+      fi
+      echo callback >> "$login_files/callbacks.txt"
+      if [ -e "$login_files/callback-crash" ]; then
+        echo "token exchange crashed" >&2
+        exit 3
+      fi
+      if [ -e "$login_files/callback-slow" ]; then
+        head -n 1 "$login_files/callback.fifo" > /dev/null
+      fi
+      code=$(printf '%s' "$line" | sed -n 's/.*"authorizationCode":"\([^"]*\)".*/\1/p')
+      state=$(printf '%s' "$line" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
+      if [ -z "$auth_open" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"No active claude_authenticate flow"}}\n' "$(reqid "$line")"
+      elif [ "$code" = good ] && [ "$state" = fake-state ]; then
+        rm -f "$login_files/logged-out"
+        printf '{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh","expiresAt":1794416907628,"refreshTokenExpiresAt":1794445707628,"scopes":["user:inference"]}}\n' > "$login_files/.credentials.json"
+        printf '{"type":"system","subtype":"commands_changed","commands":[{"name":"usage-credits"}],"session_id":"%s"}\n' "$sid"
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"account":{"email":"user@example.com","subscriptionType":"Claude Max","apiProvider":"firstParty"}}}}\n' "$(reqid "$line")"
+      else
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Request failed with status code 400"}}\n' "$(reqid "$line")"
+      fi
+      auth_open=""
       ;;
     *'"subtype":"initialize"'*)
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"%s","account":%s,"current_permission_mode":"%s","session_state":"idle"}}}\n' "$(reqid "$line")" "$version" "$(account)" "$mode"

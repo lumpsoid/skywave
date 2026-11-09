@@ -17,6 +17,7 @@ use skywave_proto::{ContextId, Decision, SessionId};
 use skywaved::agent::claude_code::limits::{
     ClaudeUsageLimits, USAGE_REQUEST_ID, get_usage_request, usage_answer,
 };
+use skywaved::agent::claude_code::login::{ClaudeLogin, control_answer};
 use skywaved::agent::claude_code::protocol::{
     self, INTERRUPT_REASON, Output, PINNED_VERSION, Protocol,
 };
@@ -32,7 +33,10 @@ use skywaved::agent::{
     QuestionAnswer, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec,
     SubagentFigures, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
-use skywaved::agent::{LimitSeverity, LimitWindow, LimitsError, UsageLimitsSource};
+use skywaved::agent::{
+    AgentLogin, LimitSeverity, LimitWindow, LimitsError, LoginAttempt, LoginError, NoAgentLogin,
+    UsageLimitsSource,
+};
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
 
@@ -5660,4 +5664,285 @@ fn replay_get_usage() {
         ]
     );
     assert!(answer.iter().all(|l| l.resets_at.is_some()));
+}
+
+// ---------------------------------------------------------------------------
+// Login
+
+/// The URL the fake CLI answers `claude_authenticate` with.
+const FAKE_MANUAL_URL: &str = "https://example.invalid/oauth/authorize?state=fake-state";
+
+/// A login whose processes run the fake CLI in `work`, with its markers,
+/// its record of requests and the credentials it writes in `login`.
+struct LoginRig {
+    _tmp: tempfile::TempDir,
+    work: PathBuf,
+    login: PathBuf,
+    claude: ClaudeLogin,
+}
+
+impl LoginRig {
+    fn new() -> LoginRig {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let login = tmp.path().join("login");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&login).unwrap();
+        let adapter = ClaudeCodeAdapter::new(AgentConfig {
+            command: fake_cli(),
+            args: vec![
+                "--fake-login-dir".to_owned(),
+                login.to_str().unwrap().to_owned(),
+            ],
+            allow_bypass: false,
+        });
+        let claude = ClaudeLogin::new(
+            login.join(".credentials.json"),
+            false,
+            adapter,
+            work.clone(),
+        );
+        LoginRig {
+            _tmp: tmp,
+            work,
+            login,
+            claude,
+        }
+    }
+
+    fn mark(&self, marker: &str) {
+        std::fs::write(self.login.join(marker), "").unwrap();
+    }
+
+    /// How many lines the fake wrote to `name` in the login dir; 0 for no
+    /// file.
+    fn lines(&self, name: &str) -> usize {
+        std::fs::read_to_string(self.login.join(name)).map_or(0, |t| t.lines().count())
+    }
+
+    async fn begin(&self) -> Result<Box<dyn LoginAttempt>, LoginError> {
+        self.claude.begin(std::time::Instant::now() + WAIT).await
+    }
+}
+
+/// Waits until `path` exists.
+async fn appears(path: &Path) {
+    tokio::time::timeout(WAIT, async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} never appeared", path.display()));
+}
+
+#[tokio::test]
+async fn a_login_begins_with_the_manual_url_in_a_process_of_its_own() {
+    let rig = LoginRig::new();
+    let attempt = rig.begin().await.unwrap();
+    assert_eq!(attempt.url(), FAKE_MANUAL_URL);
+    assert_eq!(rig.lines("authenticates.txt"), 1);
+    // A new conversation of its own, never a session's.
+    let argv = argv(&rig.work);
+    assert!(argv.iter().any(|a| a == "--session-id"));
+    assert!(!argv.iter().any(|a| a == "--resume"));
+    assert!(!rig.work.join("term.txt").exists());
+}
+
+#[tokio::test]
+async fn dropping_an_open_login_attempt_stops_its_process() {
+    let rig = LoginRig::new();
+    let attempt = rig.begin().await.unwrap();
+    drop(attempt);
+    terminated(&rig.work).await;
+    assert_eq!(rig.lines("callbacks.txt"), 0);
+}
+
+#[tokio::test]
+async fn a_refused_or_failed_login_start_says_why() {
+    let rig = LoginRig::new();
+    rig.mark("auth-refused");
+    assert_eq!(
+        rig.begin().await.unwrap_err(),
+        LoginError::Failed("Claude.ai login is disabled by your organization".into())
+    );
+    terminated(&rig.work).await;
+    std::fs::remove_file(rig.login.join("auth-refused")).unwrap();
+
+    // A CLI that exits before answering: the exit's own error.
+    rig.mark("auth-crash");
+    let Err(LoginError::Failed(why)) = rig.begin().await else {
+        panic!("expected a failure");
+    };
+    assert!(why.contains("OAuth is unavailable"), "{why}");
+    assert_eq!(rig.lines("authenticates.txt"), 2);
+}
+
+#[tokio::test]
+async fn a_login_start_gives_up_at_its_deadline_and_stops_the_process() {
+    let rig = LoginRig::new();
+    rig.mark("auth-slow");
+    let begun = rig
+        .claude
+        .begin(std::time::Instant::now() + Duration::from_millis(500))
+        .await;
+    assert!(matches!(begun, Err(LoginError::Failed(_))), "{begun:?}");
+    assert_eq!(rig.lines("authenticates.txt"), 1);
+    terminated(&rig.work).await;
+}
+
+#[tokio::test]
+async fn a_login_is_not_begun_where_it_is_not_offered() {
+    assert_eq!(
+        NoAgentLogin
+            .begin(std::time::Instant::now() + WAIT)
+            .await
+            .unwrap_err(),
+        LoginError::Unavailable
+    );
+    // The environment logs the CLI in: no process is started.
+    let rig = LoginRig::new();
+    let adapter = ClaudeCodeAdapter::new(AgentConfig {
+        command: fake_cli(),
+        args: Vec::new(),
+        allow_bypass: false,
+    });
+    let elsewhere = ClaudeLogin::new(
+        rig.login.join(".credentials.json"),
+        true,
+        adapter,
+        rig.work.clone(),
+    );
+    assert_eq!(
+        elsewhere
+            .begin(std::time::Instant::now() + WAIT)
+            .await
+            .unwrap_err(),
+        LoginError::Unavailable
+    );
+    assert!(!rig.work.join("argv.txt").exists());
+}
+
+/// The checks refuse without asking the CLI; a bad code then reaches it,
+/// which is refused by the CLI's own words and ends the attempt.
+#[tokio::test]
+async fn a_pasted_login_code_is_checked_before_the_agent_sees_it() {
+    let rig = LoginRig::new();
+    let attempt = rig.begin().await.unwrap();
+    for refused in ["nohash", "#state", "code#"] {
+        assert_eq!(
+            attempt.check(refused),
+            Err("paste the whole code shown after signing in".to_owned()),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(attempt.check("a#b#c"), Ok(()));
+    assert_eq!(rig.lines("callbacks.txt"), 0);
+
+    assert_eq!(
+        attempt.finish("bad#fake-state".into()).await,
+        Err("Request failed with status code 400".to_owned())
+    );
+    assert_eq!(rig.lines("callbacks.txt"), 1);
+    assert!(!rig.login.join(".credentials.json").exists());
+    terminated(&rig.work).await;
+}
+
+/// The attempt's task reads the CLI's stdout while it waits for the code:
+/// the fake writes more than a pipe holds after its answer, and marks when
+/// it got it all out. Then a good code logs in, and the expiry read right
+/// after the answer is the new login's.
+#[tokio::test]
+async fn a_good_code_logs_the_agent_in_while_the_login_attempt_keeps_reading() {
+    let rig = LoginRig::new();
+    rig.mark("logged-out");
+    let attempt = rig.begin().await.unwrap();
+    appears(&rig.login.join("commands-sent")).await;
+    assert_eq!(rig.claude.expires(), None);
+
+    assert_eq!(attempt.finish("good#fake-state".into()).await, Ok(()));
+    assert_eq!(
+        rig.claude.expires(),
+        chrono::DateTime::from_timestamp_millis(1_794_445_707_628)
+    );
+    assert!(!rig.login.join("logged-out").exists());
+    terminated(&rig.work).await;
+}
+
+#[tokio::test]
+async fn a_login_whose_agent_exits_on_the_code_says_why() {
+    let rig = LoginRig::new();
+    rig.mark("callback-crash");
+    let attempt = rig.begin().await.unwrap();
+    let why = attempt.finish("good#fake-state".into()).await.unwrap_err();
+    assert!(why.contains("token exchange crashed"), "{why}");
+}
+
+/// Giving up on the answer (the request that waits for it gone) stops the
+/// process the code was sent to.
+#[tokio::test]
+async fn dropping_a_login_finish_stops_its_process() {
+    let rig = LoginRig::new();
+    rig.mark("callback-slow");
+    let attempt = rig.begin().await.unwrap();
+    let mut finish = attempt.finish("good#fake-state".into());
+    let sent = rig.login.join("callbacks.txt");
+    tokio::select! {
+        outcome = &mut finish => panic!("answered without a cue: {outcome:?}"),
+        () = appears(&sent) => {}
+    }
+    assert!(!rig.work.join("term.txt").exists());
+    drop(finish);
+    terminated(&rig.work).await;
+    assert!(!rig.login.join(".credentials.json").exists());
+}
+
+/// The recorded login: the adapter writes what was recorded (the code and
+/// state scrubbed), and reads the manual URL of the answer.
+#[test]
+fn replay_login() {
+    let records = fixture("login");
+    let written = |subtype: &str| {
+        records
+            .iter()
+            .filter(|r| r["dir"] == "in")
+            .map(|r| &r["msg"])
+            .find(|m| m["request"]["subtype"] == subtype)
+            .unwrap_or_else(|| panic!("no {subtype} recorded"))
+            .clone()
+    };
+    let authenticate = written("claude_authenticate");
+    assert_eq!(
+        normalized(&authenticate),
+        normalized(&protocol::authenticate_request("x"))
+    );
+    let callback = written("claude_oauth_callback");
+    assert_eq!(
+        normalized(&callback),
+        normalized(&protocol::oauth_callback_request(
+            "x",
+            "<scrubbed-code>",
+            "<scrubbed-state>"
+        ))
+    );
+    let answer = |request: &Value| {
+        let id = request["request_id"].as_str().unwrap();
+        records
+            .iter()
+            .filter(|r| r["dir"] == "out")
+            .find_map(|r| control_answer(&r["msg"], id).map(|a| a.cloned()))
+            .expect("an answer to the request")
+    };
+    let urls = answer(&authenticate).unwrap();
+    let manual = protocol::manual_url(&urls).unwrap();
+    assert!(
+        manual.starts_with("https://claude.com/cai/oauth/authorize?"),
+        "{manual}"
+    );
+    assert!(
+        manual.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com"),
+        "{manual}"
+    );
+    assert_ne!(Some(manual), urls["automaticUrl"].as_str());
+    assert!(answer(&callback).is_ok());
 }

@@ -296,17 +296,21 @@ async fn serve(
     let limits_workdir = config.roots.first().unwrap_or(&config.data_dir).clone();
     let usage_limits = Arc::new(ClaudeUsageLimits::new(
         ClaudeCodeAdapter::new(config.agent.clone()),
-        limits_workdir,
+        limits_workdir.clone(),
     ));
     // The agent's login, read from the credentials the CLI the adapter
-    // spawns uses, so devices warn before it expires.
-    let login: Arc<dyn AgentLogin> = match ClaudeLogin::from_env() {
-        Some(login) => Arc::new(login),
-        None => {
-            tracing::warn!("no CLAUDE_CONFIG_DIR or HOME: the agent's login expiry cannot be read");
-            Arc::new(NoAgentLogin)
-        }
-    };
+    // spawns uses, so devices warn before it expires; a device logs it in
+    // with a process of its own, run where a usage read's runs.
+    let login: Arc<dyn AgentLogin> =
+        match ClaudeLogin::from_env(ClaudeCodeAdapter::new(config.agent.clone()), limits_workdir) {
+            Some(login) => Arc::new(login),
+            None => {
+                tracing::warn!(
+                    "no CLAUDE_CONFIG_DIR or HOME: the agent's login expiry cannot be read"
+                );
+                Arc::new(NoAgentLogin)
+            }
+        };
     // What the session processes say of the agent's login: the supervisor
     // learns it, `hello` reports it.
     let login_state = LoginState::new();
