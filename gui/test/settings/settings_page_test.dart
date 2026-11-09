@@ -9,7 +9,8 @@ void main() {
   testWidgets('settings shows the device and the toggle sets the policy', (
     tester,
   ) async {
-    // Tall enough that the fingerprint, under the blob wording, is built.
+    // Tall enough that the fingerprint and agent login, under the blob
+    // wording, are built.
     tester.view
       ..physicalSize = const Size(800, 900)
       ..devicePixelRatio = 1;
@@ -25,6 +26,7 @@ void main() {
             serverAddresses: null,
             device: 'dev-1',
             fingerprint: 'AB:CD',
+            agentLogin: 'expires in 12 days · 2026-11-21',
             stayConnected: null,
           ),
           link: LinkHolder(),
@@ -38,6 +40,7 @@ void main() {
       'srv:7443',
       'dev-1',
       'AB:CD',
+      'expires in 12 days · 2026-11-21',
     ]) {
       expect(find.text(text), findsOneWidget, reason: text);
     }
@@ -74,6 +77,7 @@ void main() {
         serverAddresses: serverAddresses,
         device: 'dev-1',
         fingerprint: null,
+        agentLogin: null,
         stayConnected: stayConnected,
       ),
       link: LinkHolder(),

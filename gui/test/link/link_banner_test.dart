@@ -11,6 +11,7 @@ LinkUpdate link(
   bool canRetryNow = false,
   int elsewhere = 0,
   String? elsewhereLabel,
+  String? loginLabel,
 }) => LinkUpdate(
   state: state,
   label: label,
@@ -24,6 +25,7 @@ LinkUpdate link(
   queued: 0,
   approvalsElsewhere: elsewhere,
   elsewhereLabel: elsewhereLabel,
+  loginLabel: loginLabel,
 );
 
 void main() {
@@ -44,6 +46,28 @@ void main() {
       ),
     );
   }
+
+  testWidgets('the login warning shows even while online with nothing else', (
+    tester,
+  ) async {
+    const warning = 'agent login expires in 2 days · log in again on the server';
+    await pump(tester);
+    holder.apply(link(LinkState.online, ''));
+    await tester.pump();
+    expect(find.byKey(const Key('login-label')), findsNothing);
+
+    holder.apply(link(LinkState.online, '', loginLabel: warning));
+    await tester.pumpAndSettle();
+    expect(find.text(warning), findsOneWidget);
+    expect(find.byKey(const Key('link-label')), findsNothing);
+
+    holder.apply(
+      link(LinkState.reconnecting, 'offline · timed out', loginLabel: warning),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('offline · timed out'), findsOneWidget);
+    expect(find.text(warning), findsOneWidget);
+  });
 
   testWidgets('the banner shows each state\'s label, and nothing unpaired', (
     tester,

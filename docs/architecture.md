@@ -157,7 +157,7 @@ every version.
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
-| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, and whether it allows bypass mode (`agent.allow_bypass`, D38). |
+| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, whether it allows bypass mode (`agent.allow_bypass`, D38), and when the agent's login expires (`login_expires`; see "The agent's login"). |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
@@ -524,6 +524,15 @@ the daemon's appends, which would otherwise stop `serve` (below).
   which it answers `Failed`; the reply gives up with a 503 at 20 s. A
   scope is cut to one line of `TITLE_MAX_CHARS`, a reason of
   `REFUSAL_MAX_CHARS`.
+- **The agent's login** (`login_expires` on `hello`): a headless agent
+  never says its login is about to expire, and past it no session starts
+  until someone logs the agent in again on the server. Each `hello` asks
+  an `AgentLogin` (agent-agnostic; `NoAgentLogin` says nothing) when it
+  expires, so a login renewed on the server shows at a device's next
+  connection. The Claude Code one (`agent/claude_code/login.rs`) reads the
+  refresh token's expiry from the CLI's `.credentials.json` each time,
+  and says nothing when the environment logs the CLI in another way
+  (docs/agents/claude-code.md §3.16). Nothing is stored on the server.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
@@ -759,6 +768,10 @@ logs) an event that no longer decodes rather than failing.
   workdir content across sessions). An answer for a session not in the
   replica (unknown, deleted here, or from before a re-pair) is dropped.
   `usage_limits` keeps the latest answer to the usage limits read.
+  `settings` also keeps what the last `hello` said of the server: whether
+  it runs shell commands, whether it allows bypass mode, and when its
+  agent's login expires (`login_expires`, gone with a re-pair to another
+  server), so each shows offline too.
 - **Session list order**: newest first by `SessionSummary::last_message_seq`,
   the seq of the session's newest `UserMessage` (its creation until it has
   one). Only a message someone writes moves a session up. The agent's
@@ -1119,6 +1132,18 @@ logs) an event that no longer decodes rather than failing.
   did not report is left out. The TUI opens it with `L` (session list,
   usage screen); the GUI from the usage page. From a session the limits
   show on its info page instead.
+- **Agent login** (`ViewState::login_expires`, on every screen): Settings
+  always say when the agent's login expires, once paired
+  (`skywave_present::login::expiry_label`: `expires in 12 days ·
+  2026-11-21`, `expired · …`, `no expiry reported`; the TUI's `Agent
+  login:` line, the GUI's `agent_login` tile). Within three days of the
+  expiry, and once it has passed, the banner warns too
+  (`login::expiry_warning`: `agent login expires in 2 days · log in again
+  on the server`). Both count from the head's clock, a part of a day
+  counting as a day, as the agent's own terminal counts. The TUI adds the
+  warning to the link banner; the GUI's `LinkUpdate` carries it as
+  `login_label`, shown below the link's label even while online with
+  nothing else to say.
 - **Session info page** (`Action::OpenSessionInfo { session_id }`,
   `Screen::SessionInfo(SessionInfoView)`): one session's particulars, all
   from the replica but the limits: its title and full workdir, the usage

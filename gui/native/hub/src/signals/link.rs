@@ -40,6 +40,11 @@ pub struct LinkUpdate {
     pub approvals_elsewhere: u32,
     /// `1 approval elsewhere`, `3 approvals elsewhere`; `None` for none.
     pub elsewhere_label: Option<String>,
+    /// `agent login expires in 2 days · log in again on the server`, `agent
+    /// login expired · …`, within three days of the agent's login expiring
+    /// on the server; `None` otherwise. The banner shows it whatever the
+    /// link, even while online with nothing else to say.
+    pub login_label: Option<String>,
 }
 
 /// The link's state, for the banner's colour and icon.

@@ -1013,6 +1013,7 @@ mod tests {
             devices: Vec::new(),
             shell: false,
             bypass: false,
+            login_expires: None,
         })
         .unwrap()
     }
