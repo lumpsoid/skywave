@@ -42,9 +42,9 @@ pub enum Action {
         workdir: String,
         conversation: Option<String>,
     },
-    /// Start a session in the open session's workdir, and open it once its
-    /// `SessionCreated` reaches the replica, unless the user went elsewhere
-    /// meanwhile.
+    /// Start a session in the session's workdir, from its page or from a
+    /// session list, and open it once its `SessionCreated` reaches the
+    /// replica, unless the user went elsewhere meanwhile.
     CreateSessionLike(SessionId),
     /// Complete `input` as a workdir: the session list's
     /// [`completion`](crate::SessionListView::completion) shows the

@@ -264,9 +264,9 @@ pub(crate) struct Model {
     /// or failed (in memory only).
     usage_limits: UsageLimits,
     /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
-    /// new session is not in the replica yet: its command, and the session
+    /// new session is not in the replica yet: its command, and the place
     /// it was asked from, still on screen. In memory only.
-    opening: Option<(CommandId, SessionId)>,
+    opening: Option<(CommandId, Place)>,
     /// The server's devices by name, as stored.
     devices: HashMap<DeviceId, String>,
     /// The models of the newest `ModelsOffered`, as stored.
@@ -464,10 +464,14 @@ impl Model {
                 })
             }
             Action::CreateSessionLike(from) => {
-                let Some(workdir) = self
-                    .summary(from)
-                    .and_then(|s| s.workdir.clone())
-                    .filter(|_| self.place == Place::Session(from))
+                let place = self.place;
+                let Some(workdir) =
+                    self.summary(from)
+                        .and_then(|s| s.workdir.clone())
+                        .filter(|_| {
+                            matches!(place, Place::SessionList | Place::Archived)
+                                || place == Place::Session(from)
+                        })
                 else {
                     return Vec::new();
                 };
@@ -476,7 +480,7 @@ impl Model {
                     conversation: None,
                 });
                 if let Some(Effect::Enqueue(command)) = effects.first() {
-                    self.opening = Some((command.id, from));
+                    self.opening = Some((command.id, place));
                 }
                 effects
             }
@@ -1216,7 +1220,7 @@ impl Model {
             name,
         });
         if let Some(Effect::Enqueue(command)) = moved.first() {
-            self.opening = Some((command.id, session_id));
+            self.opening = Some((command.id, Place::Session(session_id)));
         }
         effects.extend(moved);
         effects
@@ -1544,7 +1548,7 @@ impl Model {
                     _ => event.session_id,
                 };
                 // Its events come from the store: see `unloaded_session`.
-                if self.place == Place::Session(from) {
+                if self.place == from {
                     self.place = Place::Session(to);
                     self.open = None;
                     self.viewing = None;
@@ -6772,11 +6776,14 @@ mod tests {
     }
 
     #[test]
-    fn a_session_created_like_the_open_one_opens_once_it_is_logged() {
+    fn a_session_created_like_another_opens_once_it_is_logged() {
         let mut f = Fixture::paired();
         let old = f.session("/srv/a");
         let list = f.session("/srv/b");
-        // Only from the session on screen.
+        // Only from the session on screen or a session list.
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert!(f.dispatch(Action::CreateSessionLike(old)).is_empty());
+        f.open(list);
         assert!(f.dispatch(Action::CreateSessionLike(old)).is_empty());
         f.open(old);
         let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
@@ -6807,8 +6814,29 @@ mod tests {
         f.open(old);
         let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
         f.open(list);
-        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        f.log_commands(SessionId::new(), vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(list));
+
+        // From a row of the session list: opens it too.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: "/srv/a".into(),
+                conversation: None,
+            }
+        );
+        let new = SessionId::new();
+        f.log_commands(new, vec![(Some(command.id), created.clone())]);
+        assert_eq!(f.model.open_session(), Some(new));
+
+        // Left the list meanwhile: stays where it went.
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        f.dispatch(Action::Navigate(Route::Settings));
+        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        assert!(matches!(f.model.view().screen, Screen::Settings(_)));
     }
 
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {
@@ -10228,7 +10256,7 @@ mod tests {
         );
         assert_eq!(
             f.model.opening,
-            Some((moved.id, sid)),
+            Some((moved.id, Place::Session(sid))),
             "the move's id, not the clear's"
         );
         let view = f.session_view();

@@ -12,11 +12,12 @@ SessionRowView sessionRow(
   bool deletable = false,
   String? blocked,
   String? title,
+  bool hasWorkdir = true,
 }) => SessionRowView(
   sessionId: id,
   title: title ?? 'title $id',
-  workdir: '/srv/proj-$id',
-  workdirName: 'proj-$id',
+  workdir: hasWorkdir ? '/srv/proj-$id' : null,
+  workdirName: hasWorkdir ? 'proj-$id' : null,
   state: AgentState.awaitingApproval,
   badgeLabel: 'approval',
   unread: 3,
@@ -114,6 +115,28 @@ void main() {
       const GuiIntentAct(
         action: ActionIntentSetSessionArchived(sessionId: 'a', archived: false),
       ),
+    ]);
+  });
+
+  testWidgets('the menu starts a new session in the row\'s workdir', (
+    tester,
+  ) async {
+    await pump(
+      tester,
+      list(rows: [sessionRow('a'), sessionRow('b', hasWorkdir: false)]),
+    );
+    await tester.tap(find.byKey(const Key('row-menu-b')));
+    await tester.pumpAndSettle();
+    expect(find.text('New session here'), findsNothing, reason: 'no workdir');
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('row-menu-a')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('New session here'));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentCreateSessionLike(sessionId: 'a')),
     ]);
   });
 
