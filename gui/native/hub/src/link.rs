@@ -121,7 +121,10 @@ pub fn update(
         logged_out_label: login
             .logged_out
             .then(|| login::logged_out_warning(login.offered)),
+        // A logged-out agent's expiry is moot: the logged-out warning says
+        // all there is to do.
         login_label: DateTime::from_timestamp_millis(wall_ms)
+            .filter(|_| !login.logged_out)
             .and_then(|now| login::expiry_warning_for(login.expires, now, login.offered)),
     }
 }
@@ -413,6 +416,30 @@ mod tests {
         assert_eq!(
             update(&online, 0, 0, login(true, false), 0).logged_out_label,
             None
+        );
+    }
+
+    #[test]
+    fn no_expiry_warning_while_logged_out() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let online = Link::Online { latency_ms: 12 };
+        let expiring = |logged_out| AgentLogin {
+            expires: Some(now + chrono::TimeDelta::days(2)),
+            offered: true,
+            logged_out,
+        };
+        let banner = update(&online, 0, 0, expiring(true), now.timestamp_millis());
+        assert_eq!(banner.login_label, None);
+        assert_eq!(
+            banner.logged_out_label.as_deref(),
+            Some("agent not logged in · log in from settings")
+        );
+        assert_eq!(
+            update(&online, 0, 0, expiring(false), now.timestamp_millis())
+                .login_label
+                .as_deref(),
+            Some("agent login expires in 2 days · log in again from settings"),
+            "the same expiry warns while logged in"
         );
     }
 }

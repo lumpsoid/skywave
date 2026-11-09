@@ -3,13 +3,15 @@ import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
+import 'package:skywave_gui/settings/agent_login_panel.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Settings: the blob policy, Stay connected where offered (Android), and
 /// the server and device this one is
 /// paired as, the link to it with its round trip, the fingerprint to
 /// compare with what `skywaved` prints, when the agent's login on the
-/// server expires, and Re-pair. A paired server's tile opens its
+/// server expires, with Log in where the server offers a login from a
+/// device ([AgentLoginPanel] below it), and Re-pair. A paired server's tile opens its
 /// addresses ([ServerAddressesPage]), to reach it at another without
 /// re-pairing.
 class SettingsPage extends StatelessWidget {
@@ -142,12 +144,32 @@ class SettingsPage extends StatelessWidget {
                 title: const Text('Server fingerprint'),
                 subtitle: SelectableText(fingerprint, style: monoText),
               ),
-            if (screen.agentLogin case final login?)
+            if (screen.agentLogin case final expiry?)
               ListTile(
                 key: const Key('agent-login'),
                 leading: const Icon(Icons.key),
                 title: const Text('Agent login'),
-                subtitle: Text(login),
+                subtitle: Text(expiry),
+                trailing: switch (screen.login) {
+                  final login? when login.canLogIn => OutlinedButton(
+                    key: const Key('agent-log-in'),
+                    onPressed: login.canStart
+                        ? () => send.act(const ActionIntentStartAgentLogin())
+                        : null,
+                    child: Text(
+                      login.state == LoginFlowState.failed
+                          ? 'Start again'
+                          : 'Log in',
+                    ),
+                  ),
+                  _ => null,
+                },
+              ),
+            if (screen.login case final login?)
+              AgentLoginPanel(
+                key: const Key('agent-login-panel'),
+                login: login,
+                send: send,
               ),
             Padding(
               padding: const EdgeInsets.all(16),

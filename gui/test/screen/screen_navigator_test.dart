@@ -51,6 +51,46 @@ void main() {
     expect(sent, [const GuiIntentFollowingChanged(following: true)]);
   });
 
+  testWidgets('the screen leaves the top inset to the banner while it shows', (
+    tester,
+  ) async {
+    final holders = fakeHolders();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MediaQuery(
+          data: const MediaQueryData(padding: EdgeInsets.only(top: 24)),
+          child: ScreenNavigator(holders: holders, send: (_) {}),
+        ),
+      ),
+    );
+    holders.screen.apply(listScreen());
+    LinkUpdate online({String? loggedOut}) => LinkUpdate(
+      state: LinkState.online,
+      label: '',
+      connectionLabel: '',
+      canRetryNow: false,
+      rejected: false,
+      canResetReplica: false,
+      queued: 0,
+      approvalsElsewhere: 0,
+      loggedOutLabel: loggedOut,
+    );
+    double screenTop() =>
+        MediaQuery.paddingOf(tester.element(find.byType(SessionListPage))).top;
+
+    holders.link.apply(online());
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('link-banner')), findsNothing);
+    expect(screenTop(), 24, reason: 'no banner: the screen takes the inset');
+
+    holders.link.apply(
+      online(loggedOut: 'agent not logged in · log in from settings'),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('link-banner')), findsOneWidget);
+    expect(screenTop(), 0, reason: 'the banner took it');
+  });
+
   testWidgets('system back is Back only where Rust says it goes somewhere', (
     tester,
   ) async {
