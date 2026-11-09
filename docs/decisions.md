@@ -1276,3 +1276,24 @@ plain text.
 message says, outside Rust); a `BodyFormat::Markdown` on the wire (every
 agent the server runs writes markdown today); syntax highlighting in code
 blocks (later, if wanted).
+
+## D49. The agent login runs over request/response, and nothing of it is kept
+A device logs the server's agent in with `POST /v1/agent-login/start`
+(answering a URL to sign in at and a random `LoginFlowId`) and `POST
+/v1/agent-login/finish` (the flow and the code the sign-in page showed).
+- **Never the log.** The URL carries the flow's state and the code is a
+  credential: neither belongs in a permanent, replicated log every device
+  pulls. Neither is logged (tracing included) or stored, and the flow
+  appends no event; the outcome shows as `hello`'s `login_expires` and
+  `agent_logged_out`.
+- **One flow, in memory.** The server keeps one slot. Racing starts join
+  (one agent process), a finish is idempotent per flow (a retry after a
+  lost reply never sends the agent a second code, which the CLI would
+  refuse since any callback ends its flow), and a restart forgets the flow:
+  its finish is `NoFlow` and the device starts again.
+- **No timer, no cancel.** A flow left open 15 minutes goes at the next
+  start, finish or `hello`; a device that gives up just stops.
+**Rejected:** commands and events (they would store the code and the URL
+forever, and a replayed command would resend the code); a flow per device
+(the agent has one login, and two flows would race to write it); a cancel
+endpoint (an abandoned flow costs one idle process until the next touch).

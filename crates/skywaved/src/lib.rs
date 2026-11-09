@@ -20,6 +20,7 @@ pub mod error;
 pub mod event_log;
 pub mod identity;
 pub mod logging;
+pub mod login;
 pub mod pairing;
 mod process;
 pub mod server;

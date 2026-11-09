@@ -165,6 +165,8 @@ every version.
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
 | `GET /v1/usage-limits` | The usage limits of the account the agent runs as, as a `UsageLimitsResult` read from the agent when asked: `Read { at, limits }` (each limit's window, `Session` or `Weekly`, its scope such as one model, percent used, severity and reset time, a figure the agent did not report left out), `Unavailable` for an agent that reports none, or `Failed { reason }`. Nothing is stored on the server. |
+| `POST /v1/agent-login/start` | No body. Starts logging the agent in from a device (D49), as a `LoginStartResult`: `Open { flow, url }` (the user signs in at `url`, at most `LOGIN_URL_MAX_BYTES`; a longer one is `Failed`, never cut), the same flow and URL to a start while one is starting or open, `Busy` while a finish runs, `Unavailable` when `agent_login_offered` is false, or `Failed { reason }`. The agent gets 15 s; 503 at 20 s. See "The agent's login". Since v29. |
+| `POST /v1/agent-login/finish` | A `LoginFinish { flow, code }` (the code the sign-in page showed; over `LOGIN_CODE_MAX_BYTES` a 400). Answers `LoggedIn { expires }`, `NoFlow` (no such flow, or given up on) or `Failed { reason }`. The first finish of a flow is the only one the agent sees: every later one gets its outcome, whatever code it carries. 503 after 20 s of waiting for the agent, while the finish goes on; a retry collects it. Since v29. |
 | `GET /v1/workdir/changes?session=` | A session's git changes (D36) as a `ChangesResult`: every file changed against `HEAD` (staged and unstaged together) plus untracked ones, sorted by path and capped, each with its own diff blob (or `Binary` / `TooLarge` / `Omitted`). `NotGit` outside a work tree; `Failed { reason }` when git is missing, refuses, or runs past the deadline. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
@@ -211,7 +213,7 @@ every version.
   applies to an open connection's next request), 400 malformed, 404 unknown
   blob, 412 another run expected, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
   `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations`,
-  `/v1/usage-limits` and `/v1/workdir/*` 200 for every result (never 401/403 beyond
+  `/v1/usage-limits`, `/v1/agent-login/*` and `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
   `/v1/conversations`, `/v1/storage` and `/v1/workdir/*` answer 503 when
   they run out of time, or when 8 of their file-system reads are already
@@ -556,7 +558,25 @@ the daemon's appends, which would otherwise stop `serve` (below).
   check of the pasted code, and `finish`, which hands the code to the agent
   and waits, with no deadline, for its answer. Dropping the attempt stops
   it. The Claude Code one runs the CLI's manual-code login in a process of
-  its own (docs/agents/claude-code.md §3.17). No route calls it yet.
+  its own (docs/agents/claude-code.md §3.17). A device drives it over
+  `POST /v1/agent-login/start` and `/finish` (D49) through `LoginFlows`
+  (`login.rs`), one in-memory slot: idle, starting, open, finishing or
+  done. A start mints a random `LoginFlowId` and calls `begin` on a task
+  of its own; a start while it runs waits for the same answer, and one
+  while the flow is open answers the same flow and URL, so racing starts
+  run one process. A start while a finish runs is `Busy`. A finish naming
+  another flow is `NoFlow`. The first finish of the open flow checks the
+  code's shape (a refusal keeps the flow open and reaches no agent), then
+  hands the code to the attempt on a task of its own; that outcome,
+  logged in or the agent's refusal, is the flow's, and every later finish
+  of it gets it, whatever code it carries. A success tells the
+  `LoginState` (`login_succeeded`), and the answer's `expires` is read
+  right after. An open flow 15 minutes old (`LOGIN_FLOW_MAX`) is dropped,
+  its process with it, at the next start, finish or `hello`: there is no
+  timer and no cancel. The slot's lock is never held across an await,
+  since `hello` looks at it on its blocking thread. A restart forgets the
+  flow. Neither the URL nor the code is logged or stored, and the flow
+  logs no event.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob

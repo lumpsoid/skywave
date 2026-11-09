@@ -56,12 +56,13 @@ use crate::agent::{
     AgentLogin, LoginState, NoAgentLogin, NoOutsideConversations, NoUsageLimits,
     OutsideConversations, UsageLimitsSource,
 };
-use crate::api::{self, Api, CONVERSATIONS_TIMEOUT, PeerCert};
+use crate::api::{self, Api, CONVERSATIONS_TIMEOUT, LOGIN_FINISH_TIMEOUT, PeerCert};
 use crate::crop::{CROP_DEADLINE, CropHook};
 use crate::data_dir::DataDir;
 use crate::db::Db;
 use crate::error::{Error, IoContext, Result};
 use crate::identity::ServerIdentity;
+use crate::login::LOGIN_FLOW_MAX;
 use crate::pairing::{self, PairService, RateLimit, SystemClock};
 use crate::workdir::Git;
 
@@ -79,8 +80,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// What a server reads besides its data dir. The default runs git from
 /// `PATH`, reads no outside conversations, no usage limits and no login
 /// expiry, and imports within
-/// [`IMPORT_DEADLINE`], crops within [`CROP_DEADLINE`], and gives a
-/// conversations listing [`CONVERSATIONS_TIMEOUT`].
+/// [`IMPORT_DEADLINE`], crops within [`CROP_DEADLINE`], gives a
+/// conversations listing [`CONVERSATIONS_TIMEOUT`], a login flow
+/// [`LOGIN_FLOW_MAX`] and a login finish [`LOGIN_FINISH_TIMEOUT`].
 pub struct ServerOptions {
     /// How workdir changes run git.
     pub git: Git,
@@ -95,6 +97,12 @@ pub struct ServerOptions {
     /// What `GET /v1/hello` reads `agent_logged_out` from: the cell the
     /// supervisor keeps (`SupervisorConfig::login`).
     pub login_state: LoginState,
+    /// How long a device's open login flow waits for its code before the
+    /// next look at it drops it; tests set it to zero.
+    pub login_flow_max: Duration,
+    /// How long a `POST /v1/agent-login/finish` waits for the agent before
+    /// the reply is a 503 (the finish goes on); tests shorten it.
+    pub login_finish_timeout: Duration,
     /// How long such an import may take; tests shorten it.
     pub import_deadline: Duration,
     /// How long a conversations listing may take before the reply is a
@@ -112,8 +120,9 @@ pub struct ServerOptions {
     /// hold, fail or follow crops with it. `None` in the daemon.
     pub crop_hook: Option<Arc<dyn CropHook>>,
     /// Run each time a request waits for another request's preparation of
-    /// the same command (an adopting create or a crop); tests know a resend
-    /// joined from it. `None` in the daemon.
+    /// the same command (an adopting create or a crop), and each time a
+    /// login start waits for another's; tests know a resend joined from
+    /// it. `None` in the daemon.
     pub joined_hook: Option<JoinedHook>,
 }
 
@@ -128,6 +137,8 @@ impl Default for ServerOptions {
             usage_limits: Arc::new(NoUsageLimits),
             login: Arc::new(NoAgentLogin),
             login_state: LoginState::default(),
+            login_flow_max: LOGIN_FLOW_MAX,
+            login_finish_timeout: LOGIN_FINISH_TIMEOUT,
             import_deadline: IMPORT_DEADLINE,
             conversations_timeout: CONVERSATIONS_TIMEOUT,
             limits: ConnectionLimits::DEFAULT,

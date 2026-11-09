@@ -1274,6 +1274,18 @@ both halves is refused before the CLI sees it), sends
 kills the process after it, as it does when the attempt is dropped. The
 URL, the code and the account answered are never logged.
 
+The device drives it (`login.rs`, architecture.md "The agent's login"):
+`POST /v1/agent-login/start` runs `claude_authenticate` once however many
+starts race, and answers the `manualUrl` with a flow id; the user signs in
+on the device and pastes `<code>#<state>` into `POST
+/v1/agent-login/finish`. Since any callback ends the CLI's flow, only the
+first finish of a flow reaches the CLI; a retry gets that callback's
+answer, and a new start spawns a new process for a new flow. The CLI
+writes `.credentials.json` before it answers, so the finish's `expires`
+is the new login's, and running session processes pick the login up
+without a restart (step 4). A flow left open 15 minutes is dropped, and
+its process killed, at the next start, finish or `hello`.
+
 From the source, not yet probed: the flow refuses to start when managed
 settings forbid it (`forceLoginMethod` of the other kind, or an
 `allowedProviders` without first-party).
