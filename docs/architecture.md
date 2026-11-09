@@ -1194,10 +1194,25 @@ logs) an event that no longer decodes rather than failing.
   login from a device, `on the server` where not), and while the agent
   is logged out its `logged_out_label` (`login::logged_out_warning`:
   `agent not logged in · log in from settings`, or `… on the server`)
-  shows the same way, ahead of `login_label`. The GUI's settings carry
+  shows the same way, in place of `login_label` (no expiry warning for a
+  logged-out agent). The GUI's settings carry
   the login from a device as `login` (`AgentLoginView`: `can_log_in`
   whenever offered, so a login can be renewed early, the flow's state,
   its URL, `login::flow_lines` and what each login intent would do).
+  The `agent_login` tile shows `Log in` (`Start again` once a login
+  ended other than logged in) whenever `can_log_in`, and below it the
+  GUI's `AgentLoginPanel` shows the flow on the Settings screen itself,
+  so the core stays on Settings, the only place it acts on the login
+  intents: the lines as Rust words them, the URL with copy and open in
+  the browser, a field for the code with `Send code` while open,
+  `Retry` for a code that got no answer, and `Close`
+  (`DismissAgentLogin`). The pasted code lives in that widget's state
+  only (no restoration id, no draft, no keyboard suggestions or IME
+  learning). It is cleared once the login takes no code (sent, started
+  again, ended) or shows another URL, but stays after a local refusal
+  (blank, too long), and goes with the widget when Settings is left; leaving
+  does not dismiss the login, so back on Settings it is still open. The
+  TUI has no login UI yet.
   `FinishAgentLogin`'s pasted code travels in a `PastedCode` whose
   `Debug` is redacted, as core's `LoginCode` is, since the hub logs
   intents and actions with `Debug`.

@@ -12,6 +12,7 @@ LinkUpdate link(
   int elsewhere = 0,
   String? elsewhereLabel,
   String? loginLabel,
+  String? loggedOutLabel,
 }) => LinkUpdate(
   state: state,
   label: label,
@@ -26,6 +27,7 @@ LinkUpdate link(
   approvalsElsewhere: elsewhere,
   elsewhereLabel: elsewhereLabel,
   loginLabel: loginLabel,
+  loggedOutLabel: loggedOutLabel,
 );
 
 void main() {
@@ -50,7 +52,8 @@ void main() {
   testWidgets('the login warning shows even while online with nothing else', (
     tester,
   ) async {
-    const warning = 'agent login expires in 2 days · log in again on the server';
+    const warning =
+        'agent login expires in 2 days · log in again on the server';
     await pump(tester);
     holder.apply(link(LinkState.online, ''));
     await tester.pump();
@@ -67,6 +70,33 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('offline · timed out'), findsOneWidget);
     expect(find.text(warning), findsOneWidget);
+  });
+
+  testWidgets('the logged-out warning shows while online, ahead of expiry', (
+    tester,
+  ) async {
+    const loggedOut = 'agent not logged in · log in from settings';
+    const expiry = 'agent login expires in 2 days · log in again from settings';
+    await pump(tester);
+    holder.apply(link(LinkState.online, ''));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('link-banner')), findsNothing);
+
+    holder.apply(link(LinkState.online, '', loggedOutLabel: loggedOut));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('link-banner')), findsOneWidget);
+    expect(find.text(loggedOut), findsOneWidget);
+    expect(find.byKey(const Key('link-label')), findsNothing);
+
+    // Rust never sends both, but the order holds if it did.
+    holder.apply(
+      link(LinkState.online, '', loggedOutLabel: loggedOut, loginLabel: expiry),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester.getTopLeft(find.text(loggedOut)).dy,
+      lessThan(tester.getTopLeft(find.text(expiry)).dy),
+    );
   });
 
   testWidgets('the banner shows each state\'s label, and nothing unpaired', (

@@ -45,7 +45,8 @@ pub struct LinkUpdate {
     /// on the server; `None` otherwise. Says `from settings` instead of
     /// `on the server` where the server offers a login from a device. The
     /// banner shows it whatever the link, even while online with nothing
-    /// else to say.
+    /// else to say. `None` while the agent is logged out: `logged_out_label`
+    /// says so instead.
     pub login_label: Option<String>,
     /// `agent not logged in · log in from settings` (or `… on the server`
     /// where the server offers no login from a device) while the server

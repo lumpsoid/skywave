@@ -38,7 +38,7 @@ class ScreenNavigator extends StatelessWidget {
             listenable: holders.link,
             builder: (context, child) => MediaQuery.removePadding(
               context: context,
-              removeTop: holders.link.link?.label.isNotEmpty ?? false,
+              removeTop: holders.link.bannerShown,
               child: child!,
             ),
             child: ListenableBuilder(

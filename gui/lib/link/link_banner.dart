@@ -10,9 +10,9 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// mismatch (the server may have been updated since), "Reset local data"
 /// (after a confirmation) once the server lost history, and the approvals
 /// waiting in other sessions as a button to the next one, and below the
-/// label the warning that the agent's login expires soon. Nothing while
-/// Rust's label is empty and there is no such warning: unpaired, or online
-/// with nothing waiting.
+/// label the warnings that the agent is logged out or that its login
+/// expires soon. Nothing while Rust's label is empty and there is no such
+/// warning: unpaired, or online with nothing waiting.
 class LinkBanner extends StatelessWidget {
   const LinkBanner({required this.holder, required this.send, super.key});
 
@@ -25,9 +25,7 @@ class LinkBanner extends StatelessWidget {
       listenable: holder,
       builder: (context, _) {
         final link = holder.link;
-        final shown =
-            link != null &&
-            (link.label.isNotEmpty || link.loginLabel != null);
+        final shown = holder.bannerShown;
         // Slides in and out where the banner has no top inset to hand over:
         // the screen below takes the inset at once, so a phone's status bar
         // would get it twice for the length of the slide.
@@ -41,7 +39,7 @@ class LinkBanner extends StatelessWidget {
             alignment: Alignment.topCenter,
             child: child,
           ),
-          child: shown
+          child: shown && link != null
               ? KeyedSubtree(
                   key: const ValueKey('link-banner'),
                   child: _banner(context, link),
@@ -75,19 +73,22 @@ class LinkBanner extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      if (link.label.isNotEmpty)
-                        _label(link.label, foreground),
-                      if (link.loginLabel case final login?)
-                        Text(
-                          login,
-                          key: const Key('login-label'),
-                          style: TextStyle(
-                            color: foreground,
-                            fontWeight: FontWeight.bold,
+                      if (link.label.isNotEmpty) _label(link.label, foreground),
+                      for (final (key, warning) in [
+                        ('logged-out-label', link.loggedOutLabel),
+                        ('login-label', link.loginLabel),
+                      ])
+                        if (warning != null)
+                          Text(
+                            warning,
+                            key: Key(key),
+                            style: TextStyle(
+                              color: foreground,
+                              fontWeight: FontWeight.bold,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                            maxLines: 2,
                           ),
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 2,
-                        ),
                     ],
                   ),
                 ),
