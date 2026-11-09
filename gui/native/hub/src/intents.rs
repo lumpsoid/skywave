@@ -191,10 +191,12 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             ServerAddress::parse(&address).map_err(|err| err.to_string())?;
             Action::SetServerAddress { address }
         }
+        ActionIntent::ForgetServerAddress { address } => Action::ForgetServerAddress { address },
         ActionIntent::Navigate { route } => Action::Navigate(match route {
             RouteView::SessionList => Route::SessionList,
             RouteView::ArchivedSessions => Route::ArchivedSessions,
             RouteView::Settings => Route::Settings,
+            RouteView::ServerAddresses => Route::ServerAddresses,
             RouteView::Pairing => Route::Pairing,
             RouteView::Usage => Route::Usage,
             RouteView::Storage => Route::Storage,
@@ -354,6 +356,14 @@ mod tests {
             })
             .unwrap_err()
             .contains("invalid server address")
+        );
+        assert_eq!(
+            action(ActionIntent::ForgetServerAddress {
+                address: "10.0.0.7:7443".into(),
+            }),
+            Ok(Action::ForgetServerAddress {
+                address: "10.0.0.7:7443".into(),
+            })
         );
         assert_eq!(
             action(ActionIntent::ViewContext {

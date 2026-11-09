@@ -431,9 +431,13 @@ pub enum ActionIntent {
     /// start the replica over from its log; ignored otherwise.
     ResetReplica,
     /// Reach the paired server at `address` (`host:port`) from now on,
-    /// without re-pairing. One that does not parse is answered with
-    /// `PlatformEffect::Error`.
+    /// without re-pairing; the one it replaces joins the other addresses.
+    /// One that does not parse is answered with `PlatformEffect::Error`.
     SetServerAddress {
+        address: String,
+    },
+    /// Drop one of the server's other addresses from the settings.
+    ForgetServerAddress {
         address: String,
     },
     Navigate {
@@ -468,6 +472,7 @@ pub enum RouteView {
     SessionList,
     ArchivedSessions,
     Settings,
+    ServerAddresses,
     Pairing,
     Usage,
     Storage,

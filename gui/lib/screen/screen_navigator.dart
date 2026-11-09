@@ -9,6 +9,7 @@ import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/session/info_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
+import 'package:skywave_gui/settings/server_addresses_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'package:skywave_gui/storage/storage_page.dart';
@@ -120,6 +121,12 @@ class ScreenNavigator extends StatelessWidget {
           send: send,
         ),
         final ScreenViewSettings screen => SettingsPage(
+          screen: screen,
+          link: holders.link,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        final ScreenViewServerAddresses screen => ServerAddressesPage(
           screen: screen,
           link: holders.link,
           canGoBack: update.canGoBack,

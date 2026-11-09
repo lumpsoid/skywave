@@ -469,6 +469,7 @@ pub enum Screen {
     SessionList(SessionListView),
     Session(Box<SessionView>),
     Settings(SettingsView),
+    ServerAddresses(ServerAddressesView),
     Usage(UsageView),
     Storage(StorageView),
     UsageLimits(UsageLimitsView),
@@ -1795,6 +1796,16 @@ pub struct Answer {
     pub retryable: bool,
 }
 
+/// The paired server's addresses ([`Route::ServerAddresses`](crate::Route::ServerAddresses)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerAddressesView {
+    /// The address the link uses.
+    pub current: Option<String>,
+    /// The same server's other addresses, in the order they were left
+    /// ([`Settings::other_addresses`](crate::Settings::other_addresses)).
+    pub others: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsView {
     pub blob_policy: BlobPolicy,
@@ -1802,6 +1813,9 @@ pub struct SettingsView {
     /// device's disk is full ([`Pause::DiskFull`]).
     pub blobs_disk_full: bool,
     pub server_address: Option<String>,
+    /// The same server's other addresses, to switch to
+    /// ([`Settings::other_addresses`](crate::Settings::other_addresses)).
+    pub other_addresses: Vec<String>,
     pub device_id: Option<DeviceId>,
     /// The fingerprint of the server CA pinned at pairing, to compare with
     /// what `skywaved` prints; `None` if unknown.

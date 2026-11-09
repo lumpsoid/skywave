@@ -34,8 +34,8 @@ use ratatui::widgets::{
 use skywave_core::{
     BlobPolicy, BlobState, CandidateSource, Completion, CompletionStatus, ConversationPicker,
     ConversationsStatus, CropContent, FullView, Link, LinkRejection, ListKind, Outgoing,
-    PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen, SessionId, SessionListView,
-    SessionRow, SessionState, SettingsView, WorkdirPane,
+    PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen, ServerAddressesView,
+    SessionId, SessionListView, SessionRow, SessionState, SettingsView, WorkdirPane,
 };
 use skywave_present::format::{
     IMPORTING_HISTORY, adopting_note, blob_size, bytes, conversation_detail, conversation_link,
@@ -92,6 +92,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
                 }
             }
             Screen::Settings(settings) => render_settings(frame, body, app, settings),
+            Screen::ServerAddresses(view) => render_server_addresses(frame, body, view),
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
             Screen::Storage(view) => storage::render(frame, body, app, view),
             Screen::UsageLimits(view) => limits::render(frame, body, view, DateTime::from(wall)),
@@ -656,6 +657,24 @@ fn pending_session_line(pending: &PendingSession) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The server's addresses, read only: the TUI changes the address from
+/// the settings (`a`) and never opens this page itself.
+fn render_server_addresses(frame: &mut Frame, area: Rect, view: &ServerAddressesView) {
+    let mut lines = vec![Line::from(format!(
+        "Current: {}",
+        view.current.as_deref().unwrap_or("not paired")
+    ))];
+    lines.extend(
+        view.others
+            .iter()
+            .map(|other| Line::from(format!("Other:   {other}"))),
+    );
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Server addresses ")),
+        area,
+    );
+}
+
 fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &SettingsView) {
     let prompt = app.ui().prompt.as_ref();
     let [area, prompt_area] = Layout::vertical([
@@ -939,6 +958,7 @@ fn footer_keys(app: &App) -> &'static str {
             "r range · Tab group · ↑↓ scroll · L limits · Esc back · ? help · q quit"
         }
         Screen::UsageLimits(_) => "r refresh · Esc back · ? help · q quit",
+        Screen::ServerAddresses(_) => "Esc back · ? help · q quit",
         Screen::SessionInfo(_) => "r refresh limits · ↑↓ scroll · Esc back · ? help · q quit",
         Screen::Storage(_) => {
             "↑↓ select · D delete · K crop · r refresh · Tab list · Esc back · ? help · q quit"
@@ -1298,6 +1318,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from("  The last limits read are kept on this device, so they show offline."),
             Line::from("  Opening the page asks only when none were read yet."),
+        ]),
+        Screen::ServerAddresses(_) => lines.extend([
+            section("Server addresses"),
+            key("Esc", "back to the settings"),
         ]),
         Screen::SessionInfo(_) => lines.extend([
             section("Session info"),

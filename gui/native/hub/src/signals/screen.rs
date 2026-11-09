@@ -82,9 +82,10 @@ pub enum ScreenView {
         blob_policy_label: String,
         /// The server address, or `not paired`.
         server: String,
-        /// The address to start editing from; `None` while unpaired, when
+        /// Under the address, on the tile that opens the server addresses
+        /// page, e.g. `2 other addresses`; `None` while unpaired, when
         /// there is no server to move.
-        editable_address: Option<String>,
+        server_addresses: Option<String>,
         /// This device's id, or `not paired`.
         device: String,
         /// The pinned server CA fingerprint, to compare with what
@@ -123,6 +124,13 @@ pub enum ScreenView {
         /// What an empty list says; `None` when it has rows or there is
         /// no report.
         empty_label: Option<String>,
+    },
+    /// The paired server's addresses: the one in use, then the others to
+    /// switch to (`SetServerAddress`, also for a new one) or forget
+    /// (`ForgetServerAddress`), in the order they were left.
+    ServerAddresses {
+        current: String,
+        others: Vec<String>,
     },
     /// The usage limits of the account the server's agent runs as: the
     /// stored ones, asked for on opening only when none are stored.
