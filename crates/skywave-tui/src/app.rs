@@ -129,7 +129,7 @@ impl PairingForm {
     /// Fills every field from a pairing URI, already in the core's
     /// canonical form, and focuses the last, so Enter submits.
     fn fill(&mut self, uri: PairUri) {
-        self.address = uri.address;
+        self.address = uri.address.to_string();
         self.code = uri.code;
         self.fingerprint = uri.fingerprint;
         self.focus = Field::Fingerprint;
@@ -2276,7 +2276,11 @@ impl App {
                 })),
                 KeyCode::Char('p') => Some(Action::Navigate(Route::Pairing)),
                 KeyCode::Char('a') if settings.device_id.is_some() => {
-                    let address = settings.server_address.clone().unwrap_or_default();
+                    let address = settings
+                        .server_address
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
                     self.ui.prompt = Some(Prompt::new(PromptKind::ServerAddress, address));
                     None
                 }
@@ -2947,7 +2951,7 @@ impl App {
             && let Some(address) = &info.server_address
             && self.ui.form.address.is_empty()
         {
-            self.ui.form.address = address.clone();
+            self.ui.form.address = address.to_string();
             self.ui.form.focus = Field::Code;
         }
     }

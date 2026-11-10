@@ -8,8 +8,8 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, BlobDownload, Core, ExpectedRun, FileIdentity, HttpsTransport, Identity, PairError,
-    PairingStatus, Request, Screen, Transport, TransportConfig, TransportError, pair,
-    pair_and_report,
+    PairingStatus, Request, Screen, ServerAddress, Transport, TransportConfig, TransportError,
+    pair, pair_and_report,
 };
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
@@ -36,7 +36,7 @@ struct Fixture {
     storage: Storage,
     identity: Arc<ServerIdentity>,
     /// `127.0.0.1:<port>`.
-    addr: String,
+    addr: ServerAddress,
     port: u16,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<skywaved::Result<()>>,
@@ -86,7 +86,7 @@ impl Fixture {
             tmp,
             storage,
             identity,
-            addr: format!("127.0.0.1:{port}"),
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
             port,
             stop: Some(stop),
             task,
@@ -151,7 +151,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
     // As typed: lowercase code with its dash, the printed fingerprint.
     let code = fx.issue_code().code.to_string().to_lowercase();
     core.dispatch(Action::Pair {
-        address: fx.addr.clone(),
+        address: fx.addr.to_string(),
         code,
         fingerprint: fx.fingerprint(),
     })
@@ -456,7 +456,7 @@ const SHORT: Duration = Duration::from_secs(1);
 /// [`SHORT`]), and stops relaying, holding the connection open, once it has
 /// relayed `stall_after` bytes on a connection.
 struct SlowLink {
-    addr: String,
+    addr: ServerAddress,
     task: JoinHandle<()>,
 }
 
@@ -467,7 +467,9 @@ impl SlowLink {
     async fn start(upstream: u16, stall_after: Option<u64>) -> SlowLink {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let addr: ServerAddress = format!("127.0.0.1:{}", listener.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
         let task = tokio::spawn(async move {
             // Dropped with the task when the proxy is: every pipe ends too.
             let mut pipes = tokio::task::JoinSet::new();
@@ -589,8 +591,13 @@ async fn an_events_batch_comes_compressed() {
 
     let upstream = std::net::SocketAddr::from(([127, 0, 0, 1], fx.port));
     let link = LinkProxy::start(upstream, LinkProfile::clean(), seed()).await;
-    let transport =
-        HttpsTransport::new(&link.address(), &identity, config(), ExpectedRun::default()).unwrap();
+    let transport = HttpsTransport::new(
+        &link.address().parse().unwrap(),
+        &identity,
+        config(),
+        ExpectedRun::default(),
+    )
+    .unwrap();
     let batch = transport
         .events(EventsQuery {
             after: Seq::ZERO,
@@ -841,7 +848,7 @@ async fn server_certificate_must_cover_the_typed_address() {
         .unwrap_err();
     assert!(matches!(err, PairError::BadServerCertificate(_)), "{err:?}");
 
-    let by_name = format!("localhost:{}", fx.port);
+    let by_name: ServerAddress = format!("localhost:{}", fx.port).parse().unwrap();
     let paired = pair(&by_name, &code, &fx.fingerprint(), "laptop", &config())
         .await
         .unwrap();
@@ -856,7 +863,7 @@ async fn server_certificate_must_cover_the_typed_address() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paired_device_tells_identity_faults_from_transient_ones() {
     let fx = Fixture::start_with(&["localhost"]).await;
-    let by_name = format!("localhost:{}", fx.port);
+    let by_name: ServerAddress = format!("localhost:{}", fx.port).parse().unwrap();
     let code = fx.issue_code().code.to_string();
     let paired = pair(&by_name, &code, &fx.fingerprint(), "laptop", &config())
         .await
@@ -879,7 +886,7 @@ async fn a_paired_device_tells_identity_faults_from_transient_ones() {
     );
 
     let other = Fixture::start_with(&["localhost"]).await;
-    let elsewhere = format!("localhost:{}", other.port);
+    let elsewhere: ServerAddress = format!("localhost:{}", other.port).parse().unwrap();
     let err = HttpsTransport::new(&elsewhere, &identity, config(), ExpectedRun::default())
         .unwrap()
         .hello(None)
@@ -898,7 +905,7 @@ async fn a_paired_device_tells_identity_faults_from_transient_ones() {
 async fn wrong_code_then_rate_limit() {
     let fx = Fixture::start().await;
     fx.issue_code();
-    let addr = format!("localhost:{}", fx.port);
+    let addr: ServerAddress = format!("localhost:{}", fx.port).parse().unwrap();
     let fp = fx.fingerprint().to_lowercase().replace(':', "");
     for _ in 0..5 {
         let err = pair(&addr, "ZZZZZ-ZZZZZ", &fp, "laptop", &config())

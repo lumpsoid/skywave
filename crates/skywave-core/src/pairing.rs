@@ -109,8 +109,7 @@ pub fn parse_fingerprint(input: &str) -> Result<Fingerprint, PairError> {
 /// for [`Action::Pair`](crate::Action::Pair).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairUri {
-    /// `host:port`.
-    pub address: String,
+    pub address: ServerAddress,
     /// 10 symbols without `-`.
     pub code: String,
     /// Colon-separated uppercase pairs, as `skywaved pair` prints it.
@@ -145,7 +144,7 @@ pub fn parse_pair_uri(uri: &str) -> Result<PairUri, PairError> {
     let code = normalize_code(&code.ok_or_else(|| bad("missing code"))?)?;
     let fingerprint = parse_fingerprint(&fp.ok_or_else(|| bad("missing fp"))?)?;
     Ok(PairUri {
-        address: address.to_string(),
+        address,
         code,
         fingerprint: fingerprint.to_string(),
     })
@@ -173,8 +172,8 @@ fn percent_decode(text: &str) -> Option<String> {
 /// A successful pairing, not yet stored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Paired {
-    /// Canonical `host:port`, to store as the server address.
-    pub address: String,
+    /// Where it paired, to store as the server address.
+    pub address: ServerAddress,
     pub credentials: PairedCredentials,
 }
 
@@ -183,13 +182,12 @@ pub struct Paired {
 /// before anything touches the network. Nothing is stored; see
 /// [`pair_and_report`].
 pub async fn pair(
-    address: &str,
+    address: &ServerAddress,
     code: &str,
     fingerprint: &str,
     device_name: &str,
     config: &TransportConfig,
 ) -> Result<Paired, PairError> {
-    let address = ServerAddress::parse(address)?;
     let code = normalize_code(code)?;
     let expected = parse_fingerprint(fingerprint)?;
 
@@ -257,7 +255,7 @@ pub async fn pair(
         ));
     }
     Ok(Paired {
-        address: address.to_string(),
+        address: address.clone(),
         credentials: PairedCredentials {
             device_id: resp.device_id,
             device_key_pem: key.serialize_pem(),
@@ -273,7 +271,7 @@ pub async fn pair(
 /// failure the pairing screen shows the reason.
 pub async fn pair_and_report(
     seam: &Seam,
-    address: &str,
+    address: &ServerAddress,
     code: &str,
     fingerprint: &str,
     device_name: &str,
@@ -312,7 +310,7 @@ mod tests {
         assert_eq!(
             parse_pair_uri(&uri).unwrap(),
             PairUri {
-                address: "[fd00::7]:7443".into(),
+                address: "[fd00::7]:7443".parse().unwrap(),
                 code: "ABCDE12345".into(),
                 fingerprint: fp.to_string(),
             }
@@ -321,7 +319,10 @@ mod tests {
             "SKYWAVE://pair?fp={}&code=abcde-12345&x=1&addr=host.local%3A9",
             fp.to_hex()
         );
-        assert_eq!(parse_pair_uri(&plain).unwrap().address, "host.local:9");
+        assert_eq!(
+            parse_pair_uri(&plain).unwrap().address.to_string(),
+            "host.local:9"
+        );
     }
 
     #[test]

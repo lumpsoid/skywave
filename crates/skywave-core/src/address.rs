@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
+use std::str::FromStr;
 
 use rustls_pki_types::{DnsName, ServerName};
 
@@ -11,13 +12,17 @@ pub const DEFAULT_PORT: u16 = 7443;
 /// A parsed server address. The host doubles as the TLS server name: an IP
 /// address is verified against the certificate's IP SANs, a name against
 /// its DNS SANs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Equal (and hashed) by its canonical form, the [`Display`](fmt::Display)
+/// one: every spelling of the same address (`MyHost`, `myhost:7443`) is one
+/// value. Serialized as that canonical string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ServerAddress {
     host: Host,
     port: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Host {
     Ip(IpAddr),
     /// Lowercase, validated DNS name.
@@ -101,6 +106,27 @@ impl fmt::Display for ServerAddress {
     }
 }
 
+impl FromStr for ServerAddress {
+    type Err = AddressError;
+
+    fn from_str(input: &str) -> Result<ServerAddress, AddressError> {
+        ServerAddress::parse(input)
+    }
+}
+
+impl serde::Serialize for ServerAddress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ServerAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        ServerAddress::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +151,29 @@ mod tests {
             ServerAddress::parse("myhost").unwrap().server_name(),
             ServerName::DnsName(_)
         ));
+    }
+
+    #[test]
+    fn every_spelling_of_an_address_is_one_value() {
+        let canonical = ServerAddress::parse("myhost:7443").unwrap();
+        for spelling in ["MyHost", " myhost ", "MYHOST:7443"] {
+            assert_eq!(
+                ServerAddress::parse(spelling).unwrap(),
+                canonical,
+                "{spelling:?}"
+            );
+        }
+        assert_eq!(
+            ServerAddress::parse("[fd00:0::7]:7443").unwrap(),
+            ServerAddress::parse("fd00::7").unwrap()
+        );
+        let json = serde_json::to_string(&ServerAddress::parse("MyHost").unwrap()).unwrap();
+        assert_eq!(json, r#""myhost:7443""#);
+        assert_eq!(
+            serde_json::from_str::<ServerAddress>(&json).unwrap(),
+            canonical
+        );
+        assert!(serde_json::from_str::<ServerAddress>(r#""h:p""#).is_err());
     }
 
     #[test]

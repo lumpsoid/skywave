@@ -18,6 +18,7 @@ use skywave_proto::{
     LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
 };
 
+use crate::address::ServerAddress;
 use crate::blobs::{remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
@@ -51,7 +52,7 @@ pub enum Request {
     /// `fingerprint`. Answer with [`Seam::pairing_succeeded`] or
     /// [`Seam::pairing_failed`].
     Pair {
-        address: String,
+        address: ServerAddress,
         code: String,
         fingerprint: String,
     },
@@ -666,7 +667,7 @@ impl Seam {
     /// install; handles bound to the old server stop writing ([`Seam::bind`]).
     pub fn pairing_succeeded(
         &self,
-        address: &str,
+        address: &ServerAddress,
         credentials: PairedCredentials,
     ) -> Result<(), CoreError> {
         let data_dir = self.data_dir();
@@ -695,9 +696,7 @@ impl Seam {
                 }
             }
             let identity = FileIdentity::save(&data_dir, credentials)?;
-            state
-                .model
-                .paired(Paired::of(&identity), address.to_owned());
+            state.model.paired(Paired::of(&identity), address);
             state.identity = Some(Arc::new(identity));
             requests.push(Request::Connect);
             Ok(((), requests))

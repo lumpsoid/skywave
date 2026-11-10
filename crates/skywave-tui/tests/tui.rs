@@ -134,7 +134,9 @@ impl Harness {
     fn paired() -> Harness {
         let mut h = Harness::new();
         h.type_pairing("srv:7443", "ABCDE12345", FP);
-        h.seam.pairing_succeeded("srv:7443", credentials()).unwrap();
+        h.seam
+            .pairing_succeeded(&"srv:7443".parse().unwrap(), credentials())
+            .unwrap();
         h.sync();
         h.drain_requests();
         h
@@ -365,14 +367,16 @@ fn pairing_form_dispatches_pair_then_shows_progress_and_success() {
     assert_eq!(
         h.drain_requests(),
         vec![Request::Pair {
-            address: "srv:7443".into(),
+            address: "srv:7443".parse().unwrap(),
             code: "ABCDE12345".into(),
             fingerprint: FP.into(),
         }]
     );
     assert_contains(&h.screen(), "Pairing with srv:7443…");
 
-    h.seam.pairing_succeeded("srv:7443", credentials()).unwrap();
+    h.seam
+        .pairing_succeeded(&"srv:7443".parse().unwrap(), credentials())
+        .unwrap();
     h.sync();
     assert!(matches!(h.app.view().screen, Screen::SessionList(_)));
     let screen = h.screen();
@@ -678,7 +682,9 @@ fn revoked_device_gets_a_full_screen_state_with_re_pair() {
     h.key(KeyCode::Tab);
     h.type_text(FP);
     assert!(matches!(h.key(KeyCode::Enter), Some(Action::Pair { .. })));
-    h.seam.pairing_succeeded("srv:7443", credentials()).unwrap();
+    h.seam
+        .pairing_succeeded(&"srv:7443".parse().unwrap(), credentials())
+        .unwrap();
     h.sync();
     assert!(matches!(h.app.view().screen, Screen::SessionList(_)));
     assert_eq!(h.banner(), "connecting…");

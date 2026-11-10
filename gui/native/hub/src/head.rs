@@ -1654,7 +1654,7 @@ impl Head {
         {
             self.revs += 1;
             self.form = PairForm {
-                address: address.clone(),
+                address: address.to_string(),
                 rev: self.revs,
                 ..PairForm::default()
             };
@@ -1665,7 +1665,7 @@ impl Head {
     fn fill(&mut self, uri: PairUri) {
         self.revs += 1;
         self.form = PairForm {
-            address: uri.address,
+            address: uri.address.to_string(),
             code: uri.code,
             fingerprint: uri.fingerprint,
             rev: self.revs,

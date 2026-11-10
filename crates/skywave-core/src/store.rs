@@ -28,6 +28,7 @@ use skywave_proto::{
 };
 use uuid::Uuid;
 
+use crate::address::ServerAddress;
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
@@ -38,10 +39,17 @@ pub const DB_FILE: &str = "core.db";
 /// How long a statement waits for SQLite's own lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One schema migration: SQL, or code for what SQL cannot express.
+enum Migration {
+    Sql(&'static str),
+    Code(fn(&Transaction<'_>) -> Result<(), StoreError>),
+}
+use Migration::{Code, Sql};
+
 /// Schema migrations; entry `i` moves the schema from version `i` to `i + 1`.
 /// The schema version is SQLite's `user_version`.
-const MIGRATIONS: &[&str] = &[
-    r#"
+const MIGRATIONS: &[Migration] = &[
+    Sql(r#"
 CREATE TABLE events (
     seq INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -84,8 +92,8 @@ CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::stopped`, backfilled from the stored log: a session is
 -- stopped if its newest stop is newer than its newest message.
 ALTER TABLE sessions ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0;
@@ -94,8 +102,8 @@ UPDATE sessions SET stopped = 1 WHERE
         AND json_extract(event, '$.kind.type') = 'session_stopped')
     > COALESCE((SELECT MAX(seq) FROM events WHERE session_id = sessions.id
         AND json_extract(event, '$.kind.type') = 'user_message'), 0);
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Delivery bookkeeping: how often a command was claimed for sending, when it
 -- first was, and when the server answered. Any row that predates this may
 -- already have gone out, so it counts as attempted.
@@ -103,16 +111,16 @@ ALTER TABLE outbox ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE outbox ADD COLUMN first_sent_at TEXT;
 ALTER TABLE outbox ADD COLUMN answered_at TEXT;
 UPDATE outbox SET tries = 1;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Unsent messages, one per session; `cursor` counts Unicode scalar values.
 CREATE TABLE drafts (
     session_id TEXT PRIMARY KEY,
     text TEXT NOT NULL,
     cursor INTEGER NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::notable`, backfilled from the stored log with the kinds
 -- `projection::is_notable` counts: agent messages, approval requests, errors.
 -- It ran on rows from before subagent events: none has a `parent`, so every
@@ -132,8 +140,8 @@ CREATE TABLE read_marks (
     notable INTEGER NOT NULL
 );
 INSERT INTO read_marks (session_id, seq, notable) SELECT id, last_seq, notable FROM sessions;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::name` and `first_prompt`. A replica from before this
 -- holds no renames, so `name` starts empty; `first_prompt` is backfilled
 -- like `projection::first_line` cuts it: the first line of the session's
@@ -149,26 +157,26 @@ UPDATE sessions SET first_prompt = (
     WHERE t != ''
     ORDER BY seq
     LIMIT 1);
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::archived`. A replica from before this holds no archive
 -- events, so every session starts active: nothing to backfill.
 ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::usage` as JSON. A replica from before this holds no
 -- turn usage events, so every session starts without: nothing to backfill.
 ALTER TABLE sessions ADD COLUMN usage TEXT;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Sessions deleted from this device only (D5, D6: they stay on the server).
 -- Permanent: later events for one advance the cursor but are never stored.
 CREATE TABLE deleted_sessions (
     session_id TEXT PRIMARY KEY,
     at TEXT NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Pending approvals this device alerted on or judged no news (D5: never
 -- synced), so a restart alerts only for the rest. A row goes when its
 -- approval stops pending. Everything pending before this counts as
@@ -179,16 +187,16 @@ CREATE TABLE alerted_approvals (
 );
 INSERT OR IGNORE INTO alerted_approvals (id, session_id)
     SELECT approval.value, sessions.id FROM sessions, json_each(sessions.pending_approvals) AS approval;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- The names of the server's devices, as its last `hello` listed them, so
 -- the views name who answered or wrote while offline too.
 CREATE TABLE devices (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::agent` as JSON, and the models of the newest
 -- `ModelsOffered`. A replica from before this holds no such events, so
 -- every session starts without: nothing to backfill.
@@ -197,8 +205,8 @@ CREATE TABLE offered_models (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     models TEXT NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Prompts saved to use again in any session (D5: never synced). `used`
 -- orders them: higher was saved or used later.
 CREATE TABLE snippets (
@@ -207,8 +215,8 @@ CREATE TABLE snippets (
     text TEXT NOT NULL,
     used INTEGER NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Session contexts (protocol v9). `SessionSummary::context`: a replica from
 -- before this holds no context events, so every session is in its first
 -- context, which has the session's id. Stored events and queued commands
@@ -224,14 +232,14 @@ UPDATE events SET event = json_set(event, '$.kind.context_name', 'start')
 UPDATE outbox SET command = json_set(command, '$.kind.context',
         json_extract(command, '$.kind.session_id'))
     WHERE json_extract(command, '$.kind.type') = 'send_message';
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::work` as JSON (protocol v11). A replica from before this
 -- holds no background work events, so every session starts with none:
 -- nothing to backfill.
 ALTER TABLE sessions ADD COLUMN work TEXT;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Shell commands (protocol v14), all of it this device's (D5: never
 -- synced). What each session's composer writes: a session with no row
 -- writes to its agent.
@@ -260,8 +268,8 @@ ALTER TABLE drafts_by_mode RENAME TO drafts;
 -- snippet from before this was a prompt.
 ALTER TABLE snippets ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent'
     CHECK (kind IN ('agent', 'shell'));
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `TurnRecord`s: each `TurnUsage` event's figures by seq, what the usage
 -- screen totals without replaying the log. `usage` is the `TurnUsage` as
 -- JSON. Backfilled from the stored events.
@@ -275,8 +283,8 @@ INSERT INTO turns (seq, session_id, at, usage)
     SELECT seq, session_id, json_extract(event, '$.at'),
         json_remove(json_extract(event, '$.kind'), '$.type')
     FROM events WHERE json_extract(event, '$.kind.type') = 'turn_usage';
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- The latest answer to each workdir read (`Store::put_workdir`): `path` as
 -- requested, '' for changes; `result` the `ChangesResult`, `ListResult` or
 -- `FileResult` as JSON.
@@ -297,14 +305,14 @@ CREATE TABLE workdir_blob_refs (
     PRIMARY KEY (session_id, kind, path, blob_id)
 );
 CREATE INDEX workdir_blob_refs_by_blob ON workdir_blob_refs (blob_id);
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::importing` (protocol v16): an adopted session whose
 -- `ImportFinished` is not stored yet. A replica from before this holds no
 -- events of v16, so no session is mid-import: nothing to backfill.
 ALTER TABLE sessions ADD COLUMN importing INTEGER NOT NULL DEFAULT 0;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::adopted`: the outside conversation a session adopted, as
 -- its `SessionCreated` names it (`from` of kind `agent`, protocol v12 on).
 -- Backfilled from the stored log.
@@ -316,8 +324,8 @@ UPDATE sessions SET adopted = (SELECT json_extract(event, '$.kind.from.conversat
         AND json_extract(event, '$.kind.from.kind') = 'agent'
     ORDER BY seq
     LIMIT 1);
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- The skywave_proto::PROTOCOL_VERSION whose wire JSON the replica's JSON
 -- columns hold; one row, written by `migrate` when the replica is created
 -- and only rewritten by `Store::reset_replica`. `IF NOT EXISTS`: the
@@ -326,8 +334,8 @@ CREATE TABLE IF NOT EXISTS protocol_stamp (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- The server log the replica holds (skywave_proto::LogId), and the run of
 -- the server it last took a `hello` from (RunId), which the next `hello`
 -- asks about; one row once a `hello` was taken, cleared with the replica.
@@ -337,8 +345,8 @@ CREATE TABLE IF NOT EXISTS server_log (
     log_id TEXT NOT NULL,
     run_id TEXT NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- The content hash a blob's download is checked against
 -- (skywave_proto::BlobRef::sha256, lowercase hex): one row per `blobs` row,
 -- inserted with it and deleted with it by the trigger. A table, not a
@@ -353,8 +361,8 @@ CREATE TRIGGER IF NOT EXISTS blob_hashes_go_with_blobs AFTER DELETE ON blobs
 BEGIN
     DELETE FROM blob_hashes WHERE blob_id = old.id;
 END;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- What the server did to a blob (crate::BlobFate, JSON), folded from the
 -- log's `BlobDeleted` and `BlobCropped` (protocol v23), with the seq of
 -- that event. Cleared with the events. A replica from before this holds no
@@ -364,8 +372,8 @@ CREATE TABLE IF NOT EXISTS blob_fates (
     fate TEXT NOT NULL,
     seq INTEGER NOT NULL
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- Why the download of a `not_downloaded` blob was given up
 -- (BlobStatus::Failed), so a restart keeps it failed and `Eager` leaves it
 -- until it is asked for again. Any other status written deletes the row,
@@ -380,8 +388,8 @@ CREATE TRIGGER IF NOT EXISTS blob_failures_go_with_blobs AFTER DELETE ON blobs
 BEGIN
     DELETE FROM blob_failures WHERE blob_id = old.id;
 END;
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- The latest answer to the usage limits read (`Store::put_usage_limits`,
 -- protocol v27): one row, the `UsageLimitsResult` as JSON. Cleared with
 -- the replica. A replica from before this never asked: nothing to
@@ -390,8 +398,8 @@ CREATE TABLE IF NOT EXISTS usage_limits (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     result TEXT NOT NULL CHECK (json_valid(result))
 );
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- `SessionSummary::last_message_seq`, the session list's order, backfilled
 -- from the stored log: the session's newest message, else its first event.
 ALTER TABLE sessions ADD COLUMN last_message_seq INTEGER NOT NULL DEFAULT 0;
@@ -400,8 +408,8 @@ UPDATE sessions SET last_message_seq = COALESCE(
         AND json_extract(event, '$.kind.type') = 'user_message'),
     (SELECT MIN(seq) FROM events WHERE session_id = sessions.id),
     last_seq);
-"#,
-    r#"
+"#),
+    Sql(r#"
 -- What the server's last `hello` said of itself (crate::ServerFacts): one
 -- row once a `hello` was taken, written whole by each and cleared with the
 -- replica, so no fact of one server outlives a switch to another. Moved
@@ -428,8 +436,62 @@ INSERT OR REPLACE INTO server_facts (id, shell_enabled, bypass_allowed, login_ex
         'login_expires', 'agent_login_offered', 'agent_logged_out'));
 DELETE FROM settings WHERE key IN ('shell_enabled', 'bypass_allowed', 'login_expires',
     'agent_login_offered', 'agent_logged_out');
-"#,
+"#),
+    // The server addresses in their canonical form (`ServerAddress`).
+    Code(canonicalize_server_addresses),
 ];
+
+/// Rewrites the stored server addresses to their canonical form
+/// ([`ServerAddress`]'s `Display`), as the settings now read them. Before
+/// this the settings took any string: one typed in `SetServerAddress` was
+/// kept as typed (`MyHost`), so the same server could be stored as several
+/// strings. An address that does not parse is dropped, with the reason
+/// logged: connecting to it could only fail, over and over. The others
+/// lose duplicates and the current address.
+fn canonicalize_server_addresses(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let stored = |key: &str| -> rusqlite::Result<Option<Option<String>>> {
+        tx.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+            Ok(row.get_ref(0)?.as_str().ok().map(str::to_owned))
+        })
+        .optional()
+    };
+    let parse = |text: &str| {
+        ServerAddress::parse(text)
+            .inspect_err(|error| {
+                tracing::warn!(%error, "dropping a stored server address that does not parse");
+            })
+            .ok()
+    };
+    let current = match stored(KEY_SERVER_ADDRESS)? {
+        None => None,
+        Some(value) => value.as_deref().and_then(parse),
+    };
+    let mut others: Vec<ServerAddress> = Vec::new();
+    if let Some(value) = stored(KEY_OTHER_ADDRESSES)? {
+        let texts = value
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok());
+        if texts.is_none() {
+            tracing::warn!("dropping stored server addresses that are not a list of strings");
+        }
+        for address in texts.iter().flatten().filter_map(|text| parse(text)) {
+            if current.as_ref() != Some(&address) && !others.contains(&address) {
+                others.push(address);
+            }
+        }
+    }
+    put_setting_in(
+        tx,
+        KEY_SERVER_ADDRESS,
+        current.map(|a| a.to_string()).as_deref(),
+    )?;
+    put_setting_in(
+        tx,
+        KEY_OTHER_ADDRESSES,
+        other_addresses_json(&others).as_deref(),
+    )?;
+    Ok(())
+}
 
 /// First schema version with `protocol_stamp`.
 const STAMPED_SINCE: i64 = 21;
@@ -640,13 +702,13 @@ pub enum BlobPolicy {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Settings {
     pub blob_policy: BlobPolicy,
-    /// Address of the paired server, e.g. `host:port`; `None` before pairing.
-    pub server_address: Option<String>,
+    /// Address of the paired server; `None` before pairing.
+    pub server_address: Option<ServerAddress>,
     /// The paired server's other addresses, left by
     /// [`switch_to`](Settings::switch_to), to switch back to without
     /// typing them again. Never holds `server_address`; emptied by pairing
     /// with another server.
-    pub other_addresses: Vec<String>,
+    pub other_addresses: Vec<ServerAddress>,
     /// What the server's last `hello` said of itself
     /// ([`Store::set_server_facts`]); the default until one did, and again
     /// once the replica is cleared.
@@ -708,7 +770,12 @@ impl Settings {
                     }
                 }
             }
-            KEY_SERVER_ADDRESS => self.server_address = Some(value),
+            KEY_SERVER_ADDRESS => {
+                self.server_address = Some(
+                    ServerAddress::parse(&value)
+                        .map_err(|e| bad_value(1, Type::Text, format!("server address: {e}")))?,
+                );
+            }
             KEY_OTHER_ADDRESSES => {
                 self.other_addresses = serde_json::from_str(&value)
                     .map_err(|_| bad_value(1, Type::Text, format!("server addresses {value:?}")))?;
@@ -721,19 +788,19 @@ impl Settings {
     /// Makes `address` the server address. The one it replaces joins
     /// [`other_addresses`](Settings::other_addresses) at the end, and
     /// `address` leaves them; nothing changes if it is already the one.
-    pub fn switch_to(&mut self, address: &str) {
-        if self.server_address.as_deref() == Some(address) {
+    pub fn switch_to(&mut self, address: &ServerAddress) {
+        if self.server_address.as_ref() == Some(address) {
             return;
         }
         self.other_addresses.retain(|other| other != address);
-        if let Some(old) = self.server_address.replace(address.to_owned()) {
+        if let Some(old) = self.server_address.replace(address.clone()) {
             self.other_addresses.push(old);
         }
     }
 
     /// Drops `address` from [`other_addresses`](Settings::other_addresses);
     /// `false` if it was not there (the server address never is).
-    pub fn forget(&mut self, address: &str) -> bool {
+    pub fn forget(&mut self, address: &ServerAddress) -> bool {
         let before = self.other_addresses.len();
         self.other_addresses.retain(|other| other != address);
         self.other_addresses.len() != before
@@ -1471,7 +1538,7 @@ impl Store {
     /// a preference of this device, stays, as do keys a newer build wrote.
     /// Snippets, this device's too, stay. Returns the blobs that were
     /// known, whose files the caller removes.
-    pub fn reset_for_server(&mut self, address: &str) -> Result<Vec<BlobId>, StoreError> {
+    pub fn reset_for_server(&mut self, address: &ServerAddress) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
         let blobs = {
             let mut stmt = tx.prepare("SELECT id FROM blobs ORDER BY id")?;
@@ -1487,12 +1554,8 @@ impl Store {
              DELETE FROM alerted_approvals;",
         )?;
         // The old server's other addresses lead to it, not to the new one.
-        tx.execute("DELETE FROM settings WHERE key = ?1", [KEY_OTHER_ADDRESSES])?;
-        tx.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            params![KEY_SERVER_ADDRESS, address],
-        )?;
+        put_setting_in(&tx, KEY_OTHER_ADDRESSES, None)?;
+        put_setting_in(&tx, KEY_SERVER_ADDRESS, Some(&address.to_string()))?;
         tx.commit()?;
         Ok(blobs)
     }
@@ -2179,17 +2242,18 @@ impl Store {
         self.put_setting(KEY_BLOB_POLICY, Some(value))
     }
 
-    pub fn set_server_address(&self, address: Option<&str>) -> Result<(), StoreError> {
-        self.put_setting(KEY_SERVER_ADDRESS, address)
+    pub fn set_server_address(&self, address: Option<&ServerAddress>) -> Result<(), StoreError> {
+        let value = address.map(ServerAddress::to_string);
+        self.put_setting(KEY_SERVER_ADDRESS, value.as_deref())
     }
 
     /// Makes `address` the server address, keeping the one it replaces
     /// among the others ([`Settings::switch_to`]), in one transaction.
-    pub fn switch_server_address(&self, address: &str) -> Result<(), StoreError> {
+    pub fn switch_server_address(&self, address: &ServerAddress) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let mut settings = self.settings()?;
         settings.switch_to(address);
-        self.put_setting(KEY_SERVER_ADDRESS, Some(address))?;
+        self.set_server_address(Some(address))?;
         self.put_other_addresses(&settings.other_addresses)?;
         tx.commit()?;
         Ok(())
@@ -2197,7 +2261,7 @@ impl Store {
 
     /// Drops `address` from the server's other addresses
     /// ([`Settings::forget`]).
-    pub fn forget_server_address(&self, address: &str) -> Result<(), StoreError> {
+    pub fn forget_server_address(&self, address: &ServerAddress) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let mut settings = self.settings()?;
         if settings.forget(address) {
@@ -2207,10 +2271,11 @@ impl Store {
         Ok(())
     }
 
-    fn put_other_addresses(&self, addresses: &[String]) -> Result<(), StoreError> {
-        let value = (!addresses.is_empty())
-            .then(|| serde_json::to_string(addresses).expect("strings serialize"));
-        self.put_setting(KEY_OTHER_ADDRESSES, value.as_deref())
+    fn put_other_addresses(&self, addresses: &[ServerAddress]) -> Result<(), StoreError> {
+        self.put_setting(
+            KEY_OTHER_ADDRESSES,
+            other_addresses_json(addresses).as_deref(),
+        )
     }
 
     /// Keeps what the server's `hello` said of itself, replacing all it
@@ -2237,18 +2302,27 @@ impl Store {
     }
 
     fn put_setting(&self, key: &str, value: Option<&str>) -> Result<(), StoreError> {
-        match value {
-            Some(value) => self.conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )?,
-            None => self
-                .conn
-                .execute("DELETE FROM settings WHERE key = ?1", [key])?,
-        };
-        Ok(())
+        put_setting_in(&self.conn, key, value)
     }
+}
+
+/// Writes the settings row `key`, deleting it when `value` is `None`.
+fn put_setting_in(conn: &Connection, key: &str, value: Option<&str>) -> Result<(), StoreError> {
+    match value {
+        Some(value) => conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?,
+        None => conn.execute("DELETE FROM settings WHERE key = ?1", [key])?,
+    };
+    Ok(())
+}
+
+/// [`Settings::other_addresses`] as stored: a JSON array of canonical
+/// addresses, `None` (no row) when empty.
+fn other_addresses_json(addresses: &[ServerAddress]) -> Option<String> {
+    (!addresses.is_empty()).then(|| serde_json::to_string(addresses).expect("addresses serialize"))
 }
 
 const KEY_BLOB_POLICY: &str = "blob_policy";
@@ -2309,8 +2383,11 @@ fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
         None
     };
     let start = usize::try_from(found).unwrap_or(0);
-    for script in &MIGRATIONS[start..] {
-        tx.execute_batch(script)?;
+    for migration in &MIGRATIONS[start..] {
+        match migration {
+            Sql(script) => tx.execute_batch(script)?,
+            Code(step) => step(tx)?,
+        }
     }
     if let Some(protocol) = protocol {
         migrate_protocol(tx, protocol, &PROTOCOL_STEPS)?;

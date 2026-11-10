@@ -274,8 +274,8 @@ fn render_pairing(frame: &mut Frame, area: Rect, app: &App, pairing: &PairingVie
     if let Some(info) = &pairing.paired {
         let server = info
             .server_address
-            .as_deref()
-            .unwrap_or("an unknown server");
+            .as_ref()
+            .map_or_else(|| "an unknown server".to_owned(), ToString::to_string);
         intro_lines.push(Line::from(format!(
             "Currently paired as {} with {server}; pairing again replaces this identity.",
             info.device_id.0
@@ -679,7 +679,9 @@ fn pending_session_line(pending: &PendingSession) -> Line<'static> {
 fn render_server_addresses(frame: &mut Frame, area: Rect, view: &ServerAddressesView) {
     let mut lines = vec![Line::from(format!(
         "Current: {}",
-        view.current.as_deref().unwrap_or("not paired")
+        view.current
+            .as_ref()
+            .map_or_else(|| "not paired".to_owned(), ToString::to_string)
     ))];
     lines.extend(
         view.others
@@ -729,7 +731,10 @@ fn render_settings(
         Line::from(""),
         Line::from(format!(
             "Server:      {}",
-            settings.server_address.as_deref().unwrap_or("not paired")
+            settings
+                .server_address
+                .as_ref()
+                .map_or_else(|| "not paired".to_owned(), ToString::to_string)
         )),
         Line::from(format!(
             "Device:      {}",
