@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/shell_holder.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -57,13 +58,19 @@ class ShellOutputView extends StatelessWidget {
         return Scaffold(
           appBar: AppBar(
             leading: const CloseButton(),
-            title: Text(
-              run?.command.split('\n').first ?? 'Shell output',
-              style: const TextStyle(
-                fontFamily: monoFamily,
-                fontFamilyFallback: monoFallback,
+            toolbarHeight: LinkTitle.toolbarHeight(context),
+            flexibleSpace: const LinkProgress(),
+            title: LinkTitle(
+              title: Text(
+                run?.command.split('\n').first ?? 'Shell output',
+                style: const TextStyle(
+                  fontFamily: monoFamily,
+                  fontFamilyFallback: monoFallback,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
-              overflow: TextOverflow.ellipsis,
+              send: send,
             ),
             actions: [
               IconButton(

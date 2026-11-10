@@ -1,8 +1,7 @@
-import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
 import 'package:skywave_gui/session/question_panel.dart';
 import 'package:skywave_gui/session/background_sheet.dart';
@@ -454,7 +453,11 @@ class _SessionPageState extends State<SessionPage> {
                     ),
                     const SizedBox(width: 4),
                     Expanded(
-                      child: _Title(screen: screen, compact: compact),
+                      child: _Title(
+                        screen: screen,
+                        compact: compact,
+                        send: widget.send,
+                      ),
                     ),
                     if (screen.subagent case final subagent?)
                       if (subagent.taskId case final task?)
@@ -495,6 +498,7 @@ class _SessionPageState extends State<SessionPage> {
                         icon: const Icon(Icons.search),
                       ),
                     ],
+                    ApprovalsButton(send: widget.send),
                     _InterruptButton(screen: screen, onPressed: _interrupt),
                     if (compact)
                       IconButton(
@@ -532,6 +536,7 @@ class _SessionPageState extends State<SessionPage> {
                   ],
                 ),
               ),
+              flexibleSpace: const LinkProgress(),
               bottom: PreferredSize(
                 preferredSize: Size.fromHeight(StatusLine.heightOf(context)),
                 child: _Column(
@@ -865,11 +870,16 @@ class _Column extends StatelessWidget {
 }
 
 /// The header's title: the session's name with its rename on the way,
-/// then the workdir; in a subagent's view, the subagent's title with how
-/// it stands, then where it is (`work › outer`). The agent's state is on
-/// the status line.
+/// then the workdir, or the link's status line while the link is on its
+/// way back; in a subagent's view, the subagent's title with how it
+/// stands, then where it is (`work › outer`). The agent's state is on the
+/// status line.
 class _Title extends StatelessWidget {
-  const _Title({required this.screen, required this.compact});
+  const _Title({
+    required this.screen,
+    required this.compact,
+    required this.send,
+  });
 
   final SessionScreen screen;
 
@@ -877,15 +887,13 @@ class _Title extends StatelessWidget {
   /// More sheet shows the path whole.
   final bool compact;
 
+  /// For the link's status line.
+  final SendIntent send;
+
   /// The toolbar's height: the standard one, or taller when the text
   /// scale makes the title's two lines and a margin (8) need more.
-  static double heightOf(BuildContext context) {
-    final text = Theme.of(context).textTheme;
-    final lines =
-        lineHeightOf(context, text.titleMedium!) +
-        lineHeightOf(context, text.labelMedium!);
-    return max(kToolbarHeight, (lines + 8).ceilToDouble());
-  }
+  static double heightOf(BuildContext context) =>
+      LinkTitle.heightFor(context, Theme.of(context).textTheme.titleMedium!);
 
   @override
   Widget build(BuildContext context) {
@@ -896,42 +904,45 @@ class _Title extends StatelessWidget {
     final subagent = screen.subagent;
     final under =
         subagent?.trail ?? (compact ? screen.workdirName : screen.workdir);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Row(
-          children: [
-            Flexible(
-              child: Text(
-                subagent?.title ?? screen.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.titleMedium,
+    return LinkTitle(
+      send: send,
+      subtitle: under == null
+          ? null
+          : Text(
+              under,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: sub,
+            ),
+      title: Row(
+        children: [
+          Flexible(
+            child: Text(
+              subagent?.title ?? screen.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.titleMedium,
+            ),
+          ),
+          if (subagent != null) ...[
+            const SizedBox(width: 8),
+            StateBadge(
+              label: subagent.statusLabel,
+              color: colors.tool(
+                subagent.live ? ToolState.running : ToolState.done,
               ),
             ),
-            if (subagent != null) ...[
-              const SizedBox(width: 8),
-              StateBadge(
-                label: subagent.statusLabel,
-                color: colors.tool(
-                  subagent.live ? ToolState.running : ToolState.done,
-                ),
-              ),
-            ] else if (screen.renameLabel case final label?) ...[
-              const SizedBox(width: 8),
-              StateBadge(
-                label: label,
-                color: rename == null
-                    ? colors.muted
-                    : colors.outgoing(rename.state),
-              ),
-            ],
+          ] else if (screen.renameLabel case final label?) ...[
+            const SizedBox(width: 8),
+            StateBadge(
+              label: label,
+              color: rename == null
+                  ? colors.muted
+                  : colors.outgoing(rename.state),
+            ),
           ],
-        ),
-        if (under case final under?)
-          Text(under, maxLines: 1, overflow: TextOverflow.ellipsis, style: sub),
-      ],
+        ],
+      ),
     );
   }
 }

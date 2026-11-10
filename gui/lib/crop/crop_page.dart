@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/crop/crop_lines_holder.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -107,19 +108,20 @@ class _CropPageState extends State<CropPage> {
           canGoBack: widget.canGoBack,
           onBack: () => widget.send.act(const ActionIntentBack()),
         ),
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Crop'),
-            Text(
-              screen.title,
-              style: muted,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
+        toolbarHeight: LinkTitle.toolbarHeight(context),
+        flexibleSpace: const LinkProgress(),
+        title: LinkTitle(
+          title: const Text('Crop'),
+          subtitle: Text(
+            screen.title,
+            style: muted,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          send: widget.send,
         ),
         actions: [
+          ApprovalsButton(send: widget.send),
           Padding(
             padding: const EdgeInsets.only(right: 12),
             child: FilledButton.icon(

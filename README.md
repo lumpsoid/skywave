@@ -79,8 +79,9 @@ its files. It is read-only and fetched only when you ask, and what you read
 stays on the device, so you can still read it offline.
 
 ### 📡 You always know where you stand
-A link banner is always on screen: `Online · 120 ms`, `Catching up`, or
-`Offline · 3 queued · retry in 08s`. Input stays enabled in every state.
+The link's state is always one glance away: `Connecting…`, `Syncing · 4/9`
+or `Offline · retry in 08s · 3 queued`, under the title on phones and
+desktops, and in the TUI's banner. Input stays enabled in every state.
 
 ### 🔐 Private by default
 `skywaved` runs its own certificate authority. Devices pair with a one-time

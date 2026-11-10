@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/sessions/conversation_picker.dart';
 import 'package:skywave_gui/sessions/create_dialog.dart';
@@ -35,8 +36,11 @@ class SessionListPage extends StatelessWidget {
               canGoBack: canGoBack,
               onBack: () => send.act(const ActionIntentBack()),
             ),
-            title: Text(screen.title),
+            toolbarHeight: LinkTitle.toolbarHeight(context),
+            flexibleSpace: const LinkProgress(),
+            title: LinkTitle(title: Text(screen.title), send: send),
             actions: [
+              ApprovalsButton(send: send),
               IconButton(
                 tooltip: 'Usage',
                 icon: const Icon(Icons.bar_chart),

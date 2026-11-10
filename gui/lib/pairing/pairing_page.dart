@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/pairing/qr_scan.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -95,7 +96,13 @@ class _PairingPageState extends State<PairingPage> {
           canGoBack: widget.canGoBack,
           onBack: () => widget.send.act(const ActionIntentBack()),
         ),
-        title: const Text('Pair this device'),
+        toolbarHeight: LinkTitle.toolbarHeight(context),
+        flexibleSpace: const LinkProgress(),
+        title: LinkTitle(
+          title: const Text('Pair this device'),
+          send: widget.send,
+        ),
+        actions: [ApprovalsButton(send: widget.send)],
       ),
       body: ListView(
         padding: const EdgeInsets.all(16),

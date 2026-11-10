@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -41,8 +42,11 @@ class StoragePage extends StatelessWidget {
           canGoBack: canGoBack,
           onBack: () => send.act(const ActionIntentBack()),
         ),
-        title: const Text('Server storage'),
+        toolbarHeight: LinkTitle.toolbarHeight(context),
+        flexibleSpace: const LinkProgress(),
+        title: LinkTitle(title: const Text('Server storage'), send: send),
         actions: [
+          ApprovalsButton(send: send),
           IconButton(
             tooltip: 'Refresh',
             icon: const Icon(Icons.refresh),

@@ -1,5 +1,6 @@
-//! The link banner: core's [`Link`] with the queue and the approvals
-//! elsewhere, as [`LinkUpdate`], and when its countdown next changes.
+//! The link for every screen: core's [`Link`] with the queue and the
+//! approvals elsewhere, as [`LinkUpdate`], and when its countdown next
+//! changes.
 
 use std::time::Duration;
 
@@ -38,39 +39,39 @@ pub fn update(
     };
     let mut retry_in_s = None;
     let mut retry = String::new();
-    let (state, label) = match link {
-        Link::Unpaired => (LinkState::Unpaired, String::new()),
-        Link::Connecting => (LinkState::Connecting, format!("connecting…{queued_part}")),
-        // Nothing to say while online with nothing waiting: the banner
-        // hides. No latency: it changes on every ping and buys no action;
-        // Settings shows it.
-        Link::Online { .. } if queued == 0 && elsewhere == 0 => (LinkState::Online, String::new()),
-        Link::Online { .. } => (LinkState::Online, format!("online{queued_part}")),
+    let (state, label, status_label) = match link {
+        Link::Unpaired => (LinkState::Unpaired, String::new(), None),
+        Link::Connecting => (
+            LinkState::Connecting,
+            String::new(),
+            Some(format!("Connecting…{queued_part}")),
+        ),
+        // Nothing to say while online. No latency: it changes on every
+        // ping and buys no action; Settings shows it. No queue either: a
+        // send queues for a moment on every message, and its row says so.
+        Link::Online { .. } => (LinkState::Online, String::new(), None),
         Link::CatchingUp { have, server } => (
             LinkState::CatchingUp,
-            format!("syncing · {}/{}{queued_part}", have.0, server.0),
+            String::new(),
+            Some(format!("Syncing · {}/{}{queued_part}", have.0, server.0)),
         ),
         Link::Reconnecting {
-            attempt,
-            retry_at,
-            reason,
-            ..
+            retry_at, reason, ..
         } => {
             let left = seconds_left(retry_at.timestamp_millis(), wall_ms);
             retry_in_s = Some(left);
             retry = match left {
                 0 => "retrying…".to_owned(),
-                // Two digits (the cap is 30s) keep the banner from shifting.
+                // Two digits (the cap is 30s) keep the line from shifting.
                 n => format!("retry in {n:02}s"),
             };
-            let reason = link::failure(*reason);
-            // Two lines, always: wrapped as one, the ticking countdown
-            // moved the break and the banner flipped between one and two
-            // lines on a phone. The countdown goes last, so its change to
-            // `retrying…` moves nothing after it.
             (
                 LinkState::Reconnecting,
-                format!("offline · {reason}{queued_part}\nattempt {attempt} · {retry}"),
+                String::new(),
+                Some(format!(
+                    "Offline · {retry} · {}{queued_part}",
+                    link::failure(*reason)
+                )),
             )
         }
         Link::Rejected(
@@ -84,12 +85,14 @@ pub fn update(
                 "{} · re-pair to reconnect{queued_part}",
                 repair_short(*rejection)
             ),
+            None,
         ),
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => (
             LinkState::ProtocolMismatch,
             format!(
                 "protocol mismatch · client v{client}, server v{server} · update, then retry{queued_part}"
             ),
+            None,
         ),
         Link::Rejected(LinkRejection::HistoryLost { have, server }) => (
             LinkState::HistoryLost,
@@ -97,11 +100,13 @@ pub fn update(
                 "server lost history (had {}, server at {}) · sync stopped{queued_part}",
                 have.0, server.0
             ),
+            None,
         ),
     };
     LinkUpdate {
         state,
         label,
+        status_label,
         connection_label: connection_label(link, &retry),
         retry_in_s,
         can_retry_now: match link {
@@ -212,63 +217,75 @@ mod tests {
             offline_since: at,
             reason: skywave_core::LinkFailure::Unreachable,
         };
+        let repair = |what: &str| (format!("{what} · re-pair to reconnect · 2 queued"), None);
         let cases = [
-            (Link::Unpaired, ""),
-            (Link::Connecting, "connecting… · 2 queued"),
-            (Link::Online { latency_ms: 12 }, "online · 2 queued"),
+            (Link::Unpaired, (String::new(), None)),
+            (
+                Link::Connecting,
+                (String::new(), Some("Connecting… · 2 queued")),
+            ),
+            (Link::Online { latency_ms: 12 }, (String::new(), None)),
             (
                 Link::CatchingUp {
                     have: Seq(4),
                     server: Seq(9),
                 },
-                "syncing · 4/9 · 2 queued",
+                (String::new(), Some("Syncing · 4/9 · 2 queued")),
             ),
             (
                 reconnecting.clone(),
-                "offline · server unreachable · 2 queued\nattempt 3 · retry in 07s",
+                (
+                    String::new(),
+                    Some("Offline · retry in 07s · server unreachable · 2 queued"),
+                ),
             ),
             (
                 Link::Rejected(LinkRejection::Revoked),
-                "device revoked · re-pair to reconnect · 2 queued",
+                repair("device revoked"),
             ),
             (
                 Link::Rejected(LinkRejection::ServerChanged),
-                "server identity changed · re-pair to reconnect · 2 queued",
+                repair("server identity changed"),
             ),
             (
                 Link::Rejected(LinkRejection::NameMismatch),
-                "server name mismatch · re-pair to reconnect · 2 queued",
+                repair("server name mismatch"),
             ),
             (
                 Link::Rejected(LinkRejection::BadIdentity),
-                "device identity unusable · re-pair to reconnect · 2 queued",
+                repair("device identity unusable"),
             ),
             (
                 Link::Rejected(LinkRejection::HistoryLost {
                     have: Seq(9),
                     server: Seq(4),
                 }),
-                "server lost history (had 9, server at 4) · sync stopped · 2 queued",
+                (
+                    "server lost history (had 9, server at 4) · sync stopped · 2 queued".to_owned(),
+                    None,
+                ),
             ),
         ];
-        for (link, label) in cases {
+        for (link, (label, status)) in cases {
             let banner = update(&link, 2, 0, AgentLogin::default(), now);
             assert_eq!(banner.label, label, "{link:?}");
+            assert_eq!(banner.status_label.as_deref(), status, "{link:?}");
             let lost = matches!(link, Link::Rejected(LinkRejection::HistoryLost { .. }));
             assert_eq!(banner.can_reset_replica, lost, "{link:?}");
             let repair = matches!(link, Link::Rejected(r) if r.needs_repair());
             assert_eq!(banner.state == LinkState::RepairNeeded, repair, "{link:?}");
         }
-        let online = Link::Online { latency_ms: 12 };
-        assert_eq!(
-            update(&online, 0, 0, AgentLogin::default(), now).label,
-            "",
-            "nothing to say"
+        let online = update(
+            &Link::Online { latency_ms: 12 },
+            0,
+            1,
+            AgentLogin::default(),
+            now,
         );
         assert_eq!(
-            update(&online, 0, 1, AgentLogin::default(), now).label,
-            "online",
-            "a button to show"
+            (online.label.as_str(), online.status_label),
+            ("", None),
+            "approvals elsewhere are not the link's to say"
         );
         let banner = update(&reconnecting, 0, 1, AgentLogin::default(), now);
         assert_eq!(
@@ -294,7 +311,10 @@ mod tests {
             at.timestamp_millis() + 10,
         );
         assert_eq!(due.retry_in_s, Some(0));
-        assert!(due.label.ends_with("\nattempt 3 · retrying…"));
+        assert_eq!(
+            due.status_label.as_deref(),
+            Some("Offline · retrying… · server unreachable")
+        );
         assert_eq!(
             due.connection_label,
             "Offline · server unreachable · retrying…"

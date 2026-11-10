@@ -8,6 +8,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 LinkUpdate link(
   LinkState state,
   String label, {
+  String? statusLabel,
   bool canRetryNow = false,
   int elsewhere = 0,
   String? elsewhereLabel,
@@ -16,6 +17,7 @@ LinkUpdate link(
 }) => LinkUpdate(
   state: state,
   label: label,
+  statusLabel: statusLabel,
   connectionLabel: '',
   canRetryNow: canRetryNow,
   rejected:
@@ -65,11 +67,39 @@ void main() {
     expect(find.byKey(const Key('link-label')), findsNothing);
 
     holder.apply(
-      link(LinkState.reconnecting, 'offline · timed out', loginLabel: warning),
+      link(
+        LinkState.repairNeeded,
+        'device revoked · re-pair to reconnect',
+        loginLabel: warning,
+      ),
     );
     await tester.pumpAndSettle();
-    expect(find.text('offline · timed out'), findsOneWidget);
+    expect(find.text('device revoked · re-pair to reconnect'), findsOneWidget);
     expect(find.text(warning), findsOneWidget);
+  });
+
+  testWidgets('a dismissed expiry warning stays away until it changes', (
+    tester,
+  ) async {
+    const twoDays =
+        'agent login expires in 2 days · log in again on the server';
+    const oneDay = 'agent login expires in 1 day · log in again on the server';
+    await pump(tester);
+    holder.apply(link(LinkState.online, '', loginLabel: twoDays));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('login-dismiss')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('link-banner')), findsNothing);
+    expect(holder.bannerShown, isFalse);
+
+    // Rust sends the same warning again on every link change.
+    holder.apply(link(LinkState.connecting, '', loginLabel: twoDays));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('link-banner')), findsNothing);
+
+    holder.apply(link(LinkState.online, '', loginLabel: oneDay));
+    await tester.pumpAndSettle();
+    expect(find.text(oneDay), findsOneWidget);
   });
 
   testWidgets('the logged-out warning shows while online, ahead of expiry', (
@@ -87,6 +117,11 @@ void main() {
     expect(find.byKey(const Key('link-banner')), findsOneWidget);
     expect(find.text(loggedOut), findsOneWidget);
     expect(find.byKey(const Key('link-label')), findsNothing);
+    expect(
+      find.byKey(const Key('login-dismiss')),
+      findsNothing,
+      reason: 'nothing works until the agent logs in again',
+    );
 
     // Rust never sends both, but the order holds if it did.
     holder.apply(
@@ -99,18 +134,33 @@ void main() {
     );
   });
 
-  testWidgets('the banner shows each state\'s label, and nothing unpaired', (
-    tester,
-  ) async {
+  testWidgets('the banner shows only a link that stopped', (tester) async {
     await pump(tester);
-    holder.apply(link(LinkState.unpaired, ''));
-    await tester.pump();
-    expect(find.byKey(const Key('link-label')), findsNothing);
+    for (final (state, status) in [
+      (LinkState.unpaired, null),
+      (LinkState.connecting, 'Connecting…'),
+      (LinkState.catchingUp, 'Syncing · 4/9'),
+      (LinkState.reconnecting, 'Offline · retry in 07s · server unreachable'),
+    ]) {
+      holder.apply(
+        link(
+          state,
+          '',
+          statusLabel: status,
+          canRetryNow: state == LinkState.reconnecting,
+          elsewhere: 2,
+          elsewhereLabel: '2 approvals elsewhere',
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const Key('link-banner')),
+        findsNothing,
+        reason: '$state',
+      );
+    }
 
     for (final (state, label) in [
-      (LinkState.connecting, 'connecting…'),
-      (LinkState.online, 'online · 2 queued'),
-      (LinkState.catchingUp, 'syncing · 4/9'),
       (
         LinkState.repairNeeded,
         'server identity changed · re-pair to reconnect',
@@ -121,84 +171,23 @@ void main() {
       ),
     ]) {
       holder.apply(link(state, label));
-      await tester.pump();
+      await tester.pumpAndSettle();
       expect(find.text(label), findsOneWidget, reason: '$state');
     }
     expect(find.text('Retry now'), findsNothing);
-
-    holder.apply(
-      link(
-        LinkState.reconnecting,
-        'offline · server unreachable\nattempt 3 · retry in 07s',
-      ),
-    );
-    await tester.pump();
-    expect(find.text('offline · server unreachable'), findsOneWidget);
-    expect(find.text('attempt 3 · retry in 07s'), findsOneWidget);
   });
 
-  testWidgets('a phone banner keeps its height as the countdown ticks', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(320, 640);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.reset);
+  testWidgets('the banner slides away once the link is back', (tester) async {
     await pump(tester);
-    final heights = <double>[];
-    for (final retry in ['retry in 10s', 'retry in 07s', 'retrying…']) {
-      holder.apply(
-        link(
-          LinkState.reconnecting,
-          'offline · server unreachable · 4 queued\nattempt 3 · $retry',
-          canRetryNow: true,
-        ),
-      );
-      await tester.pumpAndSettle();
-      heights.add(tester.getSize(find.byType(LinkBanner)).height);
-    }
-    expect(heights.toSet(), hasLength(1), reason: '$heights');
-  });
-
-  testWidgets('a wrapped approvals button is no wider than its words', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(320, 640);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.reset);
-    await pump(tester);
-    holder.apply(
-      link(
-        LinkState.reconnecting,
-        'offline\nattempt 3 · retry in 07s',
-        canRetryNow: true,
-        elsewhere: 12,
-        elsewhereLabel: '12 approvals elsewhere',
-      ),
-    );
+    const revoked = 'device revoked · re-pair to reconnect';
+    holder.apply(link(LinkState.repairNeeded, revoked));
     await tester.pumpAndSettle();
-    final words = find.text('12 approvals elsewhere');
-    final button = find.ancestor(of: words, matching: find.byType(TextButton));
-    final bar = find.byType(OverflowBar);
-    expect(tester.getSize(words).height, greaterThan(20), reason: 'wraps');
-    expect(
-      tester.getSize(button).width,
-      lessThan(tester.getSize(bar).width - 8),
-    );
-  });
+    expect(find.text(revoked), findsOneWidget);
 
-  testWidgets('the banner slides away once online with nothing waiting', (
-    tester,
-  ) async {
-    await pump(tester);
-    holder.apply(link(LinkState.connecting, 'connecting…'));
-    await tester.pumpAndSettle();
-    expect(find.text('connecting…'), findsOneWidget);
-
-    // Rust says nothing while online with nothing queued or elsewhere.
     holder.apply(link(LinkState.online, ''));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
-    expect(find.text('connecting…'), findsOneWidget, reason: 'still sliding');
+    expect(find.text(revoked), findsOneWidget, reason: 'still sliding');
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('link-label')), findsNothing);
   });
@@ -210,9 +199,10 @@ void main() {
         const FakeAccessibilityFeatures(disableAnimations: true);
     addTearDown(tester.platformDispatcher.clearAccessibilityFeaturesTestValue);
     await pump(tester);
-    holder.apply(link(LinkState.connecting, 'connecting…'));
+    const revoked = 'device revoked · re-pair to reconnect';
+    holder.apply(link(LinkState.repairNeeded, revoked));
     await tester.pump();
-    expect(find.text('connecting…'), findsOneWidget);
+    expect(find.text(revoked), findsOneWidget);
     holder.apply(link(LinkState.online, ''));
     await tester.pump();
     expect(find.byKey(const Key('link-label')), findsNothing);
@@ -221,7 +211,11 @@ void main() {
   testWidgets('Retry now and Ctrl+R send RetryNow', (tester) async {
     await pump(tester);
     holder.apply(
-      link(LinkState.reconnecting, 'offline · retry in 07s', canRetryNow: true),
+      link(
+        LinkState.protocolMismatch,
+        'protocol mismatch · client v2, server v3 · update, then retry',
+        canRetryNow: true,
+      ),
     );
     await tester.pumpAndSettle();
     await tester.tap(find.text('Retry now'));
@@ -238,10 +232,6 @@ void main() {
     tester,
   ) async {
     await pump(tester);
-    holder.apply(link(LinkState.reconnecting, 'offline', canRetryNow: true));
-    await tester.pumpAndSettle();
-    expect(find.text('Reset local data'), findsNothing);
-
     holder.apply(link(LinkState.historyLost, 'server lost history'));
     await tester.pumpAndSettle();
     expect(find.text('Retry now'), findsNothing);
@@ -256,48 +246,5 @@ void main() {
     await tester.tap(find.text('Reset'));
     await tester.pumpAndSettle();
     expect(sent, [const GuiIntentAct(action: ActionIntentResetReplica())]);
-  });
-
-  testWidgets('approvals elsewhere and Ctrl+G open the next one', (
-    tester,
-  ) async {
-    await pump(tester);
-    holder.apply(
-      link(
-        LinkState.online,
-        'online',
-        elsewhere: 2,
-        elsewhereLabel: '2 approvals elsewhere',
-      ),
-    );
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('2 approvals elsewhere'));
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyG);
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
-    expect(sent, [
-      const GuiIntentAct(action: ActionIntentOpenNextApproval()),
-      const GuiIntentAct(action: ActionIntentOpenNextApproval()),
-    ]);
-  });
-
-  testWidgets('both buttons fit a phone-width banner', (tester) async {
-    tester.view.physicalSize = const Size(320, 640);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.reset);
-    await pump(tester);
-    holder.apply(
-      link(
-        LinkState.reconnecting,
-        'offline · 4 queued\nattempt 3 · retry in 07s',
-        canRetryNow: true,
-        elsewhere: 12,
-        elsewhereLabel: '12 approvals elsewhere',
-      ),
-    );
-    await tester.pump();
-    expect(tester.takeException(), isNull);
-    expect(find.text('Retry now'), findsOneWidget);
-    expect(find.text('12 approvals elsewhere'), findsOneWidget);
   });
 }
