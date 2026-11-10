@@ -17,12 +17,13 @@ use crate::view::{
     ConversationItem, ConversationPicker, ConversationsStatus, ConversationsUnavailable,
 };
 
+/// The picker while the session list is on screen; the list's place holds
+/// it, so leaving the list drops it. Request ids come from the model,
+/// which keeps them unused across visits.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Conversations {
     /// The open picker; `None` while it is closed.
     open: Option<Listing>,
-    /// Id of the latest [`Request::ListConversations`]; never reused.
-    req: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,8 +37,9 @@ struct Listing {
 
 impl Conversations {
     /// Opens (or reopens) the picker; returns the listing to ask the
-    /// server for. Offline (`online` false) it is unavailable at once.
-    pub(crate) fn list(&mut self, online: bool) -> Option<Request> {
+    /// server for, its id taken from `last_req` (the latest id handed out,
+    /// never reused). Offline (`online` false) it is unavailable at once.
+    pub(crate) fn list(&mut self, online: bool, last_req: &mut u64) -> Option<Request> {
         if !online {
             self.open = Some(Listing {
                 req: None,
@@ -46,13 +48,14 @@ impl Conversations {
             });
             return None;
         }
-        self.req += 1;
+        *last_req += 1;
+        let req = *last_req;
         self.open = Some(Listing {
-            req: Some(self.req),
+            req: Some(req),
             status: ConversationsStatus::Loading,
             items: Vec::new(),
         });
-        Some(Request::ListConversations { req: self.req })
+        Some(Request::ListConversations { req })
     }
 
     /// The picker closed: forget its listing.
