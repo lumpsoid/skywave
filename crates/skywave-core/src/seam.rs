@@ -281,18 +281,17 @@ impl Seam {
     /// and files, a lease on it, the queue told — unless it went already.
     pub(crate) fn local_crop_ended(&self, crop: PendingCrop) -> Result<(), CoreError> {
         let data_dir = self.data_dir();
-        self.update(|state| {
+        self.update(|state, requests| {
             let purged = state.store.end_local_crop(crop)?;
             state.blobs_purged(&purged);
             state.model.blobs_purged(&purged);
             for blob in &purged {
                 remove_blob_files(&data_dir, *blob);
             }
-            let mut requests = Vec::new();
             if !purged.is_empty() {
                 requests.push(Request::BlobsPurged(purged));
             }
-            Ok(((), requests))
+            Ok(())
         })
     }
 
@@ -310,11 +309,10 @@ impl Seam {
     pub fn apply_events(&self, batch: &EventBatch) -> Result<Applied, CoreError> {
         let now = Utc::now();
         let data_dir = self.data_dir();
-        self.update(|state| {
+        self.update(|state, requests| {
             let applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
-            let mut requests = Vec::new();
             for (id, seq) in &applied.settled {
                 let accepted = CommandResult::Accepted { seq: *seq };
                 requests.extend(state.model.command_result(*id, accepted, now));
@@ -333,7 +331,7 @@ impl Seam {
             if !applied.purged.is_empty() {
                 requests.push(Request::BlobsPurged(applied.purged.clone()));
             }
-            Ok((applied, requests))
+            Ok(applied)
         })
     }
 
@@ -343,13 +341,13 @@ impl Seam {
     /// is logged out, and show them wherever the views do, offline too
     /// after a restart.
     pub fn hello_received(&self, hello: &HelloResponse) -> Result<(), CoreError> {
-        self.update(|state| {
+        self.update(|state, _| {
             let facts = ServerFacts::of(hello);
             state.store.set_devices(&hello.devices)?;
             state.store.set_server_facts(&facts)?;
             state.model.devices_named(&hello.devices);
             state.model.server_facts(facts);
-            Ok(((), Vec::new()))
+            Ok(())
         })
     }
 
@@ -363,10 +361,7 @@ impl Seam {
     /// whether the server's log still holds what this replica has seen of
     /// it ([`Store::take_server_log`](crate::Store::take_server_log)).
     pub fn log_checked(&self, hello: &HelloResponse) -> Result<LogCheck, CoreError> {
-        self.update(|state| {
-            let check = state.store.take_server_log(hello.head, &hello.log)?;
-            Ok((check, Vec::new()))
-        })
+        self.update(|state, _| Ok(state.store.take_server_log(hello.head, &hello.log)?))
     }
 
     /// Devices `batch` names that this device knows no name for: paired
@@ -382,12 +377,12 @@ impl Seam {
     /// discard of the same command are serialized.
     pub fn command_sending(&self, id: CommandId) -> Result<bool, CoreError> {
         let now = Utc::now();
-        self.update(|state| {
+        self.update(|state, _| {
             let claimed = state.store.claim_send(id, now)?;
             if claimed {
                 state.model.command_sending(id, now);
             }
-            Ok((claimed, Vec::new()))
+            Ok(claimed)
         })
     }
 
@@ -397,12 +392,12 @@ impl Seam {
     /// again, as one the log settles does ([`Seam::apply_events`]).
     pub fn command_result(&self, id: CommandId, result: &CommandResult) -> Result<(), CoreError> {
         let now = Utc::now();
-        self.update(|state| {
+        self.update(|state, requests| {
             if !state.store.record_result(id, result, now)? {
-                return Ok(((), Vec::new()));
+                return Ok(());
             }
-            let refresh = state.model.command_result(id, result.clone(), now);
-            Ok(((), refresh.into_iter().collect()))
+            requests.extend(state.model.command_result(id, result.clone(), now));
+            Ok(())
         })
     }
 
@@ -412,11 +407,11 @@ impl Seam {
     /// on. A command already settled (or gone) stays as it is.
     pub fn command_undeliverable(&self, id: CommandId) -> Result<(), CoreError> {
         let now = Utc::now();
-        self.update(|state| {
+        self.update(|state, _| {
             if state.store.record_undeliverable(id, now)? {
                 state.model.command_undeliverable(id, now);
             }
-            Ok(((), Vec::new()))
+            Ok(())
         })
     }
 
@@ -433,30 +428,30 @@ impl Seam {
     /// a batch applied meanwhile cannot make an accepted command fail.
     pub fn command_unlogged(&self, id: CommandId, head: Seq) -> Result<bool, CoreError> {
         let now = Utc::now();
-        self.update(|state| {
+        self.update(|state, _| {
             let pending = state.store.pending_outbox()?;
             if !pending.iter().any(|e| e.command.id == id) {
-                return Ok((true, Vec::new()));
+                return Ok(true);
             }
             if state.store.cursor()? < head {
-                return Ok((false, Vec::new()));
+                return Ok(false);
             }
             if state.store.record_undeliverable(id, now)? {
                 state.model.command_undeliverable(id, now);
             }
-            Ok((true, Vec::new()))
+            Ok(true)
         })
     }
 
     pub fn set_link(&self, link: PairedLink) {
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 if self.current(state) {
                     let alerted = state.model.set_link(link);
                     mark_alerted(state, &alerted);
                 }
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
@@ -477,18 +472,18 @@ impl Seam {
         result: Result<WorkdirAnswer, TransportError>,
     ) -> Result<(), CoreError> {
         let data_dir = self.data_dir();
-        self.update(|state| {
+        self.update(|state, requests| {
             if !state.model.workdir_awaited(req, &ask) {
-                return Ok(((), Vec::new()));
+                return Ok(());
             }
             let answer = match result {
                 Err(error) => {
                     state.model.workdir_failed(&ask, error.to_string());
-                    return Ok(((), Vec::new()));
+                    return Ok(());
                 }
                 Ok(WorkdirAnswer::Changes(ChangesResult::Failed { reason })) => {
                     state.model.workdir_failed(&ask, reason);
-                    return Ok(((), Vec::new()));
+                    return Ok(());
                 }
                 Ok(answer) => answer,
             };
@@ -496,7 +491,7 @@ impl Seam {
                 Ok(Some(stored)) => stored,
                 Ok(None) => {
                     state.model.workdir_dropped(&ask);
-                    return Ok(((), Vec::new()));
+                    return Ok(());
                 }
                 Err(error) => {
                     state.model.workdir_failed(&ask, error.to_string());
@@ -508,12 +503,11 @@ impl Seam {
             for blob in &stored.purged {
                 remove_blob_files(&data_dir, *blob);
             }
-            let mut requests = Vec::new();
             if !stored.purged.is_empty() {
                 requests.push(Request::BlobsPurged(stored.purged));
             }
             requests.extend(wanted);
-            Ok(((), requests))
+            Ok(())
         })
     }
 
@@ -522,9 +516,9 @@ impl Seam {
     pub fn dirs_listed(&self, req: u64, result: Result<DirsResult, TransportError>) {
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 state.model.dirs_listed(req, result);
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
@@ -539,9 +533,9 @@ impl Seam {
     ) {
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 state.model.conversations_listed(req, result);
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
@@ -551,9 +545,9 @@ impl Seam {
     pub fn storage_reported(&self, req: u64, result: Result<StorageReport, TransportError>) {
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 state.model.storage_reported(req, result);
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
@@ -569,22 +563,22 @@ impl Seam {
         req: u64,
         result: Result<UsageLimitsResult, TransportError>,
     ) -> Result<(), CoreError> {
-        self.update(|state| {
+        self.update(|state, _| {
             if !state.model.usage_limits_awaited(req) {
-                return Ok(((), Vec::new()));
+                return Ok(());
             }
             let answer = match result {
                 Err(error) => {
                     state
                         .model
                         .usage_limits_failed(UsageLimitsUnavailable::from(error));
-                    return Ok(((), Vec::new()));
+                    return Ok(());
                 }
                 Ok(UsageLimitsResult::Failed { reason }) => {
                     state
                         .model
                         .usage_limits_failed(UsageLimitsUnavailable::Failed(reason));
-                    return Ok(((), Vec::new()));
+                    return Ok(());
                 }
                 Ok(answer) => answer,
             };
@@ -595,7 +589,7 @@ impl Seam {
                 return Err(error.into());
             }
             state.model.usage_limits_stored(answer);
-            Ok(((), Vec::new()))
+            Ok(())
         })
     }
 
@@ -604,9 +598,9 @@ impl Seam {
     pub fn login_started(&self, req: u64, result: Result<LoginStartResult, TransportError>) {
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 state.model.login_started(req, result);
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
@@ -621,9 +615,9 @@ impl Seam {
         req: u64,
         result: Result<LoginFinishResult, TransportError>,
     ) -> Result<(), CoreError> {
-        self.update(|state| {
+        self.update(|state, _| {
             if !state.model.login_awaited(req) {
-                return Ok(((), Vec::new()));
+                return Ok(());
             }
             let stored = match &result {
                 Ok(LoginFinishResult::LoggedIn { expires }) => {
@@ -639,7 +633,7 @@ impl Seam {
             // stored hello fields to the next hello.
             state.model.login_finished(req, result, stored.is_ok());
             stored?;
-            Ok(((), Vec::new()))
+            Ok(())
         })
     }
 
@@ -649,9 +643,9 @@ impl Seam {
     pub fn lines_counted(&self, req: u64, result: std::io::Result<u64>) {
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 state.model.lines_counted(req, result);
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
@@ -676,8 +670,7 @@ impl Seam {
         credentials: PairedCredentials,
     ) -> Result<(), CoreError> {
         let data_dir = self.data_dir();
-        self.update(|state| {
-            let mut requests = Vec::new();
+        self.update(|state, requests| {
             let pairing = match state
                 .pairing
                 .as_ref()
@@ -695,25 +688,26 @@ impl Seam {
                     // The reset commits before the new pairing is saved: a
                     // failure or a crash in between leaves the old pairing
                     // over an empty replica, which only pulls again, never
-                    // the old server's log under the new pairing.
+                    // the old server's log under the new pairing. What the
+                    // reset purged goes before the model reloads, which may
+                    // fail.
                     let blobs = state.store.reset_for_server()?;
                     state.server_epoch += 1;
-                    state.model.replica_reset(state.store.load()?);
                     state.blobs_purged(&blobs);
                     remove_all_blob_files(&data_dir);
                     if !blobs.is_empty() {
                         requests.push(Request::BlobsPurged(blobs));
                     }
+                    state.model.replica_reset(state.store.load()?);
                     Pairing::new(credentials, address.clone())
                 }
             };
-            let saved = state.save_pairing(&data_dir, pairing);
-            // The new pairing, or the old one its handles may no longer
-            // write for once the replica was reset.
+            // With the new pairing, or, if it cannot be saved, the old one
+            // its handles may no longer write for once the replica was
+            // reset.
             requests.push(Request::Connect);
-            Ok((saved, requests))
-        })?
-        .map_err(CoreError::from)
+            Ok(state.save_pairing(&data_dir, pairing)?)
+        })
     }
 
     /// Pairing failed; the pairing screen shows `reason`.
@@ -721,9 +715,9 @@ impl Seam {
         let reason = reason.into();
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 state.model.pairing_failed(reason);
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
@@ -750,11 +744,11 @@ impl Seam {
         lease: Option<BlobLease>,
         status: BlobStatus,
     ) -> Result<(), CoreError> {
-        self.update(|state| {
+        self.update(|state, _| {
             check_lease(state, id, lease)?;
             state.store.set_blob_status(id, &status)?;
             state.model.blob_status(id, status);
-            Ok(((), Vec::new()))
+            Ok(())
         })
     }
 
@@ -781,12 +775,12 @@ impl Seam {
         lease: Option<BlobLease>,
         reason: String,
     ) -> Result<(), CoreError> {
-        self.update(|state| {
+        self.update(|state, _| {
             check_lease(state, id, lease)?;
             let status = BlobStatus::Failed { reason };
             state.store.set_blob_status(id, &status)?;
             state.model.blob_status(id, status);
-            Ok(((), Vec::new()))
+            Ok(())
         })
     }
 
@@ -798,18 +792,18 @@ impl Seam {
     /// held), and a row purged and registered again meanwhile is not
     /// `Downloading`.
     pub(crate) fn blob_stopped(&self, id: BlobId) -> Result<(), CoreError> {
-        self.update(|state| {
+        self.update(|state, _| {
             let Some(BlobRecord {
                 status: BlobStatus::Downloading { got, path },
                 ..
             }) = state.store.blob(id)?
             else {
-                return Ok(((), Vec::new()));
+                return Ok(());
             };
             let status = BlobStatus::Stopped { got, path };
             state.store.set_blob_status(id, &status)?;
             state.model.blob_status(id, status);
-            Ok(((), Vec::new()))
+            Ok(())
         })
     }
 
@@ -819,25 +813,26 @@ impl Seam {
     pub(crate) fn blobs_disk_full(&self, full: bool) {
         self.core
             .shared
-            .update::<(), Infallible>(|state| {
+            .update::<(), Infallible>(|state, _| {
                 state.model.set_blobs_disk_full(full);
-                Ok(((), Vec::new()))
+                Ok(())
             })
             .unwrap_or_else(|never| match never {});
     }
 
     /// Runs a change that persists before touching the model, so a failed
     /// write leaves the model as it was. A handle bound to an older server
-    /// changes nothing ([`CoreError::Superseded`]).
+    /// changes nothing ([`CoreError::Superseded`]). What it pushes is sent
+    /// also on `Err` (`Shared::update`).
     fn update<R>(
         &self,
-        change: impl FnOnce(&mut State) -> Result<(R, Vec<Request>), CoreError>,
+        change: impl FnOnce(&mut State, &mut Vec<Request>) -> Result<R, CoreError>,
     ) -> Result<R, CoreError> {
-        self.core.shared.update(|state| {
+        self.core.shared.update(|state, requests| {
             if !self.current(state) {
                 return Err(CoreError::Superseded);
             }
-            change(state)
+            change(state, requests)
         })
     }
 }
@@ -867,6 +862,7 @@ mod tests {
     use super::*;
     use crate::action::{Action, Route};
     use crate::view::Screen;
+    use skywave_proto::EventKind;
 
     fn credentials(ca: &str) -> PairedCredentials {
         PairedCredentials {
@@ -879,7 +875,8 @@ mod tests {
 
     /// Storing the pairing with another server fails after the replica was
     /// reset for it: the device keeps its old pairing whole — identity and
-    /// address, shown and stored — and connects with it again.
+    /// address, shown and stored — and connects with it again. The call
+    /// fails, yet the blob queue still hears of what the reset purged.
     #[test]
     fn a_failed_save_keeps_the_old_pairing_whole() {
         let dir = tempfile::tempdir().unwrap();
@@ -890,6 +887,38 @@ mod tests {
         let old = credentials("CA");
         seam.pairing_succeeded(&old_address, old.clone()).unwrap();
         assert_eq!(requests.try_iter().last(), Some(Request::Connect));
+        let (id, blob) = (SessionId::new(), BlobId::new());
+        let event = |kind: EventKind| skywave_proto::Event {
+            session_id: id,
+            at: Utc::now(),
+            command_id: None,
+            context: skywave_proto::ContextId::first_of(id),
+            kind,
+        };
+        seam.apply_events(&EventBatch {
+            from: Seq(1),
+            events: vec![
+                event(EventKind::SessionCreated {
+                    workdir: "/srv/a".into(),
+                    context_name: "start".into(),
+                    from: None,
+                }),
+                event(EventKind::ToolResult(skywave_proto::ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "log".into(),
+                    lines: 1,
+                    output: Some(skywave_proto::Full::Blob(skywave_proto::BlobRef {
+                        id: blob,
+                        size: 3,
+                        sha256: skywave_proto::ContentHash::of(b"abc"),
+                    })),
+                })),
+            ],
+        })
+        .unwrap();
+        requests.try_iter().for_each(drop);
 
         // Something in the way of the new record's temporary file.
         let blocker = dir.path().join(crate::identity::TEMP_FILE);
@@ -900,7 +929,10 @@ mod tests {
         assert!(matches!(err, CoreError::Identity(_)), "{err}");
         let expected = Pairing::new(old.clone(), old_address.clone());
         assert_eq!(seam.pairing().as_deref(), Some(&expected));
-        assert_eq!(requests.try_iter().collect::<Vec<_>>(), [Request::Connect]);
+        assert_eq!(
+            requests.try_iter().collect::<Vec<_>>(),
+            [Request::BlobsPurged(vec![blob]), Request::Connect]
+        );
         let settings = |core: &Core| {
             core.dispatch(Action::Navigate(Route::Settings)).unwrap();
             match core.view().screen {

@@ -3158,15 +3158,12 @@ mod tests {
                 std::thread::spawn(move || {
                     for _ in 0..2000 {
                         core.shared
-                            .update::<(), Infallible>(|state| {
-                                let req = state.version;
-                                Ok((
-                                    (),
-                                    vec![crate::Request::ListDirs {
-                                        req,
-                                        dir: String::new(),
-                                    }],
-                                ))
+                            .update::<(), Infallible>(|state, requests| {
+                                requests.push(crate::Request::ListDirs {
+                                    req: state.version,
+                                    dir: String::new(),
+                                });
+                                Ok(())
                             })
                             .unwrap_or_else(|never| match never {});
                     }
