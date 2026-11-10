@@ -101,7 +101,7 @@ struct Title {
 /// that.
 #[derive(Debug, Clone, PartialEq)]
 enum Place {
-    SessionList,
+    SessionList(ListPage),
     Archived,
     Settings,
     ServerAddresses,
@@ -134,6 +134,11 @@ enum Place {
 }
 
 impl Place {
+    /// The active session list, its prompt and picker closed.
+    fn session_list() -> Place {
+        Place::SessionList(ListPage::default())
+    }
+
     /// Session `id`, its events not loaded yet, shown whole.
     fn session(id: SessionId) -> Place {
         Place::Session {
@@ -142,6 +147,18 @@ impl Place {
             scope: Scope::default(),
         }
     }
+}
+
+/// What the active session list keeps while it is on screen. Its request
+/// ids are the model's ([`Model::dirs_req`], [`Model::conversations_req`]):
+/// they must stay unused across visits, so an answer to a list since left
+/// cannot match a request of the one opened after.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ListPage {
+    /// Workdir completion in the new-session prompt.
+    completer: Completer,
+    /// The conversation picker.
+    conversations: Conversations,
 }
 
 /// What of the open session's timeline shows. In memory only:
@@ -198,7 +215,7 @@ enum LineCount {
 impl From<Route> for Place {
     fn from(route: Route) -> Self {
         match route {
-            Route::SessionList => Place::SessionList,
+            Route::SessionList => Place::session_list(),
             Route::ArchivedSessions => Place::Archived,
             Route::Settings => Place::Settings,
             Route::ServerAddresses => Place::ServerAddresses,
@@ -299,10 +316,12 @@ pub(crate) struct Model {
     /// ([`Attention::shell_alerts`]), and the last one; in memory only.
     shell_alerts: u64,
     last_shell: Option<ShellAlert>,
-    /// Workdir completion in the new-session prompt; in memory only.
-    completer: Completer,
-    /// The conversation picker on the session list; in memory only.
-    conversations: Conversations,
+    /// Id of the latest [`Request::ListDirs`] for the session list's
+    /// completion; never reused.
+    dirs_req: u64,
+    /// Id of the latest [`Request::ListConversations`] for the session
+    /// list's picker; never reused.
+    conversations_req: u64,
     /// The storage screen's report; in memory only.
     storage: Storage,
     /// The usage limits page: the stored answer, and the read in flight
@@ -361,7 +380,7 @@ impl Model {
         let mut model = Model {
             paired,
             pairing: PairingStatus::Idle,
-            place: Place::SessionList,
+            place: Place::session_list(),
             settings: Settings::default(),
             cursor: Seq::ZERO,
             sessions: Vec::new(),
@@ -381,8 +400,8 @@ impl Model {
             alerted_at: HashMap::new(),
             shell_alerts: 0,
             last_shell: None,
-            completer: Completer::default(),
-            conversations: Conversations::default(),
+            dirs_req: 0,
+            conversations_req: 0,
             storage: Storage::default(),
             usage_limits: UsageLimits::default(),
             login: AgentLogin::default(),
@@ -500,18 +519,10 @@ impl Model {
         self.loaded(id).map_or(&[], |open| open.events.as_slice())
     }
 
-    /// Shows `place`, dropping what the screen left kept, and ends the
-    /// session list's workdir completion and conversation picker.
-    fn go(&mut self, place: Place) {
-        self.place = place;
-        self.completer.end();
-        self.conversations.end();
-    }
-
     /// The screen on show as a [`Model::opening`] names it.
     fn opening_from(&self) -> Option<OpeningFrom> {
         match &self.place {
-            Place::SessionList => Some(OpeningFrom::SessionList),
+            Place::SessionList(_) => Some(OpeningFrom::SessionList),
             Place::Archived => Some(OpeningFrom::Archived),
             Place::Session { id, .. } => Some(OpeningFrom::Session(*id)),
             _ => None,
@@ -567,8 +578,9 @@ impl Model {
                 if workdir.is_empty() {
                     return Vec::new();
                 }
-                self.completer.end();
-                self.conversations.end();
+                if let Place::SessionList(page) = &mut self.place {
+                    *page = ListPage::default();
+                }
                 // No local id check: dispatch has no failure channel, and a
                 // silent drop would lose what the user typed. The server's
                 // `BadConversation` shows as a failed pending session.
@@ -602,34 +614,44 @@ impl Model {
                 effects
             }
             Action::CompleteWorkdir { input } => {
-                if self.device().is_none() || self.place != Place::SessionList {
+                if self.device().is_none() {
                     return Vec::new();
                 }
                 // While the link is down, recent workdirs stand in.
                 let online = self.online();
-                self.completer
-                    .complete(input, online)
+                let Place::SessionList(page) = &mut self.place else {
+                    return Vec::new();
+                };
+                page.completer
+                    .complete(input, online, &mut self.dirs_req)
                     .map(Effect::Request)
                     .into_iter()
                     .collect()
             }
             Action::EndCompletion => {
-                self.completer.end();
+                if let Place::SessionList(page) = &mut self.place {
+                    page.completer.end();
+                }
                 Vec::new()
             }
             Action::ListConversations => {
-                if self.device().is_none() || self.place != Place::SessionList {
+                if self.device().is_none() {
                     return Vec::new();
                 }
                 let online = self.online();
-                self.conversations
-                    .list(online)
+                let Place::SessionList(page) = &mut self.place else {
+                    return Vec::new();
+                };
+                page.conversations
+                    .list(online, &mut self.conversations_req)
                     .map(Effect::Request)
                     .into_iter()
                     .collect()
             }
             Action::EndConversations => {
-                self.conversations.end();
+                if let Place::SessionList(page) = &mut self.place {
+                    page.conversations.end();
+                }
                 Vec::new()
             }
             Action::RefreshStorage => {
@@ -916,7 +938,7 @@ impl Model {
                 if self.device().is_none() || self.summary(id).is_none() {
                     return Vec::new();
                 }
-                self.go(Place::session(id));
+                self.place = Place::session(id);
                 vec![Effect::LoadSession(id)]
             }
             Action::OpenNextApproval => match self.next_approval() {
@@ -931,11 +953,11 @@ impl Model {
                 if self.device().is_none() || self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.go(Place::Workdir {
+                self.place = Place::Workdir {
                     id: session_id,
                     pane: WorkdirPane::Changes,
                     last_dir: String::new(),
-                });
+                };
                 self.show_workdir(WorkdirPane::Changes)
             }
             Action::OpenSessionInfo { session_id } => {
@@ -948,10 +970,10 @@ impl Model {
                     _ => None,
                 };
                 let load = open.is_none().then_some(Effect::LoadSession(session_id));
-                self.go(Place::SessionInfo {
+                self.place = Place::SessionInfo {
                     id: session_id,
                     open,
-                });
+                };
                 let online = self.online();
                 let asked = self.usage_limits.open(online).map(Effect::Request);
                 load.into_iter().chain(asked).collect()
@@ -1020,7 +1042,7 @@ impl Model {
                     Place::Crop(page) => page.from,
                     _ => CropFrom::Session(session),
                 };
-                self.go(Place::Crop(Box::new(CropPage {
+                self.place = Place::Crop(Box::new(CropPage {
                     blob,
                     session,
                     holds,
@@ -1028,7 +1050,7 @@ impl Model {
                     from,
                     keep: Vec::new(),
                     lines: LineCount::Unasked,
-                })));
+                }));
                 // Its count, once held, is asked by `count_wanted`.
                 Vec::new()
             }
@@ -1060,7 +1082,7 @@ impl Model {
             },
             Action::ResetReplica => match self.link() {
                 Link::Rejected(LinkRejection::HistoryLost { .. }) => {
-                    self.go(Place::SessionList);
+                    self.place = Place::session_list();
                     self.link_to(PairedLink::Connecting);
                     vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
                 }
@@ -1072,7 +1094,7 @@ impl Model {
                     Route::UsageLimits => Place::UsageLimits(from),
                     route => route.into(),
                 };
-                self.go(place);
+                self.place = place;
                 if self.device().is_none() {
                     return Vec::new();
                 }
@@ -1144,7 +1166,7 @@ impl Model {
     fn back(&self) -> Option<Action> {
         self.device()?;
         let route = match &self.place {
-            Place::SessionList => return None,
+            Place::SessionList(_) => return None,
             Place::Archived | Place::Settings | Place::Pairing | Place::Usage | Place::Storage => {
                 Route::SessionList
             }
@@ -1281,7 +1303,7 @@ impl Model {
         if matches!(self.pairing, PairingStatus::InProgress { .. }) {
             return Vec::new();
         }
-        self.go(Place::Pairing);
+        self.place = Place::Pairing;
         let (code, fingerprint) = (code.trim().to_owned(), fingerprint.trim().to_owned());
         let address = address.trim();
         if address.is_empty() || code.is_empty() || fingerprint.is_empty() {
@@ -1706,7 +1728,7 @@ impl Model {
                 };
                 // Its events come from the store: see `unloaded_session`.
                 if self.opening_from() == Some(from) {
-                    self.go(Place::session(to));
+                    self.place = Place::session(to);
                 }
             }
         }
@@ -1873,7 +1895,7 @@ impl Model {
             | Place::SessionInfo { id: shown, .. }
             | Place::Workdir { id: shown, .. } if *shown == id)
         {
-            self.go(Place::Archived);
+            self.place = Place::Archived;
         }
     }
 
@@ -1928,7 +1950,9 @@ impl Model {
     }
 
     pub(crate) fn dirs_listed(&mut self, req: u64, result: Result<DirsResult, TransportError>) {
-        self.completer.listed(req, result);
+        if let Place::SessionList(page) = &mut self.place {
+            page.completer.listed(req, result);
+        }
     }
 
     pub(crate) fn conversations_listed(
@@ -1936,7 +1960,9 @@ impl Model {
         req: u64,
         result: Result<ConversationsResult, TransportError>,
     ) {
-        self.conversations.listed(req, result);
+        if let Place::SessionList(page) = &mut self.place {
+            page.conversations.listed(req, result);
+        }
     }
 
     /// Whether `req` is the usage limits read the page waits on
@@ -2057,10 +2083,11 @@ impl Model {
         self.wanted.clear();
         self.alerted.clear();
         self.alerted_at.clear();
-        self.completer = Completer::default();
-        // Ended, not reset: the request ids stay unused, so an answer from
-        // the old server cannot match a later request.
-        self.conversations.end();
+        // Closed, the request ids kept: an answer from the old server
+        // cannot match a later request.
+        if let Place::SessionList(page) = &mut self.place {
+            *page = ListPage::default();
+        }
         self.workdirs.reset();
         // The old server's login flow means nothing to the new one.
         self.login.forget();
@@ -2073,7 +2100,7 @@ impl Model {
     pub(crate) fn paired(&mut self, paired: Paired) {
         self.paired = Some(paired);
         self.pairing = PairingStatus::Idle;
-        self.go(Place::SessionList);
+        self.place = Place::session_list();
     }
 
     /// Mirrors the pairing's addresses as stored, after a failed write.
@@ -2242,24 +2269,26 @@ impl Model {
                     .map(|p| p.addresses.others().to_vec())
                     .unwrap_or_default(),
             }),
-            Place::SessionList => Screen::SessionList(self.session_list(ListKind::Active)),
-            Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
+            Place::SessionList(page) => {
+                Screen::SessionList(self.session_list(ListKind::Active, Some(page)))
+            }
+            Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived, None)),
             Place::Usage => Screen::Usage(self.usage_view()),
             Place::Storage => Screen::Storage(self.storage_view()),
             Place::UsageLimits(_) => Screen::UsageLimits(self.usage_limits.view()),
             Place::Session { id, open, scope } => {
                 match self.session_view(*id, open.as_ref(), *scope) {
                     Some(view) => Screen::Session(Box::new(view)),
-                    None => Screen::SessionList(self.session_list(ListKind::Active)),
+                    None => Screen::SessionList(self.session_list(ListKind::Active, None)),
                 }
             }
             Place::SessionInfo { id, open } => match self.session_info_view(*id, open.as_ref()) {
                 Some(view) => Screen::SessionInfo(Box::new(view)),
-                None => Screen::SessionList(self.session_list(ListKind::Active)),
+                None => Screen::SessionList(self.session_list(ListKind::Active, None)),
             },
             Place::Workdir { id, pane, last_dir } => match self.workdir_view(*id, pane, last_dir) {
                 Some(view) => Screen::Workdir(view),
-                None => Screen::SessionList(self.session_list(ListKind::Active)),
+                None => Screen::SessionList(self.session_list(ListKind::Active, None)),
             },
             Place::Crop(page) => Screen::Crop(self.crop_view(page)),
         }
@@ -2407,7 +2436,9 @@ impl Model {
         }
     }
 
-    fn session_list(&self, kind: ListKind) -> SessionListView {
+    /// The `kind` list; `page` is what the active list on screen keeps,
+    /// none when another place falls back to the list.
+    fn session_list(&self, kind: ListKind, page: Option<&ListPage>) -> SessionListView {
         let (listed, other): (Vec<_>, Vec<_>) = self
             .sessions
             .iter()
@@ -2472,16 +2503,17 @@ impl Model {
                 _ => None,
             })
             .collect();
-        let completion = self
-            .completer
-            .view(self.sessions.iter().filter_map(|s| s.workdir.as_deref()));
+        let completion = page.and_then(|page| {
+            page.completer
+                .view(self.sessions.iter().filter_map(|s| s.workdir.as_deref()))
+        });
         SessionListView {
             kind,
             sessions,
             other_count: other.len(),
             creating,
             completion,
-            conversations: self.conversations.view(&self.sessions),
+            conversations: page.and_then(|page| page.conversations.view(&self.sessions)),
         }
     }
 
@@ -9224,6 +9256,18 @@ mod tests {
             workdir: "/srv/x".into(),
         }));
         assert_eq!(f.list_view().completion, None);
+
+        // Leaving the list ends the completion; an answer asked before it
+        // left is stale once the prompt completes again.
+        let (old, _) = complete(&mut f, "/srv/").unwrap();
+        f.dispatch(Action::Navigate(Route::Settings));
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert_eq!(f.list_view().completion, None);
+        let (new, _) = complete(&mut f, "/srv/").unwrap();
+        assert_ne!(new, old);
+        f.model.dirs_listed(old, listed("/srv", &["api"]));
+        assert_eq!(completion(&f).status, CompletionStatus::Loading);
+        assert_eq!(candidates(&f), Vec::new());
     }
 
     use crate::view::{
@@ -9566,7 +9610,7 @@ mod tests {
         f.dispatch(Action::Navigate(Route::SessionList));
         f.dispatch(Action::Navigate(Route::UsageLimits));
         f.dispatch(Action::Back);
-        assert_eq!(f.model.place, Place::SessionList);
+        assert!(matches!(f.model.place, Place::SessionList(_)));
     }
 
     const LOGIN_URL: &str = "https://login.example/authorize?state=abc";
@@ -10039,11 +10083,20 @@ mod tests {
         f.dispatch(Action::Navigate(Route::Settings));
         assert_eq!(list_conversations(&mut f), None);
         f.dispatch(Action::Navigate(Route::SessionList));
-        assert!(list_conversations(&mut f).is_some());
-        // Leaving the list ends the picker.
+        let old = list_conversations(&mut f).unwrap();
+        // Leaving the list ends the picker; an answer asked before it left
+        // is stale once it opens again.
         f.dispatch(Action::Navigate(Route::Settings));
         f.dispatch(Action::Navigate(Route::SessionList));
         assert_eq!(f.list_view().conversations, None);
+        let new = list_conversations(&mut f).unwrap();
+        assert_ne!(new, old);
+        f.model.conversations_listed(
+            old,
+            conversations(vec![outside("c1", "/srv/b", None)], false),
+        );
+        assert_eq!(picker(&f).status, ConversationsStatus::Loading);
+        assert_eq!(picker(&f).items, Vec::new());
     }
 
     #[test]

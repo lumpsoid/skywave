@@ -17,13 +17,14 @@ use crate::seam::Request;
 use crate::transport::TransportError;
 use crate::view::{Candidate, CandidateSource, Completion, CompletionStatus};
 
+/// The prompt's completion while the session list is on screen; the
+/// list's place holds it, so leaving the list drops it. Request ids come
+/// from the model, which keeps them unused across visits.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Completer {
     /// The input being completed; `None` while no prompt completes.
     input: Option<String>,
     listing: Option<Listing>,
-    /// Id of the latest [`Request::ListDirs`]; never reused.
-    req: u64,
 }
 
 /// The last listing asked for.
@@ -40,8 +41,14 @@ struct Listing {
 
 impl Completer {
     /// Completes `input`; returns the listing to ask the server for, if
-    /// any. Nothing is asked while the link is down (`online` false).
-    pub(crate) fn complete(&mut self, input: String, online: bool) -> Option<Request> {
+    /// any, its id taken from `last_req` (the latest id handed out, never
+    /// reused). Nothing is asked while the link is down (`online` false).
+    pub(crate) fn complete(
+        &mut self,
+        input: String,
+        online: bool,
+        last_req: &mut u64,
+    ) -> Option<Request> {
         let dir = dir_of(&input).to_owned();
         let repeated = self.input.as_deref() == Some(input.as_str());
         self.input = Some(input);
@@ -59,15 +66,16 @@ impl Completer {
         if !ask {
             return None;
         }
-        self.req += 1;
+        *last_req += 1;
+        let req = *last_req;
         let result = same_dir.and_then(|l| l.result.clone());
         self.listing = Some(Listing {
             dir: dir.clone(),
-            req: self.req,
+            req,
             pending: true,
             result,
         });
-        Some(Request::ListDirs { req: self.req, dir })
+        Some(Request::ListDirs { req, dir })
     }
 
     /// The prompt closed: forget the input and the listing.
@@ -232,7 +240,9 @@ mod tests {
     #[test]
     fn listing_is_filtered_by_prefix_and_hides_dotfiles() {
         let mut c = Completer::default();
-        let Some(Request::ListDirs { req, dir }) = c.complete("/srv/".into(), true) else {
+        let mut last_req = 0;
+        let Some(Request::ListDirs { req, dir }) = c.complete("/srv/".into(), true, &mut last_req)
+        else {
             panic!("asks the server");
         };
         assert_eq!(dir, "/srv/");
@@ -248,11 +258,11 @@ mod tests {
             ]
         );
         // Same dir: the listing is reused, nothing is asked.
-        assert_eq!(c.complete("/srv/a".into(), true), None);
+        assert_eq!(c.complete("/srv/a".into(), true, &mut last_req), None);
         let view = c.view(std::iter::empty()).unwrap();
         assert_eq!(view.candidates.len(), 2);
         assert_eq!(view.fill().as_deref(), Some("/srv/ap"));
-        assert_eq!(c.complete("/srv/.".into(), true), None);
+        assert_eq!(c.complete("/srv/.".into(), true, &mut last_req), None);
         assert_eq!(
             paths(&c.view(std::iter::empty()).unwrap()),
             [("/srv/.git", CandidateSource::Server)]
