@@ -98,7 +98,9 @@ struct Title {
     rename: Option<Outgoing>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The screen shown, with what only that screen keeps: leaving it drops
+/// that.
+#[derive(Debug, Clone, PartialEq)]
 enum Place {
     SessionList,
     Archived,
@@ -110,13 +112,57 @@ enum Place {
     /// The usage limits page, opened from the session on screen, if any:
     /// back returns there.
     UsageLimits(Option<SessionId>),
-    Session(SessionId),
+    Session {
+        id: SessionId,
+        /// Its events, once loaded from the replica.
+        open: Option<OpenSession>,
+        scope: Scope,
+    },
     /// The session's info page; its events stay loaded, as the session's.
-    SessionInfo(SessionId),
-    /// The session's workdir, on [`Model::workdir_pane`].
-    Workdir(SessionId),
-    /// The crop page, [`Model::crop`].
-    Crop,
+    SessionInfo {
+        id: SessionId,
+        open: Option<OpenSession>,
+    },
+    /// The session's workdir.
+    Workdir {
+        id: SessionId,
+        pane: WorkdirPane,
+        /// The last directory shown since [`Action::OpenWorkdir`], where
+        /// the files pane opens.
+        last_dir: String,
+    },
+    Crop(Box<CropPage>),
+}
+
+impl Place {
+    /// Session `id`, its events not loaded yet, shown whole.
+    fn session(id: SessionId) -> Place {
+        Place::Session {
+            id,
+            open: None,
+            scope: Scope::default(),
+        }
+    }
+}
+
+/// What of the open session's timeline shows. In memory only:
+/// [`Action::Back`] reads where to step out of a subagent to from the log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Scope {
+    /// The context [`Action::ViewContext`] narrowed the timeline to.
+    context: Option<ContextId>,
+    /// The `Agent` call whose subagent [`Action::ViewSubagent`] shows; it
+    /// wins over `context`, which shows again once back steps out.
+    subagent: Option<CallId>,
+}
+
+/// A screen a [`Model::opening`] can be asked from, and open its new
+/// session over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpeningFrom {
+    SessionList,
+    Archived,
+    Session(SessionId),
 }
 
 /// The crop page ([`Action::OpenCrop`]), kept while it is on screen.
@@ -165,9 +211,9 @@ impl From<Route> for Place {
     }
 }
 
+/// The events of the session on screen, loaded from the replica.
 #[derive(Debug, Clone, PartialEq)]
 struct OpenSession {
-    id: SessionId,
     events: Vec<(Seq, Event)>,
     /// The first event after the read mark as it was when the session
     /// opened, past this device's own messages, if agent output follows
@@ -234,15 +280,6 @@ pub(crate) struct Model {
     /// Sessions deleted from this device, as stored: their events are
     /// skipped for good.
     deleted: HashSet<SessionId>,
-    /// Events of the session on screen, loaded from the replica.
-    open: Option<OpenSession>,
-    /// The context [`Action::ViewContext`] narrowed the session on screen
-    /// to; gone once another screen shows. In memory only.
-    viewing: Option<(SessionId, ContextId)>,
-    /// The `Agent` call whose subagent [`Action::ViewSubagent`] shows in
-    /// the session on screen; gone once another screen shows. In memory
-    /// only: [`Action::Back`] reads where to step out to from the log.
-    subagent: Option<(SessionId, CallId)>,
     /// Pending approvals the user was alerted to, or that needed no alert
     /// (answered here), in this process or an earlier one: as stored, plus
     /// what [`Model::apply_batch`] and [`Model::set_link`] hand out to
@@ -270,9 +307,9 @@ pub(crate) struct Model {
     /// the code. In memory only, never stored.
     login: AgentLogin,
     /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
-    /// new session is not in the replica yet: its command, and the place
+    /// new session is not in the replica yet: its command, and the screen
     /// it was asked from, still on screen. In memory only.
-    opening: Option<(CommandId, Place)>,
+    opening: Option<(CommandId, OpeningFrom)>,
     /// The server's devices by name, as stored.
     devices: HashMap<DeviceId, String>,
     /// The models of the newest `ModelsOffered`, as stored.
@@ -283,13 +320,6 @@ pub(crate) struct Model {
     /// What this device read of sessions' workdirs: as stored, plus the
     /// reads in flight and failed (in memory only).
     workdirs: Workdirs,
-    /// The pane the workdir screen shows; reset by [`Action::OpenWorkdir`].
-    workdir_pane: WorkdirPane,
-    /// The last directory the workdir screen showed, where its files pane
-    /// opens; reset by [`Action::OpenWorkdir`].
-    last_dir: String,
-    /// The crop page, shown while [`Model::place`] is [`Place::Crop`].
-    crop: Option<CropPage>,
     /// Id of the latest [`Request::CountLines`]; never reused, so the
     /// count of a page since closed or reopened is dropped.
     count_req: u64,
@@ -325,9 +355,6 @@ impl Model {
             read_marks: HashMap::new(),
             snippets: Snippets::default(),
             deleted: HashSet::new(),
-            open: None,
-            viewing: None,
-            subagent: None,
             alerted: HashSet::new(),
             alerts: 0,
             alerted_at: HashMap::new(),
@@ -343,9 +370,6 @@ impl Model {
             models: Vec::new(),
             turns: Vec::new(),
             workdirs: Workdirs::default(),
-            workdir_pane: WorkdirPane::Changes,
-            last_dir: String::new(),
-            crop: None,
             count_req: 0,
         };
         // An approval pending at start that no process alerted on yet (one
@@ -374,7 +398,9 @@ impl Model {
         self.turns = snapshot.turns;
         self.workdirs.stored = snapshot.workdirs;
         self.usage_limits.stored = snapshot.usage_limits;
-        self.open = None;
+        if let Some((_, open)) = self.loaded_slot() {
+            *open = None;
+        }
         // Never forget what is still pending: an approval that came in
         // during a catch-up must still alert once it is over, and one
         // alerted on whose mark failed to store must not alert again.
@@ -391,8 +417,8 @@ impl Model {
 
     /// The session on screen, whose events the model needs.
     pub(crate) fn open_session(&self) -> Option<SessionId> {
-        match self.place {
-            Place::Session(id) => Some(id),
+        match &self.place {
+            Place::Session { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -400,8 +426,8 @@ impl Model {
     /// The session whose events the screen shows: the open one, or the
     /// one whose info page is on screen.
     pub(crate) fn loaded_session(&self) -> Option<SessionId> {
-        match self.place {
-            Place::Session(id) | Place::SessionInfo(id) => Some(id),
+        match &self.place {
+            Place::Session { id, .. } | Place::SessionInfo { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -409,8 +435,66 @@ impl Model {
     /// The session on screen when its events are not loaded: one
     /// [`Model::apply_batch`] opened for a [`Action::CreateSessionLike`].
     pub(crate) fn unloaded_session(&self) -> Option<SessionId> {
-        self.loaded_session()
-            .filter(|id| self.open.as_ref().is_none_or(|open| open.id != *id))
+        match &self.place {
+            Place::Session { id, open: None, .. } | Place::SessionInfo { id, open: None } => {
+                Some(*id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Where [`Model::loaded_session`]'s events go once loaded.
+    fn loaded_slot(&mut self) -> Option<(SessionId, &mut Option<OpenSession>)> {
+        match &mut self.place {
+            Place::Session { id, open, .. } | Place::SessionInfo { id, open } => Some((*id, open)),
+            _ => None,
+        }
+    }
+
+    /// [`Model::loaded_session`] with its events, once loaded.
+    fn shown_events(&self) -> Option<(SessionId, &OpenSession)> {
+        match &self.place {
+            Place::Session {
+                id,
+                open: Some(open),
+                ..
+            }
+            | Place::SessionInfo {
+                id,
+                open: Some(open),
+            } => Some((*id, open)),
+            _ => None,
+        }
+    }
+
+    /// Session `id`'s events, if the screen shows them and they are loaded.
+    fn loaded(&self, id: SessionId) -> Option<&OpenSession> {
+        self.shown_events()
+            .filter(|(shown, _)| *shown == id)
+            .map(|(_, open)| open)
+    }
+
+    /// Session `id`'s loaded events; none unless [`Model::loaded`].
+    fn events(&self, id: SessionId) -> &[(Seq, Event)] {
+        self.loaded(id).map_or(&[], |open| open.events.as_slice())
+    }
+
+    /// Shows `place`, dropping what the screen left kept, and ends the
+    /// session list's workdir completion and conversation picker.
+    fn go(&mut self, place: Place) {
+        self.place = place;
+        self.completer.end();
+        self.conversations.end();
+    }
+
+    /// The screen on show as a [`Model::opening`] names it.
+    fn opening_from(&self) -> Option<OpeningFrom> {
+        match &self.place {
+            Place::SessionList => Some(OpeningFrom::SessionList),
+            Place::Archived => Some(OpeningFrom::Archived),
+            Place::Session { id, .. } => Some(OpeningFrom::Session(*id)),
+            _ => None,
+        }
     }
 
     // ---- actions ----------------------------------------------------------
@@ -474,15 +558,13 @@ impl Model {
                 })
             }
             Action::CreateSessionLike(from) => {
-                let place = self.place;
-                let Some(workdir) =
-                    self.summary(from)
-                        .and_then(|s| s.workdir.clone())
-                        .filter(|_| {
-                            matches!(place, Place::SessionList | Place::Archived)
-                                || place == Place::Session(from)
-                        })
-                else {
+                let Some(at) = self.opening_from().filter(|at| match at {
+                    OpeningFrom::SessionList | OpeningFrom::Archived => true,
+                    OpeningFrom::Session(id) => *id == from,
+                }) else {
+                    return Vec::new();
+                };
+                let Some(workdir) = self.summary(from).and_then(|s| s.workdir.clone()) else {
                     return Vec::new();
                 };
                 let effects = self.enqueue(CommandKind::CreateSession {
@@ -490,7 +572,7 @@ impl Model {
                     conversation: None,
                 });
                 if let Some(Effect::Enqueue(command)) = effects.first() {
-                    self.opening = Some((command.id, place));
+                    self.opening = Some((command.id, at));
                 }
                 effects
             }
@@ -538,7 +620,10 @@ impl Model {
             }
             Action::RefreshUsageLimits => {
                 if self.device().is_none()
-                    || !matches!(self.place, Place::UsageLimits(_) | Place::SessionInfo(_))
+                    || !matches!(
+                        self.place,
+                        Place::UsageLimits(_) | Place::SessionInfo { .. }
+                    )
                 {
                     return Vec::new();
                 }
@@ -731,21 +816,20 @@ impl Model {
                 session_id,
                 context,
             } => {
-                if self.place == Place::Session(session_id) {
-                    self.viewing = context.map(|context| (session_id, context));
+                if self.open_session() == Some(session_id)
+                    && let Some(scope) = self.scope_mut()
+                {
+                    scope.context = context;
                 }
                 Vec::new()
             }
             Action::ViewSubagent { session_id, call } => {
-                if self.place != Place::Session(session_id) {
+                let known = |call| self.subagent_header(session_id, call).is_some();
+                if self.open_session() != Some(session_id) || call.is_some_and(|c| !known(c)) {
                     return Vec::new();
                 }
-                match call {
-                    None => self.subagent = None,
-                    Some(call) if self.subagent_header(session_id, call).is_some() => {
-                        self.subagent = Some((session_id, call));
-                    }
-                    Some(_) => {}
+                if let Some(scope) = self.scope_mut() {
+                    scope.subagent = call;
                 }
                 Vec::new()
             }
@@ -807,12 +891,7 @@ impl Model {
                 if self.device().is_none() || self.summary(id).is_none() {
                     return Vec::new();
                 }
-                self.place = Place::Session(id);
-                self.open = None;
-                self.viewing = None;
-                self.subagent = None;
-                self.completer.end();
-                self.conversations.end();
+                self.go(Place::session(id));
                 vec![Effect::LoadSession(id)]
             }
             Action::OpenNextApproval => match self.next_approval() {
@@ -827,43 +906,40 @@ impl Model {
                 if self.device().is_none() || self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.place = Place::Workdir(session_id);
-                self.open = None;
-                self.viewing = None;
-                self.subagent = None;
-                self.completer.end();
-                self.conversations.end();
-                self.last_dir = String::new();
-                self.show_workdir(session_id, WorkdirPane::Changes)
+                self.go(Place::Workdir {
+                    id: session_id,
+                    pane: WorkdirPane::Changes,
+                    last_dir: String::new(),
+                });
+                self.show_workdir(WorkdirPane::Changes)
             }
             Action::OpenSessionInfo { session_id } => {
                 if self.device().is_none() || self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.place = Place::SessionInfo(session_id);
-                self.viewing = None;
-                self.subagent = None;
-                self.completer.end();
-                self.conversations.end();
+                // The session's events, if loaded, are the page's too.
+                let open = match self.loaded_slot() {
+                    Some((id, open)) if id == session_id => open.take(),
+                    _ => None,
+                };
+                let load = open.is_none().then_some(Effect::LoadSession(session_id));
+                self.go(Place::SessionInfo {
+                    id: session_id,
+                    open,
+                });
                 let online = self.online();
                 let asked = self.usage_limits.open(online).map(Effect::Request);
-                // The session's events, if loaded, are the page's too.
-                let loaded = self.open.as_ref().is_some_and(|open| open.id == session_id);
-                if !loaded {
-                    self.open = None;
-                }
-                let load = (!loaded).then_some(Effect::LoadSession(session_id));
                 load.into_iter().chain(asked).collect()
             }
             Action::ShowWorkdir(pane) => match self.shown_workdir() {
-                Some(id) => self.show_workdir(id, pane),
+                Some(_) => self.show_workdir(pane),
                 None => Vec::new(),
             },
             Action::RefreshWorkdir => {
-                let Some(id) = self.shown_workdir() else {
+                let Some((id, pane)) = self.shown_workdir() else {
                     return Vec::new();
                 };
-                let ask = pane_ask(id, &self.workdir_pane);
+                let ask = pane_ask(id, pane);
                 let online = self.online();
                 self.workdirs
                     .ask(ask, online)
@@ -893,8 +969,7 @@ impl Model {
             // Sent from its own crop page, the page goes where back goes:
             // left open, it would turn to `Gone` once the crop lands.
             Action::CropBlob { blob, keep } => {
-                let from_page = self.place == Place::Crop
-                    && self.crop.as_ref().is_some_and(|page| page.blob == blob);
+                let from_page = matches!(&self.place, Place::Crop(page) if page.blob == blob);
                 let mut effects = self.enqueue(CommandKind::CropBlob { blob, keep });
                 if from_page
                     && !effects.is_empty()
@@ -913,23 +988,14 @@ impl Model {
                 if self.device().is_none() {
                     return Vec::new();
                 }
-                let from = match self.place {
+                let from = match &self.place {
                     Place::Storage => CropFrom::Storage,
-                    Place::Session(id) => CropFrom::Session(id),
+                    Place::Session { id, .. } => CropFrom::Session(*id),
                     // Reopened over itself, it keeps where back goes.
-                    Place::Crop => match &self.crop {
-                        Some(page) => page.from,
-                        None => CropFrom::Session(session),
-                    },
+                    Place::Crop(page) => page.from,
                     _ => CropFrom::Session(session),
                 };
-                self.place = Place::Crop;
-                self.open = None;
-                self.viewing = None;
-                self.subagent = None;
-                self.completer.end();
-                self.conversations.end();
-                self.crop = Some(CropPage {
+                self.go(Place::Crop(Box::new(CropPage {
                     blob,
                     session,
                     holds,
@@ -937,12 +1003,12 @@ impl Model {
                     from,
                     keep: Vec::new(),
                     lines: LineCount::Unasked,
-                });
+                })));
                 // Its count, once held, is asked by `count_wanted`.
                 Vec::new()
             }
             Action::SetCropKeep(keep) => {
-                if let Some(page) = self.crop.as_mut().filter(|_| self.place == Place::Crop) {
+                if let Place::Crop(page) = &mut self.place {
                     page.keep = keep;
                 }
                 Vec::new()
@@ -969,10 +1035,7 @@ impl Model {
             },
             Action::ResetReplica => match self.link {
                 Link::Rejected(LinkRejection::HistoryLost { .. }) => {
-                    self.place = Place::SessionList;
-                    self.open = None;
-                    self.viewing = None;
-                    self.subagent = None;
+                    self.go(Place::SessionList);
                     self.link = Link::Connecting;
                     vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
                 }
@@ -980,15 +1043,11 @@ impl Model {
             },
             Action::Navigate(route) => {
                 let from = self.open_session();
-                self.place = match route {
+                let place = match route {
                     Route::UsageLimits => Place::UsageLimits(from),
                     route => route.into(),
                 };
-                self.open = None;
-                self.viewing = None;
-                self.subagent = None;
-                self.completer.end();
-                self.conversations.end();
+                self.go(place);
                 if self.device().is_none() {
                     return Vec::new();
                 }
@@ -1004,10 +1063,12 @@ impl Model {
                 // A subagent shown steps out to the one it runs under, then
                 // to the main timeline.
                 if let Some((session_id, call)) = self.shown_subagent() {
-                    self.subagent = self
+                    let outer = self
                         .subagent_header(session_id, call)
-                        .and_then(|header| header.trail.last().map(|(outer, _)| *outer))
-                        .map(|outer| (session_id, outer));
+                        .and_then(|header| header.trail.last().map(|(outer, _)| *outer));
+                    if let Some(scope) = self.scope_mut() {
+                        scope.subagent = outer;
+                    }
                     return Vec::new();
                 }
                 match self.back() {
@@ -1018,20 +1079,35 @@ impl Model {
         }
     }
 
+    /// What of the open session's timeline shows, while one is on screen.
+    fn scope_mut(&mut self) -> Option<&mut Scope> {
+        match &mut self.place {
+            Place::Session { scope, .. } => Some(scope),
+            _ => None,
+        }
+    }
+
     /// The subagent [`Action::ViewSubagent`] shows, if its session is on
     /// screen.
     fn shown_subagent(&self) -> Option<(SessionId, CallId)> {
-        self.subagent.filter(|(id, _)| {
-            self.device().is_some()
-                && self.place == Place::Session(*id)
-                && self.summary(*id).is_some()
-        })
+        match &self.place {
+            Place::Session {
+                id,
+                scope:
+                    Scope {
+                        subagent: Some(call),
+                        ..
+                    },
+                ..
+            } if self.device().is_some() && self.summary(*id).is_some() => Some((*id, *call)),
+            _ => None,
+        }
     }
 
     /// The subagent `Agent` call `call` of the open session `id` runs, as
     /// the timeline folds it; `None` for any other call.
     fn subagent_header(&self, id: SessionId, call: CallId) -> Option<SubagentHeader> {
-        let open = self.open.as_ref().filter(|open| open.id == id)?;
+        let open = self.loaded(id)?;
         let (items, _) = self.timeline(id, &open.events);
         subagent_header(&items, call)
     }
@@ -1042,7 +1118,7 @@ impl Model {
     /// from the replica shows the active list.
     fn back(&self) -> Option<Action> {
         self.device()?;
-        let route = match self.place {
+        let route = match &self.place {
             Place::SessionList => return None,
             Place::Archived | Place::Settings | Place::Pairing | Place::Usage | Place::Storage => {
                 Route::SessionList
@@ -1054,33 +1130,33 @@ impl Model {
                     None => Action::Navigate(Route::SessionList),
                 });
             }
-            Place::SessionInfo(id) => {
-                self.summary(id)?;
-                return Some(Action::OpenSession(id));
+            Place::SessionInfo { id, .. } => {
+                self.summary(*id)?;
+                return Some(Action::OpenSession(*id));
             }
-            Place::Session(id) => {
-                if self.archived(self.summary(id)?) {
+            Place::Session { id, .. } => {
+                if self.archived(self.summary(*id)?) {
                     Route::ArchivedSessions
                 } else {
                     Route::SessionList
                 }
             }
-            Place::Workdir(id) => {
-                self.summary(id)?;
+            Place::Workdir { id, pane, .. } => {
+                self.summary(*id)?;
                 let up = |path: &str| {
                     Action::ShowWorkdir(WorkdirPane::Dir {
                         path: parent(path).to_owned(),
                     })
                 };
-                return Some(match &self.workdir_pane {
+                return Some(match pane {
                     WorkdirPane::File { path } => up(path),
                     WorkdirPane::Dir { path } if !path.is_empty() => up(path),
                     WorkdirPane::Diff { .. } => Action::ShowWorkdir(WorkdirPane::Changes),
-                    WorkdirPane::Changes | WorkdirPane::Dir { .. } => Action::OpenSession(id),
+                    WorkdirPane::Changes | WorkdirPane::Dir { .. } => Action::OpenSession(*id),
                 });
             }
-            Place::Crop => {
-                return Some(match self.crop.as_ref()?.from {
+            Place::Crop(page) => {
+                return Some(match page.from {
                     CropFrom::Session(id) if self.summary(id).is_some() => Action::OpenSession(id),
                     CropFrom::Session(_) => Action::Navigate(Route::SessionList),
                     // Asked again: the crop may have changed it.
@@ -1097,23 +1173,35 @@ impl Model {
         !matches!(self.link, Link::Reconnecting { .. } | Link::Rejected(_))
     }
 
-    /// The session whose workdir is on screen.
-    fn shown_workdir(&self) -> Option<SessionId> {
-        match self.place {
-            Place::Workdir(id) if self.device().is_some() && self.summary(id).is_some() => Some(id),
+    /// The session whose workdir is on screen, and the pane shown.
+    fn shown_workdir(&self) -> Option<(SessionId, &WorkdirPane)> {
+        match &self.place {
+            Place::Workdir { id, pane, .. }
+                if self.device().is_some() && self.summary(*id).is_some() =>
+            {
+                Some((*id, pane))
+            }
             _ => None,
         }
     }
 
-    /// Shows `pane` of session `id`'s workdir: asks for its read if it has
+    /// Shows `pane` of the workdir on screen: asks for its read if it has
     /// no stored answer and none on its way, and for its content if that is
     /// a blob not downloaded.
-    fn show_workdir(&mut self, id: SessionId, pane: WorkdirPane) -> Vec<Effect> {
+    fn show_workdir(&mut self, pane: WorkdirPane) -> Vec<Effect> {
+        let Place::Workdir {
+            id,
+            pane: shown,
+            last_dir,
+        } = &mut self.place
+        else {
+            return Vec::new();
+        };
         if let WorkdirPane::Dir { path } = &pane {
-            self.last_dir.clone_from(path);
+            last_dir.clone_from(path);
         }
-        let ask = pane_ask(id, &pane);
-        self.workdir_pane = pane;
+        let ask = pane_ask(*id, &pane);
+        *shown = pane;
         let mut requests = Vec::new();
         if self.workdirs.unread(&ask) {
             let online = self.online();
@@ -1125,13 +1213,8 @@ impl Model {
 
     /// The blob the workdir pane on screen shows: a diff's or a file's.
     fn shown_blob(&self) -> Option<&BlobRef> {
-        let id = self.shown_workdir()?;
-        match (
-            &self.workdir_pane,
-            self.workdirs
-                .stored
-                .get(&pane_ask(id, &self.workdir_pane))?,
-        ) {
+        let (id, pane) = self.shown_workdir()?;
+        match (pane, self.workdirs.stored.get(&pane_ask(id, pane))?) {
             (WorkdirPane::Diff { path, untracked }, WorkdirAnswer::Changes(changes)) => {
                 match &changed_file(changes, path, *untracked)?.diff {
                     DiffBody::Blob(blob) => Some(blob),
@@ -1170,9 +1253,7 @@ impl Model {
         if matches!(self.pairing, PairingStatus::InProgress { .. }) {
             return Vec::new();
         }
-        self.place = Place::Pairing;
-        self.viewing = None;
-        self.subagent = None;
+        self.go(Place::Pairing);
         let (code, fingerprint) = (code.trim().to_owned(), fingerprint.trim().to_owned());
         let address = address.trim();
         if address.is_empty() || code.is_empty() || fingerprint.is_empty() {
@@ -1249,11 +1330,7 @@ impl Model {
             return Vec::new();
         };
         let target = self.target_context(summary);
-        let events = self
-            .open
-            .as_ref()
-            .filter(|open| open.id == session_id)
-            .map_or(&[][..], |open| open.events.as_slice());
+        let events = self.events(session_id);
         let Some(name) = self
             .contexts(session_id, events, target)
             .into_iter()
@@ -1274,7 +1351,7 @@ impl Model {
             name,
         });
         if let Some(Effect::Enqueue(command)) = moved.first() {
-            self.opening = Some((command.id, Place::Session(session_id)));
+            self.opening = Some((command.id, OpeningFrom::Session(session_id)));
         }
         effects.extend(moved);
         effects
@@ -1282,10 +1359,8 @@ impl Model {
 
     /// Whether the open session's log has `context` moved away.
     fn moved(&self, session_id: SessionId, context: ContextId) -> bool {
-        self.open
+        self.events(session_id)
             .iter()
-            .filter(|open| open.id == session_id)
-            .flat_map(|open| &open.events)
             .any(|(_, e)| e.context == context && matches!(e.kind, EventKind::ContextMoved { .. }))
     }
 
@@ -1335,10 +1410,8 @@ impl Model {
     /// Nothing to write for another session or a mark that would not move
     /// forward.
     fn mark_read(&mut self, session_id: SessionId, through: Seq) -> Vec<Effect> {
-        let (Some(open), Some(summary)) = (
-            self.open.as_ref().filter(|o| o.id == session_id),
-            self.summary(session_id),
-        ) else {
+        let (Some(open), Some(summary)) = (self.loaded(session_id), self.summary(session_id))
+        else {
             return Vec::new();
         };
         let through = through.min(summary.last_seq);
@@ -1441,7 +1514,7 @@ impl Model {
     /// Whether approval `id`, requested in the open session, offers a rule
     /// at index `rule`.
     fn offers(&self, id: ApprovalId, rule: u8) -> bool {
-        self.open.as_ref().is_some_and(|open| {
+        self.shown_events().is_some_and(|(_, open)| {
             open.events.iter().any(|(_, event)| {
                 matches!(&event.kind, EventKind::ApprovalRequested { id: requested, suggestions, .. }
                     if *requested == id && usize::from(rule) < suggestions.len())
@@ -1452,8 +1525,8 @@ impl Model {
     /// The questions of question `id`, asked in the open session; `None`
     /// for a plain approval or one asked elsewhere.
     fn asked(&self, id: ApprovalId) -> Option<&[Question]> {
-        self.open
-            .as_ref()?
+        self.shown_events()?
+            .1
             .events
             .iter()
             .find_map(|(_, event)| match &event.kind {
@@ -1587,7 +1660,9 @@ impl Model {
                     workdir: false,
                 });
             }
-            if let Some(open) = self.open.as_mut().filter(|o| o.id == event.session_id) {
+            if let Some((id, Some(open))) = self.loaded_slot()
+                && id == event.session_id
+            {
                 open.events.push((seq, event.clone()));
             }
             if let Some((command, from)) = self.opening
@@ -1602,11 +1677,8 @@ impl Model {
                     _ => event.session_id,
                 };
                 // Its events come from the store: see `unloaded_session`.
-                if self.place == from {
-                    self.place = Place::Session(to);
-                    self.open = None;
-                    self.viewing = None;
-                    self.subagent = None;
+                if self.opening_from() == Some(from) {
+                    self.go(Place::session(to));
                 }
             }
         }
@@ -1651,13 +1723,15 @@ impl Model {
     }
 
     pub(crate) fn session_loaded(&mut self, id: SessionId, events: Vec<(Seq, Event)>) {
-        if self.loaded_session() == Some(id) {
-            let read = self.read_marks.get(&id).map_or(Seq::ZERO, |m| m.seq);
-            let mut unseen = events.iter().filter(|(seq, _)| *seq > read);
-            let first = self.first_unseen(unseen.clone());
-            let unread_from = first.filter(|_| unseen.any(|(_, e)| is_notable(&e.kind)));
-            self.open = Some(OpenSession {
-                id,
+        if self.loaded_session() != Some(id) {
+            return;
+        }
+        let read = self.read_marks.get(&id).map_or(Seq::ZERO, |m| m.seq);
+        let mut unseen = events.iter().filter(|(seq, _)| *seq > read);
+        let first = self.first_unseen(unseen.clone());
+        let unread_from = first.filter(|_| unseen.any(|(_, e)| is_notable(&e.kind)));
+        if let Some((_, open)) = self.loaded_slot() {
+            *open = Some(OpenSession {
                 events,
                 unread_from,
             });
@@ -1766,12 +1840,12 @@ impl Model {
         }
         self.workdirs.forget(id);
         self.forget_resolved_alerts();
-        if matches!(self.place, Place::Session(s) | Place::SessionInfo(s) | Place::Workdir(s) if s == id)
+        if matches!(&self.place,
+            Place::Session { id: shown, .. }
+            | Place::SessionInfo { id: shown, .. }
+            | Place::Workdir { id: shown, .. } if *shown == id)
         {
-            self.place = Place::Archived;
-            self.open = None;
-            self.viewing = None;
-            self.subagent = None;
+            self.go(Place::Archived);
         }
     }
 
@@ -1971,10 +2045,7 @@ impl Model {
         // Another server's reset already emptied the other addresses.
         self.settings.switch_to(address);
         self.pairing = PairingStatus::Idle;
-        self.place = Place::SessionList;
-        self.open = None;
-        self.viewing = None;
-        self.subagent = None;
+        self.go(Place::SessionList);
         self.link = Link::Connecting;
     }
 
@@ -2109,7 +2180,7 @@ impl Model {
         if self.device().is_none() {
             return Screen::Pairing(self.pairing_view());
         }
-        match self.place {
+        match &self.place {
             Place::Pairing => Screen::Pairing(self.pairing_view()),
             Place::Settings => Screen::Settings(SettingsView {
                 blob_policy: self.settings.blob_policy,
@@ -2134,22 +2205,21 @@ impl Model {
             Place::Usage => Screen::Usage(self.usage_view()),
             Place::Storage => Screen::Storage(self.storage_view()),
             Place::UsageLimits(_) => Screen::UsageLimits(self.usage_limits.view()),
-            Place::Session(id) => match self.session_view(id) {
-                Some(view) => Screen::Session(Box::new(view)),
-                None => Screen::SessionList(self.session_list(ListKind::Active)),
-            },
-            Place::SessionInfo(id) => match self.session_info_view(id) {
+            Place::Session { id, open, scope } => {
+                match self.session_view(*id, open.as_ref(), *scope) {
+                    Some(view) => Screen::Session(Box::new(view)),
+                    None => Screen::SessionList(self.session_list(ListKind::Active)),
+                }
+            }
+            Place::SessionInfo { id, open } => match self.session_info_view(*id, open.as_ref()) {
                 Some(view) => Screen::SessionInfo(Box::new(view)),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
             },
-            Place::Workdir(id) => match self.workdir_view(id) {
+            Place::Workdir { id, pane, last_dir } => match self.workdir_view(*id, pane, last_dir) {
                 Some(view) => Screen::Workdir(view),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
             },
-            Place::Crop => match self.crop_view() {
-                Some(view) => Screen::Crop(view),
-                None => Screen::SessionList(self.session_list(ListKind::Active)),
-            },
+            Place::Crop(page) => Screen::Crop(self.crop_view(page)),
         }
     }
 
@@ -2165,8 +2235,7 @@ impl Model {
         }
     }
 
-    fn crop_view(&self) -> Option<CropView> {
-        let page = self.crop.as_ref()?;
+    fn crop_view(&self, page: &CropPage) -> CropView {
         let content = match (self.crop_path(page), &page.lines) {
             _ if self.fates.contains_key(&page.blob) => CropContent::Gone,
             (Some(path), LineCount::Counted(lines)) => CropContent::Ready {
@@ -2189,7 +2258,7 @@ impl Model {
                 None => CropContent::Gone,
             },
         };
-        Some(CropView {
+        CropView {
             blob: page.blob,
             session: page.session,
             holds: page.holds,
@@ -2197,36 +2266,37 @@ impl Model {
             content,
             keep: page.keep.clone(),
             pending: self.blob_pending(page.blob),
-        })
+        }
     }
 
     /// The count of the crop page's lines, if it is on screen, holds its
     /// blob and has not asked yet: asked once per page.
     pub(crate) fn count_wanted(&mut self) -> Option<Request> {
-        if self.place != Place::Crop || self.device().is_none() {
+        self.device()?;
+        let Place::Crop(page) = &self.place else {
             return None;
-        }
-        let page = self.crop.as_ref()?;
+        };
         if page.lines != LineCount::Unasked {
             return None;
         }
         let path = self.crop_path(page)?.clone();
         self.count_req += 1;
         let req = self.count_req;
-        self.crop.as_mut()?.lines = LineCount::Asked(req);
+        if let Place::Crop(page) = &mut self.place {
+            page.lines = LineCount::Asked(req);
+        }
         Some(Request::CountLines { req, path })
     }
 
     /// The answer to [`Request::CountLines`] `req`; any but the one the
     /// page waits on is ignored.
     pub(crate) fn lines_counted(&mut self, req: u64, result: std::io::Result<u64>) {
-        let Some(page) = self
-            .crop
-            .as_mut()
-            .filter(|page| page.lines == LineCount::Asked(req))
-        else {
+        let Place::Crop(page) = &mut self.place else {
             return;
         };
+        if page.lines != LineCount::Asked(req) {
+            return;
+        }
         page.lines = match result.map(u32::try_from) {
             Ok(Ok(lines)) => LineCount::Counted(lines),
             Ok(Err(_)) => LineCount::Failed("too many lines".to_owned()),
@@ -2234,9 +2304,14 @@ impl Model {
         };
     }
 
-    fn workdir_view(&self, id: SessionId) -> Option<WorkdirView> {
+    fn workdir_view(
+        &self,
+        id: SessionId,
+        pane: &WorkdirPane,
+        last_dir: &str,
+    ) -> Option<WorkdirView> {
         let summary = self.summary(id)?;
-        let pane = self.workdir_pane.clone();
+        let pane = pane.clone();
         let ask = pane_ask(id, &pane);
         let body = match (&pane, self.workdirs.stored.get(&ask)) {
             (WorkdirPane::Changes, Some(WorkdirAnswer::Changes(result))) => {
@@ -2274,7 +2349,7 @@ impl Model {
             title: self.title(summary).text,
             workdir: summary.workdir.clone(),
             pane,
-            last_dir: self.last_dir.clone(),
+            last_dir: last_dir.to_owned(),
             fetch: self.workdirs.fetch(&ask),
             body,
         })
@@ -2385,13 +2460,13 @@ impl Model {
         }
     }
 
-    fn session_info_view(&self, id: SessionId) -> Option<SessionInfoView> {
+    fn session_info_view(
+        &self,
+        id: SessionId,
+        open: Option<&OpenSession>,
+    ) -> Option<SessionInfoView> {
         let summary = self.summary(id)?;
-        let events = self
-            .open
-            .as_ref()
-            .filter(|open| open.id == id)
-            .map_or(&[][..], |open| open.events.as_slice());
+        let events = open.map_or(&[][..], |open| open.events.as_slice());
         let (timeline, _) = self.timeline(id, events);
         let subagents = timeline
             .iter()
@@ -2444,9 +2519,13 @@ impl Model {
         }
     }
 
-    fn session_view(&self, id: SessionId) -> Option<SessionView> {
+    fn session_view(
+        &self,
+        id: SessionId,
+        open: Option<&OpenSession>,
+        scope: Scope,
+    ) -> Option<SessionView> {
         let summary = self.summary(id)?;
-        let open = self.open.as_ref().filter(|open| open.id == id);
         let events = open.map_or(&[][..], |open| open.events.as_slice());
         let (mut timeline, rules) = self.timeline(id, events);
         let pending_approval = summary.pending_approval().and_then(|approval| {
@@ -2510,15 +2589,11 @@ impl Model {
             |kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
         );
         let context = self.target_context(summary);
-        let viewing = self
-            .viewing
-            .filter(|(session, _)| *session == id)
-            .map(|(_, context)| context);
+        let viewing = scope.context;
         let title = self.title(summary);
-        let subagent = self
+        let subagent = scope
             .subagent
-            .filter(|(session, _)| *session == id)
-            .and_then(|(_, call)| subagent_header(&timeline, call));
+            .and_then(|call| subagent_header(&timeline, call));
         // Folded whole first: results, approvals and unanswered calls
         // settle earlier items by index.
         if let Some(header) = &subagent {
@@ -2968,10 +3043,8 @@ impl Model {
     /// open session's logged ones and every clear of it in the outbox.
     fn context_names(&self, id: SessionId) -> HashSet<String> {
         let logged = self
-            .open
+            .events(id)
             .iter()
-            .filter(|open| open.id == id)
-            .flat_map(|open| &open.events)
             .filter_map(|(_, event)| match &event.kind {
                 EventKind::SessionCreated { context_name, .. } => Some(context_name),
                 EventKind::ContextStarted { name, .. } => Some(name),
@@ -9423,7 +9496,7 @@ mod tests {
         f.dispatch(Action::Navigate(Route::UsageLimits));
         assert!(f.model.view().can_go_back);
         f.dispatch(Action::Back);
-        assert_eq!(f.model.place, Place::Session(sid));
+        assert_eq!(f.model.open_session(), Some(sid));
 
         f.dispatch(Action::Navigate(Route::SessionList));
         f.dispatch(Action::Navigate(Route::UsageLimits));
@@ -10057,7 +10130,7 @@ mod tests {
     fn back_from_a_session_gone_from_the_replica_goes_nowhere() {
         let mut f = Fixture::paired();
         // The open session's summary is missing: the active list shows.
-        f.model.place = Place::Session(SessionId::new());
+        f.model.place = Place::session(SessionId::new());
         let view = f.model.view();
         assert_eq!(shown(&view), "active list");
         assert!(!view.can_go_back);
@@ -10560,7 +10633,7 @@ mod tests {
         );
         assert_eq!(
             f.model.opening,
-            Some((moved.id, Place::Session(sid))),
+            Some((moved.id, OpeningFrom::Session(sid))),
             "the move's id, not the clear's"
         );
         let view = f.session_view();
