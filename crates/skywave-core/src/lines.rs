@@ -9,7 +9,7 @@
 //! since an OSC or DCS string can swallow a `\n` and shift the numbering.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::ops::Range;
 use std::path::Path;
 
@@ -19,7 +19,9 @@ const STRIDE: u64 = 256;
 
 /// A windowed reader of a file's lines. Plain blocking I/O: [`open`]
 /// reads the whole file once and [`lines`] reads from a kept line start
-/// on, so a head calls both off its UI thread.
+/// on, so a head calls both off its UI thread. [`lines`] reads at an
+/// offset of its own, never through the file's shared cursor, so calls
+/// through a shared index may overlap.
 ///
 /// [`open`]: LineIndex::open
 /// [`lines`]: LineIndex::lines
@@ -94,9 +96,10 @@ impl LineIndex {
         else {
             return Ok(Vec::new());
         };
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(from))?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(ReadAt {
+            file: &self.file,
+            offset: from,
+        });
         let mut lines = Vec::new();
         let mut line = stride * STRIDE;
         while line < end {
@@ -110,6 +113,26 @@ impl LineIndex {
             line += 1;
         }
         Ok(lines)
+    }
+}
+
+/// A reader of `file` from `offset` on that keeps its own position:
+/// each read names the offset it reads at, so readers of one file don't
+/// move each other. Windows' `seek_read` also moves the file's cursor,
+/// which nothing here reads.
+struct ReadAt<'a> {
+    file: &'a File,
+    offset: u64,
+}
+
+impl Read for ReadAt<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(self.file, buf, self.offset)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(self.file, buf, self.offset)?;
+        self.offset += n as u64;
+        Ok(n)
     }
 }
 
@@ -185,5 +208,34 @@ mod tests {
         let lines = index(&dir, b"\n");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines.lines(0..5).unwrap(), vec![b"\n".to_vec()]);
+    }
+
+    /// Threads reading different windows through one shared index each
+    /// get their own lines: no read moves another's position.
+    #[test]
+    fn line_index_reads_overlapping_windows_from_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..5000)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let lines = std::sync::Arc::new(index(&dir, &content));
+        let threads: Vec<_> = (0..8u64)
+            .map(|t| {
+                let lines = lines.clone();
+                std::thread::spawn(move || {
+                    for round in 0..200u64 {
+                        let start = (t * 613 + round * 37) % 4990;
+                        let got = lines.lines(start..start + 7).unwrap();
+                        let want: Vec<Vec<u8>> = (start..start + 7)
+                            .map(|i| format!("line {i}\n").into_bytes())
+                            .collect();
+                        assert_eq!(got, want, "thread {t} round {round}");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 }
