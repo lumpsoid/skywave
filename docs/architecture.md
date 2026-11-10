@@ -1021,7 +1021,9 @@ logs) an event that no longer decodes rather than failing.
   download holds is kept and queued once it lets go. The core hands
   requests to the engine under the state lock, in the order of the changes
   that made them, so a purge never overtakes a later request for the same
-  id.
+  id. A change that fails part way still hands over the requests of the
+  steps it committed before (`Shared::update`): an action whose later
+  effect fails still reports the blobs an earlier local delete purged.
 
   A server delete or crop reaches every replica as the log's `BlobDeleted`
   or `BlobCropped`, whoever decided it. `apply_batch` keeps the blob's

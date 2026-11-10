@@ -366,75 +366,9 @@ impl Core {
     /// this returns `Ok`, the action survives a crash.
     pub fn dispatch(&self, action: Action) -> Result<(), CoreError> {
         let data_dir = &self.shared.data_dir;
-        self.shared.update(|state| {
+        self.shared.update(|state, requests| {
             let effects = state.model.dispatch(action);
-            let mut requests = Vec::new();
-            for effect in effects {
-                let done = match effect {
-                    Effect::Enqueue(command) => state.store.enqueue(&command),
-                    Effect::SaveBlobPolicy(policy) => state.store.set_blob_policy(policy),
-                    Effect::SaveServerAddresses(addresses) => {
-                        // The pairing record, not the store.
-                        if let Err(err) = state.save_addresses(data_dir, addresses) {
-                            state.resync();
-                            return Err(err.into());
-                        }
-                        Ok(())
-                    }
-                    Effect::SaveDraft((id, mode), draft) => {
-                        state.store.set_draft(id, mode, draft.as_ref())
-                    }
-                    Effect::SaveComposerMode(id, mode) => state.store.set_composer_mode(id, mode),
-                    Effect::SaveReadMark(id, mark) => state.store.set_read_mark(id, mark),
-                    Effect::SaveSnippet(snippet) => state.store.set_snippet(&snippet),
-                    Effect::DeleteSnippet(id) => state.store.delete_snippet(id),
-                    // Refused when the store disagrees with the model; the
-                    // resync below then shows what the store holds.
-                    Effect::Withdraw { id, draft } => state
-                        .store
-                        .withdraw(id, draft.as_ref().map(|(key, d)| (*key, d))),
-                    Effect::LoadSession(id) => state
-                        .store
-                        .session_events(id)
-                        .map(|events| state.model.session_loaded(id, events)),
-                    // The files go once the rows are gone; a download still
-                    // writing one finds its blob unknown and removes it too.
-                    Effect::DeleteLocally(id) => state
-                        .store
-                        .delete_session_locally(id, Utc::now())
-                        .map(|blobs| {
-                            state.model.session_deleted(id, &blobs);
-                            state.blobs_purged(&blobs);
-                            for blob in &blobs {
-                                remove_blob_files(data_dir, *blob);
-                            }
-                            requests.push(Request::BlobsPurged(blobs));
-                        }),
-                    Effect::ResetReplica => {
-                        state.store.reset_for_lost_history().and_then(|blobs| {
-                            // The link is stopped, but a handle bound to
-                            // the old replica must not write into the new.
-                            state.server_epoch += 1;
-                            state.model.replica_reset(state.store.load()?);
-                            state.blobs_purged(&blobs);
-                            remove_all_blob_files(data_dir);
-                            if !blobs.is_empty() {
-                                requests.push(Request::BlobsPurged(blobs));
-                            }
-                            Ok(())
-                        })
-                    }
-                    Effect::Request(request) => {
-                        requests.push(request);
-                        Ok(())
-                    }
-                };
-                if let Err(err) = done {
-                    state.resync();
-                    return Err(err.into());
-                }
-            }
-            Ok(((), requests))
+            state.run_effects(effects, data_dir, requests)
         })
     }
 
@@ -612,9 +546,16 @@ impl Shared {
         }
     }
 
-    /// Runs `change` under the state lock, hands its requests to the engine
-    /// and publishes the change — also after an error, since the model may
-    /// have been resynced. The snapshot is rendered at delivery, not here.
+    /// Runs `change` under the state lock, hands the requests it pushed to
+    /// the engine and publishes the change — also after an error, since
+    /// the model may have been resynced. The snapshot is rendered at
+    /// delivery, not here.
+    ///
+    /// Every request `change` pushed is sent, whether it then returns `Ok`
+    /// or `Err`: a step that committed before a later one failed must
+    /// still be heard of (a purge's `BlobsPurged`, for one). So a change
+    /// pushes a request only once what it reports is committed, or kept
+    /// in memory, never ahead of the write it depends on.
     ///
     /// The requests are sent before the lock is released (sending never
     /// blocks), so the engine receives them in the order the changes were
@@ -623,24 +564,20 @@ impl Shared {
     /// registered the same id again, never after.
     pub(crate) fn update<R, E>(
         &self,
-        change: impl FnOnce(&mut State) -> Result<(R, Vec<Request>), E>,
+        change: impl FnOnce(&mut State, &mut Vec<Request>) -> Result<R, E>,
     ) -> Result<R, E> {
         let outcome = {
             let mut state = lock(&self.state);
-            let result = change(&mut state);
+            let mut requests = Vec::new();
+            let result = change(&mut state, &mut requests);
             state.version += 1;
             // Whatever made the crop page's blob available (a download, a
             // local crop, opening the page), its count is asked here, once.
-            // Sent whether or not the change failed: the model counts on it.
-            if let Some(count) = state.model.count_wanted() {
-                self.requests.send(count);
+            requests.extend(state.model.count_wanted());
+            for request in requests {
+                self.requests.send(request);
             }
-            result.map(|(value, requests)| {
-                for request in requests {
-                    self.requests.send(request);
-                }
-                value
-            })
+            result
         };
         self.publish();
         outcome
@@ -814,6 +751,87 @@ impl State {
         };
         pairing.save(data_dir)?;
         self.pairing = Some(Arc::new(pairing));
+        Ok(())
+    }
+
+    /// Runs a dispatched action's effects in order, pushing their requests
+    /// as each commits. The first that fails resyncs the model and ends
+    /// the run; the requests of those before it still go
+    /// ([`Shared::update`]), as what they report is stored, or is the
+    /// model's in-memory state (an ask waited on, the link), which a
+    /// resync keeps.
+    fn run_effects(
+        &mut self,
+        effects: Vec<Effect>,
+        data_dir: &Path,
+        requests: &mut Vec<Request>,
+    ) -> Result<(), CoreError> {
+        for effect in effects {
+            let done = match effect {
+                Effect::Enqueue(command) => self.store.enqueue(&command),
+                Effect::SaveBlobPolicy(policy) => self.store.set_blob_policy(policy),
+                Effect::SaveServerAddresses(addresses) => {
+                    // The pairing record, not the store.
+                    if let Err(err) = self.save_addresses(data_dir, addresses) {
+                        self.resync();
+                        return Err(err.into());
+                    }
+                    Ok(())
+                }
+                Effect::SaveDraft((id, mode), draft) => {
+                    self.store.set_draft(id, mode, draft.as_ref())
+                }
+                Effect::SaveComposerMode(id, mode) => self.store.set_composer_mode(id, mode),
+                Effect::SaveReadMark(id, mark) => self.store.set_read_mark(id, mark),
+                Effect::SaveSnippet(snippet) => self.store.set_snippet(&snippet),
+                Effect::DeleteSnippet(id) => self.store.delete_snippet(id),
+                // Refused when the store disagrees with the model; the
+                // resync below then shows what the store holds.
+                Effect::Withdraw { id, draft } => self
+                    .store
+                    .withdraw(id, draft.as_ref().map(|(key, d)| (*key, d))),
+                Effect::LoadSession(id) => self
+                    .store
+                    .session_events(id)
+                    .map(|events| self.model.session_loaded(id, events)),
+                // The files go once the rows are gone; a download still
+                // writing one finds its blob unknown and removes it too.
+                Effect::DeleteLocally(id) => {
+                    self.store
+                        .delete_session_locally(id, Utc::now())
+                        .map(|blobs| {
+                            self.model.session_deleted(id, &blobs);
+                            self.blobs_purged(&blobs);
+                            for blob in &blobs {
+                                remove_blob_files(data_dir, *blob);
+                            }
+                            requests.push(Request::BlobsPurged(blobs));
+                        })
+                }
+                Effect::ResetReplica => self.store.reset_for_lost_history().and_then(|blobs| {
+                    // The link is stopped, but a handle bound to the old
+                    // replica must not write into the new. What the
+                    // committed reset purged goes before the model reloads,
+                    // which may fail.
+                    self.server_epoch += 1;
+                    self.blobs_purged(&blobs);
+                    remove_all_blob_files(data_dir);
+                    if !blobs.is_empty() {
+                        requests.push(Request::BlobsPurged(blobs));
+                    }
+                    self.model.replica_reset(self.store.load()?);
+                    Ok(())
+                }),
+                Effect::Request(request) => {
+                    requests.push(request);
+                    Ok(())
+                }
+            };
+            if let Err(err) = done {
+                self.resync();
+                return Err(err.into());
+            }
+        }
         Ok(())
     }
 
@@ -998,6 +1016,82 @@ mod tests {
             assert!(Instant::now() < deadline, "the store never closed");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// An action whose later effect fails still tells the engine what the
+    /// effects before it committed: the blob queue hears of the blobs a
+    /// local delete purged, in order, although the dispatch fails.
+    #[test]
+    fn a_failed_effect_keeps_the_requests_of_those_committed_before_it() {
+        use skywave_proto::{
+            BlobRef, CommandId, ContentHash, ContextId, Event, EventBatch, EventKind, Full, Seq,
+            SessionId, ToolResult,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
+        let seam = core.seam();
+        let requests = seam.take_requests().unwrap();
+        let (id, blob) = (SessionId::new(), BlobId::new());
+        let event = |kind: EventKind| Event {
+            session_id: id,
+            at: Utc::now(),
+            command_id: None,
+            context: ContextId::first_of(id),
+            kind,
+        };
+        seam.apply_events(&EventBatch {
+            from: Seq(1),
+            events: vec![
+                event(EventKind::SessionCreated {
+                    workdir: "/srv/a".into(),
+                    context_name: "start".into(),
+                    from: None,
+                }),
+                event(EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "log".into(),
+                    lines: 1,
+                    output: Some(Full::Blob(BlobRef {
+                        id: blob,
+                        size: 3,
+                        sha256: ContentHash::of(b"abc"),
+                    })),
+                })),
+            ],
+        })
+        .unwrap();
+        let file = crate::blob_dir(dir.path()).join(blob.0.to_string());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "abc").unwrap();
+        requests.try_iter().for_each(drop);
+
+        // A withdrawal the store refuses: no such command.
+        let effects = vec![
+            Effect::DeleteLocally(id),
+            Effect::Request(Request::OutboxChanged),
+            Effect::Withdraw {
+                id: CommandId::new(),
+                draft: None,
+            },
+            Effect::Request(Request::RetryNow),
+        ];
+        let err = core
+            .shared
+            .update(|state, requests| state.run_effects(effects, dir.path(), requests))
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Store(StoreError::NotWithdrawable(_))),
+            "{err}"
+        );
+        assert_eq!(
+            requests.try_iter().collect::<Vec<_>>(),
+            [Request::BlobsPurged(vec![blob]), Request::OutboxChanged]
+        );
+        assert!(!file.exists(), "its file is gone");
+        assert!(seam.blob(blob).unwrap().is_none());
     }
 
     // ---- delivery ----------------------------------------------------------
