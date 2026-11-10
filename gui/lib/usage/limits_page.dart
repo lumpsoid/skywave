@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -27,8 +28,11 @@ class LimitsPage extends StatelessWidget {
           canGoBack: canGoBack,
           onBack: () => send.act(const ActionIntentBack()),
         ),
-        title: const Text('Usage limits'),
+        toolbarHeight: LinkTitle.toolbarHeight(context),
+        flexibleSpace: const LinkProgress(),
+        title: LinkTitle(title: const Text('Usage limits'), send: send),
         actions: [
+          ApprovalsButton(send: send),
           IconButton(
             tooltip: 'Refresh',
             icon: const Icon(Icons.refresh),

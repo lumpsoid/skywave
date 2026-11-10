@@ -62,12 +62,12 @@ void main() {
       tester,
     ) async {
       final colors = await colorsIn(tester, brightness);
-      for (final state in LinkState.values) {
-        final (:background, :foreground) = colors.link(state);
+      for (final refused in [true, false]) {
+        final (:background, :foreground) = colors.banner(refused: refused);
         expect(
           contrast(foreground, background),
           greaterThanOrEqualTo(4.5),
-          reason: '$state',
+          reason: 'refused: $refused',
         );
       }
     });
@@ -118,19 +118,24 @@ void main() {
         ),
       ),
     );
-    holder.apply(link(LinkState.reconnecting, 'offline'));
+    holder.apply(
+      link(LinkState.online, '', loggedOutLabel: 'agent not logged in'),
+    );
     await tester.pumpAndSettle();
     final banner = tester.widget<Material>(
       find
           .ancestor(
-            of: find.byKey(const Key('link-label')),
+            of: find.byKey(const Key('logged-out-label')),
             matching: find.byType(Material),
           )
           .first,
     );
     expect(banner.color, const Color(0xFF4A3800));
     expect(
-      tester.widget<Text>(find.byKey(const Key('link-label'))).style!.color,
+      tester
+          .widget<Text>(find.byKey(const Key('logged-out-label')))
+          .style!
+          .color,
       const Color(0xFFFFE082),
     );
   });

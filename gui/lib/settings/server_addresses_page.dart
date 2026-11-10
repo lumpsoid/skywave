@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_holder.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -68,7 +69,10 @@ class _ServerAddressesPageState extends State<ServerAddressesPage> {
           canGoBack: widget.canGoBack,
           onBack: () => send.act(const ActionIntentBack()),
         ),
-        title: const Text('Server addresses'),
+        toolbarHeight: LinkTitle.toolbarHeight(context),
+        flexibleSpace: const LinkProgress(),
+        title: LinkTitle(title: const Text('Server addresses'), send: send),
+        actions: [ApprovalsButton(send: send)],
       ),
       body: ReadableWidth(
         child: Column(

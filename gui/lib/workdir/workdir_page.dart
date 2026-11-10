@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -43,20 +44,26 @@ class WorkdirPage extends StatelessWidget {
           canGoBack: canGoBack,
           onBack: () => send.act(const ActionIntentBack()),
         ),
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(screen.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-            if (workdir != null)
-              Text(
-                workdir,
-                style: muted,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-          ],
+        toolbarHeight: LinkTitle.toolbarHeight(context),
+        flexibleSpace: const LinkProgress(),
+        title: LinkTitle(
+          title: Text(
+            screen.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          subtitle: workdir == null
+              ? null
+              : Text(
+                  workdir,
+                  style: muted,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+          send: send,
         ),
         actions: [
+          ApprovalsButton(send: send),
           IconButton(
             tooltip: 'Refresh',
             icon: const Icon(Icons.refresh),

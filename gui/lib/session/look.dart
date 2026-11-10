@@ -105,43 +105,19 @@ class SkyColors {
     AgentState.stopped => muted,
   };
 
-  /// The link banner's background and text for [state]: online green,
-  /// syncing blue, offline amber, refused red, unpaired plain. Dark mode
-  /// keeps them deep so the banner does not glare.
-  ({Color background, Color foreground}) link(LinkState state) =>
-      switch (state) {
-        LinkState.online =>
-          dark
-              ? (
-                  background: const Color(0xFF1B5E20),
-                  foreground: const Color(0xFFE8F5E9),
-                )
-              : (background: const Color(0xFF2E7D32), foreground: Colors.white),
-        LinkState.connecting || LinkState.catchingUp =>
-          dark
-              ? (
-                  background: const Color(0xFF01579B),
-                  foreground: const Color(0xFFE1F5FE),
-                )
-              : (background: const Color(0xFF0277BD), foreground: Colors.white),
-        LinkState.reconnecting =>
-          dark
-              ? (
-                  background: const Color(0xFF4A3800),
-                  foreground: const Color(0xFFFFE082),
-                )
-              : (background: const Color(0xFFFFB300), foreground: Colors.black),
-        LinkState.repairNeeded ||
-        LinkState.protocolMismatch ||
-        LinkState.historyLost => (
-          background: scheme.error,
-          foreground: scheme.onError,
-        ),
-        LinkState.unpaired => (
-          background: scheme.surfaceContainerHighest,
-          foreground: scheme.onSurface,
-        ),
-      };
+  /// The link banner's background and text: the error colours while the
+  /// link stopped until the user acts ([refused]), amber for a warning
+  /// about the agent's login. Dark mode keeps amber deep so the banner
+  /// does not glare.
+  ({Color background, Color foreground}) banner({required bool refused}) =>
+      refused
+      ? (background: scheme.error, foreground: scheme.onError)
+      : dark
+      ? (
+          background: const Color(0xFF4A3800),
+          foreground: const Color(0xFFFFE082),
+        )
+      : (background: const Color(0xFFFFB300), foreground: Colors.black);
 
   /// A content line's text style over [base].
   TextStyle line(LineStyle style, TextStyle base) => switch (style) {

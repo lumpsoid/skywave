@@ -8,6 +8,7 @@ import 'package:skywave_gui/boot/boot_holder.dart';
 import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_banner.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -109,6 +110,9 @@ class _SkywaveAppState extends State<SkywaveApp> {
       scaffoldMessengerKey: widget.messenger,
       theme: skywaveTheme(Brightness.light),
       darkTheme: skywaveTheme(Brightness.dark),
+      // Over the root navigator, so a dialog's app bar finds the link too.
+      builder: (context, child) =>
+          LinkScope(holder: widget.holders.link, child: child!),
       home: ListenableBuilder(
         listenable: widget.boot,
         builder: (context, _) => switch (widget.boot.status) {

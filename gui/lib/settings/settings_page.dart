@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_holder.dart';
+import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/settings/agent_login_panel.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -40,7 +41,10 @@ class SettingsPage extends StatelessWidget {
           canGoBack: canGoBack,
           onBack: () => send.act(const ActionIntentBack()),
         ),
-        title: const Text('Settings'),
+        toolbarHeight: LinkTitle.toolbarHeight(context),
+        flexibleSpace: const LinkProgress(),
+        title: LinkTitle(title: const Text('Settings'), send: send),
+        actions: [ApprovalsButton(send: send)],
       ),
       body: ReadableWidth(
         child: ListView(

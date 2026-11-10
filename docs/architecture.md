@@ -1226,13 +1226,14 @@ logs) an event that no longer decodes rather than failing.
   on the server`). Both count from the head's clock, a part of a day
   counting as a day, as the agent's own terminal counts. The TUI adds the
   warning to the link banner; the GUI's `LinkUpdate` carries it as
-  `login_label`, shown below the link's label even while online with
-  nothing else to say. The GUI says where to log in again
+  `login_label`, shown in the banner even while online with nothing
+  else to say, with a close button that hides it until Rust words it
+  differently (the next day's count). The GUI says where to log in again
   (`login::expiry_warning_for`: `from settings` where the server offers a
   login from a device, `on the server` where not), and while the agent
   is logged out its `logged_out_label` (`login::logged_out_warning`:
   `agent not logged in · log in from settings`, or `… on the server`)
-  shows the same way, in place of `login_label` (no expiry warning for a
+  shows the same way, in place of `login_label` and with no close (no expiry warning for a
   logged-out agent). The GUI's settings carry
   the login from a device as `login` (`AgentLoginView`: `can_log_in`
   whenever offered, so a login can be renewed early, the flow's state,
@@ -1394,15 +1395,16 @@ enum CropContent {
 | Situation | Presentation |
 |-----------|--------------|
 | `Unpaired` | No banner; the pairing screen. |
-| `Reconnecting` with queued items | Banner: offline · why · N queued · retry in Xs. Input stays enabled. |
-| `CatchingUp` | Render local replica immediately, subtle syncing indicator. |
+| `Connecting`, `CatchingUp` | Render local replica immediately. TUI: banner. GUI: the app bar's status line (`LinkUpdate::status_label`: `Connecting…`, `Syncing · 4/9 · N queued`) in place of the page's subtitle, and a 2 dp progress line along the app bar's bottom edge; neither moves the page. |
+| `Reconnecting` with queued items | TUI: banner: offline · why · N queued · retry in Xs. GUI: the status line (`Offline · retry in 07s · why · N queued`, countdown first so a narrow app bar cuts the reason), whose tap opens a sheet with the line in full and Retry now. Input stays enabled. |
+| `Online` | Nothing, whatever is queued: a queued send says so on its own row. Settings shows the round trip. |
 | `AwaitingApproval` while offline | Show request; the answer is queued like any command. |
 | Approval answered elsewhere | "Approved on <device>", controls removed. |
 | Question pending (`SessionView::pending_question`) | A question panel instead of the approval prompt: each question with its options, their descriptions and previews, and the user's own answer. The picks stay in the head (TUI: `skywave_present::question::QuestionDraft` behind `a`; GUI: the panel's state) until every question has an answer, then go as one `Action::AnswerQuestion`; `x` / Decline is a denial. Its call's row reads "needs an answer", then "answered here / on <device>" (`ApprovalStatus::Answered`), with what was picked in its result. |
 | New approval while `Online` (`attention.alerts` grows) | Bell or desktop notification naming the session, once; never at start, after a catch-up that resolved it, or for one answered here. The GUI keeps one notification per session (ids from the hub, `PlatformEffect::Notify { id }`) and takes it down (`Dismiss`) once that session has no approval pending, however it went (`AlertUpdate::cleared`); a terminal bell has nothing to take down. |
-| Approvals pending in other sessions (`attention.elsewhere`) | Banner: N approvals elsewhere; one key opens the next. |
+| Approvals pending in other sessions (`attention.elsewhere`) | TUI: banner: N approvals elsewhere. GUI: a bell badged with N among every page's app bar actions. One key (Ctrl+G in the GUI) or a tap opens the next. |
 | `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |
-| `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. |
+| `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. In the GUI the banner shows only a rejected link and the agent login warnings (`LinkUpdate::label` is empty otherwise). |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
 | Blob `Downloading` with `paused` | Its progress, then `format::pause_note`: "paused, offline" or "paused, device disk full". |
 | `FullView::Deleted { by }` | The preview, and under it "Deleted by <device>" (`sections::deleted_note`); no download action. |

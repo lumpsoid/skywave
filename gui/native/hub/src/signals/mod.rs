@@ -7,7 +7,7 @@
 //! - [`boot`]: `Boot` in, `Booted`/`BootFailed` out, `HubFailed` on a
 //!   panic.
 //! - [`intents`]: every GUI intent after boot, as one ordered `GuiIntent`.
-//! - [`link`]: the banner (`LinkUpdate`).
+//! - [`link`]: the link's status line, banner and approvals elsewhere (`LinkUpdate`).
 //! - [`screen`]: the screen and its data but the timeline (`ScreenUpdate`).
 //! - [`timeline`]: the open session's timeline, snapshot then keyed diffs.
 //! - [`search`]: the timeline search (`SearchUpdate`).

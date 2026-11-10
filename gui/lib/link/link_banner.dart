@@ -5,14 +5,14 @@ import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The link banner across the top of every screen: Rust's label on the
-/// state's colour, "Retry now" while reconnecting or after a protocol
-/// mismatch (the server may have been updated since), "Reset local data"
-/// (after a confirmation) once the server lost history, and the approvals
-/// waiting in other sessions as a button to the next one, and below the
-/// label the warnings that the agent is logged out or that its login
-/// expires soon. Nothing while Rust's label is empty and there is no such
-/// warning: unpaired, or online with nothing waiting.
+/// The banner across the top of every screen, for what the user must act
+/// on: the link stopped (Rust's label, on the error colours, with "Retry
+/// now" after a protocol mismatch or a changed server certificate, and
+/// "Reset local data" after a confirmation once the server lost
+/// history), and below it the warnings that the agent is logged out or
+/// that its login expires soon (amber, the expiry one dismissible).
+/// Nothing otherwise: the link on its way back is the app bar's status
+/// line (`LinkTitle`), approvals elsewhere its bell (`ApprovalsButton`).
 class LinkBanner extends StatelessWidget {
   const LinkBanner({required this.holder, required this.send, super.key});
 
@@ -51,11 +51,14 @@ class LinkBanner extends StatelessWidget {
   }
 
   Widget _banner(BuildContext context, LinkUpdate link) {
-    final (:background, :foreground, :icon) = _look(link.state, context);
+    final refused = link.label.isNotEmpty;
+    final (:background, :foreground) = SkyColors.of(context)
+        .banner(refused: refused);
     final buttonStyle = TextButton.styleFrom(
       foregroundColor: foreground,
       visualDensity: VisualDensity.compact,
     );
+    final loginWarning = holder.loginWarning;
     return Material(
       color: background,
       child: SafeArea(
@@ -66,17 +69,28 @@ class LinkBanner extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Row(
               children: [
-                Icon(icon, size: 18, color: foreground),
+                Icon(
+                  refused ? _icon(link.state) : Icons.warning_amber,
+                  size: 18,
+                  color: foreground,
+                ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      if (link.label.isNotEmpty) _label(link.label, foreground),
+                      if (refused)
+                        Text(
+                          link.label,
+                          key: const Key('link-label'),
+                          style: TextStyle(color: foreground),
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 2,
+                        ),
                       for (final (key, warning) in [
                         ('logged-out-label', link.loggedOutLabel),
-                        ('login-label', link.loginLabel),
+                        ('login-label', loginWarning),
                       ])
                         if (warning != null)
                           Text(
@@ -93,9 +107,7 @@ class LinkBanner extends StatelessWidget {
                   ),
                 ),
                 // Side by side when there is room, stacked on a phone.
-                if (link.canRetryNow ||
-                    link.canResetReplica ||
-                    link.elsewhereLabel != null)
+                if ((link.canRetryNow && refused) || link.canResetReplica)
                   Flexible(
                     child: OverflowBar(
                       alignment: MainAxisAlignment.end,
@@ -107,66 +119,30 @@ class LinkBanner extends StatelessWidget {
                             onPressed: () => _confirmReset(context),
                             child: const Text('Reset local data'),
                           ),
-                        if (link.canRetryNow)
+                        if (link.canRetryNow && refused)
                           TextButton(
                             style: buttonStyle,
                             onPressed: () =>
                                 send.act(const ActionIntentRetryNow()),
                             child: const Text('Retry now'),
                           ),
-                        if (link.elsewhereLabel case final elsewhere?)
-                          TextButton.icon(
-                            style: buttonStyle,
-                            icon: const Icon(Icons.notification_important),
-                            onPressed: () =>
-                                send.act(const ActionIntentOpenNextApproval()),
-                            // Wrapped on a phone, the button hugs its
-                            // words: as wide as the bar, it splashed
-                            // across empty space.
-                            label: Text(
-                              elsewhere,
-                              textWidthBasis: TextWidthBasis.longestLine,
-                            ),
-                          ),
                       ],
                     ),
+                  ),
+                if (loginWarning != null)
+                  IconButton(
+                    key: const Key('login-dismiss'),
+                    tooltip: 'Dismiss until tomorrow',
+                    visualDensity: VisualDensity.compact,
+                    color: foreground,
+                    onPressed: holder.dismissLoginWarning,
+                    icon: const Icon(Icons.close, size: 18),
                   ),
               ],
             ),
           ),
         ),
       ),
-    );
-  }
-
-  /// Rust's label: up to two wrapped lines, or, when it says where its
-  /// lines break, each of them whole on its own, cut short if need be. A
-  /// countdown on a line of its own cannot move the break.
-  static Widget _label(String label, Color foreground) {
-    final style = TextStyle(color: foreground);
-    final lines = label.split('\n');
-    if (lines.length == 1) {
-      return Text(
-        label,
-        key: const Key('link-label'),
-        style: style,
-        overflow: TextOverflow.ellipsis,
-        maxLines: 2,
-      );
-    }
-    return Column(
-      key: const Key('link-label'),
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        for (final line in lines)
-          Text(
-            line,
-            style: style,
-            overflow: TextOverflow.ellipsis,
-            maxLines: 1,
-          ),
-      ],
     );
   }
 
@@ -197,22 +173,11 @@ class LinkBanner extends StatelessWidget {
     if (reset ?? false) send.act(const ActionIntentResetReplica());
   }
 
-  /// The banner's colours (the theme's) and icon for each state.
-  static ({Color background, Color foreground, IconData icon}) _look(
-    LinkState state,
-    BuildContext context,
-  ) {
-    final (:background, :foreground) = SkyColors.of(context).link(state);
-    final icon = switch (state) {
-      LinkState.online => Icons.cloud_done,
-      LinkState.connecting || LinkState.catchingUp => Icons.cloud_sync,
-      LinkState.reconnecting => Icons.cloud_off,
-      LinkState.repairNeeded || LinkState.protocolMismatch => Icons.block,
-      LinkState.historyLost => Icons.history_toggle_off,
-      LinkState.unpaired => Icons.link_off,
-    };
-    return (background: background, foreground: foreground, icon: icon);
-  }
+  /// The banner's icon for a link that stopped.
+  static IconData _icon(LinkState state) => switch (state) {
+    LinkState.historyLost => Icons.history_toggle_off,
+    _ => Icons.block,
+  };
 }
 
 /// Desktop shortcuts that work on every screen, as in the TUI: Ctrl+R
