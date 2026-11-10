@@ -221,7 +221,8 @@ after a y/N question: its events, blobs, draft and read mark go, freeing
 their space. It stays on the server and on other devices, and never comes
 back here, not even when it is used elsewhere. It cannot be deleted while it
 has a pending approval, a running turn or a command from this device still
-unanswered.
+waiting to be sent or answered (one given up on as undeliverable does not
+count).
 
 When the agent reports them, each turn ends with its time and cost, the
 session's status line shows the last turn's time, tokens and cost, the

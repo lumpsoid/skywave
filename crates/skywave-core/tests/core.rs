@@ -9,10 +9,10 @@ use std::thread;
 use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
-    Draft, Entry, FailReason, Fingerprint, FullView, Link, Outgoing, PairedCredentials,
-    PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView,
-    ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem,
-    ViewState,
+    Draft, Entry, FailReason, Fingerprint, FullView, Link, OutboxStatus, Outgoing,
+    PairedCredentials, PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam, SessionView,
+    SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError,
+    TimelineItem, ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
@@ -383,6 +383,56 @@ fn offline_send_is_persisted_first_and_appears_once() {
     let cold = core.view();
     assert_eq!(cold.screen, live.screen);
     assert_eq!(cold.link, Link::Connecting);
+}
+
+#[test]
+fn a_late_answer_leaves_an_undeliverable_command_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, _device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![event(
+            sid,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+                context_name: "start".into(),
+                from: None,
+            },
+        )],
+    })
+    .unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    core.dispatch(Action::SendMessage {
+        session_id: sid,
+        text: "hi".into(),
+    })
+    .unwrap();
+    let command = seam.pending_outbox().unwrap()[0].command.id;
+    assert!(seam.command_sending(command).unwrap());
+    seam.command_undeliverable(command).unwrap();
+    let failed = Outgoing::Failed(FailReason::Undeliverable);
+    let outgoing = |view: &ViewState| match &session_view(view).timeline[..] {
+        [TimelineItem::Pending { outgoing, .. }] => *outgoing,
+        other => panic!("one pending message: {other:?}"),
+    };
+    assert_eq!(outgoing(&core.view()), failed);
+    assert_eq!(core.view().queued, 0, "given up on, not queued");
+
+    seam.command_result(command, &CommandResult::Accepted { seq: Seq(2) })
+        .unwrap();
+    let live = core.view();
+    assert_eq!(outgoing(&live), failed);
+    assert_eq!(live.queued, 0);
+    let stored = Store::open(dir.path()).unwrap().outbox().unwrap();
+    assert_eq!(stored[0].status, OutboxStatus::Undeliverable);
+    drop((core, seam));
+
+    // The replica alone shows the same.
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(core.view().screen, live.screen);
 }
 
 /// An own message's delivery, pending or logged.

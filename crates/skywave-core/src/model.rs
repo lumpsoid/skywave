@@ -1765,7 +1765,7 @@ impl Model {
         self.composer_modes.remove(&id);
         self.read_marks.remove(&id);
         self.outbox
-            .retain(|e| e.status.is_pending() || command_session(&e.command.kind) != Some(id));
+            .retain(|e| !e.status.is_settled() || command_session(&e.command.kind) != Some(id));
         for blob in blobs {
             self.forget_blob(*blob);
             self.fates.remove(blob);
@@ -1783,7 +1783,7 @@ impl Model {
 
     /// Mirrors [`Store::claim_send`](crate::Store::claim_send).
     pub(crate) fn command_sending(&mut self, id: CommandId, now: DateTime<Utc>) {
-        if let Some(entry) = self.outbox_entry(id).filter(|e| e.status.is_pending()) {
+        if let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) {
             entry.status = OutboxStatus::Sending;
             entry.tries += 1;
             entry.first_sent_at.get_or_insert(now);
@@ -1801,7 +1801,7 @@ impl Model {
         result: CommandResult,
         now: DateTime<Utc>,
     ) -> Option<Request> {
-        let entry = self.outbox_entry(id).filter(|e| e.status.is_pending())?;
+        let entry = self.outbox_entry(id).filter(|e| !e.status.is_settled())?;
         let frees = matches!(
             entry.command.kind,
             CommandKind::DeleteBlob { .. } | CommandKind::CropBlob { .. }
@@ -1817,7 +1817,7 @@ impl Model {
 
     /// Mirrors [`Store::record_undeliverable`](crate::Store::record_undeliverable).
     pub(crate) fn command_undeliverable(&mut self, id: CommandId, now: DateTime<Utc>) {
-        if let Some(entry) = self.outbox_entry(id).filter(|e| e.status.is_pending()) {
+        if let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) {
             entry.status = OutboxStatus::Undeliverable;
             entry.answered_at = Some(now);
         }
@@ -2071,7 +2071,11 @@ impl Model {
     pub(crate) fn view(&self) -> ViewState {
         ViewState {
             link: self.link.clone(),
-            queued: self.outbox.iter().filter(|e| e.status.is_pending()).count(),
+            queued: self
+                .outbox
+                .iter()
+                .filter(|e| !e.status.is_settled())
+                .count(),
             attention: self.attention(),
             screen: self.screen(),
             can_go_back: self.shown_subagent().is_some() || self.back().is_some(),
@@ -2661,16 +2665,16 @@ impl Model {
 
     /// Whether [`Action::DeleteSessionLocally`] may remove the session: it
     /// is archived, and nothing about it is still open here — no pending
-    /// approval, no running turn, no command of this device unanswered.
+    /// approval, no running turn, no command of this device unsettled. An
+    /// undeliverable one is settled: it is never sent again.
     fn deletable(&self, summary: &SessionSummary) -> bool {
-        let unanswered = self
-            .outbox
-            .iter()
-            .any(|e| e.status.is_pending() && command_session(&e.command.kind) == Some(summary.id));
+        let unsettled = self.outbox.iter().any(|e| {
+            !e.status.is_settled() && command_session(&e.command.kind) == Some(summary.id)
+        });
         self.archived(summary)
             && summary.pending_approvals.is_empty()
             && summary.state != LogState::AgentWorking
-            && !unanswered
+            && !unsettled
     }
 
     /// The device whose request `answers` names, if it was seen.
