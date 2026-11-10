@@ -19,7 +19,8 @@ below before designing anything.
   and a member of the Cargo workspace.
 - `docs/`: `architecture.md` (how the system works: protocol, server,
   pairing, core, testing), `decisions.md` (D-numbered and settled),
-  `agents/claude-code.md` (the stream-json protocol notes).
+  `agents/claude-code.md` (the stream-json protocol notes),
+  `agents/omp.md` (research for an omp adapter; none exists yet).
 
 ## Gates
 
