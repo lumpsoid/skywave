@@ -7,9 +7,9 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
-    BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
-    OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Settings, Snippet, SnippetId,
-    Store, StoreError,
+    Action, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
+    OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen, ServerFacts, Settings,
+    Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
@@ -158,11 +158,7 @@ fn fresh_store_is_empty_with_defaults() {
             blob_policy: BlobPolicy::OnDemand,
             server_address: None,
             other_addresses: Vec::new(),
-            shell_enabled: false,
-            bypass_allowed: false,
-            login_expires: None,
-            agent_login_offered: false,
-            agent_logged_out: false,
+            server: ServerFacts::default(),
         }
     );
 }
@@ -850,7 +846,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -980,7 +976,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1654,7 +1650,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -1688,7 +1684,11 @@ fn v28_opens_a_v27_replica_without_a_login_expiry() {
     };
     let mut store = Store::open(&dir).unwrap();
     store.apply_batch(&batch, Utc::now()).unwrap();
-    store.set_bypass_allowed(true).unwrap();
+    let bypass = ServerFacts {
+        bypass_allowed: true,
+        ..ServerFacts::default()
+    };
+    store.set_server_facts(&bypass).unwrap();
     drop(store);
     // What v27 left: stamped 27, no `login_expires` setting.
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -1698,9 +1698,7 @@ fn v28_opens_a_v27_replica_without_a_login_expiry() {
 
     let store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
-    let settings = store.settings().unwrap();
-    assert!(settings.bypass_allowed);
-    assert_eq!(settings.login_expires, None);
+    assert_eq!(store.settings().unwrap().server, bypass);
     let events: Vec<EventKind> = store
         .session_events(id)
         .unwrap()
@@ -1728,30 +1726,22 @@ fn v29_opens_a_v28_replica_without_the_agent_login_flags() {
     };
     let mut store = Store::open(&dir).unwrap();
     store.apply_batch(&batch, Utc::now()).unwrap();
-    store.set_bypass_allowed(true).unwrap();
-    store.set_login_expires(Some(at(9))).unwrap();
+    let facts = ServerFacts {
+        bypass_allowed: true,
+        login_expires: Some(at(9)),
+        ..ServerFacts::default()
+    };
+    store.set_server_facts(&facts).unwrap();
     drop(store);
-    // What v28 left: stamped 28, neither agent login setting.
+    // What v28 left: stamped 28, neither agent login flag set.
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute("UPDATE protocol_stamp SET version = 28", [])
         .unwrap();
-    let keys: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM settings
-             WHERE key IN ('agent_login_offered', 'agent_logged_out')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(keys, 0);
     drop(conn);
 
     let store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
-    let settings = store.settings().unwrap();
-    assert!(settings.bypass_allowed);
-    assert_eq!(settings.login_expires, Some(at(9)));
-    assert!(!settings.agent_login_offered && !settings.agent_logged_out);
+    assert_eq!(store.settings().unwrap().server, facts);
     let events: Vec<EventKind> = store
         .session_events(id)
         .unwrap()
@@ -1759,8 +1749,12 @@ fn v29_opens_a_v28_replica_without_the_agent_login_flags() {
         .map(|(_, e)| e.kind)
         .collect();
     assert_eq!(events, [created]);
-    store.set_agent_logged_out(true).unwrap();
-    assert!(store.settings().unwrap().agent_logged_out);
+    let logged_out = ServerFacts {
+        agent_logged_out: true,
+        ..facts
+    };
+    store.set_server_facts(&logged_out).unwrap();
+    assert_eq!(store.settings().unwrap().server, logged_out);
 }
 
 fn usage_limits_read() -> UsageLimitsResult {
@@ -1825,7 +1819,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -1966,7 +1960,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
     drop(store);
 
     // A replica from before the column: the migration derives it from the log.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
     let store = Store::open(&dir).unwrap();
     assert_eq!(order(&store), vec![c, b, a]);
     assert_eq!(store.session(c).unwrap().unwrap().last_message_seq, Seq(5));
@@ -1975,15 +1969,82 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
 const AGENT: ComposerMode = ComposerMode::Agent;
 const SHELL: ComposerMode = ComposerMode::Shell;
 
-/// Rewinds the schema to `version`. Every rewind reruns the last
-/// migration, so this undoes it (the list-order column) here.
+/// Rewinds the schema to `version`. A rewind past the list-order column's
+/// migration reruns it, so this undoes it here; the last one, moving the
+/// server facts, reruns over a current schema as is.
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
-    if version < skywave_core::store::SCHEMA_VERSION {
+    if version < skywave_core::store::SCHEMA_VERSION - 1 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN last_message_seq;")
             .unwrap();
     }
     conn.pragma_update(None, "user_version", version).unwrap();
+}
+
+/// The schema before `server_facts` kept each fact of the server's `hello`
+/// as a `settings` row of its own; the migration moves them into the one
+/// row, and a replica that never took a `hello` gets none.
+#[test]
+fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
+    let previous_schema = |dir: &Path, rows: &str| {
+        drop(Store::open(dir).unwrap());
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TABLE server_facts;
+             INSERT OR REPLACE INTO settings (key, value) VALUES ('blob_policy', 'eager');
+             {rows}"
+        ))
+        .unwrap();
+        drop(conn);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 1);
+    };
+    let settings_keys = |dir: &Path| -> Vec<String> {
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT key FROM settings ORDER BY key")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+
+    let (_tmp, dir) = data_dir();
+    // As the previous schema's setters wrote them.
+    previous_schema(
+        &dir,
+        &format!(
+            "INSERT INTO settings (key, value) VALUES
+                ('shell_enabled', 'false'),
+                ('bypass_allowed', 'true'),
+                ('login_expires', '{}'),
+                ('agent_login_offered', 'true'),
+                ('agent_logged_out', 'true');",
+            at(7).to_rfc3339()
+        ),
+    );
+    let settings = Store::open(&dir).unwrap().settings().unwrap();
+    assert_eq!(
+        settings.server,
+        ServerFacts {
+            shell_enabled: false,
+            ..every_fact()
+        }
+    );
+    assert_eq!(settings.blob_policy, BlobPolicy::Eager);
+    assert_eq!(settings_keys(&dir), ["blob_policy"], "the rows moved");
+
+    let (_tmp, dir) = data_dir();
+    previous_schema(&dir, "");
+    assert_eq!(
+        Store::open(&dir).unwrap().settings().unwrap().server,
+        ServerFacts::default()
+    );
+    let rows: i64 = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM server_facts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "no hello, no row");
 }
 
 #[test]
@@ -2437,6 +2498,7 @@ fn server_rows(dir: &Path) -> Vec<(&'static str, i64)> {
         "composer_modes",
         "read_marks",
         "deleted_sessions",
+        "server_facts",
     ]
     .into_iter()
     .map(|table| {
@@ -2482,10 +2544,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     };
     store.set_draft(log.a, AGENT, Some(&draft)).unwrap();
     store.set_composer_mode(log.a, ComposerMode::Shell).unwrap();
-    store.set_shell_enabled(true).unwrap();
-    store.set_login_expires(Some(at(9))).unwrap();
-    store.set_agent_login_offered(true).unwrap();
-    store.set_agent_logged_out(true).unwrap();
+    seam.hello_received(&hello_saying(every_fact())).unwrap();
     store.switch_server_address("vpn.example:7443").unwrap();
     store.switch_server_address("old.example:7443").unwrap();
     assert_eq!(
@@ -2502,7 +2561,13 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
         .unwrap();
     store.set_blob_policy(BlobPolicy::Eager).unwrap();
     let before = store.load().unwrap();
-    assert!(before.settings.agent_login_offered && before.settings.agent_logged_out);
+    assert_eq!(before.settings.server, every_fact());
+    core.dispatch(Action::OpenSession(log.a)).unwrap();
+    let shown = |core: &Core| match core.view().screen {
+        Screen::Session(session) => (session.agent.bypass_allowed, session.shell.enabled),
+        other => panic!("expected the session screen, got {other:?}"),
+    };
+    assert_eq!(shown(&core), (true, true), "shown before the switch");
     let rows = server_rows(&dir);
     assert!(rows.iter().all(|(_, n)| *n > 0), "{rows:?}");
 
@@ -2526,20 +2591,29 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
             blob_policy: BlobPolicy::Eager,
             server_address: Some("new.example:7443".into()),
             other_addresses: Vec::new(),
-            shell_enabled: false,
-            bypass_allowed: false,
-            login_expires: None,
-            agent_login_offered: false,
-            agent_logged_out: false,
+            server: ServerFacts::default(),
         },
-        "the blob policy is this device's; the shell flag, the agent's login \
-         and the other addresses were the old server's"
+        "the blob policy is this device's; everything the old server's hello \
+         said, bypass included, and the other addresses were the old server's"
     );
     assert!(!blob_file.exists(), "blob files go with their rows");
 
     // The new server's log starts from the beginning.
     let applied = seam.apply_events(&log.batch(1, 2)).unwrap();
     assert_eq!((applied.cursor, applied.new_events), (Seq(2), 2));
+
+    // The model holds what the store does: the new server said nothing yet.
+    let view = core.view();
+    assert_eq!(
+        (
+            view.login_expires,
+            view.agent_login_offered,
+            view.agent_logged_out
+        ),
+        (None, false, false)
+    );
+    core.dispatch(Action::OpenSession(log.a)).unwrap();
+    assert_eq!(shown(&core), (false, false), "no bypass, no shell");
 }
 
 fn requested(session_id: SessionId, minute: u32, id: ApprovalId) -> Event {
@@ -2811,7 +2885,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -3241,24 +3315,8 @@ fn snippets_of_both_kinds_keep_the_same_text() {
     assert_eq!(snippets, [prompt, command]);
 }
 
-#[test]
-fn the_shell_flag_is_kept_in_the_settings() {
-    let (_tmp, dir) = data_dir();
-    let store = Store::open(&dir).unwrap();
-    assert!(
-        !store.settings().unwrap().shell_enabled,
-        "off until a hello"
-    );
-    store.set_shell_enabled(true).unwrap();
-    drop(store);
-    let store = Store::open(&dir).unwrap();
-    assert!(store.load().unwrap().settings.shell_enabled);
-    store.set_shell_enabled(false).unwrap();
-    assert!(!store.settings().unwrap().shell_enabled);
-}
-
-/// A server's `hello` with the agent's login as it says it.
-fn hello_with_agent_login(offered: bool, logged_out: bool) -> skywave_proto::HelloResponse {
+/// A server's `hello` saying `facts` of itself.
+fn hello_saying(facts: ServerFacts) -> skywave_proto::HelloResponse {
     skywave_proto::HelloResponse {
         protocol_version: skywave_proto::PROTOCOL_VERSION,
         server_id: skywave_proto::ServerId::new(),
@@ -3270,12 +3328,21 @@ fn hello_with_agent_login(offered: bool, logged_out: bool) -> skywave_proto::Hel
             since: None,
         },
         devices: Vec::new(),
-        shell: false,
-        bypass: false,
-        login_expires: None,
+        shell: facts.shell_enabled,
+        bypass: facts.bypass_allowed,
+        login_expires: facts.login_expires,
+        agent_login_offered: facts.agent_login_offered,
+        agent_logged_out: facts.agent_logged_out,
+    }
+}
+
+/// A server's `hello` with the agent's login as it says it.
+fn hello_with_agent_login(offered: bool, logged_out: bool) -> skywave_proto::HelloResponse {
+    hello_saying(ServerFacts {
         agent_login_offered: offered,
         agent_logged_out: logged_out,
-    }
+        ..ServerFacts::default()
+    })
 }
 
 /// A `hello` keeps whether a device may log the agent in and whether it is
@@ -3291,7 +3358,10 @@ fn a_hello_keeps_the_agent_login_until_another_server_is_paired() {
     let kept = |offered: bool, logged_out: bool| {
         let settings = Store::open(&dir).unwrap().settings().unwrap();
         assert_eq!(
-            (settings.agent_login_offered, settings.agent_logged_out),
+            (
+                settings.server.agent_login_offered,
+                settings.server.agent_logged_out
+            ),
             (offered, logged_out),
             "stored"
         );
@@ -3407,8 +3477,8 @@ fn an_agent_login_stores_its_outcome_and_never_its_url_or_code() {
     assert!(!view.agent_logged_out);
     assert_eq!(view.login_expires, Some(expires));
     let settings = Store::open(&dir).unwrap().settings().unwrap();
-    assert!(!settings.agent_logged_out);
-    assert_eq!(settings.login_expires, Some(expires));
+    assert!(!settings.server.agent_logged_out);
+    assert_eq!(settings.server.login_expires, Some(expires));
 
     let secrets = [url.as_str(), code.as_str(), STATE];
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -3495,7 +3565,7 @@ fn pairing_with_another_server_forgets_the_agent_login() {
     );
     let settings = Store::open(&dir).unwrap().settings().unwrap();
     assert!(
-        !settings.agent_logged_out,
+        !settings.server.agent_logged_out,
         "reset, and not set by the late answer"
     );
     seam.hello_received(&hello_with_agent_login(true, true))
@@ -3505,60 +3575,38 @@ fn pairing_with_another_server_forgets_the_agent_login() {
     assert!(core.view().agent_logged_out, "still dropped after a hello");
 }
 
-#[test]
-fn the_agent_login_flags_are_kept_in_the_settings_until_a_hello_changes_them() {
-    let (_tmp, dir) = data_dir();
-    let store = Store::open(&dir).unwrap();
-    let settings = store.settings().unwrap();
-    assert!(
-        !settings.agent_login_offered && !settings.agent_logged_out,
-        "off until a hello"
-    );
-    store.set_agent_login_offered(true).unwrap();
-    store.set_agent_logged_out(true).unwrap();
-    drop(store);
-    let store = Store::open(&dir).unwrap();
-    let settings = store.load().unwrap().settings;
-    assert!(settings.agent_login_offered && settings.agent_logged_out);
-    assert!(!settings.bypass_allowed && !settings.shell_enabled);
-    store.set_agent_logged_out(false).unwrap();
-    let settings = store.settings().unwrap();
-    assert!(settings.agent_login_offered && !settings.agent_logged_out);
+/// Every fact a `hello` reports, each set apart from its default.
+fn every_fact() -> ServerFacts {
+    ServerFacts {
+        shell_enabled: true,
+        bypass_allowed: true,
+        login_expires: Some(at(7)),
+        agent_login_offered: true,
+        agent_logged_out: true,
+    }
 }
 
+/// What a `hello` says of the server is kept whole across a reopen, and
+/// the next replaces all of it: nothing an earlier one said lingers.
 #[test]
-fn the_bypass_flag_is_kept_in_the_settings_apart_from_the_shell_flag() {
-    let (_tmp, dir) = data_dir();
-    let store = Store::open(&dir).unwrap();
-    assert!(
-        !store.settings().unwrap().bypass_allowed,
-        "off until a hello"
-    );
-    store.set_bypass_allowed(true).unwrap();
-    drop(store);
-    let store = Store::open(&dir).unwrap();
-    let settings = store.load().unwrap().settings;
-    assert!(settings.bypass_allowed);
-    assert!(!settings.shell_enabled);
-    store.set_bypass_allowed(false).unwrap();
-    assert!(!store.settings().unwrap().bypass_allowed);
-}
-
-#[test]
-fn the_login_expiry_is_kept_in_the_settings_until_a_hello_says_none() {
+fn the_server_facts_are_kept_whole_until_a_hello_replaces_them() {
     let (_tmp, dir) = data_dir();
     let store = Store::open(&dir).unwrap();
     assert_eq!(
-        store.settings().unwrap().login_expires,
-        None,
-        "none until a hello"
+        store.settings().unwrap().server,
+        ServerFacts::default(),
+        "the defaults until a hello"
     );
-    store.set_login_expires(Some(at(7))).unwrap();
+    store.set_server_facts(&every_fact()).unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
-    assert_eq!(store.load().unwrap().settings.login_expires, Some(at(7)));
-    store.set_login_expires(None).unwrap();
-    assert_eq!(store.settings().unwrap().login_expires, None);
+    assert_eq!(store.load().unwrap().settings.server, every_fact());
+    let bypass_only = ServerFacts {
+        bypass_allowed: true,
+        ..ServerFacts::default()
+    };
+    store.set_server_facts(&bypass_only).unwrap();
+    assert_eq!(store.settings().unwrap().server, bypass_only);
 }
 
 /// Name, type, `NOT NULL`, default and primary key position of each column.
@@ -3607,7 +3655,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -3889,7 +3937,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -4016,7 +4064,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -4055,7 +4103,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -4468,7 +4516,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -4596,7 +4644,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);

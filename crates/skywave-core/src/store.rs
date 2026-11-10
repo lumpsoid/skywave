@@ -22,8 +22,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
-    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, MIGRATED_SINCE,
-    ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId, UsageLimitsResult,
+    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, HelloResponse, LogId, LogRun,
+    MIGRATED_SINCE, ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
+    UsageLimitsResult,
 };
 use uuid::Uuid;
 
@@ -400,6 +401,34 @@ UPDATE sessions SET last_message_seq = COALESCE(
     (SELECT MIN(seq) FROM events WHERE session_id = sessions.id),
     last_seq);
 "#,
+    r#"
+-- What the server's last `hello` said of itself (crate::ServerFacts): one
+-- row once a `hello` was taken, written whole by each and cleared with the
+-- replica, so no fact of one server outlives a switch to another. Moved
+-- from the `settings` rows that kept each fact apart; a flag stored as
+-- anything but 'true' reads as false. Over a current schema those rows
+-- are gone and nothing moves; `IF NOT EXISTS` as above.
+CREATE TABLE IF NOT EXISTS server_facts (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    shell_enabled INTEGER NOT NULL CHECK (shell_enabled IN (0, 1)),
+    bypass_allowed INTEGER NOT NULL CHECK (bypass_allowed IN (0, 1)),
+    login_expires TEXT,
+    agent_login_offered INTEGER NOT NULL CHECK (agent_login_offered IN (0, 1)),
+    agent_logged_out INTEGER NOT NULL CHECK (agent_logged_out IN (0, 1))
+);
+INSERT OR REPLACE INTO server_facts (id, shell_enabled, bypass_allowed, login_expires,
+        agent_login_offered, agent_logged_out)
+    SELECT 1,
+        EXISTS (SELECT 1 FROM settings WHERE key = 'shell_enabled' AND value = 'true'),
+        EXISTS (SELECT 1 FROM settings WHERE key = 'bypass_allowed' AND value = 'true'),
+        (SELECT value FROM settings WHERE key = 'login_expires'),
+        EXISTS (SELECT 1 FROM settings WHERE key = 'agent_login_offered' AND value = 'true'),
+        EXISTS (SELECT 1 FROM settings WHERE key = 'agent_logged_out' AND value = 'true')
+    WHERE EXISTS (SELECT 1 FROM settings WHERE key IN ('shell_enabled', 'bypass_allowed',
+        'login_expires', 'agent_login_offered', 'agent_logged_out'));
+DELETE FROM settings WHERE key IN ('shell_enabled', 'bypass_allowed', 'login_expires',
+    'agent_login_offered', 'agent_logged_out');
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -618,21 +647,49 @@ pub struct Settings {
     /// typing them again. Never holds `server_address`; emptied by pairing
     /// with another server.
     pub other_addresses: Vec<String>,
-    /// Whether the server runs shell commands, as its last `hello` said
-    /// ([`Store::set_shell_enabled`]); `false` until one said so.
+    /// What the server's last `hello` said of itself
+    /// ([`Store::set_server_facts`]); the default until one did, and again
+    /// once the replica is cleared.
+    pub server: ServerFacts,
+}
+
+/// What the server's `hello` says of itself, kept so it shows offline too.
+/// One unit, stored as one row: each `hello` replaces all of it, and
+/// clearing the replica drops all of it, so nothing one server said
+/// survives pairing with another. The default is what is assumed before
+/// any `hello`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ServerFacts {
+    /// Whether the server runs shell commands.
     pub shell_enabled: bool,
-    /// Whether the server allows bypass mode, as its last `hello` said
-    /// ([`Store::set_bypass_allowed`]); `false` until one said so.
+    /// Whether the server allows bypass mode.
     pub bypass_allowed: bool,
-    /// When the agent's login expires, as the server's last `hello` said
-    /// ([`Store::set_login_expires`]); `None` until one said so.
+    /// When the agent's login expires; `None` when none was reported.
     pub login_expires: Option<DateTime<Utc>>,
-    /// Whether a device may log the server's agent in, as its last `hello`
-    /// said ([`Store::set_agent_login_offered`]); `false` until one said so.
+    /// Whether a device may log the server's agent in.
     pub agent_login_offered: bool,
-    /// Whether the server's agent is logged out, as its last `hello` said
-    /// ([`Store::set_agent_logged_out`]); `false` until one said so.
+    /// Whether the server's agent is logged out.
     pub agent_logged_out: bool,
+}
+
+impl ServerFacts {
+    /// What `hello` says.
+    pub fn of(hello: &HelloResponse) -> Self {
+        ServerFacts {
+            shell_enabled: hello.shell,
+            bypass_allowed: hello.bypass,
+            login_expires: hello.login_expires,
+            agent_login_offered: hello.agent_login_offered,
+            agent_logged_out: hello.agent_logged_out,
+        }
+    }
+
+    /// A login from this device ended `LoggedIn`, expiring at `expires`:
+    /// what a `hello` would say now.
+    pub fn logged_in(&mut self, expires: Option<DateTime<Utc>>) {
+        self.agent_logged_out = false;
+        self.login_expires = expires;
+    }
 }
 
 impl Settings {
@@ -655,17 +712,6 @@ impl Settings {
             KEY_OTHER_ADDRESSES => {
                 self.other_addresses = serde_json::from_str(&value)
                     .map_err(|_| bad_value(1, Type::Text, format!("server addresses {value:?}")))?;
-            }
-            KEY_SHELL_ENABLED => self.shell_enabled = flag(&value, "shell")?,
-            KEY_BYPASS_ALLOWED => self.bypass_allowed = flag(&value, "bypass")?,
-            KEY_AGENT_LOGIN_OFFERED => {
-                self.agent_login_offered = flag(&value, "agent login offered")?;
-            }
-            KEY_AGENT_LOGGED_OUT => self.agent_logged_out = flag(&value, "agent logged out")?,
-            KEY_LOGIN_EXPIRES => {
-                let at = DateTime::parse_from_rfc3339(&value)
-                    .map_err(|_| bad_value(1, Type::Text, format!("login expiry {value:?}")))?;
-                self.login_expires = Some(at.with_timezone(&Utc));
             }
             _ => {}
         }
@@ -1416,16 +1462,15 @@ impl Store {
 
     /// Makes the replica a fresh one for the server at `address`, in one
     /// transaction: the event log, session summaries, cursor, outbox,
-    /// stored workdir answers and
-    /// blob rows the old server produced go, as do its device names and
-    /// offered models, and so does what this
-    /// device kept beside them — drafts, composer modes, read marks, locally
-    /// deleted sessions and alerted approvals. Of the settings, the server
-    /// address becomes `address` and the old server's shell flag and other
-    /// addresses go;
-    /// the blob policy, a preference of this device, stays, as do keys a
-    /// newer build wrote. Snippets, this device's too, stay. Returns the blobs that were known, whose files
-    /// the caller removes.
+    /// stored workdir answers and blob rows the old server produced go, as
+    /// do its device names, offered models and everything its `hello` said
+    /// ([`ServerFacts`]), and so does what this device kept beside them —
+    /// drafts, composer modes, read marks, locally deleted sessions and
+    /// alerted approvals. Of the settings, the server address becomes
+    /// `address` and the old server's other addresses go; the blob policy,
+    /// a preference of this device, stays, as do keys a newer build wrote.
+    /// Snippets, this device's too, stay. Returns the blobs that were
+    /// known, whose files the caller removes.
     pub fn reset_for_server(&mut self, address: &str) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
         let blobs = {
@@ -1441,19 +1486,8 @@ impl Store {
              DELETE FROM deleted_sessions;
              DELETE FROM alerted_approvals;",
         )?;
-        // The old server's word on shell commands and on its agent's login
-        // says nothing of the new, and its other addresses lead to it, not
-        // to the new one.
-        tx.execute(
-            "DELETE FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5)",
-            [
-                KEY_SHELL_ENABLED,
-                KEY_LOGIN_EXPIRES,
-                KEY_AGENT_LOGIN_OFFERED,
-                KEY_AGENT_LOGGED_OUT,
-                KEY_OTHER_ADDRESSES,
-            ],
-        )?;
+        // The old server's other addresses lead to it, not to the new one.
+        tx.execute("DELETE FROM settings WHERE key = ?1", [KEY_OTHER_ADDRESSES])?;
         tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -2115,6 +2149,25 @@ impl Store {
             let value: String = row.get(1)?;
             settings.read(&key, value)?;
         }
+        settings.server = self
+            .conn
+            .query_row(
+                "SELECT shell_enabled, bypass_allowed, login_expires, agent_login_offered,
+                    agent_logged_out
+                 FROM server_facts WHERE id = 1",
+                [],
+                |row| {
+                    Ok(ServerFacts {
+                        shell_enabled: row.get(0)?,
+                        bypass_allowed: row.get(1)?,
+                        login_expires: opt_time_col(row, 2)?,
+                        agent_login_offered: row.get(3)?,
+                        agent_logged_out: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
         Ok(settings)
     }
 
@@ -2160,36 +2213,27 @@ impl Store {
         self.put_setting(KEY_OTHER_ADDRESSES, value.as_deref())
     }
 
-    /// Keeps whether the server runs shell commands, as its `hello` said.
-    pub fn set_shell_enabled(&self, enabled: bool) -> Result<(), StoreError> {
-        let value = if enabled { "true" } else { "false" };
-        self.put_setting(KEY_SHELL_ENABLED, Some(value))
-    }
-
-    /// Keeps whether the server allows bypass mode, as its `hello` said.
-    pub fn set_bypass_allowed(&self, allowed: bool) -> Result<(), StoreError> {
-        let value = if allowed { "true" } else { "false" };
-        self.put_setting(KEY_BYPASS_ALLOWED, Some(value))
-    }
-
-    /// Keeps whether a device may log the server's agent in, as its
-    /// `hello` said.
-    pub fn set_agent_login_offered(&self, offered: bool) -> Result<(), StoreError> {
-        let value = if offered { "true" } else { "false" };
-        self.put_setting(KEY_AGENT_LOGIN_OFFERED, Some(value))
-    }
-
-    /// Keeps whether the server's agent is logged out, as its `hello` said.
-    pub fn set_agent_logged_out(&self, logged_out: bool) -> Result<(), StoreError> {
-        let value = if logged_out { "true" } else { "false" };
-        self.put_setting(KEY_AGENT_LOGGED_OUT, Some(value))
-    }
-
-    /// Keeps when the agent's login expires, as the server's `hello` said;
-    /// `None` forgets it.
-    pub fn set_login_expires(&self, at: Option<DateTime<Utc>>) -> Result<(), StoreError> {
-        let value = at.map(|at| at.to_rfc3339());
-        self.put_setting(KEY_LOGIN_EXPIRES, value.as_deref())
+    /// Keeps what the server's `hello` said of itself, replacing all it
+    /// said before.
+    pub fn set_server_facts(&self, facts: &ServerFacts) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO server_facts (id, shell_enabled, bypass_allowed, login_expires,
+                 agent_login_offered, agent_logged_out)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (id) DO UPDATE SET shell_enabled = excluded.shell_enabled,
+                 bypass_allowed = excluded.bypass_allowed,
+                 login_expires = excluded.login_expires,
+                 agent_login_offered = excluded.agent_login_offered,
+                 agent_logged_out = excluded.agent_logged_out",
+            params![
+                facts.shell_enabled,
+                facts.bypass_allowed,
+                facts.login_expires.map(|at| at.to_rfc3339()),
+                facts.agent_login_offered,
+                facts.agent_logged_out,
+            ],
+        )?;
+        Ok(())
     }
 
     fn put_setting(&self, key: &str, value: Option<&str>) -> Result<(), StoreError> {
@@ -2211,21 +2255,6 @@ const KEY_BLOB_POLICY: &str = "blob_policy";
 const KEY_SERVER_ADDRESS: &str = "server_address";
 /// [`Settings::other_addresses`] as a JSON array; absent when empty.
 const KEY_OTHER_ADDRESSES: &str = "other_server_addresses";
-const KEY_SHELL_ENABLED: &str = "shell_enabled";
-const KEY_BYPASS_ALLOWED: &str = "bypass_allowed";
-const KEY_LOGIN_EXPIRES: &str = "login_expires";
-const KEY_AGENT_LOGIN_OFFERED: &str = "agent_login_offered";
-const KEY_AGENT_LOGGED_OUT: &str = "agent_logged_out";
-
-/// A server flag setting as [`Store::set_shell_enabled`],
-/// [`Store::set_bypass_allowed`] and the agent login's setters write it.
-fn flag(value: &str, what: &str) -> Result<bool, StoreError> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(bad_value(1, Type::Text, format!("{what} flag {value:?}")).into()),
-    }
-}
 
 /// Opens the database in `data_dir`, creating both if needed, unmigrated.
 fn connect(data_dir: &Path) -> Result<Connection, StoreError> {
@@ -2325,9 +2354,9 @@ fn stamped_protocol(conn: &Connection) -> Result<Option<u32>, StoreError> {
 
 /// Deletes what the server's log produced: the events and what is folded
 /// from them, the cursor, the outbox, blob rows, stored workdir answers,
-/// the stored usage limits, offered models and the server's device names.
-/// What is this device's
-/// alone is the caller's to keep or drop.
+/// the stored usage limits, offered models, the server's device names and
+/// what its last `hello` said of itself ([`ServerFacts`]). What is this
+/// device's alone is the caller's to keep or drop.
 fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(
         "DELETE FROM events;
@@ -2342,7 +2371,8 @@ fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
          DELETE FROM workdir_snapshots;
          DELETE FROM workdir_blob_refs;
          DELETE FROM usage_limits;
-         DELETE FROM server_log;",
+         DELETE FROM server_log;
+         DELETE FROM server_facts;",
     )?;
     Ok(())
 }

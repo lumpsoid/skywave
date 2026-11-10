@@ -2314,8 +2314,9 @@ fn a_setting_this_build_cannot_read_is_dropped_in_place_and_the_rest_kept() {
     sql(
         dir,
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('blob_policy', 'sometimes');
-         INSERT OR REPLACE INTO settings (key, value) VALUES ('shell_enabled', 'maybe');
-         INSERT OR REPLACE INTO settings (key, value) VALUES ('from_a_newer_build', 'x');",
+         INSERT OR REPLACE INTO settings (key, value) VALUES ('from_a_newer_build', 'x');
+         INSERT OR REPLACE INTO server_facts (id, shell_enabled, bypass_allowed, login_expires,
+             agent_login_offered, agent_logged_out) VALUES (1, 1, 1, 'never', 0, 0);",
     );
     unreadable_reason(dir);
     Core::reset_replica(dir).unwrap();
@@ -2324,7 +2325,11 @@ fn a_setting_this_build_cannot_read_is_dropped_in_place_and_the_rest_kept() {
     let settings = seam.settings().unwrap();
     assert_eq!(settings.server_address.as_deref(), Some("srv:7443"));
     assert_eq!(settings.blob_policy, skywave_core::BlobPolicy::default());
-    assert!(!settings.shell_enabled);
+    assert_eq!(
+        settings.server,
+        skywave_core::ServerFacts::default(),
+        "the server's word goes with the replica"
+    );
     drop((core, seam));
     let store = Store::open(dir).unwrap();
     let kept = store.load().unwrap();
