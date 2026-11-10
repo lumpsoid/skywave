@@ -961,7 +961,9 @@ logs) an event that no longer decodes rather than failing.
   longer has), blobs, workdir answers, devices, offered models and the
   kept log and run; settings, drafts, composer modes, snippets, read marks,
   local deletes and alerted approvals stay. It then connects again and
-  pulls the log from seq 0. The GUI's banner offers "Reset local data"
+  pulls the log from seq 0; the link shows `Connecting` only once the
+  reset is stored and reloaded, so a reset that fails leaves it
+  `Rejected(HistoryLost)` to be tried again. The GUI's banner offers "Reset local data"
   after a confirmation; the TUI says to restart with `--reset-replica`.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
   link by three workers (two take any blob, the third only blobs the user
