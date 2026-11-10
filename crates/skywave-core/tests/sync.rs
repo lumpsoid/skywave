@@ -1653,6 +1653,22 @@ async fn a_log_restored_from_an_older_backup_stops_the_link_until_the_replica_is
     client.dispatch(Action::RetryNow);
     assert!(history_lost(&client.core.view().link).is_some());
 
+    // A reset that cannot be stored keeps the link stopped, so it can be
+    // tried again, rather than showing a connect that was never sent.
+    let db =
+        rusqlite::Connection::open(client.dir.path().join(skywave_core::store::DB_FILE)).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER full BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    assert!(client.core.dispatch(Action::ResetReplica).is_err());
+    assert_eq!(
+        history_lost(&client.core.view().link),
+        Some((have, backed_up))
+    );
+    assert_eq!(client.local_events(), before);
+    db.execute_batch("DROP TRIGGER full").unwrap();
+
     client.dispatch(Action::ResetReplica);
     client
         .wait("the reset replica to sync the restored log", |c, view| {

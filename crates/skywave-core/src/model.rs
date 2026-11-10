@@ -82,7 +82,7 @@ pub(crate) enum Effect {
     DeleteLocally(SessionId),
     /// Clear the replica after the server's log lost events it holds
     /// ([`Store::reset_for_lost_history`](crate::Store::reset_for_lost_history)),
-    /// then the model ([`Model::replica_reset`]), and remove the blob files.
+    /// then the model ([`Model::history_reset`]), and remove the blob files.
     ResetReplica,
     /// Hand to the engine once every persistence effect succeeded.
     Request(Request),
@@ -1080,10 +1080,12 @@ impl Model {
                 }
                 _ => Vec::new(),
             },
+            // The link shows `Connecting` only once the reset reloaded the
+            // model ([`Model::history_reset`]): if it fails, the `Connect`
+            // after it is never sent and the link stays rejected.
             Action::ResetReplica => match self.link() {
                 Link::Rejected(LinkRejection::HistoryLost { .. }) => {
                     self.place = Place::session_list();
-                    self.link_to(PairedLink::Connecting);
                     vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
                 }
                 _ => Vec::new(),
@@ -2094,6 +2096,13 @@ impl Model {
         if had_drafts {
             self.draft_rev += 1;
         }
+    }
+
+    /// [`Model::replica_reset`] after the server's log lost history: the
+    /// link goes on, `Connecting` until the engine reports.
+    pub(crate) fn history_reset(&mut self, snapshot: Snapshot) {
+        self.replica_reset(snapshot);
+        self.link_to(PairedLink::Connecting);
     }
 
     /// The device paired (again): `paired` is the record just saved.
@@ -8019,6 +8028,12 @@ mod tests {
             f.dispatch(Action::ResetReplica),
             vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
         );
+        // Rejected until the reset is stored.
+        assert!(matches!(
+            f.model.view().link,
+            Link::Rejected(LinkRejection::HistoryLost { .. })
+        ));
+        f.model.history_reset(empty_snapshot());
         assert_eq!(f.model.view().link, Link::Connecting);
     }
 

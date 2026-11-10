@@ -819,7 +819,7 @@ impl State {
                     if !blobs.is_empty() {
                         requests.push(Request::BlobsPurged(blobs));
                     }
-                    self.model.replica_reset(self.store.load()?);
+                    self.model.history_reset(self.store.load()?);
                     Ok(())
                 }),
                 Effect::Request(request) => {
