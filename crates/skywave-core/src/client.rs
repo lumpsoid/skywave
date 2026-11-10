@@ -19,9 +19,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc as async_mpsc, watch};
 
 use crate::action::Action;
+use crate::address::ServerAddresses;
 use crate::blobs::{remove_all_blob_files, remove_blob_files};
 use crate::engine::{Engine, EngineConfig};
-use crate::identity::{FileIdentity, IdentityError};
+use crate::identity::{IdentityError, Pairing};
 use crate::lock::{DataDirLock, LockError};
 use crate::model::{Effect, Model, Paired};
 use crate::seam::{Request, Seam};
@@ -224,7 +225,9 @@ impl Deliverer {
 pub(crate) struct State {
     pub(crate) store: Store,
     pub(crate) model: Model,
-    pub(crate) identity: Option<Arc<FileIdentity>>,
+    /// The device's pairing as stored; the model holds what it shows of it
+    /// ([`Paired::of`]).
+    pub(crate) pairing: Option<Arc<Pairing>>,
     /// Bumped whenever pairing with another server resets the replica; a
     /// [`Seam`] bound to an older one may no longer write.
     pub(crate) server_epoch: u64,
@@ -370,11 +373,13 @@ impl Core {
                 let done = match effect {
                     Effect::Enqueue(command) => state.store.enqueue(&command),
                     Effect::SaveBlobPolicy(policy) => state.store.set_blob_policy(policy),
-                    Effect::SaveServerAddress(address) => {
-                        state.store.switch_server_address(&address)
-                    }
-                    Effect::ForgetServerAddress(address) => {
-                        state.store.forget_server_address(&address)
+                    Effect::SaveServerAddresses(addresses) => {
+                        // The pairing record, not the store.
+                        if let Err(err) = state.save_addresses(data_dir, addresses) {
+                            state.resync();
+                            return Err(err.into());
+                        }
+                        Ok(())
                     }
                     Effect::SaveDraft((id, mode), draft) => {
                         state.store.set_draft(id, mode, draft.as_ref())
@@ -568,15 +573,15 @@ impl Shared {
     ) -> Result<Arc<Shared>, CoreError> {
         let lock = DataDirLock::take(data_dir)?;
         let store = Store::open(data_dir).map_err(CoreError::opening)?;
-        let identity = FileIdentity::load(data_dir)?.map(Arc::new);
+        let pairing = Pairing::open(data_dir, &store)?.map(Arc::new);
         let snapshot = store.load().map_err(CoreError::opening)?;
-        let model = Model::new(snapshot, identity.as_deref().map(Paired::of));
+        let model = Model::new(snapshot, pairing.as_deref().map(Paired::of));
         Ok(Arc::new(Shared {
             data_dir: data_dir.to_path_buf(),
             state: Mutex::new(State {
                 store,
                 model,
-                identity,
+                pairing,
                 server_epoch: 0,
                 leases: HashMap::new(),
                 last_lease: 0,
@@ -779,10 +784,46 @@ impl State {
         self.leases.len()
     }
 
-    /// Rebuilds the model from the store after a failed write, so it never
-    /// shows what was not persisted. Best effort: if the store cannot be
-    /// read either, the model keeps its state.
+    /// Stores `pairing` as the device's, replacing the record whole, and
+    /// only then shows it: the model switches to it.
+    pub(crate) fn save_pairing(
+        &mut self,
+        data_dir: &Path,
+        pairing: Pairing,
+    ) -> Result<(), IdentityError> {
+        pairing.save(data_dir)?;
+        self.model.paired(Paired::of(&pairing));
+        self.pairing = Some(Arc::new(pairing));
+        Ok(())
+    }
+
+    /// Stores `addresses`, which the model switched to, as the pairing's.
+    /// The model asks only while paired; unpaired, there is no record to
+    /// hold them.
+    fn save_addresses(
+        &mut self,
+        data_dir: &Path,
+        addresses: ServerAddresses,
+    ) -> Result<(), IdentityError> {
+        let Some(old) = &self.pairing else {
+            return Ok(());
+        };
+        let pairing = Pairing {
+            credentials: old.credentials.clone(),
+            addresses,
+        };
+        pairing.save(data_dir)?;
+        self.pairing = Some(Arc::new(pairing));
+        Ok(())
+    }
+
+    /// Rebuilds the model from the store and the pairing after a failed
+    /// write, so it never shows what was not persisted. Best effort: if the
+    /// store cannot be read either, the model keeps the rest of its state.
     pub(crate) fn resync(&mut self) {
+        if let Some(pairing) = &self.pairing {
+            self.model.addresses_stored(pairing.addresses.clone());
+        }
         let Ok(snapshot) = self.store.load() else {
             return;
         };
@@ -1112,7 +1153,7 @@ mod tests {
                 let seam = seam.clone();
                 thread::spawn(move || {
                     for i in 0..50 {
-                        seam.set_link(crate::view::Link::Online {
+                        seam.set_link(crate::view::PairedLink::Online {
                             latency_ms: t * 1000 + i,
                         });
                     }

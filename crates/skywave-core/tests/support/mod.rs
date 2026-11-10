@@ -389,7 +389,7 @@ impl Client {
     }
 
     pub fn device(&self) -> DeviceId {
-        self.seam.identity().unwrap().device_id()
+        self.seam.pairing().unwrap().credentials.device_id
     }
 
     pub fn cursor(&self) -> Seq {

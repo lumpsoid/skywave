@@ -127,6 +127,69 @@ impl<'de> serde::Deserialize<'de> for ServerAddress {
     }
 }
 
+/// The paired server's addresses: the one the device connects to, and the
+/// others it was reached at, to switch back to without typing them again
+/// (architecture.md "Pairing"). The others never hold the current one, nor
+/// one twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerAddresses {
+    current: ServerAddress,
+    others: Vec<ServerAddress>,
+}
+
+impl ServerAddresses {
+    /// Just `current`, as pairing with a new server leaves them.
+    pub fn new(current: ServerAddress) -> ServerAddresses {
+        ServerAddresses {
+            current,
+            others: Vec::new(),
+        }
+    }
+
+    /// `current` with `others` in their order, less `current` and repeats.
+    pub(crate) fn with_others(
+        current: ServerAddress,
+        others: impl IntoIterator<Item = ServerAddress>,
+    ) -> ServerAddresses {
+        let mut addresses = ServerAddresses::new(current);
+        for other in others {
+            if other != addresses.current && !addresses.others.contains(&other) {
+                addresses.others.push(other);
+            }
+        }
+        addresses
+    }
+
+    /// The address the device connects to.
+    pub fn current(&self) -> &ServerAddress {
+        &self.current
+    }
+
+    pub fn others(&self) -> &[ServerAddress] {
+        &self.others
+    }
+
+    /// Makes `address` the current one. The one it replaces joins the
+    /// others at the end, and `address` leaves them; nothing changes if it
+    /// is already the current one.
+    pub fn switch_to(&mut self, address: &ServerAddress) {
+        if self.current == *address {
+            return;
+        }
+        self.others.retain(|other| other != address);
+        let old = std::mem::replace(&mut self.current, address.clone());
+        self.others.push(old);
+    }
+
+    /// Drops `address` from the others; `false` if it was not there (the
+    /// current one never is).
+    pub fn forget(&mut self, address: &ServerAddress) -> bool {
+        let before = self.others.len();
+        self.others.retain(|other| other != address);
+        self.others.len() != before
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +253,30 @@ mod tests {
         ] {
             assert!(ServerAddress::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn switching_keeps_the_old_address_until_forgotten() {
+        let addr = |text: &str| ServerAddress::parse(text).unwrap();
+        let mut addresses = ServerAddresses::new(addr("home"));
+        addresses.switch_to(&addr("vpn"));
+        addresses.switch_to(&addr("public"));
+        // The same address spelt otherwise: not a fourth one.
+        addresses.switch_to(&addr("HOME:7443"));
+        assert_eq!(addresses.current(), &addr("home"));
+        assert_eq!(addresses.others(), [addr("vpn"), addr("public")]);
+        addresses.switch_to(&addr("home"));
+        assert_eq!(addresses.others(), [addr("vpn"), addr("public")]);
+
+        assert!(!addresses.forget(&addr("home")), "the current one");
+        assert!(addresses.forget(&addr("vpn")));
+        assert!(!addresses.forget(&addr("vpn")));
+        assert_eq!(addresses.others(), [addr("public")]);
+
+        let loaded = ServerAddresses::with_others(
+            addr("home"),
+            [addr("vpn"), addr("HOME"), addr("vpn"), addr("public")],
+        );
+        assert_eq!(loaded.others(), [addr("vpn"), addr("public")]);
     }
 }

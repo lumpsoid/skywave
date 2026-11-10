@@ -294,7 +294,7 @@ impl Rig {
     /// Back to the session list, online.
     fn online_on_the_list(&mut self) {
         self.seam
-            .set_link(skywave_core::Link::Online { latency_ms: 5 });
+            .set_link(skywave_core::PairedLink::Online { latency_ms: 5 });
         self.intent(GuiIntent::Act {
             action: ActionIntent::Back,
         });
@@ -474,7 +474,7 @@ fn closing_the_conversation_picker_keeps_the_prompt() {
 #[test]
 fn offline_the_conversation_picker_says_why_it_is_empty() {
     let mut rig = Rig::new();
-    rig.seam.set_link(skywave_core::Link::Reconnecting {
+    rig.seam.set_link(skywave_core::PairedLink::Reconnecting {
         attempt: 1,
         retry_at: Utc::now() + chrono::TimeDelta::seconds(2),
         offline_since: Utc::now(),
@@ -503,13 +503,13 @@ fn offline_the_conversation_picker_says_why_it_is_empty() {
 /// shows until the link is fine again; a damaged identity has no retry.
 #[test]
 fn an_identity_fault_sends_the_re_pair_notice() {
-    use skywave_core::{Link, LinkRejection};
+    use skywave_core::{LinkRejection, PairedLink};
     let mut rig = Rig::new();
     rig.online_on_the_list();
     assert_eq!(rig.head.sent.screen.as_ref().unwrap().repair, None);
 
     rig.seam
-        .set_link(Link::Rejected(LinkRejection::ServerChanged));
+        .set_link(PairedLink::Rejected(LinkRejection::ServerChanged));
     rig.view();
     let repair = rig
         .head
@@ -531,17 +531,17 @@ fn an_identity_fault_sends_the_re_pair_notice() {
     rig.list();
 
     rig.seam
-        .set_link(Link::Rejected(LinkRejection::BadIdentity));
+        .set_link(PairedLink::Rejected(LinkRejection::BadIdentity));
     rig.view();
     assert_eq!(
         rig.head.sent.screen.as_ref().unwrap().repair,
         None,
         "dismissed until the link is fine again"
     );
-    rig.seam.set_link(Link::Connecting);
+    rig.seam.set_link(PairedLink::Connecting);
     rig.view();
     rig.seam
-        .set_link(Link::Rejected(LinkRejection::BadIdentity));
+        .set_link(PairedLink::Rejected(LinkRejection::BadIdentity));
     rig.view();
     let repair = rig
         .head
@@ -1948,7 +1948,7 @@ fn a_pasted_login_code_never_shows_in_a_debug() {
 fn the_session_info_page_shows_its_sections_limits_and_subagents() {
     let mut rig = Rig::new();
     rig.seam
-        .set_link(skywave_core::Link::Online { latency_ms: 5 });
+        .set_link(skywave_core::PairedLink::Online { latency_ms: 5 });
     rig.intent(GuiIntent::Act {
         action: ActionIntent::OpenSessionInfo {
             session_id: rig.session.0.to_string(),
@@ -2067,7 +2067,7 @@ impl Rig {
 fn a_context_cleared_or_switched_is_a_divider_row() {
     let mut rig = Rig::new();
     let walrus = skywave_proto::ContextId::new();
-    let me = rig.seam.identity().unwrap().device_id();
+    let me = rig.seam.pairing().unwrap().credentials.device_id;
     let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
     let event = |context, kind| Event {
         session_id: rig.session,
@@ -2122,7 +2122,7 @@ fn a_context_cleared_or_switched_is_a_divider_row() {
 #[test]
 fn a_moved_context_is_a_divider_row() {
     let mut rig = Rig::new();
-    let me = rig.seam.identity().unwrap().device_id();
+    let me = rig.seam.pairing().unwrap().credentials.device_id;
     let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
     let new = SessionId::new();
     let start = skywave_proto::ContextId::first_of(rig.session);
@@ -2354,7 +2354,7 @@ fn a_context_moves_once_the_core_offers_it_and_a_queued_move_can_be_discarded() 
 #[test]
 fn a_moved_context_row_names_where_it_went() {
     let mut rig = Rig::new();
-    let me = rig.seam.identity().unwrap().device_id();
+    let me = rig.seam.pairing().unwrap().credentials.device_id;
     let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
     let new = SessionId::new();
     let start = skywave_proto::ContextId::first_of(rig.session);

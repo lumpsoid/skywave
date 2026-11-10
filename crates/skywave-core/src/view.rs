@@ -138,9 +138,10 @@ pub struct PendingApprovalRef {
 /// State of the connection to the server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Link {
-    /// The device has never paired: there is no server to connect to.
-    /// Pairing moves it to `Connecting`; it never comes back, as a paired
-    /// device stays paired (a revoked one is `Rejected`).
+    /// The device is not paired: there is no server to connect to. Pairing
+    /// moves it to `Connecting`; it never comes back, as a paired device
+    /// stays paired (a revoked one is `Rejected`). Only the core decides
+    /// it, from the pairing: the sync engine reports a [`PairedLink`].
     Unpaired,
     Connecting,
     Online {
@@ -176,6 +177,50 @@ pub enum Link {
     /// [`LinkRejection::can_retry`] says one may help). Local data stays
     /// readable.
     Rejected(LinkRejection),
+}
+
+/// The [`Link`] of a paired device: what the sync engine reports
+/// ([`Seam::set_link`](crate::Seam::set_link)). It has no `Unpaired`, which
+/// only the pairing decides. Each variant means what [`Link`]'s does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairedLink {
+    Connecting,
+    Online {
+        latency_ms: u32,
+    },
+    CatchingUp {
+        have: Seq,
+        server: Seq,
+    },
+    Reconnecting {
+        attempt: u32,
+        retry_at: DateTime<Utc>,
+        offline_since: DateTime<Utc>,
+        reason: LinkFailure,
+    },
+    Rejected(LinkRejection),
+}
+
+impl From<PairedLink> for Link {
+    fn from(link: PairedLink) -> Link {
+        match link {
+            PairedLink::Connecting => Link::Connecting,
+            PairedLink::Online { latency_ms } => Link::Online { latency_ms },
+            PairedLink::CatchingUp { have, server } => Link::CatchingUp { have, server },
+            PairedLink::Reconnecting {
+                attempt,
+                retry_at,
+                offline_since,
+                reason,
+            } => Link::Reconnecting {
+                attempt,
+                retry_at,
+                offline_since,
+                reason,
+            },
+            PairedLink::Rejected(rejection) => Link::Rejected(rejection),
+        }
+    }
 }
 
 /// Why a connection failed in a way worth retrying: what a head shows
@@ -608,7 +653,8 @@ pub struct PairingView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairedInfo {
     pub device_id: DeviceId,
-    pub server_address: Option<ServerAddress>,
+    /// The address the device connects to.
+    pub server_address: ServerAddress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1896,7 +1942,7 @@ pub struct ServerAddressesView {
     /// The address the link uses.
     pub current: Option<ServerAddress>,
     /// The same server's other addresses, in the order they were left
-    /// ([`Settings::other_addresses`](crate::Settings::other_addresses)).
+    /// ([`ServerAddresses::others`](crate::ServerAddresses::others)).
     pub others: Vec<ServerAddress>,
 }
 
@@ -1908,7 +1954,7 @@ pub struct SettingsView {
     pub blobs_disk_full: bool,
     pub server_address: Option<ServerAddress>,
     /// The same server's other addresses, to switch to
-    /// ([`Settings::other_addresses`](crate::Settings::other_addresses)).
+    /// ([`ServerAddresses::others`](crate::ServerAddresses::others)).
     pub other_addresses: Vec<ServerAddress>,
     pub device_id: Option<DeviceId>,
     /// The fingerprint of the server CA pinned at pairing, to compare with

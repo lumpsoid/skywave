@@ -1817,7 +1817,7 @@ mod tests {
                     ..EngineConfig::default()
                 }),
                 address: "srv:7443".parse().unwrap(),
-                identity: self.seam.identity().unwrap(),
+                identity: self.seam.pairing().unwrap(),
                 run: ExpectedRun::default(),
                 queue: self.queue.clone(),
             }

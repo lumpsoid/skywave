@@ -21,8 +21,7 @@ use skywave_proto::{
 use crate::address::ServerAddress;
 use crate::blobs::{remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
-use crate::identity::{FileIdentity, Identity, PairedCredentials};
-use crate::model::Paired;
+use crate::identity::{PairedCredentials, Pairing};
 use crate::projection::BlobFate;
 use crate::store::{
     Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, PendingCrop, ServerFacts,
@@ -30,7 +29,7 @@ use crate::store::{
 };
 use crate::transport::TransportError;
 use crate::view::{
-    ApprovalId, BlobId, CommandId, DeviceId, Link, Seq, SessionId, UsageLimitsResult,
+    ApprovalId, BlobId, CommandId, DeviceId, PairedLink, Seq, SessionId, UsageLimitsResult,
     UsageLimitsUnavailable,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
@@ -56,7 +55,8 @@ pub enum Request {
         code: String,
         fingerprint: String,
     },
-    /// A (new) identity is in place: (re)connect with it.
+    /// A (new) pairing is in place, or its address changed: (re)connect
+    /// with it.
     Connect,
     /// A command was queued; the sender should drain the outbox.
     OutboxChanged,
@@ -141,19 +141,19 @@ impl Seam {
         Seam { core, epoch: None }
     }
 
-    /// The identity, with a handle bound to it for a link or a downloader
+    /// The pairing, with a handle bound to it for a link or a downloader
     /// using it; `None` before pairing. Once the device pairs with another
     /// server, every write through the bound handle fails with
     /// [`CoreError::Superseded`] and its link changes are ignored, so work
     /// still running for the old server cannot reach the new replica.
-    pub(crate) fn bind(&self) -> Option<(Seam, Arc<dyn Identity>)> {
+    pub(crate) fn bind(&self) -> Option<(Seam, Arc<Pairing>)> {
         let state = lock(&self.core.shared.state);
-        let identity = state.identity.clone()? as Arc<dyn Identity>;
+        let pairing = state.pairing.clone()?;
         let bound = Seam {
             core: self.core.clone(),
             epoch: Some(state.server_epoch),
         };
-        Some((bound, identity))
+        Some((bound, pairing))
     }
 
     /// Spawns `work`, as `what`, on the current runtime; a panic in it
@@ -185,10 +185,10 @@ impl Seam {
         self.core.shared.data_dir.clone()
     }
 
-    /// The device identity, `None` before pairing.
-    pub fn identity(&self) -> Option<Arc<dyn Identity>> {
-        let state = lock(&self.core.shared.state);
-        state.identity.clone().map(|i| i as Arc<dyn Identity>)
+    /// The device's pairing — its identity and the server's addresses —
+    /// `None` before pairing.
+    pub fn pairing(&self) -> Option<Arc<Pairing>> {
+        lock(&self.core.shared.state).pairing.clone()
     }
 
     pub fn settings(&self) -> Result<Settings, CoreError> {
@@ -448,7 +448,7 @@ impl Seam {
         })
     }
 
-    pub fn set_link(&self, link: Link) {
+    pub fn set_link(&self, link: PairedLink) {
         self.core
             .shared
             .update::<(), Infallible>(|state| {
@@ -660,11 +660,16 @@ impl Seam {
     /// store them, switch to the session list and ask for a connection.
     ///
     /// Pairing again with the same server (the same CA,
-    /// [`PairedCredentials::same_server`]) keeps the replica. Pairing with
-    /// another one — or with none known — first resets it
+    /// [`PairedCredentials::same_server`]) keeps the replica, and the
+    /// address it replaces stays among the others. Pairing with another
+    /// one — or with none known — first resets the replica
     /// ([`Store::reset_for_server`](crate::Store::reset_for_server)) and
     /// removes the blob files, so the device starts over like a fresh
     /// install; handles bound to the old server stop writing ([`Seam::bind`]).
+    ///
+    /// The new pairing replaces the old one whole, last
+    /// ([`Pairing`]): if storing it fails, the device keeps its old pairing
+    /// — identity and addresses — and connects with it again.
     pub fn pairing_succeeded(
         &self,
         address: &ServerAddress,
@@ -672,35 +677,43 @@ impl Seam {
     ) -> Result<(), CoreError> {
         let data_dir = self.data_dir();
         self.update(|state| {
-            let same_server = state
-                .identity
-                .as_ref()
-                .is_some_and(|old| old.credentials().same_server(&credentials));
             let mut requests = Vec::new();
-            if same_server {
-                // Address first: an address without an identity is
-                // harmless, the device simply stays unpaired.
-                state.store.switch_server_address(address)?;
-            } else {
-                // The reset commits (with the address) before the new
-                // identity is saved: a crash in between leaves the old
-                // identity over an empty replica, which only pulls again,
-                // never the old server's log under the new identity.
-                let blobs = state.store.reset_for_server(address)?;
-                state.server_epoch += 1;
-                state.model.replica_reset(state.store.load()?);
-                state.blobs_purged(&blobs);
-                remove_all_blob_files(&data_dir);
-                if !blobs.is_empty() {
-                    requests.push(Request::BlobsPurged(blobs));
+            let pairing = match state
+                .pairing
+                .as_ref()
+                .filter(|old| old.credentials.same_server(&credentials))
+            {
+                Some(old) => {
+                    let mut addresses = old.addresses.clone();
+                    addresses.switch_to(address);
+                    Pairing {
+                        credentials,
+                        addresses,
+                    }
                 }
-            }
-            let identity = FileIdentity::save(&data_dir, credentials)?;
-            state.model.paired(Paired::of(&identity), address);
-            state.identity = Some(Arc::new(identity));
+                None => {
+                    // The reset commits before the new pairing is saved: a
+                    // failure or a crash in between leaves the old pairing
+                    // over an empty replica, which only pulls again, never
+                    // the old server's log under the new pairing.
+                    let blobs = state.store.reset_for_server()?;
+                    state.server_epoch += 1;
+                    state.model.replica_reset(state.store.load()?);
+                    state.blobs_purged(&blobs);
+                    remove_all_blob_files(&data_dir);
+                    if !blobs.is_empty() {
+                        requests.push(Request::BlobsPurged(blobs));
+                    }
+                    Pairing::new(credentials, address.clone())
+                }
+            };
+            let saved = state.save_pairing(&data_dir, pairing);
+            // The new pairing, or the old one its handles may no longer
+            // write for once the replica was reset.
             requests.push(Request::Connect);
-            Ok(((), requests))
-        })
+            Ok((saved, requests))
+        })?
+        .map_err(CoreError::from)
     }
 
     /// Pairing failed; the pairing screen shows `reason`.
@@ -846,5 +859,62 @@ fn check_lease(state: &State, id: BlobId, lease: Option<BlobLease>) -> Result<()
 fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
     if let Err(error) = state.store.mark_alerted(approvals) {
         tracing::warn!(%error, "cannot store alerted approvals");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action::{Action, Route};
+    use crate::view::Screen;
+
+    fn credentials(ca: &str) -> PairedCredentials {
+        PairedCredentials {
+            device_id: DeviceId::new(),
+            device_key_pem: "KEY".into(),
+            device_cert_pem: "CERT".into(),
+            ca_cert_pem: ca.into(),
+        }
+    }
+
+    /// Storing the pairing with another server fails after the replica was
+    /// reset for it: the device keeps its old pairing whole — identity and
+    /// address, shown and stored — and connects with it again.
+    #[test]
+    fn a_failed_save_keeps_the_old_pairing_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
+        let seam = core.seam();
+        let requests = seam.take_requests().unwrap();
+        let old_address: ServerAddress = "old:7443".parse().unwrap();
+        let old = credentials("CA");
+        seam.pairing_succeeded(&old_address, old.clone()).unwrap();
+        assert_eq!(requests.try_iter().last(), Some(Request::Connect));
+
+        // Something in the way of the new record's temporary file.
+        let blocker = dir.path().join(crate::identity::TEMP_FILE);
+        std::fs::create_dir(&blocker).unwrap();
+        let err = seam
+            .pairing_succeeded(&"new:7443".parse().unwrap(), credentials("ANOTHER CA"))
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Identity(_)), "{err}");
+        let expected = Pairing::new(old.clone(), old_address.clone());
+        assert_eq!(seam.pairing().as_deref(), Some(&expected));
+        assert_eq!(requests.try_iter().collect::<Vec<_>>(), [Request::Connect]);
+        let settings = |core: &Core| {
+            core.dispatch(Action::Navigate(Route::Settings)).unwrap();
+            match core.view().screen {
+                Screen::Settings(settings) => (settings.device_id, settings.server_address),
+                other => panic!("expected settings, got {other:?}"),
+            }
+        };
+        let shown = (Some(old.device_id), Some(old_address));
+        assert_eq!(settings(&core), shown);
+
+        drop((core, seam));
+        std::fs::remove_dir(&blocker).unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
+        assert_eq!(core.seam().pairing().as_deref(), Some(&expected));
+        assert_eq!(settings(&core), shown);
     }
 }

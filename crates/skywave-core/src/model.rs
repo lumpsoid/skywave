@@ -18,10 +18,10 @@ use skywave_proto::{
 };
 
 use crate::action::{Action, Route};
-use crate::address::ServerAddress;
+use crate::address::{ServerAddress, ServerAddresses};
 use crate::completion::Completer;
 use crate::conversations::Conversations;
-use crate::identity::Identity;
+use crate::identity::{Identity, Pairing};
 use crate::limits::UsageLimits;
 use crate::login::AgentLogin;
 use crate::projection::{
@@ -43,8 +43,8 @@ use crate::view::{
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
-    LinkRejection, ListKind, LoginView, ModelChoice, Outgoing, PairedInfo, PairingStatus,
-    PairingView, Pause, PendingApprovalRef, PendingSession, QUESTION_TOOL, Question,
+    LinkRejection, ListKind, LoginView, ModelChoice, Outgoing, PairedInfo, PairedLink,
+    PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession, QUESTION_TOOL, Question,
     QuestionPrompt, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, ServerAddressesView, SessionId,
     SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
     SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
@@ -61,9 +61,8 @@ pub(crate) enum Effect {
     /// Write the command to the outbox.
     Enqueue(Command),
     SaveBlobPolicy(BlobPolicy),
-    /// Switch to the address ([`Settings::switch_to`](crate::Settings::switch_to)).
-    SaveServerAddress(ServerAddress),
-    ForgetServerAddress(ServerAddress),
+    /// Store the pairing's addresses as these, after a switch or a forget.
+    SaveServerAddresses(ServerAddresses),
     /// Keep the session's draft in that mode; `None` deletes it.
     SaveDraft((SessionId, ComposerMode), Option<Draft>),
     SaveComposerMode(SessionId, ComposerMode),
@@ -221,31 +220,37 @@ struct OpenSession {
     unread_from: Option<Seq>,
 }
 
-/// Who this device is paired as, taken from its identity when it is
-/// loaded or saved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the model holds of the device's pairing, taken from the record
+/// when it is loaded or saved, and the link to its server, which only a
+/// paired device has.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Paired {
     pub(crate) device: DeviceId,
     /// The pinned server CA's fingerprint; `None` if its PEM holds no
     /// certificate.
     pub(crate) server: Option<Fingerprint>,
+    pub(crate) addresses: ServerAddresses,
+    pub(crate) link: PairedLink,
 }
 
 impl Paired {
-    pub(crate) fn of(identity: &impl Identity) -> Paired {
+    /// Freshly loaded or saved: the link starts by connecting.
+    pub(crate) fn of(pairing: &Pairing) -> Paired {
         Paired {
-            device: identity.device_id(),
-            server: tls::first_cert_der(identity.ca_cert_pem()).map(|ca| Fingerprint::of_der(&ca)),
+            device: pairing.device_id(),
+            server: tls::first_cert_der(pairing.ca_cert_pem()).map(|ca| Fingerprint::of_der(&ca)),
+            addresses: pairing.addresses.clone(),
+            link: PairedLink::Connecting,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Model {
-    /// Who this device is paired as; `None` while unpaired.
+    /// Who this device is paired as, where its server is and how the link
+    /// to it is; `None` while unpaired.
     paired: Option<Paired>,
     pairing: PairingStatus,
-    link: Link,
     place: Place,
     settings: Settings,
     cursor: Seq,
@@ -327,19 +332,35 @@ pub(crate) struct Model {
 
 impl Model {
     fn device(&self) -> Option<DeviceId> {
-        self.paired.map(|p| p.device)
+        self.paired.as_ref().map(|p| p.device)
+    }
+
+    /// The link as heads see it: `Unpaired` exactly while the device is.
+    fn link(&self) -> Link {
+        match &self.paired {
+            None => Link::Unpaired,
+            Some(paired) => paired.link.clone().into(),
+        }
+    }
+
+    /// The paired link, `None` while unpaired.
+    fn paired_link(&self) -> Option<&PairedLink> {
+        self.paired.as_ref().map(|p| &p.link)
+    }
+
+    /// Sets the paired link; no-op while unpaired.
+    fn link_to(&mut self, link: PairedLink) {
+        if let Some(paired) = &mut self.paired {
+            paired.link = link;
+        }
     }
 
     /// The model after a (cold) start: the replica as stored, `paired` from
-    /// the identity if the device is paired.
+    /// the pairing record if the device is paired.
     pub(crate) fn new(snapshot: Snapshot, paired: Option<Paired>) -> Model {
         let mut model = Model {
             paired,
             pairing: PairingStatus::Idle,
-            link: match paired {
-                Some(_) => Link::Connecting,
-                None => Link::Unpaired,
-            },
             place: Place::SessionList,
             settings: Settings::default(),
             cursor: Seq::ZERO,
@@ -513,15 +534,16 @@ impl Model {
                 let Ok(address) = ServerAddress::parse(&address) else {
                     return Vec::new();
                 };
-                if self.device().is_none()
-                    || self.settings.server_address.as_ref() == Some(&address)
-                {
+                let Some(paired) = &mut self.paired else {
+                    return Vec::new();
+                };
+                if *paired.addresses.current() == address {
                     return Vec::new();
                 }
-                self.settings.switch_to(&address);
-                self.link = Link::Connecting;
+                paired.addresses.switch_to(&address);
+                paired.link = PairedLink::Connecting;
                 vec![
-                    Effect::SaveServerAddress(address),
+                    Effect::SaveServerAddresses(paired.addresses.clone()),
                     Effect::Request(Request::Connect),
                 ]
             }
@@ -529,10 +551,13 @@ impl Model {
                 let Ok(address) = ServerAddress::parse(&address) else {
                     return Vec::new();
                 };
-                if !self.settings.forget(&address) {
+                let Some(paired) = &mut self.paired else {
+                    return Vec::new();
+                };
+                if !paired.addresses.forget(&address) {
                     return Vec::new();
                 }
-                vec![Effect::ForgetServerAddress(address)]
+                vec![Effect::SaveServerAddresses(paired.addresses.clone())]
             }
             Action::CreateSession {
                 workdir,
@@ -1023,20 +1048,20 @@ impl Model {
                     Effect::Request(Request::BlobPolicyChanged(policy)),
                 ]
             }
-            Action::RetryNow => match self.link {
+            Action::RetryNow => match self.link() {
                 Link::Reconnecting { .. } => vec![Effect::Request(Request::RetryNow)],
                 // The server may have been updated (or its certificate
                 // restored) since: ask it again.
                 Link::Rejected(rejection) if rejection.can_retry() => {
-                    self.link = Link::Connecting;
+                    self.link_to(PairedLink::Connecting);
                     vec![Effect::Request(Request::Connect)]
                 }
                 _ => Vec::new(),
             },
-            Action::ResetReplica => match self.link {
+            Action::ResetReplica => match self.link() {
                 Link::Rejected(LinkRejection::HistoryLost { .. }) => {
                     self.go(Place::SessionList);
-                    self.link = Link::Connecting;
+                    self.link_to(PairedLink::Connecting);
                     vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
                 }
                 _ => Vec::new(),
@@ -1170,7 +1195,10 @@ impl Model {
     /// Whether the link may answer a request now, as far as the model
     /// knows: not while it waits to reconnect or the server refused it.
     fn online(&self) -> bool {
-        !matches!(self.link, Link::Reconnecting { .. } | Link::Rejected(_))
+        !matches!(
+            self.paired_link(),
+            Some(PairedLink::Reconnecting { .. } | PairedLink::Rejected(_))
+        )
     }
 
     /// The session whose workdir is on screen, and the pane shown.
@@ -1586,7 +1614,7 @@ impl Model {
     /// Returns the approvals it marked alerted, to store, so a later
     /// process does not alert for them again.
     fn note_new_approvals(&mut self) -> Vec<(SessionId, ApprovalId)> {
-        if !matches!(self.link, Link::Online { .. }) {
+        if !matches!(self.paired_link(), Some(PairedLink::Online { .. })) {
             return Vec::new();
         }
         self.forget_resolved_alerts();
@@ -1892,9 +1920,10 @@ impl Model {
     }
 
     /// Returns the approvals newly marked alerted, as
-    /// [`apply_batch`](Model::apply_batch).
-    pub(crate) fn set_link(&mut self, link: Link) -> Vec<(SessionId, ApprovalId)> {
-        self.link = link;
+    /// [`apply_batch`](Model::apply_batch). Only a paired device has a
+    /// link to set: unpaired, the link stays `Unpaired`.
+    pub(crate) fn set_link(&mut self, link: PairedLink) -> Vec<(SessionId, ApprovalId)> {
+        self.link_to(link);
         self.note_new_approvals()
     }
 
@@ -2040,13 +2069,18 @@ impl Model {
         }
     }
 
-    pub(crate) fn paired(&mut self, paired: Paired, address: &ServerAddress) {
+    /// The device paired (again): `paired` is the record just saved.
+    pub(crate) fn paired(&mut self, paired: Paired) {
         self.paired = Some(paired);
-        // Another server's reset already emptied the other addresses.
-        self.settings.switch_to(address);
         self.pairing = PairingStatus::Idle;
         self.go(Place::SessionList);
-        self.link = Link::Connecting;
+    }
+
+    /// Mirrors the pairing's addresses as stored, after a failed write.
+    pub(crate) fn addresses_stored(&mut self, addresses: ServerAddresses) {
+        if let Some(paired) = &mut self.paired {
+            paired.addresses = addresses;
+        }
     }
 
     pub(crate) fn pairing_failed(&mut self, reason: String) {
@@ -2134,7 +2168,7 @@ impl Model {
 
     pub(crate) fn view(&self) -> ViewState {
         ViewState {
-            link: self.link.clone(),
+            link: self.link(),
             queued: self
                 .outbox
                 .iter()
@@ -2185,10 +2219,14 @@ impl Model {
             Place::Settings => Screen::Settings(SettingsView {
                 blob_policy: self.settings.blob_policy,
                 blobs_disk_full: self.blobs_disk_full,
-                server_address: self.settings.server_address.clone(),
-                other_addresses: self.settings.other_addresses.clone(),
+                server_address: self.paired.as_ref().map(|p| p.addresses.current().clone()),
+                other_addresses: self
+                    .paired
+                    .as_ref()
+                    .map(|p| p.addresses.others().to_vec())
+                    .unwrap_or_default(),
                 device_id: self.device(),
-                server_fingerprint: self.paired.and_then(|p| p.server),
+                server_fingerprint: self.paired.as_ref().and_then(|p| p.server),
                 login: LoginView {
                     offered: self.settings.server.agent_login_offered,
                     logged_out: self.settings.server.agent_logged_out,
@@ -2197,8 +2235,12 @@ impl Model {
                 },
             }),
             Place::ServerAddresses => Screen::ServerAddresses(ServerAddressesView {
-                current: self.settings.server_address.clone(),
-                others: self.settings.other_addresses.clone(),
+                current: self.paired.as_ref().map(|p| p.addresses.current().clone()),
+                others: self
+                    .paired
+                    .as_ref()
+                    .map(|p| p.addresses.others().to_vec())
+                    .unwrap_or_default(),
             }),
             Place::SessionList => Screen::SessionList(self.session_list(ListKind::Active)),
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
@@ -2357,9 +2399,9 @@ impl Model {
 
     fn pairing_view(&self) -> PairingView {
         PairingView {
-            paired: self.device().map(|device_id| PairedInfo {
-                device_id,
-                server_address: self.settings.server_address.clone(),
+            paired: self.paired.as_ref().map(|paired| PairedInfo {
+                device_id: paired.device,
+                server_address: paired.addresses.current().clone(),
             }),
             status: self.pairing.clone(),
         }
@@ -3831,7 +3873,10 @@ impl Model {
                 // waits for it.
                 paused: if self.blobs_disk_full {
                     Some(Pause::DiskFull)
-                } else if matches!(self.link, Link::Online { .. } | Link::CatchingUp { .. }) {
+                } else if matches!(
+                    self.paired_link(),
+                    Some(PairedLink::Online { .. } | PairedLink::CatchingUp { .. })
+                ) {
                     None
                 } else {
                     Some(Pause::Offline)
@@ -4281,11 +4326,19 @@ mod tests {
         CandidateSource, Completion, CompletionStatus, FailReason, LinkRejection, Refusal,
     };
 
-    /// Paired as `device` with a server CA whose DER is `b"ca"`.
+    /// Paired as `device` at `srv:7443` with a server CA whose DER is
+    /// `b"ca"`.
     fn paired_as(device: DeviceId) -> Paired {
+        paired_at(device, "srv:7443")
+    }
+
+    /// [`paired_as`] at `address`.
+    fn paired_at(device: DeviceId, address: &str) -> Paired {
         Paired {
             device,
             server: Some(Fingerprint::of_der(b"ca")),
+            addresses: ServerAddresses::new(addr(address)),
+            link: PairedLink::Connecting,
         }
     }
 
@@ -4541,7 +4594,7 @@ mod tests {
 
         assert_eq!(model.dispatch(pair).len(), 1);
         let device = DeviceId::new();
-        model.paired(paired_as(device), &addr("host:7443"));
+        model.paired(paired_at(device, "host:7443"));
         let view = model.view();
         assert_eq!(view.link, Link::Connecting);
         assert_eq!(
@@ -4562,7 +4615,7 @@ mod tests {
             pairing(&model).paired,
             Some(PairedInfo {
                 device_id: device,
-                server_address: Some(addr("host:7443")),
+                server_address: addr("host:7443"),
             })
         );
     }
@@ -6635,7 +6688,7 @@ mod tests {
         assert_eq!(output_state(&f), BlobState::Requested { size: 10_000 });
 
         // Paused follows the link, with no status change.
-        f.model.set_link(Link::Online { latency_ms: 20 });
+        f.model.set_link(PairedLink::Online { latency_ms: 20 });
         let path = PathBuf::from("/data/blobs/x");
         f.model.blob_status(
             output.id,
@@ -6650,7 +6703,7 @@ mod tests {
             paused,
         };
         assert_eq!(output_state(&f), downloading(None));
-        f.model.set_link(Link::Reconnecting {
+        f.model.set_link(PairedLink::Reconnecting {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
@@ -6662,7 +6715,7 @@ mod tests {
         assert_eq!(output_state(&f), downloading(Some(Pause::DiskFull)));
         f.model.set_blobs_disk_full(false);
         assert_eq!(output_state(&f), downloading(Some(Pause::Offline)));
-        f.model.set_link(Link::CatchingUp {
+        f.model.set_link(PairedLink::CatchingUp {
             have: Seq(1),
             server: Seq(2),
         });
@@ -6828,8 +6881,9 @@ mod tests {
         assert!(model.dispatch(set("10.0.0.7:7443")).is_empty(), "unpaired");
 
         let mut f = Fixture::paired();
-        f.model.paired(paired_as(f.me), &addr("host:7443"));
-        f.model.set_link(Link::Rejected(LinkRejection::Revoked));
+        f.model.paired(paired_at(f.me, "host:7443"));
+        f.model
+            .set_link(PairedLink::Rejected(LinkRejection::Revoked));
         assert!(f.dispatch(set(" host:7443 ")).is_empty(), "unchanged");
         assert!(
             f.dispatch(set("HOST")).is_empty(),
@@ -6837,10 +6891,12 @@ mod tests {
         );
         assert!(f.dispatch(set("not an address:x")).is_empty(), "invalid");
         assert!(f.dispatch(set("  ")).is_empty(), "blank");
+        let mut switched = ServerAddresses::new(addr("host:7443"));
+        switched.switch_to(&addr("10.0.0.7:7443"));
         assert_eq!(
             f.dispatch(set(" 10.0.0.7:7443 ")),
             vec![
-                Effect::SaveServerAddress(addr("10.0.0.7:7443")),
+                Effect::SaveServerAddresses(switched),
                 Effect::Request(Request::Connect),
             ]
         );
@@ -6859,58 +6915,59 @@ mod tests {
 
     #[test]
     fn a_left_address_is_kept_to_switch_back_to_or_forget() {
+        let addresses = |f: &Fixture| f.model.paired.as_ref().unwrap().addresses.clone();
         let mut f = Fixture::paired();
-        f.model.paired(paired_as(f.me), &addr("home:7443"));
+        f.model.paired(paired_at(f.me, "home:7443"));
         f.dispatch(Action::SetServerAddress {
             address: "vpn:7443".into(),
         });
         f.dispatch(Action::SetServerAddress {
-            address: "public:7443".into(),
+            address: "lan:7443".into(),
         });
-        assert_eq!(
-            f.model.settings.other_addresses,
-            addrs(&["home:7443", "vpn:7443"])
-        );
+        assert_eq!(addresses(&f).others(), addrs(&["home:7443", "vpn:7443"]));
 
         // Back to one under another spelling: the same address, not a new one.
         f.dispatch(Action::SetServerAddress {
             address: "HOME".into(),
         });
-        assert_eq!(f.model.settings.server_address, Some(addr("home:7443")));
-        assert_eq!(
-            f.model.settings.other_addresses,
-            addrs(&["vpn:7443", "public:7443"])
-        );
-
-        // Pairing again at a new address keeps the one it leaves.
-        f.model.paired(paired_as(f.me), &addr("lan:7443"));
-        assert_eq!(
-            f.model.settings.other_addresses,
-            addrs(&["vpn:7443", "public:7443", "home:7443"])
-        );
+        assert_eq!(addresses(&f).current(), &addr("home:7443"));
+        assert_eq!(addresses(&f).others(), addrs(&["vpn:7443", "lan:7443"]));
+        f.dispatch(Action::SetServerAddress {
+            address: "lan".into(),
+        });
 
         let forget = |address: &str| Action::ForgetServerAddress {
             address: address.into(),
         };
         assert!(f.dispatch(forget("LAN")).is_empty(), "the current one");
         assert!(f.dispatch(forget("other:7443")).is_empty(), "not kept");
+        let forgotten = ServerAddresses::with_others(addr("lan"), addrs(&["home:7443"]));
         assert_eq!(
             f.dispatch(forget(" VPN ")),
-            vec![Effect::ForgetServerAddress(addr("vpn:7443"))]
+            vec![Effect::SaveServerAddresses(forgotten.clone())]
         );
-        assert_eq!(
-            f.model.settings.other_addresses,
-            addrs(&["public:7443", "home:7443"])
-        );
+        assert_eq!(addresses(&f), forgotten);
+
+        // A failed write puts back what is stored.
+        f.model.addresses_stored(ServerAddresses::with_others(
+            addr("lan"),
+            addrs(&["vpn", "home"]),
+        ));
+        assert_eq!(addresses(&f).others(), addrs(&["vpn:7443", "home:7443"]));
+        f.model.addresses_stored(forgotten);
 
         f.dispatch(Action::Navigate(Route::ServerAddresses));
         assert_eq!(
             f.model.view().screen,
             Screen::ServerAddresses(ServerAddressesView {
                 current: Some(addr("lan:7443")),
-                others: addrs(&["public:7443", "home:7443"]),
+                others: addrs(&["home:7443"]),
             })
         );
+
+        // Unpaired, there are no addresses to forget.
+        let mut model = Model::new(empty_snapshot(), None);
+        assert!(model.dispatch(forget("home")).is_empty());
     }
 
     #[test]
@@ -7833,33 +7890,40 @@ mod tests {
         assert_eq!(f.list_view().sessions.len(), 1);
         assert_eq!(f.list_view().sessions[0].id, sid);
 
-        let reconnecting = Link::Reconnecting {
+        let reconnecting = PairedLink::Reconnecting {
             attempt: 3,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(4),
             offline_since: chrono::Utc::now(),
             reason: crate::view::LinkFailure::Unreachable,
         };
         f.model.set_link(reconnecting.clone());
-        assert_eq!(f.model.view().link, reconnecting);
-        f.model.set_link(Link::Rejected(LinkRejection::Revoked));
+        assert_eq!(f.model.view().link, Link::from(reconnecting));
+        f.model
+            .set_link(PairedLink::Rejected(LinkRejection::Revoked));
         // Local data stays readable while rejected.
         assert_eq!(f.list_view().sessions.len(), 1);
     }
 
     #[test]
     fn retry_now_only_while_reconnecting() {
+        // Unpaired there is nothing to retry, and no link the engine
+        // reports makes it paired.
+        let mut model = Model::new(empty_snapshot(), None);
+        model.set_link(PairedLink::Online { latency_ms: 5 });
+        assert_eq!(model.view().link, Link::Unpaired);
+        assert!(model.dispatch(Action::RetryNow).is_empty());
+
         let mut f = Fixture::paired();
         for link in [
-            Link::Unpaired,
-            Link::Connecting,
-            Link::Online { latency_ms: 5 },
-            Link::Rejected(LinkRejection::Revoked),
-            Link::Rejected(LinkRejection::BadIdentity),
+            PairedLink::Connecting,
+            PairedLink::Online { latency_ms: 5 },
+            PairedLink::Rejected(LinkRejection::Revoked),
+            PairedLink::Rejected(LinkRejection::BadIdentity),
         ] {
             f.model.set_link(link);
             assert!(f.dispatch(Action::RetryNow).is_empty());
         }
-        f.model.set_link(Link::Reconnecting {
+        f.model.set_link(PairedLink::Reconnecting {
             attempt: 2,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(30),
             offline_since: chrono::Utc::now(),
@@ -7885,7 +7949,7 @@ mod tests {
             LinkRejection::NameMismatch,
         ] {
             let mut f = Fixture::paired();
-            f.model.set_link(Link::Rejected(rejection));
+            f.model.set_link(PairedLink::Rejected(rejection));
             assert_eq!(
                 f.dispatch(Action::RetryNow),
                 vec![Effect::Request(Request::Connect)],
@@ -7901,10 +7965,10 @@ mod tests {
     fn reset_replica_only_after_the_server_lost_history() {
         let mut f = Fixture::paired();
         for link in [
-            Link::Connecting,
-            Link::Online { latency_ms: 5 },
-            Link::Rejected(LinkRejection::Revoked),
-            Link::Rejected(LinkRejection::ProtocolMismatch {
+            PairedLink::Connecting,
+            PairedLink::Online { latency_ms: 5 },
+            PairedLink::Rejected(LinkRejection::Revoked),
+            PairedLink::Rejected(LinkRejection::ProtocolMismatch {
                 client: 3,
                 server: 2,
             }),
@@ -7912,10 +7976,11 @@ mod tests {
             f.model.set_link(link);
             assert!(f.dispatch(Action::ResetReplica).is_empty());
         }
-        f.model.set_link(Link::Rejected(LinkRejection::HistoryLost {
-            have: Seq(9),
-            server: Seq(4),
-        }));
+        f.model
+            .set_link(PairedLink::Rejected(LinkRejection::HistoryLost {
+                have: Seq(9),
+                server: Seq(4),
+            }));
         // Retrying does not get past it.
         assert!(f.dispatch(Action::RetryNow).is_empty());
         assert_eq!(
@@ -8681,10 +8746,10 @@ mod tests {
         assert_eq!(f.session_view().unread_from, Some(Seq(15)), "the tool call");
     }
 
-    const ONLINE: Link = Link::Online { latency_ms: 5 };
+    const ONLINE: PairedLink = PairedLink::Online { latency_ms: 5 };
 
-    fn catching_up() -> Link {
-        Link::CatchingUp {
+    fn catching_up() -> PairedLink {
+        PairedLink::CatchingUp {
             have: Seq(1),
             server: Seq(9),
         }
@@ -8829,7 +8894,7 @@ mod tests {
         );
         assert_eq!(alerts(&f), 2);
         f.log(sid, vec![agent("still waiting")]);
-        f.model.set_link(Link::Online { latency_ms: 9 });
+        f.model.set_link(PairedLink::Online { latency_ms: 9 });
         assert_eq!(alerts(&f), 2);
         // Requested and resolved in one batch: no news.
         let quick = ApprovalId::new();
@@ -9092,7 +9157,7 @@ mod tests {
     fn offline_or_failed_completion_falls_back_to_recents() {
         let mut f = Fixture::paired();
         f.session("/srv/api");
-        f.model.set_link(Link::Reconnecting {
+        f.model.set_link(PairedLink::Reconnecting {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
@@ -9106,7 +9171,7 @@ mod tests {
         );
 
         // Back online; an old server without the endpoint answers 404.
-        f.model.set_link(Link::Online { latency_ms: 5 });
+        f.model.set_link(PairedLink::Online { latency_ms: 5 });
         let (req, _) = complete(&mut f, "/srv/").unwrap();
         f.model.dirs_listed(req, Err(TransportError::NotFound));
         assert_eq!(completion(&f).status, CompletionStatus::Unavailable);
@@ -9273,7 +9338,7 @@ mod tests {
     #[test]
     fn the_picker_offline_is_unavailable_at_once_and_asks_nothing() {
         let mut f = Fixture::paired();
-        f.model.set_link(Link::Reconnecting {
+        f.model.set_link(PairedLink::Reconnecting {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
@@ -9283,7 +9348,7 @@ mod tests {
         assert_eq!(list_conversations(&mut f), None, "nothing is asked offline");
         assert_eq!(picker(&f).status, offline);
         // Nothing was queued for later: coming back online asks nothing.
-        f.model.set_link(Link::Online { latency_ms: 5 });
+        f.model.set_link(PairedLink::Online { latency_ms: 5 });
         assert_eq!(picker(&f).status, offline);
         // Asking again online does.
         let req = list_conversations(&mut f).expect("asked online");
@@ -9383,7 +9448,7 @@ mod tests {
         assert_eq!(view.report, Some(report));
 
         // Offline nothing is asked.
-        f.model.set_link(Link::Reconnecting {
+        f.model.set_link(PairedLink::Reconnecting {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
@@ -9396,7 +9461,7 @@ mod tests {
         );
 
         // Elsewhere a refresh asks nothing.
-        f.model.set_link(Link::Online { latency_ms: 5 });
+        f.model.set_link(PairedLink::Online { latency_ms: 5 });
         f.dispatch(Action::Navigate(Route::Settings));
         assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
     }
@@ -9469,7 +9534,7 @@ mod tests {
         assert_eq!(view.answer, Some(stored.clone()));
 
         // Offline nothing is asked, and the stored answer still shows.
-        f.model.set_link(Link::Reconnecting {
+        f.model.set_link(PairedLink::Reconnecting {
             attempt: 1,
             retry_at: Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: Utc::now(),
@@ -9679,7 +9744,7 @@ mod tests {
     #[test]
     fn a_blob_delete_or_crop_queues_offline_and_is_discardable_until_accepted() {
         let mut f = Fixture::paired();
-        f.model.set_link(Link::Reconnecting {
+        f.model.set_link(PairedLink::Reconnecting {
             attempt: 1,
             retry_at: Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: Utc::now(),
@@ -11522,8 +11587,8 @@ mod tests {
             }
         }
 
-        fn offline() -> Link {
-            Link::Reconnecting {
+        fn offline() -> PairedLink {
+            PairedLink::Reconnecting {
                 attempt: 1,
                 retry_at: Utc::now(),
                 offline_since: Utc::now(),

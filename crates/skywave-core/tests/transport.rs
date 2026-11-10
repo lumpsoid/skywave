@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobDownload, Core, ExpectedRun, FileIdentity, HttpsTransport, Identity, PairError,
-    PairingStatus, Request, Screen, ServerAddress, Transport, TransportConfig, TransportError,
-    pair, pair_and_report,
+    Action, BlobDownload, Core, ExpectedRun, HttpsTransport, Identity, PairError,
+    PairedCredentials, Pairing, PairingStatus, Request, Screen, ServerAddress, Transport,
+    TransportConfig, TransportError, pair, pair_and_report,
 };
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
@@ -180,16 +180,15 @@ async fn pair_then_talk_to_the_server_until_revoked() {
         core.view().screen
     );
 
-    let stored = FileIdentity::load(data.path())
-        .unwrap()
-        .expect("identity saved");
+    let stored = Pairing::load(data.path()).unwrap().expect("pairing saved");
     assert_eq!(stored.ca_cert_pem(), fx.identity.ca_cert_pem());
     let server_device = devices::get(fx.storage.db.conn(), stored.device_id())
         .unwrap()
         .expect("server knows the device");
     assert_eq!(server_device.name, "test laptop");
-    let address = seam.settings().unwrap().server_address.unwrap();
+    let address = stored.addresses.current().clone();
     assert_eq!(address, fx.addr);
+    assert_eq!(seam.pairing().as_deref(), Some(&stored));
 
     let transport: Arc<dyn Transport> =
         Arc::new(HttpsTransport::new(&address, &stored, config(), ExpectedRun::default()).unwrap());
@@ -430,21 +429,18 @@ async fn conversations_are_listed_by_a_real_server() {
 
 /// A transport for a device freshly paired with `fx`.
 async fn paired_transport(fx: &Fixture) -> HttpsTransport {
-    let (_data, identity) = paired_identity(fx).await;
+    let identity = paired_identity(fx).await;
     HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap()
 }
 
-/// The identity of a device freshly paired with `fx`, and the directory
-/// that holds it.
-async fn paired_identity(fx: &Fixture) -> (TempDir, FileIdentity) {
+/// The credentials of a device freshly paired with `fx`.
+async fn paired_identity(fx: &Fixture) -> PairedCredentials {
     let code = fx.issue_code().code.to_string();
     let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
         .await
         .unwrap();
     assert_eq!(paired.address, fx.addr);
-    let data = tempfile::tempdir().unwrap();
-    let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
-    (data, identity)
+    paired.credentials
 }
 
 /// The request timeout of the slow-link tests: short, so a whole-exchange
@@ -581,7 +577,7 @@ async fn log_of(transport: &HttpsTransport, fx: &Fixture, texts: Vec<String>) ->
 #[tokio::test(flavor = "multi_thread")]
 async fn an_events_batch_comes_compressed() {
     let fx = Fixture::start().await;
-    let (_data, identity) = paired_identity(&fx).await;
+    let identity = paired_identity(&fx).await;
     let direct =
         HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
     let texts: Vec<String> = (0..5)
@@ -630,7 +626,7 @@ async fn an_events_batch_comes_compressed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_events_body_arrives_whole() {
     let fx = Fixture::start().await;
-    let (_data, identity) = paired_identity(&fx).await;
+    let identity = paired_identity(&fx).await;
     let direct =
         HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
     let last = big_log(&direct, &fx, 5, 32 * 1024).await;
@@ -665,7 +661,7 @@ async fn a_slow_events_body_arrives_whole() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_events_body_times_out() {
     let fx = Fixture::start().await;
-    let (_data, identity) = paired_identity(&fx).await;
+    let identity = paired_identity(&fx).await;
     let direct =
         HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
     big_log(&direct, &fx, 5, 32 * 1024).await;
@@ -727,8 +723,7 @@ async fn workdir_reads_reach_a_real_server() {
     let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
         .await
         .unwrap();
-    let data = tempfile::tempdir().unwrap();
-    let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
+    let identity = paired.credentials;
     let transport =
         HttpsTransport::new(&paired.address, &identity, config(), ExpectedRun::default()).unwrap();
 
@@ -868,8 +863,7 @@ async fn a_paired_device_tells_identity_faults_from_transient_ones() {
     let paired = pair(&by_name, &code, &fx.fingerprint(), "laptop", &config())
         .await
         .unwrap();
-    let data = tempfile::tempdir().unwrap();
-    let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
+    let identity = paired.credentials;
 
     let named = HttpsTransport::new(&by_name, &identity, config(), ExpectedRun::default()).unwrap();
     named.hello(None).await.unwrap();
@@ -960,7 +954,7 @@ async fn bad_input_is_reported_on_the_pairing_screen() {
             reason: PairError::InvalidCode.to_string(),
         }
     );
-    assert!(FileIdentity::load(data.path()).unwrap().is_none());
+    assert!(Pairing::load(data.path()).unwrap().is_none());
 }
 
 /// The reply to an adopting `CreateSession` waits for the server's import;

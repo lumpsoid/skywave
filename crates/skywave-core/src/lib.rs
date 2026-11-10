@@ -13,7 +13,8 @@
 //! - [`store`]: the local replica (SQLite) — events, session projection,
 //!   outbox, cursor, blobs, settings.
 //! - [`projection`]: the pure fold from events to session summaries.
-//! - [`identity`]: the device's pairing credentials behind [`Identity`].
+//! - [`identity`]: the device's pairing — its credentials behind
+//!   [`Identity`] and the server's addresses — as one stored record.
 //! - [`transport`]: the [`Transport`] trait to the server and its typed
 //!   errors; [`HttpsTransport`] is the mTLS implementation.
 //! - blob downloads ([`blob_dir`]) follow the [`BlobPolicy`] apart from
@@ -53,7 +54,7 @@ pub mod view;
 pub mod workdir;
 
 pub use action::{Action, Route};
-pub use address::{AddressError, DEFAULT_PORT, ServerAddress};
+pub use address::{AddressError, DEFAULT_PORT, ServerAddress, ServerAddresses};
 pub use backoff::{Backoff, Jitter};
 pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
@@ -63,7 +64,7 @@ pub use engine::{
     default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
-pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
+pub use identity::{DeviceKey, Identity, IdentityError, PairedCredentials, Pairing};
 pub use lines::LineIndex;
 pub use lock::LockError;
 pub use login::LoginCode;
@@ -88,14 +89,15 @@ pub use view::{
     ConversationsStatus, ConversationsUnavailable, CropContent, CropView, Decision, Delivery,
     DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo, FailReason, FullView, ImportOutcome,
     ImportedEntry, Link, LinkFailure, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo,
-    PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession, PermissionMode,
-    QUESTION_TOOL, Question, QuestionAnswer, QuestionOption, QuestionPrompt, Refusal, RejectReason,
-    RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId, Screen, Seq,
-    ServerAddressesView, SessionId, SessionListView, SessionRef, SessionRow, SessionState,
-    SessionView, SettingChange, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
-    ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus, SubagentUsage, TaskId, TaskKind,
-    TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession,
-    UsageView, ViewState, WorkdirBody, WorkdirFetch, WorkdirPane, WorkdirView,
+    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession,
+    PermissionMode, QUESTION_TOOL, Question, QuestionAnswer, QuestionOption, QuestionPrompt,
+    Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule,
+    ScheduleId, Screen, Seq, ServerAddressesView, SessionId, SessionListView, SessionRef,
+    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellEnd,
+    ShellRun, ShellRunState, ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
+    SubagentUsage, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView,
+    TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirFetch, WorkdirPane,
+    WorkdirView,
 };
 pub use view::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,

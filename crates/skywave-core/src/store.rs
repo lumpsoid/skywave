@@ -28,7 +28,7 @@ use skywave_proto::{
 };
 use uuid::Uuid;
 
-use crate::address::ServerAddress;
+use crate::address::{ServerAddress, ServerAddresses};
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
@@ -698,17 +698,11 @@ pub enum BlobPolicy {
     OnDemand,
 }
 
-/// User settings kept in the replica.
+/// User settings kept in the replica. The server addresses are not among
+/// them: they belong to the pairing ([`Pairing`](crate::Pairing)).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Settings {
     pub blob_policy: BlobPolicy,
-    /// Address of the paired server; `None` before pairing.
-    pub server_address: Option<ServerAddress>,
-    /// The paired server's other addresses, left by
-    /// [`switch_to`](Settings::switch_to), to switch back to without
-    /// typing them again. Never holds `server_address`; emptied by pairing
-    /// with another server.
-    pub other_addresses: Vec<ServerAddress>,
     /// What the server's last `hello` said of itself
     /// ([`Store::set_server_facts`]); the default until one did, and again
     /// once the replica is cleared.
@@ -756,54 +750,20 @@ impl ServerFacts {
 
 impl Settings {
     /// Takes in the stored row `key` = `value`; an error if this build
-    /// cannot read the value. Keys written by a newer build are left alone.
+    /// cannot read the value. Keys written by a newer build are left alone,
+    /// as are the server addresses an older build kept here, which opening
+    /// the core moves into the pairing ([`Store::legacy_server_addresses`]).
     fn read(&mut self, key: &str, value: String) -> Result<(), StoreError> {
-        match key {
-            KEY_BLOB_POLICY => {
-                self.blob_policy = match value.as_str() {
-                    "eager" => BlobPolicy::Eager,
-                    "on_demand" => BlobPolicy::OnDemand,
-                    _ => {
-                        return Err(
-                            bad_value(1, Type::Text, format!("blob policy {value:?}")).into()
-                        );
-                    }
+        if key == KEY_BLOB_POLICY {
+            self.blob_policy = match value.as_str() {
+                "eager" => BlobPolicy::Eager,
+                "on_demand" => BlobPolicy::OnDemand,
+                _ => {
+                    return Err(bad_value(1, Type::Text, format!("blob policy {value:?}")).into());
                 }
             }
-            KEY_SERVER_ADDRESS => {
-                self.server_address = Some(
-                    ServerAddress::parse(&value)
-                        .map_err(|e| bad_value(1, Type::Text, format!("server address: {e}")))?,
-                );
-            }
-            KEY_OTHER_ADDRESSES => {
-                self.other_addresses = serde_json::from_str(&value)
-                    .map_err(|_| bad_value(1, Type::Text, format!("server addresses {value:?}")))?;
-            }
-            _ => {}
         }
         Ok(())
-    }
-
-    /// Makes `address` the server address. The one it replaces joins
-    /// [`other_addresses`](Settings::other_addresses) at the end, and
-    /// `address` leaves them; nothing changes if it is already the one.
-    pub fn switch_to(&mut self, address: &ServerAddress) {
-        if self.server_address.as_ref() == Some(address) {
-            return;
-        }
-        self.other_addresses.retain(|other| other != address);
-        if let Some(old) = self.server_address.replace(address.clone()) {
-            self.other_addresses.push(old);
-        }
-    }
-
-    /// Drops `address` from [`other_addresses`](Settings::other_addresses);
-    /// `false` if it was not there (the server address never is).
-    pub fn forget(&mut self, address: &ServerAddress) -> bool {
-        let before = self.other_addresses.len();
-        self.other_addresses.retain(|other| other != address);
-        self.other_addresses.len() != before
     }
 
     /// Whether [`read`](Settings::read) takes the row in.
@@ -1527,18 +1487,17 @@ impl Store {
         Ok(blobs)
     }
 
-    /// Makes the replica a fresh one for the server at `address`, in one
+    /// Makes the replica a fresh one for another server, in one
     /// transaction: the event log, session summaries, cursor, outbox,
     /// stored workdir answers and blob rows the old server produced go, as
     /// do its device names, offered models and everything its `hello` said
     /// ([`ServerFacts`]), and so does what this device kept beside them —
     /// drafts, composer modes, read marks, locally deleted sessions and
-    /// alerted approvals. Of the settings, the server address becomes
-    /// `address` and the old server's other addresses go; the blob policy,
-    /// a preference of this device, stays, as do keys a newer build wrote.
-    /// Snippets, this device's too, stay. Returns the blobs that were
-    /// known, whose files the caller removes.
-    pub fn reset_for_server(&mut self, address: &ServerAddress) -> Result<Vec<BlobId>, StoreError> {
+    /// alerted approvals. The settings — the blob policy, a preference of
+    /// this device, and keys a newer build wrote — stay, as do snippets,
+    /// this device's too. Returns the blobs that were known, whose files
+    /// the caller removes.
+    pub fn reset_for_server(&mut self) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
         let blobs = {
             let mut stmt = tx.prepare("SELECT id FROM blobs ORDER BY id")?;
@@ -1553,9 +1512,6 @@ impl Store {
              DELETE FROM deleted_sessions;
              DELETE FROM alerted_approvals;",
         )?;
-        // The old server's other addresses lead to it, not to the new one.
-        put_setting_in(&tx, KEY_OTHER_ADDRESSES, None)?;
-        put_setting_in(&tx, KEY_SERVER_ADDRESS, Some(&address.to_string()))?;
         tx.commit()?;
         Ok(blobs)
     }
@@ -2242,40 +2198,47 @@ impl Store {
         self.put_setting(KEY_BLOB_POLICY, Some(value))
     }
 
-    pub fn set_server_address(&self, address: Option<&ServerAddress>) -> Result<(), StoreError> {
-        let value = address.map(ServerAddress::to_string);
-        self.put_setting(KEY_SERVER_ADDRESS, value.as_deref())
+    /// The server addresses an older build kept among the settings, before
+    /// they moved into the pairing ([`Pairing`](crate::Pairing)); `None`
+    /// without a current address that parses. Read leniently, as only the
+    /// move to the pairing reads them: an address that does not parse is
+    /// left out, with the reason logged.
+    pub(crate) fn legacy_server_addresses(&self) -> Result<Option<ServerAddresses>, StoreError> {
+        let stored = |key: &str| -> rusqlite::Result<Option<String>> {
+            self.conn
+                .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                    Ok(row.get_ref(0)?.as_str().ok().map(str::to_owned))
+                })
+                .optional()
+                .map(Option::flatten)
+        };
+        let parse = |text: &str| {
+            ServerAddress::parse(text)
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "dropping a stored server address that does not parse");
+                })
+                .ok()
+        };
+        let Some(current) = stored(KEY_SERVER_ADDRESS)?.as_deref().and_then(parse) else {
+            return Ok(None);
+        };
+        let others = stored(KEY_OTHER_ADDRESSES)?
+            .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+            .unwrap_or_default();
+        Ok(Some(ServerAddresses::with_others(
+            current,
+            others.iter().filter_map(|text| parse(text)),
+        )))
     }
 
-    /// Makes `address` the server address, keeping the one it replaces
-    /// among the others ([`Settings::switch_to`]), in one transaction.
-    pub fn switch_server_address(&self, address: &ServerAddress) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let mut settings = self.settings()?;
-        settings.switch_to(address);
-        self.set_server_address(Some(address))?;
-        self.put_other_addresses(&settings.other_addresses)?;
-        tx.commit()?;
+    /// Drops the settings rows [`legacy_server_addresses`](Store::legacy_server_addresses)
+    /// reads, once the pairing holds what they said.
+    pub(crate) fn drop_legacy_server_addresses(&self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM settings WHERE key IN (?1, ?2)",
+            [KEY_SERVER_ADDRESS, KEY_OTHER_ADDRESSES],
+        )?;
         Ok(())
-    }
-
-    /// Drops `address` from the server's other addresses
-    /// ([`Settings::forget`]).
-    pub fn forget_server_address(&self, address: &ServerAddress) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let mut settings = self.settings()?;
-        if settings.forget(address) {
-            self.put_other_addresses(&settings.other_addresses)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn put_other_addresses(&self, addresses: &[ServerAddress]) -> Result<(), StoreError> {
-        self.put_setting(
-            KEY_OTHER_ADDRESSES,
-            other_addresses_json(addresses).as_deref(),
-        )
     }
 
     /// Keeps what the server's `hello` said of itself, replacing all it
@@ -2319,15 +2282,18 @@ fn put_setting_in(conn: &Connection, key: &str, value: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// [`Settings::other_addresses`] as stored: a JSON array of canonical
-/// addresses, `None` (no row) when empty.
+/// The other addresses as an older build stored them: a JSON array of
+/// canonical addresses, `None` (no row) when empty.
 fn other_addresses_json(addresses: &[ServerAddress]) -> Option<String> {
     (!addresses.is_empty()).then(|| serde_json::to_string(addresses).expect("addresses serialize"))
 }
 
 const KEY_BLOB_POLICY: &str = "blob_policy";
+/// Where an older build kept the current server address, before it moved
+/// into the pairing ([`Store::legacy_server_addresses`]).
 const KEY_SERVER_ADDRESS: &str = "server_address";
-/// [`Settings::other_addresses`] as a JSON array; absent when empty.
+/// The server's other addresses as an older build kept them, a JSON array;
+/// absent when empty.
 const KEY_OTHER_ADDRESSES: &str = "other_server_addresses";
 
 /// Opens the database in `data_dir`, creating both if needed, unmigrated.
