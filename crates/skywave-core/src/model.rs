@@ -62,8 +62,8 @@ pub(crate) enum Effect {
     Enqueue(Command),
     SaveBlobPolicy(BlobPolicy),
     /// Switch to the address ([`Settings::switch_to`](crate::Settings::switch_to)).
-    SaveServerAddress(String),
-    ForgetServerAddress(String),
+    SaveServerAddress(ServerAddress),
+    ForgetServerAddress(ServerAddress),
     /// Keep the session's draft in that mode; `None` deletes it.
     SaveDraft((SessionId, ComposerMode), Option<Draft>),
     SaveComposerMode(SessionId, ComposerMode),
@@ -426,26 +426,29 @@ impl Model {
                 fingerprint,
             } => self.pair(address, code, fingerprint),
             Action::SetServerAddress { address } => {
-                let address = address.trim();
+                let Ok(address) = ServerAddress::parse(&address) else {
+                    return Vec::new();
+                };
                 if self.device().is_none()
-                    || self.settings.server_address.as_deref() == Some(address)
-                    || ServerAddress::parse(address).is_err()
+                    || self.settings.server_address.as_ref() == Some(&address)
                 {
                     return Vec::new();
                 }
-                self.settings.switch_to(address);
+                self.settings.switch_to(&address);
                 self.link = Link::Connecting;
                 vec![
-                    Effect::SaveServerAddress(address.to_owned()),
+                    Effect::SaveServerAddress(address),
                     Effect::Request(Request::Connect),
                 ]
             }
             Action::ForgetServerAddress { address } => {
-                let address = address.trim();
-                if !self.settings.forget(address) {
+                let Ok(address) = ServerAddress::parse(&address) else {
+                    return Vec::new();
+                };
+                if !self.settings.forget(&address) {
                     return Vec::new();
                 }
-                vec![Effect::ForgetServerAddress(address.to_owned())]
+                vec![Effect::ForgetServerAddress(address)]
             }
             Action::CreateSession {
                 workdir,
@@ -1170,18 +1173,25 @@ impl Model {
         self.place = Place::Pairing;
         self.viewing = None;
         self.subagent = None;
-        let (address, code, fingerprint) = (
-            address.trim().to_owned(),
-            code.trim().to_owned(),
-            fingerprint.trim().to_owned(),
-        );
+        let (code, fingerprint) = (code.trim().to_owned(), fingerprint.trim().to_owned());
+        let address = address.trim();
         if address.is_empty() || code.is_empty() || fingerprint.is_empty() {
             self.pairing = PairingStatus::Failed {
-                address,
+                address: address.to_owned(),
                 reason: "address, code and fingerprint are all required".into(),
             };
             return Vec::new();
         }
+        let address = match ServerAddress::parse(address) {
+            Ok(address) => address,
+            Err(error) => {
+                self.pairing = PairingStatus::Failed {
+                    address: address.to_owned(),
+                    reason: error.to_string(),
+                };
+                return Vec::new();
+            }
+        };
         self.pairing = PairingStatus::InProgress {
             address: address.clone(),
         };
@@ -1956,10 +1966,10 @@ impl Model {
         }
     }
 
-    pub(crate) fn paired(&mut self, paired: Paired, address: String) {
+    pub(crate) fn paired(&mut self, paired: Paired, address: &ServerAddress) {
         self.paired = Some(paired);
         // Another server's reset already emptied the other addresses.
-        self.settings.switch_to(&address);
+        self.settings.switch_to(address);
         self.pairing = PairingStatus::Idle;
         self.place = Place::SessionList;
         self.open = None;
@@ -1971,7 +1981,7 @@ impl Model {
     pub(crate) fn pairing_failed(&mut self, reason: String) {
         if let PairingStatus::InProgress { address } = &self.pairing {
             self.pairing = PairingStatus::Failed {
-                address: address.clone(),
+                address: address.to_string(),
                 reason,
             };
         }
@@ -4206,6 +4216,14 @@ mod tests {
         }
     }
 
+    fn addr(text: &str) -> ServerAddress {
+        text.parse().unwrap()
+    }
+
+    fn addrs(texts: &[&str]) -> Vec<ServerAddress> {
+        texts.iter().map(|text| addr(text)).collect()
+    }
+
     /// A paired model over an empty replica, plus a log builder.
     struct Fixture {
         model: Model,
@@ -4405,6 +4423,18 @@ mod tests {
             pairing(&model).status,
             PairingStatus::Failed { .. }
         ));
+        // An address that does not parse fails here, before any request.
+        let unparseable = model.dispatch(Action::Pair {
+            address: " h:p ".into(),
+            code: "123456".into(),
+            fingerprint: "ab:cd".into(),
+        });
+        assert!(unparseable.is_empty());
+        assert!(matches!(
+            &pairing(&model).status,
+            PairingStatus::Failed { address, reason }
+                if address == "h:p" && reason.contains("invalid server address")
+        ));
 
         let pair = Action::Pair {
             address: " host:7443 ".into(),
@@ -4415,13 +4445,13 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::Request(Request::Pair {
-                address: "host:7443".into(),
+                address: addr("host:7443"),
                 code: "123456".into(),
                 fingerprint: "ab:cd".into(),
             })]
         );
         let in_progress = PairingStatus::InProgress {
-            address: "host:7443".into(),
+            address: addr("host:7443"),
         };
         assert_eq!(pairing(&model).status, in_progress);
         // A second attempt while one is running is ignored.
@@ -4438,7 +4468,7 @@ mod tests {
 
         assert_eq!(model.dispatch(pair).len(), 1);
         let device = DeviceId::new();
-        model.paired(paired_as(device), "host:7443".into());
+        model.paired(paired_as(device), &addr("host:7443"));
         let view = model.view();
         assert_eq!(view.link, Link::Connecting);
         assert_eq!(
@@ -4459,7 +4489,7 @@ mod tests {
             pairing(&model).paired,
             Some(PairedInfo {
                 device_id: device,
-                server_address: Some("host:7443".into()),
+                server_address: Some(addr("host:7443")),
             })
         );
     }
@@ -6725,15 +6755,19 @@ mod tests {
         assert!(model.dispatch(set("10.0.0.7:7443")).is_empty(), "unpaired");
 
         let mut f = Fixture::paired();
-        f.model.paired(paired_as(f.me), "host:7443".into());
+        f.model.paired(paired_as(f.me), &addr("host:7443"));
         f.model.set_link(Link::Rejected(LinkRejection::Revoked));
         assert!(f.dispatch(set(" host:7443 ")).is_empty(), "unchanged");
+        assert!(
+            f.dispatch(set("HOST")).is_empty(),
+            "unchanged, spelt otherwise"
+        );
         assert!(f.dispatch(set("not an address:x")).is_empty(), "invalid");
         assert!(f.dispatch(set("  ")).is_empty(), "blank");
         assert_eq!(
             f.dispatch(set(" 10.0.0.7:7443 ")),
             vec![
-                Effect::SaveServerAddress("10.0.0.7:7443".into()),
+                Effect::SaveServerAddress(addr("10.0.0.7:7443")),
                 Effect::Request(Request::Connect),
             ]
         );
@@ -6742,8 +6776,8 @@ mod tests {
         f.dispatch(Action::Navigate(Route::Settings));
         match f.model.view().screen {
             Screen::Settings(settings) => {
-                assert_eq!(settings.server_address.as_deref(), Some("10.0.0.7:7443"));
-                assert_eq!(settings.other_addresses, ["host:7443"]);
+                assert_eq!(settings.server_address, Some(addr("10.0.0.7:7443")));
+                assert_eq!(settings.other_addresses, addrs(&["host:7443"]));
                 assert_eq!(settings.device_id, Some(f.me));
             }
             other => panic!("expected settings, got {other:?}"),
@@ -6753,54 +6787,55 @@ mod tests {
     #[test]
     fn a_left_address_is_kept_to_switch_back_to_or_forget() {
         let mut f = Fixture::paired();
-        f.model.paired(paired_as(f.me), "home:7443".into());
+        f.model.paired(paired_as(f.me), &addr("home:7443"));
         f.dispatch(Action::SetServerAddress {
             address: "vpn:7443".into(),
         });
         f.dispatch(Action::SetServerAddress {
             address: "public:7443".into(),
         });
-        assert_eq!(f.model.settings.other_addresses, ["home:7443", "vpn:7443"]);
-
-        f.dispatch(Action::SetServerAddress {
-            address: "home:7443".into(),
-        });
-        assert_eq!(
-            f.model.settings.server_address.as_deref(),
-            Some("home:7443")
-        );
         assert_eq!(
             f.model.settings.other_addresses,
-            ["vpn:7443", "public:7443"]
+            addrs(&["home:7443", "vpn:7443"])
+        );
+
+        // Back to one under another spelling: the same address, not a new one.
+        f.dispatch(Action::SetServerAddress {
+            address: "HOME".into(),
+        });
+        assert_eq!(f.model.settings.server_address, Some(addr("home:7443")));
+        assert_eq!(
+            f.model.settings.other_addresses,
+            addrs(&["vpn:7443", "public:7443"])
         );
 
         // Pairing again at a new address keeps the one it leaves.
-        f.model.paired(paired_as(f.me), "lan:7443".into());
+        f.model.paired(paired_as(f.me), &addr("lan:7443"));
         assert_eq!(
             f.model.settings.other_addresses,
-            ["vpn:7443", "public:7443", "home:7443"]
+            addrs(&["vpn:7443", "public:7443", "home:7443"])
         );
 
         let forget = |address: &str| Action::ForgetServerAddress {
             address: address.into(),
         };
-        assert!(f.dispatch(forget("lan:7443")).is_empty(), "the current one");
+        assert!(f.dispatch(forget("LAN")).is_empty(), "the current one");
         assert!(f.dispatch(forget("other:7443")).is_empty(), "not kept");
         assert_eq!(
-            f.dispatch(forget(" vpn:7443 ")),
-            vec![Effect::ForgetServerAddress("vpn:7443".into())]
+            f.dispatch(forget(" VPN ")),
+            vec![Effect::ForgetServerAddress(addr("vpn:7443"))]
         );
         assert_eq!(
             f.model.settings.other_addresses,
-            ["public:7443", "home:7443"]
+            addrs(&["public:7443", "home:7443"])
         );
 
         f.dispatch(Action::Navigate(Route::ServerAddresses));
         assert_eq!(
             f.model.view().screen,
             Screen::ServerAddresses(ServerAddressesView {
-                current: Some("lan:7443".into()),
-                others: vec!["public:7443".into(), "home:7443".into()],
+                current: Some(addr("lan:7443")),
+                others: addrs(&["public:7443", "home:7443"]),
             })
         );
     }
@@ -11802,7 +11837,7 @@ mod tests {
                 let core = Core::open_detached(dir.path()).unwrap();
                 let seam = core.seam();
                 let requests = seam.take_requests().unwrap();
-                seam.pairing_succeeded("srv:7443", credentials("CA"))
+                seam.pairing_succeeded(&"srv:7443".parse().unwrap(), credentials("CA"))
                     .unwrap();
                 let session = SessionId::new();
                 seam.apply_events(&EventBatch {
@@ -12610,7 +12645,7 @@ mod tests {
                 session_id: live.session,
             });
             live.seam
-                .pairing_succeeded("other:7443", credentials("ANOTHER CA"))
+                .pairing_succeeded(&"other:7443".parse().unwrap(), credentials("ANOTHER CA"))
                 .unwrap();
             live.seam
                 .workdir_answered(req, ask, Ok(changes(Vec::new())))

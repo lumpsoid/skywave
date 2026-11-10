@@ -122,6 +122,7 @@ use skywave_proto::{EventsQuery, Seq};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::address::ServerAddress;
 use crate::backoff::Backoff;
 use crate::blobs::{BlobCtx, BlobQueue, run_downloader};
 use crate::client::CoreError;
@@ -201,7 +202,7 @@ impl Default for EngineConfig {
 }
 
 type Connect = dyn Fn(
-        &str,
+        &ServerAddress,
         &dyn Identity,
         &TransportConfig,
         &ExpectedRun,
@@ -209,7 +210,7 @@ type Connect = dyn Fn(
     + Send
     + Sync;
 
-/// Builds the [`Transport`] to the server at an address (`host:port`) for
+/// Builds the [`Transport`] to the server at an address for
 /// an identity, naming the run an [`ExpectedRun`] holds on every request.
 /// [`Connector::https`] by default; tests and the link harness wrap or
 /// replace it. A connector that builds an [`HttpsTransport`] must hand it
@@ -232,7 +233,7 @@ impl Connector {
 
     pub fn new(
         connect: impl Fn(
-            &str,
+            &ServerAddress,
             &dyn Identity,
             &TransportConfig,
             &ExpectedRun,
@@ -246,7 +247,7 @@ impl Connector {
 
     pub(crate) fn connect(
         &self,
-        address: &str,
+        address: &ServerAddress,
         identity: &dyn Identity,
         config: &TransportConfig,
         run: &ExpectedRun,
@@ -681,7 +682,7 @@ pub(crate) struct LinkCtx {
     pub(crate) retry_now: Arc<Notify>,
     /// Where an `Eager` policy queues the blobs a batch registers.
     pub(crate) blobs: Arc<BlobQueue>,
-    pub(crate) address: String,
+    pub(crate) address: ServerAddress,
     pub(crate) identity: Arc<dyn Identity>,
     /// Set once a connection's `hello` passes the log check.
     pub(crate) run: ExpectedRun,
@@ -1310,7 +1311,7 @@ mod tests {
         let core = Core::open_detached(dir).unwrap();
         let seam = core.seam();
         seam.pairing_succeeded(
-            "srv:7443",
+            &"srv:7443".parse().unwrap(),
             PairedCredentials {
                 device_id: DeviceId::new(),
                 device_key_pem: "KEY".into(),
@@ -1347,7 +1348,7 @@ mod tests {
         bound.apply_events(&batch(1)).unwrap();
 
         seam.pairing_succeeded(
-            "other:7443",
+            &"other:7443".parse().unwrap(),
             PairedCredentials {
                 device_id: DeviceId::new(),
                 device_key_pem: "KEY".into(),
@@ -1403,7 +1404,7 @@ mod tests {
             outbox: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
-            address: "srv:7443".into(),
+            address: "srv:7443".parse().unwrap(),
             identity: seam.identity().unwrap(),
             run: ExpectedRun::default(),
         };
@@ -1534,7 +1535,7 @@ mod tests {
             outbox: Arc::new(Notify::new()),
             retry_now: retry_now.clone(),
             blobs: Arc::new(BlobQueue::default()),
-            address: "srv:7443".into(),
+            address: "srv:7443".parse().unwrap(),
             identity: seam.identity().unwrap(),
             run: ExpectedRun::default(),
         };
@@ -1802,7 +1803,7 @@ mod tests {
             outbox: Arc::new(Notify::new()),
             retry_now,
             blobs: Arc::new(BlobQueue::default()),
-            address: "srv:7443".into(),
+            address: "srv:7443".parse().unwrap(),
             identity: seam.identity().unwrap(),
             run: ExpectedRun::default(),
         }
@@ -1898,6 +1899,55 @@ mod tests {
             "connected {waited:?} after resume"
         );
         assert_eq!(links.lock().unwrap().first(), Some(&Link::Connecting));
+        engine.abort();
+    }
+
+    /// A server address stored before the settings parsed it, that does
+    /// not parse, is dropped when the replica opens: the engine has no
+    /// address to try, rather than one that fails as unreachable forever.
+    #[tokio::test(start_paused = true)]
+    async fn an_unparseable_stored_address_is_never_connected_to() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(crate::Store::open(dir.path()).unwrap());
+        let db = rusqlite::Connection::open(dir.path().join(crate::store::DB_FILE)).unwrap();
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES ('server_address', 'host:port')",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(db);
+        crate::identity::FileIdentity::save(
+            dir.path(),
+            PairedCredentials {
+                device_id: DeviceId::new(),
+                device_key_pem: "KEY".into(),
+                device_cert_pem: "CERT".into(),
+                ca_cert_pem: "CA".into(),
+            },
+        )
+        .unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
+        let seam = core.seam();
+        assert_eq!(seam.settings().unwrap().server_address, None);
+
+        let connects = Arc::new(AtomicUsize::new(0));
+        let counted = connects.clone();
+        let config = EngineConfig {
+            connector: Connector::new(move |_, _, _, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::Unreachable("no server here".into()))
+            }),
+            ..EngineConfig::default()
+        };
+        let (requests, requests_rx) = mpsc::unbounded_channel();
+        let (_suspended, suspended_rx) = watch::channel(false);
+        let engine =
+            tokio::spawn(Engine::new(seam.clone(), config, requests_rx, suspended_rx).run());
+        requests.send(Request::Connect).unwrap();
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(connects.load(Ordering::SeqCst), 0, "never tried");
         engine.abort();
     }
 
@@ -2134,7 +2184,7 @@ mod tests {
             outbox: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
-            address: "srv:7443".into(),
+            address: "srv:7443".parse().unwrap(),
             identity: seam.identity().unwrap(),
             run: ExpectedRun::default(),
         }

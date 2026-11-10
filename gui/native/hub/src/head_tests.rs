@@ -636,7 +636,7 @@ impl Rig {
         .unwrap();
         let me = DeviceId::new();
         seam.pairing_succeeded(
-            "srv:7443",
+            &"srv:7443".parse().unwrap(),
             PairedCredentials {
                 device_id: me,
                 device_key_pem: "KEY".into(),

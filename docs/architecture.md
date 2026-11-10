@@ -744,6 +744,15 @@ D9. The server owns a CA; every device holds a certificate it signed.
   same CA replaces, is kept among the server's other addresses
   (`Settings::other_addresses`, a setting of the replica), to switch back
   to in one step or forget. Pairing with another server drops them.
+  The core parses an address once, where it comes in (`Action::Pair`,
+  `SetServerAddress`, the pairing URI), into a `ServerAddress`, and
+  carries that type from there on: settings, the pairing request, the
+  transport. Equality is on its canonical form (lowercase name, port
+  filled in, IPv6 bracketed), so `MyHost` and `myhost:7443` are one
+  address, and that form is what the replica stores. Schema 29
+  canonicalised the addresses stored before, dropping (with a logged
+  reason) any that did not parse; a stored one that does not parse makes
+  the replica unreadable rather than an address the link retries forever.
 - The device key and certificate live in the core's data directory behind
   the `Identity` trait, so a platform keystore can replace it.
 

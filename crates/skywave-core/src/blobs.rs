@@ -169,6 +169,7 @@ use skywave_proto::ContentHash;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, OnceCell};
 
+use crate::address::ServerAddress;
 use crate::client::{BlobLease, CoreError, lock};
 use crate::engine::EngineConfig;
 use crate::identity::Identity;
@@ -899,7 +900,7 @@ impl Drop for Claim<'_> {
 pub(crate) struct BlobCtx {
     pub(crate) seam: Seam,
     pub(crate) config: Arc<EngineConfig>,
-    pub(crate) address: String,
+    pub(crate) address: ServerAddress,
     pub(crate) identity: Arc<dyn Identity>,
     /// The link's; the downloader only reads it.
     pub(crate) run: ExpectedRun,
@@ -1731,7 +1732,7 @@ mod tests {
             let core = Core::open_detached(dir.path()).unwrap();
             let seam = core.seam();
             seam.pairing_succeeded(
-                "srv:7443",
+                &"srv:7443".parse().unwrap(),
                 PairedCredentials {
                     device_id: DeviceId::new(),
                     device_key_pem: "KEY".into(),
@@ -1815,7 +1816,7 @@ mod tests {
                     }),
                     ..EngineConfig::default()
                 }),
-                address: "srv:7443".into(),
+                address: "srv:7443".parse().unwrap(),
                 identity: self.seam.identity().unwrap(),
                 run: ExpectedRun::default(),
                 queue: self.queue.clone(),

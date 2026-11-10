@@ -99,8 +99,12 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         },
         Screen::Settings(settings) => settings_view(settings, view, ui.stay_connected, ui.wall_ms),
         Screen::ServerAddresses(view) => ScreenView::ServerAddresses {
-            current: view.current.clone().unwrap_or_default(),
-            others: view.others.clone(),
+            current: view
+                .current
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            others: view.others.iter().map(ToString::to_string).collect(),
         },
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
@@ -140,7 +144,10 @@ fn pairing_view(pairing: &PairingView, form: &PairForm) -> ScreenView {
         PairingStatus::Idle => (PairingState::Idle, None),
         PairingStatus::InProgress { address } => (
             PairingState::InProgress,
-            Some(format!("pairing with {}…", clean_line(address))),
+            Some(format!(
+                "pairing with {}…",
+                clean_line(&address.to_string())
+            )),
         ),
         PairingStatus::Failed { address, reason } => (
             PairingState::Failed,
@@ -156,7 +163,8 @@ fn pairing_view(pairing: &PairingView, form: &PairForm) -> ScreenView {
         paired_server: pairing
             .paired
             .as_ref()
-            .and_then(|p| p.server_address.clone()),
+            .and_then(|p| p.server_address.as_ref())
+            .map(ToString::to_string),
         state,
         status_label,
         form: form.clone(),
@@ -863,8 +871,8 @@ fn settings_view(
         blob_policy_label: blob_policy_label.to_owned(),
         server: settings
             .server_address
-            .clone()
-            .unwrap_or_else(|| "not paired".to_owned()),
+            .as_ref()
+            .map_or_else(|| "not paired".to_owned(), ToString::to_string),
         server_addresses: settings
             .device_id
             .map(|_| server_addresses_label(settings.other_addresses.len())),

@@ -27,6 +27,7 @@ pub use skywave_proto::{LimitSeverity, LimitWindow, UsageLimit, UsageLimitsResul
 
 pub use crate::projection::{SessionUsage, TurnRecord};
 
+use crate::address::ServerAddress;
 use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
 
 /// One full snapshot of everything a head shows. Pushed whole after every
@@ -607,7 +608,7 @@ pub struct PairingView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairedInfo {
     pub device_id: DeviceId,
-    pub server_address: Option<String>,
+    pub server_address: Option<ServerAddress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,8 +616,9 @@ pub enum PairingStatus {
     /// Waiting for the user to enter address, code and fingerprint.
     Idle,
     InProgress {
-        address: String,
+        address: ServerAddress,
     },
+    /// The address as typed: it may be what failed to parse.
     Failed {
         address: String,
         reason: String,
@@ -1892,10 +1894,10 @@ pub struct Answer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerAddressesView {
     /// The address the link uses.
-    pub current: Option<String>,
+    pub current: Option<ServerAddress>,
     /// The same server's other addresses, in the order they were left
     /// ([`Settings::other_addresses`](crate::Settings::other_addresses)).
-    pub others: Vec<String>,
+    pub others: Vec<ServerAddress>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1904,10 +1906,10 @@ pub struct SettingsView {
     /// Blob downloads, `Eager` ones included, are paused because this
     /// device's disk is full ([`Pause::DiskFull`]).
     pub blobs_disk_full: bool,
-    pub server_address: Option<String>,
+    pub server_address: Option<ServerAddress>,
     /// The same server's other addresses, to switch to
     /// ([`Settings::other_addresses`](crate::Settings::other_addresses)).
-    pub other_addresses: Vec<String>,
+    pub other_addresses: Vec<ServerAddress>,
     pub device_id: Option<DeviceId>,
     /// The fingerprint of the server CA pinned at pairing, to compare with
     /// what `skywaved` prints; `None` if unknown.

@@ -8,8 +8,8 @@ use chrono::{TimeZone, Utc};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
-    OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen, ServerFacts, Settings,
-    Snippet, SnippetId, Store, StoreError,
+    OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen, ServerAddress,
+    ServerFacts, Settings, Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
@@ -132,6 +132,10 @@ impl Log {
             events: self.events[range].to_vec(),
         }
     }
+}
+
+fn addr(text: &str) -> ServerAddress {
+    ServerAddress::parse(text).unwrap()
 }
 
 fn data_dir() -> (tempfile::TempDir, PathBuf) {
@@ -389,7 +393,7 @@ fn reopen_restores_state() {
         store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
         store.set_blob_policy(BlobPolicy::Eager).unwrap();
         store
-            .set_server_address(Some("skywave.example:7443"))
+            .set_server_address(Some(&addr("skywave.example:7443")))
             .unwrap();
         store
             .set_blob_status(
@@ -410,8 +414,8 @@ fn reopen_restores_state() {
     assert_eq!(snapshot.sessions.len(), 2);
     assert_eq!(snapshot.settings.blob_policy, BlobPolicy::Eager);
     assert_eq!(
-        snapshot.settings.server_address.as_deref(),
-        Some("skywave.example:7443")
+        snapshot.settings.server_address,
+        Some(addr("skywave.example:7443"))
     );
 
     store.set_server_address(None).unwrap();
@@ -423,20 +427,27 @@ fn switching_the_server_address_keeps_the_old_one_until_forgotten() {
     let (_tmp, dir) = data_dir();
     {
         let store = Store::open(&dir).unwrap();
-        store.switch_server_address("home:7443").unwrap();
-        store.switch_server_address("vpn:7443").unwrap();
-        store.switch_server_address("public:7443").unwrap();
-        store.switch_server_address("home:7443").unwrap();
+        store.switch_server_address(&addr("home:7443")).unwrap();
+        store.switch_server_address(&addr("vpn:7443")).unwrap();
+        store.switch_server_address(&addr("public:7443")).unwrap();
+        // The same address spelt otherwise: not a fourth one.
+        store.switch_server_address(&addr("HOME")).unwrap();
     }
     let store = Store::open(&dir).unwrap();
     let settings = store.settings().unwrap();
-    assert_eq!(settings.server_address.as_deref(), Some("home:7443"));
-    assert_eq!(settings.other_addresses, ["vpn:7443", "public:7443"]);
+    assert_eq!(settings.server_address, Some(addr("home:7443")));
+    assert_eq!(
+        settings.other_addresses,
+        [addr("vpn:7443"), addr("public:7443")]
+    );
 
-    store.forget_server_address("home:7443").unwrap();
-    store.forget_server_address("vpn:7443").unwrap();
-    assert_eq!(store.settings().unwrap().other_addresses, ["public:7443"]);
-    store.forget_server_address("public:7443").unwrap();
+    store.forget_server_address(&addr("home:7443")).unwrap();
+    store.forget_server_address(&addr("vpn:7443")).unwrap();
+    assert_eq!(
+        store.settings().unwrap().other_addresses,
+        [addr("public:7443")]
+    );
+    store.forget_server_address(&addr("public:7443")).unwrap();
     assert!(store.settings().unwrap().other_addresses.is_empty());
 }
 
@@ -846,7 +857,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -864,7 +875,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     store.apply_batch(&later, Utc::now()).unwrap();
     assert_eq!(turns(&store).len(), 1);
 
-    store.reset_for_server("other:7443").unwrap();
+    store.reset_for_server(&addr("other:7443")).unwrap();
     assert!(turns(&store).is_empty());
 }
 
@@ -976,7 +987,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1650,7 +1661,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -1787,7 +1798,7 @@ fn the_usage_limits_answer_is_kept_until_the_replica_is_reset() {
         store.load().unwrap().usage_limits,
         Some(usage_limits_read())
     );
-    store.reset_for_server("other:7443").unwrap();
+    store.reset_for_server(&addr("other:7443")).unwrap();
     assert_eq!(store.usage_limits().unwrap(), None);
 }
 
@@ -1819,7 +1830,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -1960,7 +1971,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
     drop(store);
 
     // A replica from before the column: the migration derives it from the log.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
     let store = Store::open(&dir).unwrap();
     assert_eq!(order(&store), vec![c, b, a]);
     assert_eq!(store.session(c).unwrap().unwrap().last_message_seq, Seq(5));
@@ -1970,11 +1981,12 @@ const AGENT: ComposerMode = ComposerMode::Agent;
 const SHELL: ComposerMode = ComposerMode::Shell;
 
 /// Rewinds the schema to `version`. A rewind past the list-order column's
-/// migration reruns it, so this undoes it here; the last one, moving the
-/// server facts, reruns over a current schema as is.
+/// migration reruns it, so this undoes it here; the last two, moving the
+/// server facts and canonicalizing the server addresses, rerun over a
+/// current schema as is.
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
-    if version < skywave_core::store::SCHEMA_VERSION - 1 {
+    if version < skywave_core::store::SCHEMA_VERSION - 2 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN last_message_seq;")
             .unwrap();
     }
@@ -1996,7 +2008,7 @@ fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
         ))
         .unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 1);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 2);
     };
     let settings_keys = |dir: &Path| -> Vec<String> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2045,6 +2057,102 @@ fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
         .query_row("SELECT COUNT(*) FROM server_facts", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0, "no hello, no row");
+}
+
+/// The schema before the settings parsed the server address kept it as
+/// written: `SetServerAddress` saved it as typed. The migration rewrites
+/// every address to its canonical form, drops the ones that do not parse
+/// and the others that repeat one, so each address is stored once.
+#[test]
+fn the_migration_canonicalizes_the_stored_server_addresses() {
+    let previous_schema = |dir: &Path, rows: &str| {
+        drop(Store::open(dir).unwrap());
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        conn.execute_batch(rows).unwrap();
+        drop(conn);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 1);
+    };
+    let stored = |dir: &Path| -> Vec<(String, String)> {
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, value FROM settings
+                 WHERE key IN ('server_address', 'other_server_addresses') ORDER BY key",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+
+    let (_tmp, dir) = data_dir();
+    previous_schema(
+        &dir,
+        r#"INSERT INTO settings (key, value) VALUES
+            ('server_address', ' MyHost '),
+            ('other_server_addresses',
+             '["myhost:7443", "VPN.example", "h:p", "vpn.example:7443", "[fd00::7]"]');"#,
+    );
+    let settings = Store::open(&dir).unwrap().settings().unwrap();
+    assert_eq!(settings.server_address, Some(addr("myhost:7443")));
+    assert_eq!(
+        settings.other_addresses,
+        [addr("vpn.example:7443"), addr("[fd00::7]:7443")],
+        "the current one, the repeat and the unparseable one go"
+    );
+    assert_eq!(
+        stored(&dir),
+        [
+            (
+                "other_server_addresses".to_owned(),
+                r#"["vpn.example:7443","[fd00::7]:7443"]"#.to_owned()
+            ),
+            ("server_address".to_owned(), "myhost:7443".to_owned()),
+        ]
+    );
+
+    // Nothing usable: both rows go, and the device has no address to try.
+    let (_tmp, dir) = data_dir();
+    previous_schema(
+        &dir,
+        r#"INSERT INTO settings (key, value) VALUES
+            ('server_address', 'host:'),
+            ('other_server_addresses', '["h:p"]');"#,
+    );
+    let settings = Store::open(&dir).unwrap().settings().unwrap();
+    assert_eq!(settings.server_address, None);
+    assert!(settings.other_addresses.is_empty());
+    assert!(stored(&dir).is_empty());
+
+    let (_tmp, dir) = data_dir();
+    previous_schema(
+        &dir,
+        "INSERT INTO settings (key, value) VALUES ('other_server_addresses', 'not json');",
+    );
+    assert_eq!(
+        Store::open(&dir).unwrap().settings().unwrap(),
+        Settings::default()
+    );
+    assert!(stored(&dir).is_empty());
+}
+
+/// Past the migration every stored address is canonical; one that does not
+/// parse (written by hand, say) makes the replica unreadable, which only a
+/// reset gets past, rather than an address the link tries forever.
+#[test]
+fn a_stored_server_address_that_does_not_parse_is_unreadable() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    store.switch_server_address(&addr("myhost:7443")).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute(
+        "UPDATE settings SET value = 'host:port' WHERE key = 'server_address'",
+        [],
+    )
+    .unwrap();
+    let err = store.settings().unwrap_err();
+    assert!(err.unreadable(), "{err}");
 }
 
 #[test]
@@ -2519,7 +2627,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     let ca = ca_pem();
     let core = Core::open_detached(&dir).unwrap();
     let seam = core.seam();
-    seam.pairing_succeeded("old.example:7443", paired_with(&ca))
+    seam.pairing_succeeded(&addr("old.example:7443"), paired_with(&ca))
         .unwrap();
     seam.apply_events(&log.batch(1, 7)).unwrap();
 
@@ -2545,11 +2653,15 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     store.set_draft(log.a, AGENT, Some(&draft)).unwrap();
     store.set_composer_mode(log.a, ComposerMode::Shell).unwrap();
     seam.hello_received(&hello_saying(every_fact())).unwrap();
-    store.switch_server_address("vpn.example:7443").unwrap();
-    store.switch_server_address("old.example:7443").unwrap();
+    store
+        .switch_server_address(&addr("vpn.example:7443"))
+        .unwrap();
+    store
+        .switch_server_address(&addr("old.example:7443"))
+        .unwrap();
     assert_eq!(
         store.settings().unwrap().other_addresses,
-        ["vpn.example:7443"]
+        [addr("vpn.example:7443")]
     );
     let mark = ReadMark {
         seq: Seq(3),
@@ -2572,14 +2684,14 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     assert!(rows.iter().all(|(_, n)| *n > 0), "{rows:?}");
 
     // Again with the same server, e.g. after a revocation: all kept.
-    seam.pairing_succeeded("old.example:7443", paired_with(&ca))
+    seam.pairing_succeeded(&addr("old.example:7443"), paired_with(&ca))
         .unwrap();
     assert_eq!(store.load().unwrap(), before);
     assert_eq!(server_rows(&dir), rows);
     assert!(blob_file.exists());
 
     // Another server: nothing of the old one is left.
-    seam.pairing_succeeded("new.example:7443", paired_with(&ca_pem()))
+    seam.pairing_succeeded(&addr("new.example:7443"), paired_with(&ca_pem()))
         .unwrap();
     let rows = server_rows(&dir);
     assert!(rows.iter().all(|(_, n)| *n == 0), "{rows:?}");
@@ -2589,7 +2701,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
         after.settings,
         Settings {
             blob_policy: BlobPolicy::Eager,
-            server_address: Some("new.example:7443".into()),
+            server_address: Some(addr("new.example:7443")),
             other_addresses: Vec::new(),
             server: ServerFacts::default(),
         },
@@ -2746,7 +2858,7 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
         )
         .unwrap();
     store.mark_alerted(&[(a, w)]).unwrap();
-    store.reset_for_server("other:7443").unwrap();
+    store.reset_for_server(&addr("other:7443")).unwrap();
     assert!(store.alerted().unwrap().is_empty());
 }
 
@@ -2885,7 +2997,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -3012,7 +3124,7 @@ fn device_names_survive_a_reopen_and_go_with_the_server() {
     assert_eq!(devices[&laptop], "laptop");
     assert_eq!(devices[&phone], "Pixel 8");
 
-    store.reset_for_server("other:7443").unwrap();
+    store.reset_for_server(&addr("other:7443")).unwrap();
     assert!(store.devices().unwrap().is_empty());
 }
 
@@ -3049,7 +3161,7 @@ fn snippets_survive_a_reopen_and_a_new_server() {
     snippets.sort_by_key(|s| s.used);
     assert_eq!(snippets, [plain.clone(), renamed]);
 
-    store.reset_for_server("other:7443").unwrap();
+    store.reset_for_server(&addr("other:7443")).unwrap();
     store.delete_snippet(named.id).unwrap();
     assert_eq!(store.snippets().unwrap(), [plain], "a device preference");
 }
@@ -3353,7 +3465,7 @@ fn a_hello_keeps_the_agent_login_until_another_server_is_paired() {
     let (_tmp, dir) = data_dir();
     let core = Core::open_detached(&dir).unwrap();
     let seam = core.seam();
-    seam.pairing_succeeded("old.example:7443", paired_with(&ca_pem()))
+    seam.pairing_succeeded(&addr("old.example:7443"), paired_with(&ca_pem()))
         .unwrap();
     let kept = |offered: bool, logged_out: bool| {
         let settings = Store::open(&dir).unwrap().settings().unwrap();
@@ -3383,7 +3495,7 @@ fn a_hello_keeps_the_agent_login_until_another_server_is_paired() {
         .unwrap();
     kept(true, true);
 
-    seam.pairing_succeeded("new.example:7443", paired_with(&ca_pem()))
+    seam.pairing_succeeded(&addr("new.example:7443"), paired_with(&ca_pem()))
         .unwrap();
     kept(false, false);
 }
@@ -3431,7 +3543,7 @@ fn an_agent_login_stores_its_outcome_and_never_its_url_or_code() {
     let core = Core::open_detached(&dir).unwrap();
     let seam = core.seam();
     let requests = seam.take_requests().unwrap();
-    seam.pairing_succeeded("srv.example:7443", paired_with(&ca_pem()))
+    seam.pairing_succeeded(&addr("srv.example:7443"), paired_with(&ca_pem()))
         .unwrap();
     seam.hello_received(&hello_with_agent_login(true, true))
         .unwrap();
@@ -3525,7 +3637,7 @@ fn pairing_with_another_server_forgets_the_agent_login() {
     let core = Core::open_detached(&dir).unwrap();
     let seam = core.seam();
     let requests = seam.take_requests().unwrap();
-    seam.pairing_succeeded("old.example:7443", paired_with(&ca_pem()))
+    seam.pairing_succeeded(&addr("old.example:7443"), paired_with(&ca_pem()))
         .unwrap();
     seam.hello_received(&hello_with_agent_login(true, true))
         .unwrap();
@@ -3552,7 +3664,7 @@ fn pairing_with_another_server_forgets_the_agent_login() {
     };
     assert!(matches!(login_flow(&core), LoginFlowView::Finishing { .. }));
 
-    seam.pairing_succeeded("new.example:7443", paired_with(&ca_pem()))
+    seam.pairing_succeeded(&addr("new.example:7443"), paired_with(&ca_pem()))
         .unwrap();
     core.dispatch(Action::Navigate(Route::Settings)).unwrap();
     assert_eq!(login_flow(&core), LoginFlowView::Idle);
@@ -3655,7 +3767,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -3878,7 +3990,7 @@ fn reset_for_server_clears_workdir_answers() {
     let d1 = diff_blob(1);
     put(&mut store, &file_ask(log.b, "x"), &file("x", &d1));
 
-    let mut blobs = store.reset_for_server("other:7443").unwrap();
+    let mut blobs = store.reset_for_server(&addr("other:7443")).unwrap();
     let mut expected = vec![log.blob.id, d1.id];
     blobs.sort();
     expected.sort();
@@ -3918,7 +4030,7 @@ fn a_workdir_answer_for_a_deleted_or_unknown_session_writes_nothing() {
     assert!(store.blob(blob.id).unwrap().unwrap().workdir);
 
     // After a re-pair, an old server's answer finds no session.
-    store.reset_for_server("other:7443").unwrap();
+    store.reset_for_server(&addr("other:7443")).unwrap();
     let written = store
         .put_workdir(&file_ask(log.b, "x"), &file("x", &blob))
         .unwrap();
@@ -3937,7 +4049,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -4064,7 +4176,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -4103,7 +4215,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -4516,7 +4628,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -4644,7 +4756,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);

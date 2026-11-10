@@ -10,9 +10,9 @@ use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
     Draft, Entry, FailReason, Fingerprint, FullView, Link, OutboxStatus, Outgoing,
-    PairedCredentials, PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam, SessionView,
-    SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError,
-    TimelineItem, ViewState,
+    PairedCredentials, PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam, ServerAddress,
+    SessionView, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store,
+    StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
@@ -20,6 +20,10 @@ use skywave_proto::{
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
+
+fn addr(text: &str) -> ServerAddress {
+    ServerAddress::parse(text).unwrap()
+}
 
 #[test]
 fn view_state_is_owned_clone_and_send() {
@@ -81,7 +85,7 @@ fn paired_core(dir: &Path) -> (Core, Seam, Receiver<Request>, DeviceId) {
     .unwrap();
     let creds = credentials();
     let device = creds.device_id;
-    seam.pairing_succeeded("srv:7443", creds).unwrap();
+    seam.pairing_succeeded(&addr("srv:7443"), creds).unwrap();
     drain(&requests);
     (core, seam, requests, device)
 }
@@ -126,7 +130,7 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     assert_eq!(
         drain(&requests),
         vec![Request::Pair {
-            address: "srv:7443".into(),
+            address: addr("srv:7443"),
             code: "000000".into(),
             fingerprint: "ab:cd".into(),
         }]
@@ -142,7 +146,7 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     assert_eq!(
         pairing_status(views.last()),
         PairingStatus::InProgress {
-            address: "srv:7443".into()
+            address: addr("srv:7443")
         }
     );
 
@@ -158,7 +162,7 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     core.dispatch(pair).unwrap();
     let creds = credentials();
     let device = creds.device_id;
-    seam.pairing_succeeded("srv:7443", creds).unwrap();
+    seam.pairing_succeeded(&addr("srv:7443"), creds).unwrap();
     assert_eq!(drain(&requests).last(), Some(&Request::Connect));
     let view = views.last();
     assert_eq!(view.link, Link::Connecting);
@@ -172,8 +176,8 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     let seam = core.seam();
     assert_eq!(seam.identity().unwrap().device_id(), device);
     assert_eq!(
-        seam.settings().unwrap().server_address.as_deref(),
-        Some("srv:7443")
+        seam.settings().unwrap().server_address,
+        Some(addr("srv:7443"))
     );
 }
 
@@ -202,13 +206,13 @@ fn a_new_server_address_reconnects_keeps_the_pairing_and_survives_restart() {
     .unwrap();
     assert_eq!(drain(&requests), vec![Request::Connect]);
     let settings = settings_view(&core);
-    assert_eq!(settings.server_address.as_deref(), Some("10.0.0.7:7443"));
+    assert_eq!(settings.server_address, Some(addr("10.0.0.7:7443")));
     assert_eq!(settings.device_id, Some(device));
     drop((core, seam));
 
     let core = Core::open_detached(dir.path()).unwrap();
     let settings = settings_view(&core);
-    assert_eq!(settings.server_address.as_deref(), Some("10.0.0.7:7443"));
+    assert_eq!(settings.server_address, Some(addr("10.0.0.7:7443")));
     assert_eq!(settings.device_id, Some(device), "no re-pairing");
     core.dispatch(Action::Navigate(Route::SessionList)).unwrap();
     match core.view().screen {
@@ -233,7 +237,8 @@ fn settings_show_the_pinned_server_fingerprint_also_after_restart() {
         ca_cert_pem: ca.pem(),
         ..credentials()
     };
-    seam.pairing_succeeded("srv:7443", credentials).unwrap();
+    seam.pairing_succeeded(&addr("srv:7443"), credentials)
+        .unwrap();
     assert_eq!(settings_view(&core).server_fingerprint, Some(expected));
     drop((core, seam));
 
@@ -579,7 +584,7 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
         ca_cert_pem: "ANOTHER CA".into(),
         ..credentials()
     };
-    seam.pairing_succeeded("other:7443", creds).unwrap();
+    seam.pairing_succeeded(&addr("other:7443"), creds).unwrap();
     assert_eq!(drain(&requests), vec![Request::Connect]);
     assert_eq!(rows(&core), vec![], "nothing of the old server shows");
 
@@ -2273,7 +2278,7 @@ fn a_replica_of_another_protocol_version_is_reset_keeping_what_is_this_devices()
     assert!(store.session_events(r.sid).unwrap().is_empty());
     assert_eq!(kept.drafts.len(), 1, "drafts stay");
     assert_eq!(kept.snippets.len(), 1, "snippets stay");
-    assert_eq!(kept.settings.server_address.as_deref(), Some("srv:7443"));
+    assert_eq!(kept.settings.server_address, Some(addr("srv:7443")));
     drop(store);
 
     // It opens paired, and syncs the log again from the start.
@@ -2323,7 +2328,7 @@ fn a_setting_this_build_cannot_read_is_dropped_in_place_and_the_rest_kept() {
     let core = Core::open_detached(dir).unwrap();
     let seam = core.seam();
     let settings = seam.settings().unwrap();
-    assert_eq!(settings.server_address.as_deref(), Some("srv:7443"));
+    assert_eq!(settings.server_address, Some(addr("srv:7443")));
     assert_eq!(settings.blob_policy, skywave_core::BlobPolicy::default());
     assert_eq!(
         settings.server,
@@ -2367,8 +2372,8 @@ fn a_replica_that_cannot_be_reset_in_place_is_created_again_with_its_settings() 
     let seam = core.seam();
     assert_eq!(seam.identity().unwrap().device_id(), r.device);
     assert_eq!(
-        seam.settings().unwrap().server_address.as_deref(),
-        Some("srv:7443")
+        seam.settings().unwrap().server_address,
+        Some(addr("srv:7443"))
     );
     drop((core, seam));
     assert!(Store::open(dir).unwrap().drafts().unwrap().is_empty());

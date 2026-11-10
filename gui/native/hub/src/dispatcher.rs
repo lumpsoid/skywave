@@ -137,7 +137,8 @@ mod tests {
             fingerprint: "ab:cd:ef".into(),
         })
         .unwrap();
-        seam.pairing_succeeded("srv:7443", credentials()).unwrap();
+        seam.pairing_succeeded(&"srv:7443".parse().unwrap(), credentials())
+            .unwrap();
         core
     }
 

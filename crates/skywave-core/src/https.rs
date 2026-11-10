@@ -634,20 +634,17 @@ pub struct HttpsTransport {
 }
 
 impl HttpsTransport {
-    /// A transport to `address` (`host:port`, as stored at pairing) that
-    /// authenticates with `identity` and names the run `run` expects.
-    /// Opens no connection yet.
+    /// A transport to `address` that authenticates with `identity` and
+    /// names the run `run` expects. Opens no connection yet.
     pub fn new(
-        address: &str,
+        address: &ServerAddress,
         identity: &dyn Identity,
         config: TransportConfig,
         run: ExpectedRun,
     ) -> Result<HttpsTransport, TransportError> {
-        let address = ServerAddress::parse(address)
-            .map_err(|e| TransportError::Unreachable(e.to_string()))?;
         let tls = tls::device_config(identity)?;
         Ok(HttpsTransport {
-            http: Http::new(address, tls, config),
+            http: Http::new(address.clone(), tls, config),
             run,
         })
     }
