@@ -163,8 +163,7 @@ fn pairing_view(pairing: &PairingView, form: &PairForm) -> ScreenView {
         paired_server: pairing
             .paired
             .as_ref()
-            .and_then(|p| p.server_address.as_ref())
-            .map(ToString::to_string),
+            .map(|p| p.server_address.to_string()),
         state,
         status_label,
         form: form.clone(),

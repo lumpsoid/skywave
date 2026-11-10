@@ -15,8 +15,8 @@ use ratatui::style::Color;
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, ComposerMode, Core, Decision,
-    Delivery, DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, Request,
-    Route, RunWhen, Screen, Seam, Seq, SessionId, TimelineItem, ViewState, WorkdirPane,
+    Delivery, DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, PairedLink,
+    Request, Route, RunWhen, Screen, Seam, Seq, SessionId, TimelineItem, ViewState, WorkdirPane,
 };
 use skywave_present::format::took_label;
 use skywave_present::sections::{ItemKey, delivery, find};
@@ -471,40 +471,40 @@ fn a_malformed_pairing_uri_is_reported_not_typed() {
 fn banner_shows_every_link_state() {
     let mut h = Harness::paired();
     let cases = [
-        (Link::Connecting, "connecting…"),
-        (Link::Online { latency_ms: 42 }, "online · 42 ms"),
+        (PairedLink::Connecting, "connecting…"),
+        (PairedLink::Online { latency_ms: 42 }, "online · 42 ms"),
         (
-            Link::CatchingUp {
+            PairedLink::CatchingUp {
                 have: Seq(120),
                 server: Seq(450),
             },
             "syncing · 120/450",
         ),
         (
-            Link::Rejected(LinkRejection::Revoked),
+            PairedLink::Rejected(LinkRejection::Revoked),
             "device revoked · re-pair to reconnect",
         ),
         (
-            Link::Rejected(LinkRejection::ServerChanged),
+            PairedLink::Rejected(LinkRejection::ServerChanged),
             "server identity changed · re-pair to reconnect · Ctrl-R retry",
         ),
         (
-            Link::Rejected(LinkRejection::NameMismatch),
+            PairedLink::Rejected(LinkRejection::NameMismatch),
             "server name mismatch · re-pair to reconnect · Ctrl-R retry",
         ),
         (
-            Link::Rejected(LinkRejection::BadIdentity),
+            PairedLink::Rejected(LinkRejection::BadIdentity),
             "device identity unusable · re-pair to reconnect",
         ),
         (
-            Link::Rejected(LinkRejection::ProtocolMismatch {
+            PairedLink::Rejected(LinkRejection::ProtocolMismatch {
                 client: 1,
                 server: 2,
             }),
             "protocol mismatch · client v1, server v2 · update, then Ctrl-R",
         ),
         (
-            Link::Rejected(LinkRejection::HistoryLost {
+            PairedLink::Rejected(LinkRejection::HistoryLost {
                 have: Seq(9),
                 server: Seq(4),
             }),
@@ -535,7 +535,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         .unwrap();
     // The killed server: the engine reports it is backing off.
     let t0 = mockup_now();
-    h.seam.set_link(Link::Reconnecting {
+    h.seam.set_link(PairedLink::Reconnecting {
         attempt: 3,
         retry_at: t0 + TimeDelta::seconds(5),
         offline_since: t0,
@@ -576,7 +576,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
 
     // A new attempt counts down to its own deadline.
     let later = t0 + TimeDelta::seconds(10);
-    h.seam.set_link(Link::Reconnecting {
+    h.seam.set_link(PairedLink::Reconnecting {
         attempt: 4,
         retry_at: later + TimeDelta::seconds(10),
         offline_since: t0,
@@ -590,7 +590,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     );
 
     // Back online, the queue drains; the count stays until results arrive.
-    h.seam.set_link(Link::Online { latency_ms: 80 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 80 });
     h.sync();
     assert_eq!(h.banner(), "online · 80 ms · 3 queued");
 }
@@ -636,7 +636,8 @@ fn settings_change_the_server_address_without_re_pairing() {
 #[test]
 fn revoked_device_gets_a_full_screen_state_with_re_pair() {
     let mut h = Harness::paired();
-    h.seam.set_link(Link::Rejected(LinkRejection::Revoked));
+    h.seam
+        .set_link(PairedLink::Rejected(LinkRejection::Revoked));
     h.sync();
     let screen = h.screen();
     assert_contains(&screen, "This device was revoked.");
@@ -664,9 +665,10 @@ fn revoked_device_gets_a_full_screen_state_with_re_pair() {
     assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
 
     // From the full-screen state, p goes straight to pairing.
-    h.seam.set_link(Link::Connecting);
+    h.seam.set_link(PairedLink::Connecting);
     h.sync();
-    h.seam.set_link(Link::Rejected(LinkRejection::Revoked));
+    h.seam
+        .set_link(PairedLink::Rejected(LinkRejection::Revoked));
     h.sync();
     assert_contains(&h.screen(), "This device was revoked.");
     assert_eq!(
@@ -698,7 +700,7 @@ fn revoked_device_gets_a_full_screen_state_with_re_pair() {
 fn identity_faults_get_the_re_pair_screen_saying_why() {
     let mut h = Harness::paired();
     h.seam
-        .set_link(Link::Rejected(LinkRejection::ServerChanged));
+        .set_link(PairedLink::Rejected(LinkRejection::ServerChanged));
     h.sync();
     let screen = h.screen();
     assert_contains(&screen, "The server's identity changed.");
@@ -707,11 +709,13 @@ fn identity_faults_get_the_re_pair_screen_saying_why() {
     assert_eq!(h.key_with(ctrl('r')), Some(Action::RetryNow));
     assert_eq!(h.drain_requests(), vec![Request::Connect]);
 
-    h.seam.set_link(Link::Rejected(LinkRejection::NameMismatch));
+    h.seam
+        .set_link(PairedLink::Rejected(LinkRejection::NameMismatch));
     h.sync();
     assert_contains(&h.screen(), "does not cover this address");
 
-    h.seam.set_link(Link::Rejected(LinkRejection::BadIdentity));
+    h.seam
+        .set_link(PairedLink::Rejected(LinkRejection::BadIdentity));
     h.sync();
     let screen = h.screen();
     assert_contains(&screen, "This device's identity is damaged.");
@@ -723,7 +727,7 @@ fn identity_faults_get_the_re_pair_screen_saying_why() {
 
     let mut h = Harness::paired();
     h.seam
-        .set_link(Link::Rejected(LinkRejection::ProtocolMismatch {
+        .set_link(PairedLink::Rejected(LinkRejection::ProtocolMismatch {
             client: 1,
             server: 2,
         }));
@@ -887,7 +891,8 @@ fn every_help_key_is_reachable_on_an_80x24_terminal() {
     assert_contains(&help.join("\n"), "command's text before its output");
 
     let mut h = Harness::paired();
-    h.seam.set_link(Link::Rejected(LinkRejection::Revoked));
+    h.seam
+        .set_link(PairedLink::Rejected(LinkRejection::Revoked));
     h.sync();
     let help = read_help(&mut h);
     assert_keys(&help, &everywhere);
@@ -1579,7 +1584,7 @@ fn a_listed_conversation_already_in_a_session_opens_it() {
 fn the_picker_says_when_it_cannot_list() {
     let mut h = Harness::paired();
     // Offline: nothing is asked for, the picker says why at once.
-    h.seam.set_link(Link::Reconnecting {
+    h.seam.set_link(PairedLink::Reconnecting {
         attempt: 1,
         retry_at: mockup_now(),
         offline_since: mockup_now(),
@@ -1599,7 +1604,7 @@ fn the_picker_says_when_it_cannot_list() {
     assert!(!h.screen().contains("offline · the server lists"));
 
     // An agent that cannot list them.
-    h.seam.set_link(Link::Online { latency_ms: 20 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 20 });
     h.sync();
     let req = open_conversations(&mut h);
     h.seam
@@ -1675,7 +1680,7 @@ fn esc_closes_the_popup_then_the_prompt() {
         &mut h,
         vec![created(a, 0, "/srv/one"), created(b, 1, "/srv/two")],
     );
-    h.seam.set_link(Link::Reconnecting {
+    h.seam.set_link(PairedLink::Reconnecting {
         attempt: 1,
         retry_at: Utc::now() + TimeDelta::seconds(5),
         offline_since: Utc::now(),
@@ -1712,7 +1717,7 @@ fn open_session() -> (Harness, SessionId, DeviceId) {
     let id = SessionId::new();
     pull(&mut h, vec![created(id, 0, "/srv/work")]);
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
-    let me = h.seam.identity().unwrap().device_id();
+    let me = h.seam.pairing().unwrap().credentials.device_id;
     (h, id, me)
 }
 
@@ -2630,7 +2635,7 @@ fn rename_from_the_list_shows_at_once_and_empty_restores_the_default() {
     h.seam
         .command_result(command, &CommandResult::Accepted { seq: Seq(3) })
         .unwrap();
-    let me = h.seam.identity().unwrap().device_id();
+    let me = h.seam.pairing().unwrap().credentials.device_id;
     pull(
         &mut h,
         vec![event(
@@ -2856,7 +2861,7 @@ fn an_adopted_session_starts_with_a_divider_naming_the_conversation() {
 fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionId, DeviceId) {
     use skywave_proto::{ImportedItem, SessionOrigin};
     let mut h = Harness::paired();
-    let me = h.seam.identity().unwrap().device_id();
+    let me = h.seam.pairing().unwrap().credentials.device_id;
     let id = SessionId::new();
     let agent_at = |minute| Some(Utc.with_ymd_and_hms(2026, 10, 29, 9, minute, 0).unwrap());
     let imported = |minute, item| {
@@ -3455,7 +3460,7 @@ fn tool_output_expands_through_every_blob_state() {
     assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
     assert_contains(&h.screen(), "│ requested · waiting for a slot · 9.8 KiB");
 
-    h.seam.set_link(Link::Online { latency_ms: 20 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 20 });
     let dir = tempfile::tempdir().unwrap();
     let part = dir.path().join("blob.part");
     h.seam
@@ -3474,7 +3479,7 @@ fn tool_output_expands_through_every_blob_state() {
     h.key(KeyCode::Enter);
     assert_contains(&h.screen(), "│ … downloading 40% ");
     // With the link down it is paused, not frozen; back online it goes on.
-    h.seam.set_link(Link::Reconnecting {
+    h.seam.set_link(PairedLink::Reconnecting {
         attempt: 1,
         retry_at: mockup_now() + TimeDelta::seconds(5),
         offline_since: mockup_now(),
@@ -3487,7 +3492,7 @@ fn tool_output_expands_through_every_blob_state() {
         &h.screen(),
         "│ downloading · 4.0 KiB of 9.8 KiB (40%) · paused, offline",
     );
-    h.seam.set_link(Link::Online { latency_ms: 20 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 20 });
     h.sync();
     assert!(!h.screen().contains("paused"));
 
@@ -4258,7 +4263,7 @@ fn history_includes_other_devices_and_pending_messages() {
 #[test]
 fn offline_composer_says_messages_wait() {
     let (mut h, _, _) = open_session();
-    h.seam.set_link(Link::Reconnecting {
+    h.seam.set_link(PairedLink::Reconnecting {
         attempt: 1,
         retry_at: mockup_now() + TimeDelta::seconds(5),
         offline_since: mockup_now(),
@@ -5371,7 +5376,7 @@ fn shift_a_grants_the_one_rule_offered() {
     );
 
     // Logged: said on the call, counted in the status line, listed in help.
-    let me = h.seam.identity().unwrap().device_id();
+    let me = h.seam.pairing().unwrap().credentials.device_id;
     pull(&mut h, vec![event(id, 2, granted(approval, me, 0))]);
     let screen = h.screen();
     assert!(!screen.contains("Approval needed"), "{screen}");
@@ -7086,7 +7091,7 @@ fn open_id(h: &Harness) -> Option<SessionId> {
 #[test]
 fn the_agent_login_expiry_shows_in_settings_and_warns_in_the_banner_within_three_days() {
     let mut h = Harness::paired();
-    h.seam.set_link(Link::Online { latency_ms: 5 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 5 });
     let hello = |h: &mut Harness, expires| {
         h.seam
             .hello_received(&HelloResponse {
@@ -7142,7 +7147,7 @@ fn the_agent_login_expiry_shows_in_settings_and_warns_in_the_banner_within_three
 fn ctrl_g_opens_approvals_elsewhere_counted_in_the_banner() {
     use skywave_tui::app::Focus;
     let mut h = Harness::paired();
-    h.seam.set_link(Link::Online { latency_ms: 5 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 5 });
     let (a, b) = (SessionId::new(), SessionId::new());
     pull(
         &mut h,
@@ -7203,7 +7208,7 @@ fn a_new_approval_alerts_once_naming_the_session_only() {
     let first = ApprovalId::new();
     pull(&mut h, vec![approval(id, 1, first, "cat ~/.secret")]);
     assert_eq!(h.app.ui().alert, None);
-    h.seam.set_link(Link::Online { latency_ms: 5 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 5 });
     h.sync();
 
     let notify = skywave_tui::Notify::parse("bell,osc9").unwrap();
@@ -7233,7 +7238,7 @@ fn a_new_approval_alerts_once_naming_the_session_only() {
 
     // Pending at a (re)start: never news.
     let mut h = h.restart();
-    h.seam.set_link(Link::Online { latency_ms: 5 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 5 });
     h.sync();
     let mut out = Vec::new();
     skywave_tui::alert(&mut h.app, &mut out, notify, false);
@@ -7349,7 +7354,7 @@ fn a_message_brings_an_archived_session_back() {
 #[test]
 fn an_approval_in_an_archived_session_still_shows() {
     let mut h = Harness::paired();
-    h.seam.set_link(Link::Online { latency_ms: 5 });
+    h.seam.set_link(PairedLink::Online { latency_ms: 5 });
     let (a, b) = (SessionId::new(), SessionId::new());
     pull(
         &mut h,

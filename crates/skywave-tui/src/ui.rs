@@ -272,13 +272,9 @@ fn render_pairing(frame: &mut Frame, area: Rect, app: &App, pairing: &PairingVie
         "Enter what `skywaved pair` printed on the server.",
     )];
     if let Some(info) = &pairing.paired {
-        let server = info
-            .server_address
-            .as_ref()
-            .map_or_else(|| "an unknown server".to_owned(), ToString::to_string);
         intro_lines.push(Line::from(format!(
-            "Currently paired as {} with {server}; pairing again replaces this identity.",
-            info.device_id.0
+            "Currently paired as {} with {}; pairing again replaces this identity.",
+            info.device_id.0, info.server_address
         )));
     }
     frame.render_widget(

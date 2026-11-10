@@ -742,19 +742,42 @@ D9. The server owns a CA; every device holds a certificate it signed.
   (`SetServerAddress`) without re-pairing: the pinned CA still decides
   whom it trusts. The address it leaves, or the one a re-pair with the
   same CA replaces, is kept among the server's other addresses
-  (`Settings::other_addresses`, a setting of the replica), to switch back
-  to in one step or forget. Pairing with another server drops them.
+  (`ServerAddresses`, part of the pairing), to switch back to in one step
+  or forget. Pairing with another server drops them.
   The core parses an address once, where it comes in (`Action::Pair`,
   `SetServerAddress`, the pairing URI), into a `ServerAddress`, and
-  carries that type from there on: settings, the pairing request, the
+  carries that type from there on: the pairing, the pairing request, the
   transport. Equality is on its canonical form (lowercase name, port
   filled in, IPv6 bracketed), so `MyHost` and `myhost:7443` are one
-  address, and that form is what the replica stores. Schema 29
+  address, and that form is what the core stores. Schema 29
   canonicalised the addresses stored before, dropping (with a logged
-  reason) any that did not parse; a stored one that does not parse makes
-  the replica unreadable rather than an address the link retries forever.
-- The device key and certificate live in the core's data directory behind
-  the `Identity` trait, so a platform keystore can replace it.
+  reason) any that did not parse.
+- **The pairing record** (`Pairing`): the device key, its certificate, the
+  pinned CA and the server's addresses are one value, stored as one file
+  in the core's data directory (`pairing.json`, mode 0600). A save writes
+  `pairing.json.new`, flushes it, renames it over the record and flushes
+  the directory, so a crash leaves the old pairing or the new one, never
+  a mix and never none where there was one; a leftover `pairing.json.new`
+  is ignored. A device is paired exactly when the record exists:
+  `Link::Unpaired` is derived from it, and the sync engine reports a
+  `PairedLink`, which has no `Unpaired`. A record that does not read (an
+  address that does not parse, say) fails the open rather than leave an
+  address the link retries forever. Pairing with another server resets
+  the replica first and saves the record last: if the save fails, the
+  device keeps its old pairing whole over an empty replica, and connects
+  with it again.
+- **Older data dirs:** a build before the record kept the identity in
+  `identity/` (four files, replaced through `identity.new/`) and the
+  addresses among the replica's settings. Opening the core moves both into
+  the record, then removes them; a crash before that redoes the move, or
+  finds the record and only clears up. A complete `identity.new/` without
+  `identity/` (a crash between the old build's remove and rename) is
+  recovered; an incomplete one alone was an interrupted first pairing. An
+  identity without an address that parses (one schema 29 dropped) has no
+  server to reach: the device is unpaired and pairs again, rather than
+  showing `Connecting` with nothing trying.
+- The device key and certificate are read behind the `Identity` trait, so
+  a platform keystore can replace it.
 
 ## Client core
 
@@ -1321,7 +1344,7 @@ logs) an event that no longer decodes rather than failing.
 
 ```rust
 enum Link {
-    Unpaired,                        // never paired: nothing to connect to
+    Unpaired,                        // not paired (no pairing record): nothing to connect to
     Connecting,
     Online { latency_ms: u32 },
     CatchingUp { have: Seq, server: Seq },

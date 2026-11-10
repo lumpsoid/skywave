@@ -10,9 +10,9 @@ use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
     Draft, Entry, FailReason, Fingerprint, FullView, Link, OutboxStatus, Outgoing,
-    PairedCredentials, PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam, ServerAddress,
-    SessionView, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store,
-    StoreError, TimelineItem, ViewState,
+    PairedCredentials, PairedLink, PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam,
+    ServerAddress, SessionView, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
+    ShellView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
@@ -23,6 +23,11 @@ fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
 
 fn addr(text: &str) -> ServerAddress {
     ServerAddress::parse(text).unwrap()
+}
+
+/// The address the device's pairing connects to.
+fn current_address(seam: &Seam) -> ServerAddress {
+    seam.pairing().unwrap().addresses.current().clone()
 }
 
 #[test]
@@ -119,7 +124,7 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     let seam = core.seam();
     let requests = seam.take_requests().unwrap();
     assert!(seam.take_requests().is_none(), "one receiver");
-    assert!(seam.identity().is_none());
+    assert!(seam.pairing().is_none());
 
     let pair = Action::Pair {
         address: "srv:7443".into(),
@@ -167,18 +172,15 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     let view = views.last();
     assert_eq!(view.link, Link::Connecting);
     assert!(matches!(view.screen, Screen::SessionList(_)));
-    assert_eq!(seam.identity().unwrap().device_id(), device);
+    assert_eq!(seam.pairing().unwrap().credentials.device_id, device);
     drop((core, seam));
 
     // Cold start: paired, address remembered, straight to the session list.
     let core = Core::open_detached(dir.path()).unwrap();
     assert!(matches!(core.view().screen, Screen::SessionList(_)));
     let seam = core.seam();
-    assert_eq!(seam.identity().unwrap().device_id(), device);
-    assert_eq!(
-        seam.settings().unwrap().server_address,
-        Some(addr("srv:7443"))
-    );
+    assert_eq!(seam.pairing().unwrap().credentials.device_id, device);
+    assert_eq!(current_address(&seam), addr("srv:7443"));
 }
 
 fn settings_view(core: &Core) -> SettingsView {
@@ -219,6 +221,45 @@ fn a_new_server_address_reconnects_keeps_the_pairing_and_survives_restart() {
         Screen::SessionList(list) => assert_eq!(list.creating.len(), 1, "the outbox is kept"),
         other => panic!("expected the session list, got {other:?}"),
     }
+}
+
+/// Pairing again with the same server at a new address keeps the one it
+/// leaves among the others, across a restart; pairing with another server
+/// drops them.
+#[test]
+fn pairing_again_keeps_the_left_address_until_another_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, _) = paired_core(dir.path());
+    core.dispatch(Action::SetServerAddress {
+        address: "vpn:7443".into(),
+    })
+    .unwrap();
+    let same_ca = credentials();
+    let device = same_ca.device_id;
+    seam.pairing_succeeded(&addr("lan:7443"), same_ca).unwrap();
+    drop((core, seam));
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    let seam = core.seam();
+    let pairing = seam.pairing().unwrap();
+    assert_eq!(pairing.credentials.device_id, device);
+    assert_eq!(pairing.addresses.current(), &addr("lan:7443"));
+    assert_eq!(
+        pairing.addresses.others(),
+        [addr("srv:7443"), addr("vpn:7443")]
+    );
+    assert_eq!(
+        settings_view(&core).other_addresses,
+        [addr("srv:7443"), addr("vpn:7443")]
+    );
+
+    let other_ca = PairedCredentials {
+        ca_cert_pem: "ANOTHER CA".into(),
+        ..credentials()
+    };
+    seam.pairing_succeeded(&addr("lan:7443"), other_ca).unwrap();
+    assert!(seam.pairing().unwrap().addresses.others().is_empty());
+    assert!(settings_view(&core).other_addresses.is_empty());
 }
 
 #[test]
@@ -279,7 +320,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
     })
     .unwrap();
     core.dispatch(Action::OpenSession(sid)).unwrap();
-    seam.set_link(Link::Reconnecting {
+    seam.set_link(PairedLink::Reconnecting {
         attempt: 1,
         retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(2),
         offline_since: chrono::Utc::now(),
@@ -322,7 +363,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
     );
 
     // Reconnect: the sender drains the outbox.
-    seam.set_link(Link::Online { latency_ms: 80 });
+    seam.set_link(PairedLink::Online { latency_ms: 80 });
     let pending = seam.pending_outbox().unwrap();
     assert_eq!(pending.len(), 1);
     assert!(seam.command_sending(command.id).unwrap());
@@ -779,7 +820,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
     let core = Core::open_detached(dir.path()).unwrap();
     let seam = core.seam();
     assert_eq!(core.view().attention.alerts, 0, "nothing before online");
-    seam.set_link(Link::CatchingUp {
+    seam.set_link(PairedLink::CatchingUp {
         have: Seq(4),
         server: Seq(5),
     });
@@ -798,7 +839,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
     })
     .unwrap();
     assert_eq!(core.view().attention.alerts, 0, "nor while catching up");
-    seam.set_link(Link::Online { latency_ms: 5 });
+    seam.set_link(PairedLink::Online { latency_ms: 5 });
     let view = core.view();
     assert_eq!(view.attention.alerts, 1, "one alert, for the news only");
     assert_eq!(ids(&view), vec![news]);
@@ -806,7 +847,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
 
     // Alerted on: a later start stays quiet.
     let core = Core::open_detached(dir.path()).unwrap();
-    core.seam().set_link(Link::Online { latency_ms: 5 });
+    core.seam().set_link(PairedLink::Online { latency_ms: 5 });
     let view = core.view();
     assert_eq!(view.attention.alerts, 0);
     assert_eq!(ids(&view), vec![news]);
@@ -949,7 +990,7 @@ fn callbacks_may_dispatch_and_every_subscriber_ends_on_the_latest_snapshot() {
             let seam = seam.clone();
             thread::spawn(move || {
                 for i in 0..50 {
-                    seam.set_link(Link::Online {
+                    seam.set_link(PairedLink::Online {
                         latency_ms: t * 1000 + i,
                     });
                 }
@@ -968,7 +1009,7 @@ fn callbacks_may_dispatch_and_every_subscriber_ends_on_the_latest_snapshot() {
     let sink = gone.clone();
     let id = core.subscribe(move |view| sink.0.lock().unwrap().push(view));
     core.unsubscribe(id);
-    seam.set_link(Link::Connecting);
+    seam.set_link(PairedLink::Connecting);
     assert_eq!(gone.count(), 1);
 }
 
@@ -977,14 +1018,15 @@ struct PublishOnDrop(Seam);
 
 impl Drop for PublishOnDrop {
     fn drop(&mut self) {
-        self.0.set_link(Link::Online { latency_ms: 7 });
+        self.0.set_link(PairedLink::Online { latency_ms: 7 });
     }
 }
 
 #[test]
 fn a_snapshot_published_during_unsubscribe_still_reaches_the_others() {
     let dir = tempfile::tempdir().unwrap();
-    let core = Core::open_detached(dir.path()).unwrap();
+    // Paired: an unpaired core has no link to set.
+    let (core, _seam, _requests, _) = paired_core(dir.path());
     let watching = Views::subscribe(&core);
 
     // `unsubscribe` drops the removed callback while it holds the
@@ -2026,7 +2068,7 @@ fn a_long_run_of_this_device_alerts_once_wherever_it_finished() {
     // Away from the session, catching up; the request and the start come
     // in an earlier batch than the finish.
     log.core.dispatch(Action::Back).unwrap();
-    log.seam.set_link(Link::CatchingUp {
+    log.seam.set_link(PairedLink::CatchingUp {
         have: Seq(1),
         server: Seq(9),
     });
@@ -2052,7 +2094,7 @@ fn a_long_run_of_this_device_alerts_once_wherever_it_finished() {
             end: ShellEnd::Exited { code: 1 },
         })
     );
-    log.seam.set_link(Link::Online { latency_ms: 5 });
+    log.seam.set_link(PairedLink::Online { latency_ms: 5 });
     assert_eq!(log.attention().shell_alerts, 1, "once");
 
     // Too short, another device's, never started: no alert.
@@ -2278,13 +2320,13 @@ fn a_replica_of_another_protocol_version_is_reset_keeping_what_is_this_devices()
     assert!(store.session_events(r.sid).unwrap().is_empty());
     assert_eq!(kept.drafts.len(), 1, "drafts stay");
     assert_eq!(kept.snippets.len(), 1, "snippets stay");
-    assert_eq!(kept.settings.server_address, Some(addr("srv:7443")));
     drop(store);
 
     // It opens paired, and syncs the log again from the start.
     let core = Core::open_detached(dir).unwrap();
     let seam = core.seam();
-    assert_eq!(seam.identity().unwrap().device_id(), r.device);
+    assert_eq!(seam.pairing().unwrap().credentials.device_id, r.device);
+    assert_eq!(current_address(&seam), addr("srv:7443"));
     assert_eq!(seam.apply_events(&r.log).unwrap().cursor, Seq(3));
     core.dispatch(Action::Navigate(Route::ArchivedSessions))
         .unwrap();
@@ -2309,7 +2351,10 @@ fn a_stored_row_that_no_longer_decodes_makes_the_replica_unreadable() {
     assert!(!reason.is_empty());
     Core::reset_replica(dir).unwrap();
     let core = Core::open_detached(dir).unwrap();
-    assert_eq!(core.seam().identity().unwrap().device_id(), r.device);
+    assert_eq!(
+        core.seam().pairing().unwrap().credentials.device_id,
+        r.device
+    );
 }
 
 #[test]
@@ -2328,7 +2373,7 @@ fn a_setting_this_build_cannot_read_is_dropped_in_place_and_the_rest_kept() {
     let core = Core::open_detached(dir).unwrap();
     let seam = core.seam();
     let settings = seam.settings().unwrap();
-    assert_eq!(settings.server_address, Some(addr("srv:7443")));
+    assert_eq!(current_address(&seam), addr("srv:7443"));
     assert_eq!(settings.blob_policy, skywave_core::BlobPolicy::default());
     assert_eq!(
         settings.server,
@@ -2370,11 +2415,8 @@ fn a_replica_that_cannot_be_reset_in_place_is_created_again_with_its_settings() 
     assert!(!dir.join("core.db.new").exists() && !dir.join("core.db.new-journal").exists());
     let core = Core::open_detached(dir).unwrap();
     let seam = core.seam();
-    assert_eq!(seam.identity().unwrap().device_id(), r.device);
-    assert_eq!(
-        seam.settings().unwrap().server_address,
-        Some(addr("srv:7443"))
-    );
+    assert_eq!(seam.pairing().unwrap().credentials.device_id, r.device);
+    assert_eq!(current_address(&seam), addr("srv:7443"));
     drop((core, seam));
     assert!(Store::open(dir).unwrap().drafts().unwrap().is_empty());
 
@@ -2386,7 +2428,10 @@ fn a_replica_that_cannot_be_reset_in_place_is_created_again_with_its_settings() 
     unreadable_reason(dir);
     Core::reset_replica(dir).unwrap();
     let core = Core::open_detached(dir).unwrap();
-    assert_eq!(core.seam().identity().unwrap().device_id(), r.device);
+    assert_eq!(
+        core.seam().pairing().unwrap().credentials.device_id,
+        r.device
+    );
 }
 
 #[test]

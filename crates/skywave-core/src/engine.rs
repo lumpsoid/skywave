@@ -132,7 +132,7 @@ use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
 use crate::store::{LogCheck, OutboxEntry, StoreError};
 use crate::transport::{ExpectedRun, Transport, TransportError};
-use crate::view::{CommandId, Link, LinkFailure, LinkRejection};
+use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
 use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
@@ -537,14 +537,14 @@ impl Engine {
         if let Some(transport) = &self.side {
             return Some(transport.clone());
         }
-        let identity = self.seam.identity()?;
-        let address = self.seam.settings().ok()?.server_address?;
+        let pairing = self.seam.pairing()?;
+        let address = pairing.addresses.current().clone();
         let transport = self
             .config
             .connector
             .connect(
                 &address,
-                identity.as_ref(),
+                pairing.as_ref(),
                 &self.config.transport,
                 &self.run,
             )
@@ -565,19 +565,11 @@ impl Engine {
         }
         // Bound: if the device pairs with another server, this link and
         // downloader can no longer write to the replica.
-        let Some((seam, identity)) = self.seam.bind() else {
+        let Some((seam, pairing)) = self.seam.bind() else {
             return;
         };
-        let address = match seam.settings() {
-            Ok(settings) => settings.server_address,
-            Err(error) => {
-                tracing::warn!(%error, "cannot read the server address; not connecting");
-                None
-            }
-        };
-        let Some(address) = address else {
-            return;
-        };
+        let address = pairing.addresses.current().clone();
+        let identity: Arc<dyn Identity> = pairing;
         let blobs = BlobCtx {
             seam: seam.clone(),
             config: self.config.clone(),
@@ -720,11 +712,11 @@ impl LinkError {
 /// Reports `Link` changes, skipping repeats.
 struct LinkReporter {
     seam: Seam,
-    last: Option<Link>,
+    last: Option<PairedLink>,
 }
 
 impl LinkReporter {
-    fn set(&mut self, link: Link) {
+    fn set(&mut self, link: PairedLink) {
         if self.last.as_ref() != Some(&link) {
             self.seam.set_link(link.clone());
             self.last = Some(link);
@@ -802,7 +794,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
         seam: ctx.seam.clone(),
         last: None,
     };
-    reporter.set(Link::Connecting);
+    reporter.set(PairedLink::Connecting);
     let mut retry = Retry::default();
     let mut errors = HeadCount::default();
     let mut transport: Option<Arc<dyn Transport>> = None;
@@ -832,7 +824,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
             Ok(reason) => reason,
             Err(rejection) => {
                 tracing::warn!(%error, "link stopped");
-                reporter.set(Link::Rejected(rejection));
+                reporter.set(PairedLink::Rejected(rejection));
                 return rejection;
             }
         };
@@ -852,7 +844,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
             failed_wall,
             delay: next_in,
         };
-        reporter.set(Link::Reconnecting {
+        reporter.set(PairedLink::Reconnecting {
             attempt: retry.attempt,
             retry_at: wait.retry_at(),
             offline_since,
@@ -873,7 +865,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
                     pressed = true;
                     wait.delay = wait.delay.min(Backoff::RETRY_NOW_MIN);
                     tracing::debug!(after = ?wait.delay, "retrying now");
-                    reporter.set(Link::Reconnecting {
+                    reporter.set(PairedLink::Reconnecting {
                         attempt: retry.attempt,
                         retry_at: wait.retry_at(),
                         offline_since,
@@ -981,12 +973,12 @@ async fn pull(
     loop {
         let cursor = ctx.seam.cursor()?;
         reporter.set(if cursor < head {
-            Link::CatchingUp {
+            PairedLink::CatchingUp {
                 have: cursor,
                 server: head,
             }
         } else {
-            Link::Online { latency_ms }
+            PairedLink::Online { latency_ms }
         });
         let batch = transport
             .events(EventsQuery {
@@ -1200,7 +1192,7 @@ mod tests {
     use crate::identity::PairedCredentials;
     use crate::store::OutboxStatus;
     use crate::transport::{BlobDownload, BoxFuture};
-    use crate::view::{DeviceId, FailReason, Outgoing, Screen};
+    use crate::view::{DeviceId, FailReason, Link, Outgoing, Screen};
 
     /// The one log, in one run, every fake server here serves: whatever
     /// run it is asked about is the current one.
@@ -1361,7 +1353,7 @@ mod tests {
             bound.apply_events(&batch(1)),
             Err(CoreError::Superseded)
         ));
-        bound.set_link(Link::Online { latency_ms: 1 });
+        bound.set_link(PairedLink::Online { latency_ms: 1 });
         assert_eq!(seam.cursor().unwrap(), Seq::ZERO);
         assert_eq!(seam.core.view().link, Link::Connecting);
 
@@ -1405,7 +1397,7 @@ mod tests {
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
-            identity: seam.identity().unwrap(),
+            identity: seam.pairing().unwrap(),
             run: ExpectedRun::default(),
         };
         let link = tokio::spawn(run_link(ctx));
@@ -1536,7 +1528,7 @@ mod tests {
             retry_now: retry_now.clone(),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
-            identity: seam.identity().unwrap(),
+            identity: seam.pairing().unwrap(),
             run: ExpectedRun::default(),
         };
         let link = tokio::spawn(run_link(ctx));
@@ -1804,7 +1796,7 @@ mod tests {
             retry_now,
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
-            identity: seam.identity().unwrap(),
+            identity: seam.pairing().unwrap(),
             run: ExpectedRun::default(),
         }
     }
@@ -1902,11 +1894,12 @@ mod tests {
         engine.abort();
     }
 
-    /// A server address stored before the settings parsed it, that does
-    /// not parse, is dropped when the replica opens: the engine has no
-    /// address to try, rather than one that fails as unreachable forever.
+    /// An identity whose stored server address does not parse (the
+    /// address schema 29 dropped) is no pairing: the device shows the
+    /// pairing screen, unpaired, rather than `Connecting` with nothing
+    /// trying, and the engine has nothing to connect to.
     #[tokio::test(start_paused = true)]
-    async fn an_unparseable_stored_address_is_never_connected_to() {
+    async fn an_identity_without_a_usable_address_is_unpaired() {
         let dir = tempfile::tempdir().unwrap();
         drop(crate::Store::open(dir.path()).unwrap());
         let db = rusqlite::Connection::open(dir.path().join(crate::store::DB_FILE)).unwrap();
@@ -1918,19 +1911,21 @@ mod tests {
         db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 1)
             .unwrap();
         drop(db);
-        crate::identity::FileIdentity::save(
+        crate::identity::write_legacy_identity(
             dir.path(),
-            PairedCredentials {
+            &PairedCredentials {
                 device_id: DeviceId::new(),
                 device_key_pem: "KEY".into(),
                 device_cert_pem: "CERT".into(),
                 ca_cert_pem: "CA".into(),
             },
-        )
-        .unwrap();
+        );
         let core = Core::open_detached(dir.path()).unwrap();
         let seam = core.seam();
-        assert_eq!(seam.settings().unwrap().server_address, None);
+        assert!(seam.pairing().is_none());
+        let view = core.view();
+        assert_eq!(view.link, Link::Unpaired);
+        assert!(matches!(view.screen, Screen::Pairing(_)), "{view:?}");
 
         let connects = Arc::new(AtomicUsize::new(0));
         let counted = connects.clone();
@@ -2185,7 +2180,7 @@ mod tests {
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
-            identity: seam.identity().unwrap(),
+            identity: seam.pairing().unwrap(),
             run: ExpectedRun::default(),
         }
     }

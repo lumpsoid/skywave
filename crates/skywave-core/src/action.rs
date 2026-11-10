@@ -22,7 +22,7 @@ pub enum Action {
     /// changed, and reconnect there. No re-pairing: the pinned CA and this
     /// device's certificate still decide whom the link trusts, so a wrong
     /// address can only fail to connect. The address it replaces is kept
-    /// among the others ([`Settings::switch_to`](crate::Settings::switch_to)),
+    /// among the others ([`ServerAddresses::switch_to`](crate::ServerAddresses::switch_to)),
     /// to switch back to. Trimmed; a no-op when unpaired, unchanged or not
     /// a [`ServerAddress`](crate::ServerAddress).
     SetServerAddress {

@@ -160,8 +160,6 @@ fn fresh_store_is_empty_with_defaults() {
         snapshot.settings,
         Settings {
             blob_policy: BlobPolicy::OnDemand,
-            server_address: None,
-            other_addresses: Vec::new(),
             server: ServerFacts::default(),
         }
     );
@@ -393,9 +391,6 @@ fn reopen_restores_state() {
         store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
         store.set_blob_policy(BlobPolicy::Eager).unwrap();
         store
-            .set_server_address(Some(&addr("skywave.example:7443")))
-            .unwrap();
-        store
             .set_blob_status(
                 log.blob.id,
                 &BlobStatus::Available {
@@ -413,42 +408,6 @@ fn reopen_restores_state() {
     assert_eq!(snapshot.cursor, Seq(7));
     assert_eq!(snapshot.sessions.len(), 2);
     assert_eq!(snapshot.settings.blob_policy, BlobPolicy::Eager);
-    assert_eq!(
-        snapshot.settings.server_address,
-        Some(addr("skywave.example:7443"))
-    );
-
-    store.set_server_address(None).unwrap();
-    assert_eq!(store.settings().unwrap().server_address, None);
-}
-
-#[test]
-fn switching_the_server_address_keeps_the_old_one_until_forgotten() {
-    let (_tmp, dir) = data_dir();
-    {
-        let store = Store::open(&dir).unwrap();
-        store.switch_server_address(&addr("home:7443")).unwrap();
-        store.switch_server_address(&addr("vpn:7443")).unwrap();
-        store.switch_server_address(&addr("public:7443")).unwrap();
-        // The same address spelt otherwise: not a fourth one.
-        store.switch_server_address(&addr("HOME")).unwrap();
-    }
-    let store = Store::open(&dir).unwrap();
-    let settings = store.settings().unwrap();
-    assert_eq!(settings.server_address, Some(addr("home:7443")));
-    assert_eq!(
-        settings.other_addresses,
-        [addr("vpn:7443"), addr("public:7443")]
-    );
-
-    store.forget_server_address(&addr("home:7443")).unwrap();
-    store.forget_server_address(&addr("vpn:7443")).unwrap();
-    assert_eq!(
-        store.settings().unwrap().other_addresses,
-        [addr("public:7443")]
-    );
-    store.forget_server_address(&addr("public:7443")).unwrap();
-    assert!(store.settings().unwrap().other_addresses.is_empty());
 }
 
 fn send(session_id: SessionId, text: &str) -> Command {
@@ -875,7 +834,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     store.apply_batch(&later, Utc::now()).unwrap();
     assert_eq!(turns(&store).len(), 1);
 
-    store.reset_for_server(&addr("other:7443")).unwrap();
+    store.reset_for_server().unwrap();
     assert!(turns(&store).is_empty());
 }
 
@@ -1798,7 +1757,7 @@ fn the_usage_limits_answer_is_kept_until_the_replica_is_reset() {
         store.load().unwrap().usage_limits,
         Some(usage_limits_read())
     );
-    store.reset_for_server(&addr("other:7443")).unwrap();
+    store.reset_for_server().unwrap();
     assert_eq!(store.usage_limits().unwrap(), None);
 }
 
@@ -2094,13 +2053,7 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
             ('other_server_addresses',
              '["myhost:7443", "VPN.example", "h:p", "vpn.example:7443", "[fd00::7]"]');"#,
     );
-    let settings = Store::open(&dir).unwrap().settings().unwrap();
-    assert_eq!(settings.server_address, Some(addr("myhost:7443")));
-    assert_eq!(
-        settings.other_addresses,
-        [addr("vpn.example:7443"), addr("[fd00::7]:7443")],
-        "the current one, the repeat and the unparseable one go"
-    );
+    drop(Store::open(&dir).unwrap());
     assert_eq!(
         stored(&dir),
         [
@@ -2120,9 +2073,7 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
             ('server_address', 'host:'),
             ('other_server_addresses', '["h:p"]');"#,
     );
-    let settings = Store::open(&dir).unwrap().settings().unwrap();
-    assert_eq!(settings.server_address, None);
-    assert!(settings.other_addresses.is_empty());
+    drop(Store::open(&dir).unwrap());
     assert!(stored(&dir).is_empty());
 
     let (_tmp, dir) = data_dir();
@@ -2135,24 +2086,6 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
         Settings::default()
     );
     assert!(stored(&dir).is_empty());
-}
-
-/// Past the migration every stored address is canonical; one that does not
-/// parse (written by hand, say) makes the replica unreadable, which only a
-/// reset gets past, rather than an address the link tries forever.
-#[test]
-fn a_stored_server_address_that_does_not_parse_is_unreadable() {
-    let (_tmp, dir) = data_dir();
-    let store = Store::open(&dir).unwrap();
-    store.switch_server_address(&addr("myhost:7443")).unwrap();
-    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
-    conn.execute(
-        "UPDATE settings SET value = 'host:port' WHERE key = 'server_address'",
-        [],
-    )
-    .unwrap();
-    let err = store.settings().unwrap_err();
-    assert!(err.unreadable(), "{err}");
 }
 
 #[test]
@@ -2653,16 +2586,14 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     store.set_draft(log.a, AGENT, Some(&draft)).unwrap();
     store.set_composer_mode(log.a, ComposerMode::Shell).unwrap();
     seam.hello_received(&hello_saying(every_fact())).unwrap();
-    store
-        .switch_server_address(&addr("vpn.example:7443"))
+    for address in ["vpn.example:7443", "old.example:7443"] {
+        core.dispatch(Action::SetServerAddress {
+            address: address.into(),
+        })
         .unwrap();
-    store
-        .switch_server_address(&addr("old.example:7443"))
-        .unwrap();
-    assert_eq!(
-        store.settings().unwrap().other_addresses,
-        [addr("vpn.example:7443")]
-    );
+    }
+    let others = |seam: &skywave_core::Seam| seam.pairing().unwrap().addresses.others().to_vec();
+    assert_eq!(others(&seam), [addr("vpn.example:7443")]);
     let mark = ReadMark {
         seq: Seq(3),
         notable: 1,
@@ -2687,6 +2618,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     seam.pairing_succeeded(&addr("old.example:7443"), paired_with(&ca))
         .unwrap();
     assert_eq!(store.load().unwrap(), before);
+    assert_eq!(others(&seam), [addr("vpn.example:7443")]);
     assert_eq!(server_rows(&dir), rows);
     assert!(blob_file.exists());
 
@@ -2701,12 +2633,18 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
         after.settings,
         Settings {
             blob_policy: BlobPolicy::Eager,
-            server_address: Some(addr("new.example:7443")),
-            other_addresses: Vec::new(),
             server: ServerFacts::default(),
         },
         "the blob policy is this device's; everything the old server's hello \
-         said, bypass included, and the other addresses were the old server's"
+         said, bypass included, was the old server's"
+    );
+    assert_eq!(
+        *seam.pairing().unwrap().addresses.current(),
+        addr("new.example:7443")
+    );
+    assert!(
+        others(&seam).is_empty(),
+        "the other addresses were the old server's"
     );
     assert!(!blob_file.exists(), "blob files go with their rows");
 
@@ -2858,7 +2796,7 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
         )
         .unwrap();
     store.mark_alerted(&[(a, w)]).unwrap();
-    store.reset_for_server(&addr("other:7443")).unwrap();
+    store.reset_for_server().unwrap();
     assert!(store.alerted().unwrap().is_empty());
 }
 
@@ -3124,7 +3062,7 @@ fn device_names_survive_a_reopen_and_go_with_the_server() {
     assert_eq!(devices[&laptop], "laptop");
     assert_eq!(devices[&phone], "Pixel 8");
 
-    store.reset_for_server(&addr("other:7443")).unwrap();
+    store.reset_for_server().unwrap();
     assert!(store.devices().unwrap().is_empty());
 }
 
@@ -3161,7 +3099,7 @@ fn snippets_survive_a_reopen_and_a_new_server() {
     snippets.sort_by_key(|s| s.used);
     assert_eq!(snippets, [plain.clone(), renamed]);
 
-    store.reset_for_server(&addr("other:7443")).unwrap();
+    store.reset_for_server().unwrap();
     store.delete_snippet(named.id).unwrap();
     assert_eq!(store.snippets().unwrap(), [plain], "a device preference");
 }
@@ -3990,7 +3928,7 @@ fn reset_for_server_clears_workdir_answers() {
     let d1 = diff_blob(1);
     put(&mut store, &file_ask(log.b, "x"), &file("x", &d1));
 
-    let mut blobs = store.reset_for_server(&addr("other:7443")).unwrap();
+    let mut blobs = store.reset_for_server().unwrap();
     let mut expected = vec![log.blob.id, d1.id];
     blobs.sort();
     expected.sort();
@@ -4030,7 +3968,7 @@ fn a_workdir_answer_for_a_deleted_or_unknown_session_writes_nothing() {
     assert!(store.blob(blob.id).unwrap().unwrap().workdir);
 
     // After a re-pair, an old server's answer finds no session.
-    store.reset_for_server(&addr("other:7443")).unwrap();
+    store.reset_for_server().unwrap();
     let written = store
         .put_workdir(&file_ask(log.b, "x"), &file("x", &blob))
         .unwrap();

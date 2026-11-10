@@ -2948,10 +2948,9 @@ impl App {
         if let Screen::Pairing(PairingView {
             paired: Some(info), ..
         }) = &view.screen
-            && let Some(address) = &info.server_address
             && self.ui.form.address.is_empty()
         {
-            self.ui.form.address = address.to_string();
+            self.ui.form.address = info.server_address.to_string();
             self.ui.form.focus = Field::Code;
         }
     }

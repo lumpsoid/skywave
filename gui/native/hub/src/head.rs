@@ -1649,12 +1649,11 @@ impl Head {
         if let Screen::Pairing(PairingView {
             paired: Some(info), ..
         }) = &view.screen
-            && let Some(address) = &info.server_address
             && self.form.address.is_empty()
         {
             self.revs += 1;
             self.form = PairForm {
-                address: address.to_string(),
+                address: info.server_address.to_string(),
                 rev: self.revs,
                 ..PairForm::default()
             };

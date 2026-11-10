@@ -331,7 +331,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
         ..config()
     });
     daemon.pair(&client, &proxy.address()).await;
-    let device = client.seam.identity().unwrap().device_id();
+    let device = client.seam.pairing().unwrap().credentials.device_id;
 
     devices::revoke(daemon.storage.db.conn(), device, Utc::now()).unwrap();
     client
@@ -381,7 +381,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
         .dispatch(Action::Navigate(skywave_core::Route::Pairing))
         .unwrap();
     daemon.pair(&client, &proxy.address()).await;
-    assert_ne!(client.seam.identity().unwrap().device_id(), device);
+    assert_ne!(client.seam.pairing().unwrap().credentials.device_id, device);
     client
         .wait("the queue to drain", |c, view| {
             view.queued == 0 && c.cursor() == Seq(daemon.events().len() as u64)
@@ -456,7 +456,11 @@ async fn a_damaged_identity_stops_the_link_until_re_paired() {
     daemon.pair(&client, &proxy.address()).await;
 
     let dir = client.stop();
-    std::fs::write(dir.path().join("identity/device_key.pem"), "not a key").unwrap();
+    let record = dir.path().join("pairing.json");
+    let mut pairing: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    pairing["device_key_pem"] = "not a key".into();
+    std::fs::write(&record, serde_json::to_vec(&pairing).unwrap()).unwrap();
     let client = Client::open_in(dir, config());
     let rejected = rejection(&client).await;
     assert_eq!(rejected, LinkRejection::BadIdentity);
