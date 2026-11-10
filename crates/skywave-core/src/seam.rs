@@ -400,13 +400,16 @@ impl Seam {
         })
     }
 
-    /// The server answered the command; the first answer is final. An
+    /// The server answered the command; the first answer is final, and one
+    /// for a command already settled (or gone) changes nothing. An
     /// accepted blob delete or crop asks an open storage screen's report
     /// again, as one the log settles does ([`Seam::apply_events`]).
     pub fn command_result(&self, id: CommandId, result: &CommandResult) -> Result<(), CoreError> {
         let now = Utc::now();
         self.update(|state| {
-            state.store.record_result(id, result, now)?;
+            if !state.store.record_result(id, result, now)? {
+                return Ok(((), Vec::new()));
+            }
             let refresh = state.model.command_result(id, result.clone(), now);
             Ok(((), refresh.into_iter().collect()))
         })
@@ -415,12 +418,13 @@ impl Seam {
     /// The server refused the command's request without an answer
     /// ([`TransportError::refuses_command`]), or never logged it
     /// ([`Seam::command_unlogged`]): it fails for good and the outbox moves
-    /// on.
+    /// on. A command already settled (or gone) stays as it is.
     pub fn command_undeliverable(&self, id: CommandId) -> Result<(), CoreError> {
         let now = Utc::now();
         self.update(|state| {
-            state.store.record_undeliverable(id, now)?;
-            state.model.command_undeliverable(id, now);
+            if state.store.record_undeliverable(id, now)? {
+                state.model.command_undeliverable(id, now);
+            }
             Ok(((), Vec::new()))
         })
     }
@@ -446,8 +450,9 @@ impl Seam {
             if state.store.cursor()? < head {
                 return Ok((false, Vec::new()));
             }
-            state.store.record_undeliverable(id, now)?;
-            state.model.command_undeliverable(id, now);
+            if state.store.record_undeliverable(id, now)? {
+                state.model.command_undeliverable(id, now);
+            }
             Ok((true, Vec::new()))
         })
     }

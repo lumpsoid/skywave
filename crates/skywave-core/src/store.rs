@@ -742,9 +742,16 @@ enum LocalResult {
 }
 
 impl OutboxStatus {
-    /// Whether the command still needs to be (re)sent.
-    pub fn is_pending(&self) -> bool {
-        !matches!(self, OutboxStatus::Done(_))
+    /// Whether the command has its final outcome: the server's answer, or
+    /// given up on as [`Undeliverable`](OutboxStatus::Undeliverable). Only
+    /// an unsettled command (the outbox's `result IS NULL`) is still sent,
+    /// claimed ([`Store::claim_send`]) or settled ([`Store::record_result`],
+    /// [`Store::record_undeliverable`]).
+    pub fn is_settled(&self) -> bool {
+        match self {
+            OutboxStatus::Queued | OutboxStatus::Sending => false,
+            OutboxStatus::Done(_) | OutboxStatus::Undeliverable => true,
+        }
     }
 }
 
@@ -1571,37 +1578,32 @@ impl Store {
 
     /// Records the server's answer, received at `now`. The first recorded
     /// result is kept; the server returns the same one for every resend
-    /// anyway.
+    /// anyway. `false` when nothing changed: the command was already
+    /// settled, or is not in the outbox.
     pub fn record_result(
         &self,
         id: CommandId,
         result: &CommandResult,
         now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        self.settle(id, &Settled::Answered(result.clone()), now)
+    ) -> Result<bool, StoreError> {
+        settle_in(&self.conn, id, &Settled::Answered(result.clone()), now)
     }
 
     /// Gives up on a command the server refused without an answer, at
     /// `now` ([`OutboxStatus::Undeliverable`]). Like an answer, it is final
-    /// and the first one is kept.
+    /// and the first one is kept; `false` when nothing changed, as for
+    /// [`record_result`](Store::record_result).
     pub fn record_undeliverable(
         &self,
         id: CommandId,
         now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        self.settle(id, &Settled::Local(LocalResult::Undeliverable), now)
-    }
-
-    /// A command no longer in the outbox settles nothing: the user took it
-    /// back while its request was out ([`Store::withdraw`]).
-    fn settle(
-        &self,
-        id: CommandId,
-        settled: &Settled,
-        now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        settle_in(&self.conn, id, settled, now)?;
-        Ok(())
+    ) -> Result<bool, StoreError> {
+        settle_in(
+            &self.conn,
+            id,
+            &Settled::Local(LocalResult::Undeliverable),
+            now,
+        )
     }
 
     /// Takes a command back: deletes it from the outbox if the server has

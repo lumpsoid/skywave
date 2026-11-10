@@ -35,8 +35,8 @@ use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
 pub struct ViewState {
     /// Link banner data; present on every screen.
     pub link: Link,
-    /// Own commands persisted locally and not yet answered by the server
-    /// ("offline · N queued").
+    /// Own commands persisted locally and not yet settled: neither answered
+    /// by the server nor given up on as undeliverable ("offline · N queued").
     pub queued: usize,
     /// Approvals waiting for an answer; present on every screen.
     pub attention: Attention,
