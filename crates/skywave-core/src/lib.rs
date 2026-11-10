@@ -77,7 +77,7 @@ pub use skywave_proto::Fingerprint;
 pub use skywave_proto::PROTOCOL_VERSION;
 pub use store::{
     Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, OutboxStatus, PendingCrop,
-    ReadMark, Settings, Snapshot, Store, StoreError,
+    ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
 };
 pub use transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
 pub use view::{

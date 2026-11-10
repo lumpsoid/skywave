@@ -812,12 +812,14 @@ logs) an event that no longer decodes rather than failing.
   workdir content across sessions). An answer for a session not in the
   replica (unknown, deleted here, or from before a re-pair) is dropped.
   `usage_limits` keeps the latest answer to the usage limits read.
-  `settings` also keeps what the last `hello` said of the server: whether
-  it runs shell commands, whether it allows bypass mode, when its agent's
-  login expires (`login_expires`), whether a device may log the agent in
+  `server_facts` keeps what the last `hello` said of the server
+  (`ServerFacts`, `Settings::server`): whether it runs shell commands,
+  whether it allows bypass mode, when its agent's login expires
+  (`login_expires`), whether a device may log the agent in
   (`agent_login_offered`) and whether the agent is logged out
-  (`agent_logged_out`); the last three are gone with a re-pair to another
-  server. Each shows offline too.
+  (`agent_logged_out`). One row, replaced whole by each `hello` and
+  cleared with the replica, so a re-pair to another server (or any reset)
+  drops all of it until the next `hello`. It shows offline too.
 - **Session list order**: newest first by `SessionSummary::last_message_seq`,
   the seq of the session's newest `UserMessage` (its creation until it has
   one). Only a message someone writes moves a session up. The agent's

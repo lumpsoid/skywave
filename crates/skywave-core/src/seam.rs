@@ -24,8 +24,8 @@ use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::model::Paired;
 use crate::projection::BlobFate;
 use crate::store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, PendingCrop, Settings,
-    StoreError,
+    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, PendingCrop, ServerFacts,
+    Settings, StoreError,
 };
 use crate::transport::TransportError;
 use crate::view::{
@@ -343,21 +343,11 @@ impl Seam {
     /// after a restart.
     pub fn hello_received(&self, hello: &HelloResponse) -> Result<(), CoreError> {
         self.update(|state| {
+            let facts = ServerFacts::of(hello);
             state.store.set_devices(&hello.devices)?;
-            state.store.set_shell_enabled(hello.shell)?;
-            state.store.set_bypass_allowed(hello.bypass)?;
-            state.store.set_login_expires(hello.login_expires)?;
-            state
-                .store
-                .set_agent_login_offered(hello.agent_login_offered)?;
-            state.store.set_agent_logged_out(hello.agent_logged_out)?;
+            state.store.set_server_facts(&facts)?;
             state.model.devices_named(&hello.devices);
-            state.model.shell_enabled(hello.shell);
-            state.model.bypass_allowed(hello.bypass);
-            state.model.login_expires(hello.login_expires);
-            state
-                .model
-                .agent_login(hello.agent_login_offered, hello.agent_logged_out);
+            state.model.server_facts(facts);
             Ok(((), Vec::new()))
         })
     }
@@ -635,10 +625,13 @@ impl Seam {
                 return Ok(((), Vec::new()));
             }
             let stored = match &result {
-                Ok(LoginFinishResult::LoggedIn { expires }) => state
-                    .store
-                    .set_agent_logged_out(false)
-                    .and_then(|()| state.store.set_login_expires(*expires)),
+                Ok(LoginFinishResult::LoggedIn { expires }) => {
+                    state.store.settings().and_then(|settings| {
+                        let mut facts = settings.server;
+                        facts.logged_in(*expires);
+                        state.store.set_server_facts(&facts)
+                    })
+                }
                 _ => Ok(()),
             };
             // The login ended either way; a failed write only leaves the

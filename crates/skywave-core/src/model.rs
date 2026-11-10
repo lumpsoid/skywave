@@ -32,7 +32,8 @@ use crate::snippets::Snippets;
 use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
-    BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
+    BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, ServerFacts, Settings,
+    Snapshot,
 };
 use crate::tls;
 use crate::transport::TransportError;
@@ -1716,26 +1717,9 @@ impl Model {
         }
     }
 
-    /// The server said whether it runs shell commands (already stored).
-    pub(crate) fn shell_enabled(&mut self, enabled: bool) {
-        self.settings.shell_enabled = enabled;
-    }
-
-    /// The server said whether it allows bypass mode (already stored).
-    pub(crate) fn bypass_allowed(&mut self, allowed: bool) {
-        self.settings.bypass_allowed = allowed;
-    }
-
-    /// The server said when its agent's login expires (already stored).
-    pub(crate) fn login_expires(&mut self, at: Option<DateTime<Utc>>) {
-        self.settings.login_expires = at;
-    }
-
-    /// The server said whether a device may log its agent in, and whether
-    /// the agent is logged out (already stored).
-    pub(crate) fn agent_login(&mut self, offered: bool, logged_out: bool) {
-        self.settings.agent_login_offered = offered;
-        self.settings.agent_logged_out = logged_out;
+    /// What the server's `hello` said of itself (already stored).
+    pub(crate) fn server_facts(&mut self, facts: ServerFacts) {
+        self.settings.server = facts;
     }
 
     /// Devices the events name that this device knows no name for.
@@ -1888,8 +1872,7 @@ impl Model {
             return;
         }
         if stored && let Ok(LoginFinishResult::LoggedIn { expires }) = &result {
-            self.settings.agent_logged_out = false;
-            self.settings.login_expires = *expires;
+            self.settings.server.logged_in(*expires);
         }
         self.login.finished(result);
     }
@@ -2080,9 +2063,9 @@ impl Model {
             screen: self.screen(),
             can_go_back: self.shown_subagent().is_some() || self.back().is_some(),
             snippets: self.snippets.list().to_vec(),
-            login_expires: self.settings.login_expires,
-            agent_login_offered: self.settings.agent_login_offered,
-            agent_logged_out: self.settings.agent_logged_out,
+            login_expires: self.settings.server.login_expires,
+            agent_login_offered: self.settings.server.agent_login_offered,
+            agent_logged_out: self.settings.server.agent_logged_out,
         }
     }
 
@@ -2126,9 +2109,9 @@ impl Model {
                 device_id: self.device(),
                 server_fingerprint: self.paired.and_then(|p| p.server),
                 login: LoginView {
-                    offered: self.settings.agent_login_offered,
-                    logged_out: self.settings.agent_logged_out,
-                    expires: self.settings.login_expires,
+                    offered: self.settings.server.agent_login_offered,
+                    logged_out: self.settings.server.agent_logged_out,
+                    expires: self.settings.server.login_expires,
                     flow: self.login.view(),
                 },
             }),
@@ -2858,7 +2841,7 @@ impl Model {
             }
         }
         ShellView {
-            enabled: self.settings.shell_enabled,
+            enabled: self.settings.server.shell_enabled,
             cwd,
             runs,
         }
@@ -2924,7 +2907,7 @@ impl Model {
             mode_refused: agent.mode.refused.clone(),
             model_refused: agent.model.refused.clone(),
             models: self.models.clone(),
-            bypass_allowed: self.settings.bypass_allowed,
+            bypass_allowed: self.settings.server.bypass_allowed,
         }
     }
 
@@ -9521,7 +9504,11 @@ mod tests {
 
         let flow = skywave_proto::LoginFlowId::random();
         let mut f = login_opened(flow);
-        f.model.agent_login(true, true);
+        f.model.server_facts(ServerFacts {
+            agent_login_offered: true,
+            agent_logged_out: true,
+            ..ServerFacts::default()
+        });
         let view = login_view(&f);
         assert!(view.offered && view.logged_out);
         assert_eq!(view.expires, None);
