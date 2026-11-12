@@ -450,17 +450,24 @@ pub struct CreatePrompt {
     /// The input as the hub last set it; Dart overwrites its field only
     /// when `input_rev` changes (a completion filled it in).
     pub input: String,
+    /// Changes when a user action (Tab, Enter, a tap) rewrote the input;
+    /// never on a reply.
     pub input_rev: u32,
-    /// The candidate list, while open.
+    /// The candidate list; shown whenever the core has a completion.
     pub popup: Option<CompletionPopup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct CompletionPopup {
     pub candidates: Vec<CandidateView>,
-    /// The highlighted candidate.
-    pub selected: u32,
-    /// `listing…`, `offline · recent only`, `more not shown · keep typing`.
+    /// The highlighted candidate; none until ↓ (Enter then creates).
+    pub selected: Option<u32>,
+    /// The candidates are for an earlier input while a new directory loads:
+    /// shown dimmed, and they cannot be highlighted or chosen.
+    pub stale: bool,
+    /// A listing is pending: Dart shows a progress bar, not a label.
+    pub loading: bool,
+    /// `offline · recent only`, `more not shown · keep typing`.
     pub status_label: Option<String>,
     /// `no matching directories`, when there are no candidates.
     pub empty_label: Option<String>,
@@ -469,6 +476,9 @@ pub struct CompletionPopup {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct CandidateView {
     pub path: String,
+    /// The text a row shows: for a server listing under the input's
+    /// directory, the name past it; otherwise the full path.
+    pub label: String,
     /// From recent workdirs, not the server's listing.
     pub recent: bool,
 }

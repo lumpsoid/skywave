@@ -4,13 +4,13 @@ use chrono::{TimeZone, Utc};
 use skywave_core::attachment;
 use skywave_core::{ContentHash, Core, CoreError, DeviceId, PairedCredentials, Seam};
 use skywave_present::policy::DRAFT_SAVE_AFTER;
-use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
+use skywave_proto::{CommandId, CommandKind, DirsResult, Event, EventBatch, EventKind};
 
 use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
-    ActionIntent, ListKindView, LoginFlowState, PastedCode, RouteView, RowKind, ScreenView,
-    ShellPromptView, ToolState,
+    ActionIntent, CreatePrompt, ListKindView, LoginFlowState, PastedCode, RouteView, RowKind,
+    ScreenView, ShellPromptView, ToolState,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -2173,22 +2173,56 @@ fn a_tapped_candidate_fills_the_create_prompt() {
     rig.intent(GuiIntent::CompletionComplete);
     rig.results();
     rig.view();
-    let prompt = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
-        ScreenView::SessionList { create, .. } => create.clone().unwrap(),
-        other => panic!("not the list: {other:?}"),
-    };
-    let listed = prompt(&rig).popup.expect("the candidates are listed");
+    let listed = shown_prompt(&rig).popup.expect("the candidates are listed");
     let paths: Vec<_> = listed.candidates.iter().map(|c| c.path.clone()).collect();
     assert!(paths.len() >= 2, "both recent workdirs: {paths:?}");
 
     let outs = rig.intent(GuiIntent::CompletionPick { index: 99 });
     assert!(outs.is_empty(), "a stale tap does nothing");
-    let before = prompt(&rig).input_rev;
+    let before = shown_prompt(&rig).input_rev;
     rig.intent(GuiIntent::CompletionPick { index: 1 });
-    let after = prompt(&rig);
+    rig.results();
+    rig.view();
+    let after = shown_prompt(&rig);
     assert_eq!(after.input, format!("{}/", paths[1]));
     assert!(after.input_rev > before);
-    assert!(after.popup.is_none(), "taking one closes the list");
+    let popup = after.popup.expect("taking one keeps the list");
+    assert_eq!(popup.selected, None, "with nothing highlighted");
+}
+
+/// The new-session prompt as the head last sent it.
+fn shown_prompt(rig: &Rig) -> CreatePrompt {
+    match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::SessionList { create, .. } => create.clone().unwrap(),
+        other => panic!("not the list: {other:?}"),
+    }
+}
+
+/// Answers the newest directory listing the core asked for with `names`
+/// under `dir`.
+fn answer_listing(
+    rig: &mut Rig,
+    requests: &std::sync::mpsc::Receiver<skywave_core::Request>,
+    dir: &str,
+    names: &[&str],
+) {
+    let req = requests
+        .try_iter()
+        .filter_map(|r| match r {
+            skywave_core::Request::ListDirs { req, .. } => Some(req),
+            _ => None,
+        })
+        .last()
+        .expect("the core asked for a listing");
+    rig.seam.dirs_listed(
+        req,
+        Ok(DirsResult::Listed {
+            dir: dir.into(),
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+            truncated: false,
+        }),
+    );
+    rig.view();
 }
 
 impl Rig {
@@ -3191,21 +3225,213 @@ fn accepting_a_candidate_leaves_the_conversation_alone() {
     rig.intent(GuiIntent::CreateConversationTyped {
         conversation: "abc-123".into(),
     });
-    // The seeded session's workdir is a recent candidate.
-    rig.intent(GuiIntent::CompletionComplete);
+    // The seeded session's workdir is the one recent candidate: highlight it.
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/".into(),
+    });
     rig.results();
     rig.view();
+    rig.intent(GuiIntent::CompletionMove { up: false });
     let before = rig.actions.len();
     rig.intent(GuiIntent::CompletionAccept);
     assert_eq!(
         rig.actions.len(),
-        before,
-        "taking a candidate dispatches nothing"
+        before + 1,
+        "taking a candidate descends into it"
     );
+    assert!(matches!(
+        rig.actions.last(),
+        Some(Action::CompleteWorkdir { .. })
+    ));
     assert!(queued_creations(&rig).is_empty());
     rig.intent(GuiIntent::CompletionAccept);
     assert_eq!(queued_creations(&rig).len(), 1);
     assert_eq!(queued_creations(&rig)[0].1.as_deref(), Some("abc-123"));
+}
+
+#[test]
+fn opening_the_prompt_lists_at_once() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::CompleteWorkdir {
+            input: String::new()
+        })
+    );
+    rig.results();
+    rig.view();
+    let popup = shown_prompt(&rig)
+        .popup
+        .expect("the candidate list is shown at once");
+    assert!(!popup.candidates.is_empty(), "the recent workdir is listed");
+    assert_eq!(popup.selected, None, "nothing is highlighted");
+}
+
+#[test]
+fn enter_on_a_highlighted_row_descends_and_keeps_the_list() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/".into(),
+    });
+    rig.results();
+    rig.view();
+    let listed = shown_prompt(&rig).popup.expect("the candidates are listed");
+    let paths: Vec<_> = listed.candidates.iter().map(|c| c.path.clone()).collect();
+    assert!(!paths.is_empty(), "a recent workdir is listed");
+    assert!(listed.candidates.iter().any(|c| c.recent));
+    for c in listed.candidates.iter().filter(|c| c.recent) {
+        assert_eq!(c.label, c.path, "a recent row shows its full path");
+    }
+
+    rig.intent(GuiIntent::CompletionMove { up: false });
+    let before = shown_prompt(&rig).input_rev;
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::CompleteWorkdir {
+            input: format!("{}/", paths[0])
+        }),
+        "Enter descends rather than creating"
+    );
+    assert!(queued_creations(&rig).is_empty());
+    rig.results();
+    rig.view();
+    let after = shown_prompt(&rig);
+    assert_eq!(after.input, format!("{}/", paths[0]));
+    assert!(after.input_rev > before);
+    let popup = after.popup.expect("the list stays open");
+    assert_eq!(popup.selected, None);
+}
+
+#[test]
+fn a_listing_never_rewrites_the_input() {
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::CreateOpen);
+    // Nothing matches, so Tab fills nothing and asks again.
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/nope/".into(),
+    });
+    rig.intent(GuiIntent::CompletionComplete);
+    rig.results();
+    rig.view();
+    let before = shown_prompt(&rig);
+    assert_eq!(before.input, "/nope/");
+
+    answer_listing(&mut rig, &requests, "/nope/", &["x"]);
+    let after = shown_prompt(&rig);
+    let names: Vec<_> = after
+        .popup
+        .expect("the list is shown")
+        .candidates
+        .iter()
+        .map(|c| c.path.clone())
+        .collect();
+    assert_eq!(names, ["/nope/x"], "the reply reached the list");
+    assert_eq!(after.input, before.input);
+    assert_eq!(after.input_rev, before.input_rev);
+}
+
+#[test]
+fn stale_rows_are_marked_and_cannot_be_picked() {
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::CreateOpen);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/".into(),
+    });
+    rig.results();
+    rig.view();
+    answer_listing(&mut rig, &requests, "/srv/", &["api", "web"]);
+    // A new directory: its listing is pending, the answered one stays.
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/api/".into(),
+    });
+    rig.results();
+    rig.view();
+    let shown = shown_prompt(&rig);
+    assert_eq!(shown.input, "/srv/api/");
+    let popup = shown.popup.expect("the list is shown");
+    assert!(popup.stale, "the rows are for the earlier input");
+    assert!(popup.loading, "the new directory's listing is pending");
+    assert!(
+        !popup.candidates.is_empty(),
+        "the stale rows are still shown"
+    );
+
+    let actions = rig.actions.len();
+    rig.intent(GuiIntent::CompletionPick { index: 0 });
+    assert_eq!(rig.actions.len(), actions, "a stale row is not taken");
+    rig.results();
+    rig.view();
+    let after = shown_prompt(&rig);
+    assert_eq!(after.input, "/srv/api/");
+    assert_eq!(after.input_rev, shown.input_rev);
+
+    answer_listing(&mut rig, &requests, "/srv/api/", &["x"]);
+    let answered = shown_prompt(&rig).popup.expect("the list is shown");
+    assert!(!answered.loading, "the listing has answered");
+    assert!(!answered.stale, "the rows are for the input now");
+}
+
+#[test]
+fn a_listed_row_shows_its_name() {
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::CreateOpen);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/".into(),
+    });
+    rig.results();
+    rig.view();
+    answer_listing(&mut rig, &requests, "/srv/", &["api"]);
+    let popup = shown_prompt(&rig).popup.expect("the listing is shown");
+    let api = popup
+        .candidates
+        .iter()
+        .find(|c| !c.recent)
+        .expect("the server listed a directory");
+    assert_eq!(api.path, "/srv/api");
+    assert_eq!(api.label, "api", "under the input's directory: its name");
+}
+
+#[test]
+fn esc_unselects_then_closes() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/".into(),
+    });
+    rig.results();
+    rig.view();
+    rig.intent(GuiIntent::CompletionMove { up: false });
+    rig.results();
+    rig.view();
+    assert_eq!(shown_prompt(&rig).popup.unwrap().selected, Some(0));
+
+    rig.intent(GuiIntent::CompletionCancel);
+    rig.results();
+    rig.view();
+    let kept = shown_prompt(&rig);
+    assert_eq!(
+        kept.popup.unwrap().selected,
+        None,
+        "the first Esc unselects"
+    );
+
+    rig.intent(GuiIntent::CompletionCancel);
+    assert_eq!(rig.actions.last(), Some(&Action::EndCompletion));
+    rig.results();
+    rig.view();
+    let ScreenView::SessionList { create, .. } = rig.list() else {
+        unreachable!()
+    };
+    assert_eq!(create, None, "the second Esc closes the prompt");
 }
 
 #[test]

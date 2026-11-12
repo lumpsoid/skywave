@@ -181,18 +181,19 @@ pub enum GuiIntent {
     CreateConversationTyped {
         conversation: String,
     },
-    /// Tab: take the highlighted candidate, or ask for candidates.
+    /// Tab: open the highlighted row, else fill or list again.
     CompletionComplete,
-    /// Move the highlight.
+    /// Move the highlight: ↓ from none highlights the first row, ↑ from
+    /// the first returns to none.
     CompletionMove {
         up: bool,
     },
-    /// Enter: take the highlighted candidate, or create the session.
+    /// Enter: open the highlighted row, else create the session.
     CompletionAccept,
-    /// Esc: close the candidate list, or else the prompt.
+    /// Esc: unselect, else close the prompt.
     CompletionCancel,
-    /// A tap on a listed candidate: take the one at `index` (of the
-    /// popup's `candidates`). One no longer listed is ignored.
+    /// A tap on a row: open the candidate at `index` (of the popup's
+    /// `candidates`). One not choosable (stale, or out of range) is ignored.
     CompletionPick {
         index: u32,
     },
