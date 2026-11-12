@@ -113,6 +113,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -120,7 +121,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
 use skywave_proto::limits::ATTACHMENT_MAX_BYTES;
-use skywave_proto::{Command, CommandKind, CommandResult, EventsQuery, Seq, UploadResult};
+use skywave_proto::{
+    Command, CommandKind, CommandResult, ContentHash, EventsQuery, Seq, UploadResult,
+};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -317,6 +320,8 @@ pub(crate) struct Engine {
     suspended: watch::Receiver<bool>,
     /// Wakes the outbox sender; outlives each link so no wake-up is lost.
     outbox: Arc<Notify>,
+    /// Wakes the draft image stager; outlives each link so no wake-up is lost.
+    drafts: Arc<Notify>,
     /// Ends the link's backoff wait; outlives each link.
     retry_now: Arc<Notify>,
     link: Option<JoinHandle<()>>,
@@ -354,6 +359,7 @@ impl Engine {
             requests,
             suspended,
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             link: None,
             downloader: None,
@@ -410,6 +416,7 @@ impl Engine {
                 self.start_link();
             }
             Request::OutboxChanged => self.outbox.notify_one(),
+            Request::DraftImagesChanged => self.drafts.notify_one(),
             // Only a link already waiting is woken: no permit is stored, so
             // a press that lands mid-connect cannot skip the next wait.
             Request::RetryNow => self.retry_now.notify_waiters(),
@@ -590,6 +597,7 @@ impl Engine {
             seam,
             config: self.config.clone(),
             outbox: self.outbox.clone(),
+            drafts: self.drafts.clone(),
             retry_now: self.retry_now.clone(),
             blobs: self.blobs.clone(),
             address,
@@ -673,6 +681,8 @@ pub(crate) struct LinkCtx {
     pub(crate) seam: Seam,
     pub(crate) config: Arc<EngineConfig>,
     pub(crate) outbox: Arc<Notify>,
+    /// Wakes the draft image stager.
+    pub(crate) drafts: Arc<Notify>,
     /// Ends a backoff wait early.
     pub(crate) retry_now: Arc<Notify>,
     /// Where an `Eager` policy queues the blobs a batch registers.
@@ -950,6 +960,7 @@ async fn connection(
     let ended = tokio::select! {
         ended = pull(ctx, transport, reporter, &progress, hello.head, latency_ms) => ended,
         ended = send(ctx, transport, &progress, errors) => ended,
+        ended = stage_drafts(ctx, transport) => ended,
     };
     let Err(error) = ended;
     Ended {
@@ -1096,42 +1107,130 @@ async fn stage_attachments(
         if !still_pending(ctx, command.id)? {
             return Ok(Staged::Withdrawn);
         }
-        if transport.attachment_staged(sha).await? {
-            continue;
-        }
-        let path = attachment_path(&data_dir, sha);
-        let size = match tokio::fs::metadata(&path).await {
-            Ok(meta) => meta.len(),
-            Err(error) => {
-                tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
-                return Ok(Staged::Refused(AttachmentRefusal::Missing));
-            }
-        };
-        if size > ATTACHMENT_MAX_BYTES {
-            tracing::warn!(sha256 = %sha.to_hex(), size, "attachment is over the upload limit");
-            return Ok(Staged::Refused(AttachmentRefusal::TooLarge));
-        }
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
-                return Ok(Staged::Refused(AttachmentRefusal::Missing));
-            }
-        };
-        match transport.upload_attachment(sha, Bytes::from(bytes)).await? {
-            UploadResult::Stored { .. } => {}
-            UploadResult::DiskLow => break,
-            UploadResult::TooLarge => return Ok(Staged::Refused(AttachmentRefusal::TooLarge)),
-            UploadResult::NotAnImage => return Ok(Staged::Refused(AttachmentRefusal::NotAnImage)),
-            UploadResult::HashMismatch => {
-                return Ok(Staged::Refused(AttachmentRefusal::HashMismatch));
-            }
+        match stage_one(transport, &data_dir, sha).await? {
+            ImageStaging::Staged => {}
+            ImageStaging::DiskLow => break,
+            ImageStaging::Refused(reason) => return Ok(Staged::Refused(reason)),
         }
     }
     if !still_pending(ctx, command.id)? {
         return Ok(Staged::Withdrawn);
     }
     Ok(Staged::Post)
+}
+
+/// What staging one image came to.
+enum ImageStaging {
+    /// The server holds the image.
+    Staged,
+    /// A low disk stopped the upload.
+    DiskLow,
+    /// The image cannot be staged, and why.
+    Refused(AttachmentRefusal),
+}
+
+/// Stages one image: a HEAD, then, unless the server holds it, the local
+/// file is PUT. A missing, unreadable or oversized file is refused without an
+/// upload. A transport error is returned to the caller.
+async fn stage_one(
+    transport: &dyn Transport,
+    data_dir: &Path,
+    sha: ContentHash,
+) -> Result<ImageStaging, TransportError> {
+    if transport.attachment_staged(sha).await? {
+        return Ok(ImageStaging::Staged);
+    }
+    let path = attachment_path(data_dir, sha);
+    let size = match tokio::fs::metadata(&path).await {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
+            return Ok(ImageStaging::Refused(AttachmentRefusal::Missing));
+        }
+    };
+    if size > ATTACHMENT_MAX_BYTES {
+        tracing::warn!(sha256 = %sha.to_hex(), size, "attachment is over the upload limit");
+        return Ok(ImageStaging::Refused(AttachmentRefusal::TooLarge));
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
+            return Ok(ImageStaging::Refused(AttachmentRefusal::Missing));
+        }
+    };
+    let answer = transport.upload_attachment(sha, Bytes::from(bytes)).await?;
+    Ok(match answer {
+        UploadResult::Stored { .. } => ImageStaging::Staged,
+        UploadResult::DiskLow => ImageStaging::DiskLow,
+        UploadResult::TooLarge => ImageStaging::Refused(AttachmentRefusal::TooLarge),
+        UploadResult::NotAnImage => ImageStaging::Refused(AttachmentRefusal::NotAnImage),
+        UploadResult::HashMismatch => ImageStaging::Refused(AttachmentRefusal::HashMismatch),
+    })
+}
+
+/// The background stager for agent drafts: uploads the images a draft
+/// gains as soon as it gains them, so on a bad link the bytes are usually on
+/// the server before the message is sent. It runs beside the pull and the
+/// outbox sender, and wakes when a draft gains images
+/// ([`Request::DraftImagesChanged`]).
+///
+/// Each image is staged once per connection. `done` only stops this loop
+/// from repeating itself; nothing else trusts it. The outbox still HEADs
+/// every hash before it posts a message, since the server unlinks the staged
+/// files a message uses. Abandoned drafts leave staged files behind, which
+/// the server's own cap and age eviction remove. A refused or missing image
+/// is marked done and left for the outbox to report when its message is
+/// sent. A transport error waits a backoff and tries again: it never ends
+/// the connection, as the pull is what notices a dead link.
+async fn stage_drafts(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, LinkError> {
+    let data_dir = ctx.seam.data_dir();
+    let mut done: HashSet<ContentHash> = HashSet::new();
+    let mut failures = 0u32;
+    loop {
+        let wanted: Vec<ContentHash> = ctx
+            .seam
+            .draft_image_hashes()?
+            .into_iter()
+            .filter(|sha| !done.contains(sha))
+            .collect();
+        if wanted.is_empty() {
+            ctx.drafts.notified().await;
+            continue;
+        }
+        let mut failed = false;
+        for sha in wanted {
+            match stage_one(transport, &data_dir, sha).await {
+                Ok(ImageStaging::Staged) => {}
+                Ok(ImageStaging::DiskLow) => {
+                    tracing::debug!(sha256 = %sha.to_hex(), "disk low; left for the outbox");
+                }
+                Ok(ImageStaging::Refused(reason)) => {
+                    tracing::debug!(
+                        ?reason,
+                        sha256 = %sha.to_hex(),
+                        "refused; left for the outbox"
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "staging a draft image failed; trying again later");
+                    failed = true;
+                    break;
+                }
+            }
+            done.insert(sha);
+        }
+        if failed {
+            failures = failures.saturating_add(1);
+            let after = ctx.config.backoff.delay(failures);
+            tokio::select! {
+                () = tokio::time::sleep(after) => {}
+                () = ctx.drafts.notified() => {}
+            }
+        } else {
+            failures = 0;
+        }
+    }
 }
 
 /// Claims and sends one outbox entry read earlier, and says whether the
@@ -1314,7 +1413,7 @@ mod tests {
 
     use super::*;
     use crate::Core;
-    use crate::attachment::attachment_dir;
+    use crate::attachment::{AttachedImage, attachment_dir};
     use crate::backoff::Jitter;
     use crate::identity::PairedCredentials;
     use crate::store::OutboxStatus;
@@ -1521,6 +1620,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -1652,6 +1752,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: retry_now.clone(),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -1920,6 +2021,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now,
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -2304,6 +2406,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(EngineConfig::default()),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -2729,7 +2832,11 @@ mod tests {
         }
 
         fn record(&self, call: String) {
-            self.calls.lock().unwrap().push(call);
+            let mut calls = self.calls.lock().unwrap();
+            // A stager that repeats itself never yields, so no timeout could
+            // end it: fail here instead.
+            assert!(calls.len() < 1000, "the sender repeats itself");
+            calls.push(call);
         }
 
         fn calls(&self) -> Vec<String> {
@@ -3094,6 +3201,126 @@ mod tests {
             statuses(&seam),
             [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
         );
+    }
+
+    /// Attaches the image `bytes` make to a draft of `session`, as the model
+    /// does when the user attaches it.
+    fn attach_draft_image(seam: &Seam, session: SessionId, bytes: &[u8]) {
+        let image = AttachedImage {
+            sha256: ContentHash::of(bytes),
+            media_type: ImageType::Png,
+            size: bytes.len() as u64,
+            width: 4,
+            height: 3,
+        };
+        crate::client::lock(&seam.core.shared.state)
+            .store
+            .attach_to_draft(session, &image, Utc::now())
+            .unwrap();
+    }
+
+    /// Runs the stager for a minute of paused time. It only ends on an
+    /// error, so the timeout is what ends it.
+    async fn stage_for_a_minute(ctx: &LinkCtx, server: &StagingServer) {
+        let staged = tokio::time::timeout(Duration::from_secs(60), stage_drafts(ctx, server)).await;
+        assert!(staged.is_err(), "the stager only ends on an error");
+    }
+
+    /// A draft image is uploaded as soon as it is attached, and only once
+    /// per link: a local one is PUT, one the server holds is only checked,
+    /// and nothing repeats while the draft stays as it is.
+    #[tokio::test(start_paused = true)]
+    async fn draft_images_are_staged_once_per_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = ContentHash::of(b"image b");
+        let server = StagingServer::new();
+        server.staged.lock().unwrap().insert(b);
+        let session = SessionId::new();
+        attach_draft_image(&seam, session, b"image a");
+        attach_draft_image(&seam, session, b"image b");
+
+        stage_for_a_minute(&sender_ctx(&seam), &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a), head_call(b)]);
+    }
+
+    /// A failed upload waits a backoff, then tries again from the head
+    /// check; the stager does not end over it.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_draft_upload_is_tried_again_after_a_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let mut server = StagingServer::new();
+        *server.put_failures.lock().unwrap() = 1;
+        let puts = Arc::new(Mutex::new(Vec::new()));
+        let at_put = puts.clone();
+        server.on_put = Some(Box::new(move || {
+            at_put.lock().unwrap().push(tokio::time::Instant::now());
+        }));
+        attach_draft_image(&seam, SessionId::new(), b"image a");
+        // Jitter fixed at its top, so the first retry waits exactly `base`.
+        let ctx = LinkCtx {
+            config: Arc::new(EngineConfig {
+                backoff: Backoff {
+                    base: Duration::from_secs(1),
+                    cap: Duration::from_secs(8),
+                    jitter: Jitter::fixed(1.0),
+                },
+                ..EngineConfig::default()
+            }),
+            ..sender_ctx(&seam)
+        };
+
+        stage_for_a_minute(&ctx, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), head_call(a), put_call(a)]
+        );
+        let puts = puts.lock().unwrap();
+        assert!(
+            puts[1] - puts[0] >= Duration::from_secs(1),
+            "retried after {:?}, not after a backoff",
+            puts[1] - puts[0]
+        );
+    }
+
+    /// An image the server refuses is left for the outbox to report when its
+    /// message is sent: the stager does not upload it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_draft_image_is_left_to_the_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"not really a picture");
+        let mut server = StagingServer::new();
+        server.put_answer = Some(UploadResult::NotAnImage);
+        attach_draft_image(&seam, SessionId::new(), b"not really a picture");
+
+        stage_for_a_minute(&sender_ctx(&seam), &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a)]);
+    }
+
+    /// An image attached while the stager waits wakes it at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_image_wakes_the_stager() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        let ctx = sender_ctx(&seam);
+        let session = SessionId::new();
+        let attach = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            attach_draft_image(&seam, session, b"image a");
+            ctx.drafts.notify_one();
+        };
+
+        let ((), staged) = tokio::join!(attach, async {
+            tokio::time::timeout(Duration::from_secs(60), stage_drafts(&ctx, &server)).await
+        });
+        assert!(staged.is_err(), "the stager only ends on an error");
+        assert_eq!(server.calls(), [head_call(a), put_call(a)]);
     }
 
     /// A command whose request never gets through can be taken back while

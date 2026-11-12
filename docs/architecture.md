@@ -910,7 +910,13 @@ logs) an event that no longer decodes rather than failing.
   message as `AttachmentRefused`: final, discardable, never posted. A low disk
   stops the uploads and posts the message anyway, so the server's stored
   `DiskLow` refusal shows it and the outbox keeps moving. A HEAD or PUT that
-  fails in transport backs off like the command's own request. The user may
+  fails in transport backs off like the command's own request. A third loop,
+  the draft stager, runs beside the pull and the sender: it uploads a draft's
+  images as soon as they are attached (woken when a draft gains images), HEAD
+  then PUT, each image once per connection. It only saves time, since the
+  outbox still checks every image before posting; a transport error makes it
+  wait a backoff and never ends the connection, and a refused image is left
+  for the outbox to report when the message is sent. The user may
   take back any message, shell run, session creation, context move, or
   blob delete or crop the
   server has not accepted, sent or not (`OutboxEntry::discardable`): the

@@ -824,7 +824,10 @@ impl Model {
                 }
                 self.attachments.insert(image.sha256, image.clone());
                 self.set_draft_images(session_id, images);
-                vec![Effect::AttachToDraft(session_id, image)]
+                vec![
+                    Effect::AttachToDraft(session_id, image),
+                    Effect::Request(Request::DraftImagesChanged),
+                ]
             }
             Action::Detach { session_id, sha256 } => {
                 let mut images = self.draft_images_of(session_id).to_vec();
@@ -1616,14 +1619,19 @@ impl Model {
             self.set_draft_images(key.0, images);
             (key.0, hashes)
         });
-        vec![
+        let restored_images = images.is_some();
+        let mut effects = vec![
             Effect::Withdraw {
                 id,
                 draft: Some((key, draft)),
                 images,
             },
             Effect::Request(Request::OutboxChanged),
-        ]
+        ];
+        if restored_images {
+            effects.push(Effect::Request(Request::DraftImagesChanged));
+        }
+        effects
     }
 
     /// The images an edited message puts back into `session_id`'s agent
@@ -7439,7 +7447,10 @@ mod tests {
                 session_id: sid,
                 image: a.clone(),
             }),
-            vec![Effect::AttachToDraft(sid, a.clone())]
+            vec![
+                Effect::AttachToDraft(sid, a.clone()),
+                Effect::Request(Request::DraftImagesChanged),
+            ]
         );
         assert_eq!(draft_images(&f), vec![a.clone()]);
         assert!(
@@ -7487,7 +7498,7 @@ mod tests {
                 session_id: sid,
                 image: image(tag, 1_000),
             });
-            assert_eq!(effects.len(), 1, "image {tag} fits");
+            assert_eq!(effects.len(), 2, "image {tag} fits");
         }
         assert!(
             f.dispatch(Action::Attach {
@@ -7508,7 +7519,7 @@ mod tests {
                 session_id: other,
                 image: image(tag, 4_000_000),
             });
-            assert_eq!(effects.len(), 1, "image {tag} fits");
+            assert_eq!(effects.len(), 2, "image {tag} fits");
         }
         assert!(
             f.dispatch(Action::Attach {
@@ -7628,6 +7639,7 @@ mod tests {
                     images: Some((sid, vec![a.sha256, b.sha256, c.sha256])),
                 },
                 Effect::Request(Request::OutboxChanged),
+                Effect::Request(Request::DraftImagesChanged),
             ]
         );
         let view = f.session_view();

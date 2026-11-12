@@ -14,8 +14,8 @@ use std::sync::mpsc::Receiver;
 
 use chrono::Utc;
 use skywave_proto::{
-    ChangesResult, CommandResult, ConversationsResult, DirsResult, EventBatch, HelloResponse,
-    LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
+    ChangesResult, CommandResult, ContentHash, ConversationsResult, DirsResult, EventBatch,
+    HelloResponse, LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
 };
 
 use crate::address::ServerAddress;
@@ -60,6 +60,9 @@ pub enum Request {
     Connect,
     /// A command was queued; the sender should drain the outbox.
     OutboxChanged,
+    /// A draft gained images: the stager should upload the ones the server
+    /// lacks.
+    DraftImagesChanged,
     /// The user wants this blob's content.
     DownloadBlob(BlobId),
     BlobPolicyChanged(BlobPolicy),
@@ -203,6 +206,19 @@ impl Seam {
     /// Commands awaiting a result, in send order.
     pub fn pending_outbox(&self) -> Result<Vec<OutboxEntry>, CoreError> {
         Ok(lock(&self.core.shared.state).store.pending_outbox()?)
+    }
+
+    /// The images agent drafts hold, each hash once: a session's in the
+    /// order they were attached.
+    pub fn draft_image_hashes(&self) -> Result<Vec<ContentHash>, CoreError> {
+        let drafts = lock(&self.core.shared.state).store.draft_images()?;
+        let mut seen = HashSet::new();
+        Ok(drafts
+            .values()
+            .flatten()
+            .map(|image| image.sha256)
+            .filter(|sha256| seen.insert(*sha256))
+            .collect())
     }
 
     pub fn blobs(&self) -> Result<Vec<BlobRecord>, CoreError> {
