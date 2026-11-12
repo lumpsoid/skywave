@@ -70,9 +70,11 @@ class TimelineViewState extends State<TimelineView> {
   /// until it is in view or the user scrolls.
   ({String key, bool line})? _reveal;
 
-  /// The newest row in view and its offset in the list, taken when the
-  /// rows change while the user reads older ones, until they are laid out.
-  ({String key, double offset})? _held;
+  /// The rows in view, newest first, and where each one's top edge sits in
+  /// the list, taken when the rows change while the user reads older ones,
+  /// until they are laid out. The newest of them still in the list stays
+  /// put; only if all of them left does the view keep its offset.
+  List<({String key, double top})>? _held;
 
   late final _physics = _HoldPhysics(shift: _heldShift);
 
@@ -135,9 +137,11 @@ class TimelineViewState extends State<TimelineView> {
       _setFollowing(true, force: true);
     }
     if (!_following && _reveal == null && _held == null) {
-      final key = newestVisibleKey();
-      final offset = key == null ? null : _offsetOf(key);
-      if (offset != null) _held = (key: key!, offset: offset);
+      final held = [
+        for (final key in _keysInView())
+          if (_topOf(key) case final top?) (key: key, top: top),
+      ];
+      if (held.isNotEmpty) _held = held;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -150,29 +154,43 @@ class TimelineViewState extends State<TimelineView> {
     });
   }
 
-  /// Where the row keyed [key] was last laid out, from the newest end.
-  double? _offsetOf(String key) {
+  /// Where the top edge of the row keyed [key] sits on screen, measured from
+  /// the newest end, as last laid out.
+  double? _topOf(String key) {
+    final slot = _slots[key]?.findRenderObject();
+    if (slot is! _RenderSlotBox) return null;
+    final height = slot.height;
+    if (height == null) return null;
     // The list wraps each row (repaint boundary, semantics): the list's
     // own child is a few boxes up.
-    var box = _slots[key]?.findRenderObject();
+    RenderObject? box = slot;
     while (box != null) {
       final parentData = box.parentData;
       if (parentData is SliverMultiBoxAdaptorParentData) {
-        return parentData.layoutOffset;
+        final offset = parentData.layoutOffset;
+        if (offset == null) return null;
+        return offset + height;
       }
       box = box.parent;
     }
     return null;
   }
 
-  /// How far the held row moved in this layout: the rows newer than it
-  /// grew by that much, and the view scrolls with it to keep it in place.
+  /// How far the newest held row still in the list moved in this layout, so
+  /// the view scrolls with it and keeps it in place.
   double _heldShift() {
     final held = _held;
-    final offset = held == null ? null : _offsetOf(held.key);
-    if (held == null || offset == null) return 0;
-    _held = (key: held.key, offset: offset);
-    return offset - held.offset;
+    if (held == null) return 0;
+    final kept = <({String key, double top})>[];
+    var shift = 0.0;
+    for (final row in held) {
+      final top = _topOf(row.key);
+      if (top == null) continue;
+      if (kept.isEmpty) shift = top - row.top;
+      kept.add((key: row.key, top: top));
+    }
+    _held = kept;
+    return shift;
   }
 
   (String?, int?) _targetOf(SearchUpdate? search) =>
@@ -302,13 +320,12 @@ class TimelineViewState extends State<TimelineView> {
     return nearest.offset + (nearest.index - index) * (total / count);
   }
 
-  /// The newest row in view, for a search step that starts from it.
-  String? newestVisibleKey() {
-    if (!_scroll.hasClients) return null;
+  /// The keys of the rows in view that are in the timeline, newest first.
+  List<String> _keysInView() {
+    if (!_scroll.hasClients) return const [];
     final top = _scroll.position.pixels;
     final bottom = top + _scroll.position.viewportDimension;
-    String? newest;
-    var newestIndex = -1;
+    final inView = <({String key, int index})>[];
     for (final MapEntry(:key, value: context) in _slots.entries) {
       final box = context.findRenderObject();
       if (box is! RenderBox || !box.hasSize) continue;
@@ -317,12 +334,16 @@ class TimelineViewState extends State<TimelineView> {
           .offset;
       if (start >= bottom || start + box.size.height <= top) continue;
       final index = widget.timeline.indexOf(key);
-      if (index > newestIndex) {
-        newestIndex = index;
-        newest = key;
-      }
+      if (index >= 0) inView.add((key: key, index: index));
     }
-    return newest;
+    inView.sort((a, b) => b.index.compareTo(a.index));
+    return [for (final item in inView) item.key];
+  }
+
+  /// The newest row in view, for a search step that starts from it.
+  String? newestVisibleKey() {
+    final keys = _keysInView();
+    return keys.isEmpty ? null : keys.first;
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
@@ -517,5 +538,26 @@ class _SlotState extends State<_Slot> {
   }
 
   @override
-  Widget build(BuildContext context) => widget.child;
+  Widget build(BuildContext context) => _SlotBox(child: widget.child);
+}
+
+/// Sizes its child and keeps the height, so the hold can read a row's height
+/// from the row itself.
+class _SlotBox extends SingleChildRenderObjectWidget {
+  const _SlotBox({super.child});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) => _RenderSlotBox();
+}
+
+/// Keeps the row's height from its own layout: the hold needs it during the
+/// viewport's layout, when a row's size may not be read.
+class _RenderSlotBox extends RenderProxyBox {
+  double? height;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    height = size.height;
+  }
 }

@@ -29,6 +29,22 @@ String heldKey(WidgetTester tester) => tester
 double topOf(WidgetTester tester, int n) =>
     tester.getRect(find.text('row $n')).top;
 
+/// The number `n` of the newest row whose `row <n>` text lies entirely inside
+/// the list's rect.
+int wholeRowInView(WidgetTester tester) {
+  final view = tester.getRect(listScrollable());
+  var newest = -1;
+  for (final text in tester.widgetList<Text>(find.byType(Text))) {
+    final data = text.data ?? text.textSpan?.toPlainText();
+    if (data == null || !data.startsWith('row ')) continue;
+    final n = int.tryParse(data.substring(4));
+    if (n == null || n <= newest) continue;
+    final rect = tester.getRect(find.text(data));
+    if (rect.top >= view.top && rect.bottom <= view.bottom) newest = n;
+  }
+  return newest;
+}
+
 /// Sixty rows, `row 0` to `row 59`, keyed `s:0` to `s:59`; the row keyed
 /// `s:<tallAt>` has its detail of 40 lines.
 List<TimelineRow> sixty({int? tallAt}) => [
@@ -168,7 +184,6 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    // Fails: Found 0 widgets with text "row 52": []
     testWidgets('the held row removed with its neighbours keeps the rows '
         'above still', (tester) async {
       final timeline = await scrolledBack(tester);
@@ -184,7 +199,7 @@ void main() {
 
       expect(topOf(tester, n - 2), closeTo(twoUp, 0.5));
       expect(tester.takeException(), isNull);
-    }, skip: true);
+    });
 
     testWidgets('every row removed, then rows back, lays out cleanly', (
       tester,
@@ -360,7 +375,7 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    // Fails: Expected: a numeric value within <0.5> of <524.0>
+    // Fails: Expected <524.0>, actual <508.0> (line 389)
     testWidgets('the held row growing keeps its top still', (tester) async {
       final timeline = await scrolledBack(tester);
       final held = heldKey(tester);
@@ -377,7 +392,7 @@ void main() {
       expect(tester.takeException(), isNull);
     }, skip: true);
 
-    // Fails: Found 0 widgets with text "row 57": []
+    // Fails: Expected <168.0>, actual <292.0> (line 405)
     testWidgets('the held row shrinking keeps its top still', (tester) async {
       final timeline = await pumpRows(tester, sixty(tallAt: 57));
       await scrollTo(tester, 500);
@@ -537,7 +552,6 @@ void main() {
   });
 
   group('scroll hold, conversation only, reveals and gestures', () {
-    // Fails: Expected: a numeric value within <0.5> of <456.0>
     testWidgets('conversation only on keeps the message in view still', (
       tester,
     ) async {
@@ -551,7 +565,7 @@ void main() {
       expect(timeline.rows.length, 30, reason: 'the tool rows went');
       expect(topOf(tester, watched), closeTo(before, 0.5));
       expect(tester.takeException(), isNull);
-    }, skip: true);
+    });
 
     testWidgets('conversation only off keeps the message in view still', (
       tester,
@@ -570,7 +584,7 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    // Fails: Expected: a numeric value within <0.5> of <456.0>
+    // Fails: Expected <456.0>, actual <428.0>, after toggle 2
     testWidgets('conversation only toggled five times keeps the message in '
         'view still', (tester) async {
       final timeline = await pumpMixedAtTool(tester);
@@ -659,15 +673,13 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    // Fails: Found 0 widgets with text "row 54": []
     testWidgets('rows changing during a drag keep the held row under the '
         'finger', (tester) async {
       final timeline = await scrolledBack(tester);
       final g = await tester.startGesture(tester.getCenter(listScrollable()));
       await g.moveBy(const Offset(0, 40));
       await tester.pump();
-      final held = heldKey(tester);
-      final n = int.parse(held.substring(2));
+      final n = wholeRowInView(tester);
       final top = topOf(tester, n);
 
       timeline.apply(
@@ -691,7 +703,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(tester.takeException(), isNull);
-    }, skip: true);
+    });
 
     testWidgets('rows changing during a fling back lay out cleanly', (
       tester,
