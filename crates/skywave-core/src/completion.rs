@@ -6,10 +6,13 @@
 //! matches them, and recent workdirs, by any path component. Only the last
 //! listing is kept, for one directory: further edits within it filter the
 //! same names, and the server is asked again only when the directory
-//! changes, the same input is completed twice, or the listing failed. Until
-//! a listing arrives, and whenever there is none, recent workdirs from the
-//! replica stand in. Names starting with `.` show only when the prefix
-//! does. Everything here is in memory.
+//! changes, the same input is completed twice, or the listing failed. While
+//! a new directory loads, the last answered listing stays on screen, for the
+//! input it was listed for, so the rows do not jump. Until a listing
+//! arrives, and whenever there is none, recent workdirs from the replica
+//! stand in, and a relative input lists them before the roots. Names
+//! starting with `.` show only when the prefix does. Everything here is in
+//! memory.
 
 use skywave_proto::DirsResult;
 
@@ -25,6 +28,9 @@ pub(crate) struct Completer {
     /// The input being completed; `None` while no prompt completes.
     input: Option<String>,
     listing: Option<Listing>,
+    /// The input and the answer of the last answered listing, kept while a
+    /// new directory loads: its candidates stay on screen for that input.
+    stale: Option<(String, DirsResult)>,
 }
 
 /// The last listing asked for.
@@ -51,11 +57,12 @@ impl Completer {
     ) -> Option<Request> {
         let dir = dir_of(&input).to_owned();
         let repeated = self.input.as_deref() == Some(input.as_str());
-        self.input = Some(input);
+        let previous = self.input.replace(input);
         let same_dir = self.listing.as_ref().filter(|l| l.dir == dir);
         if !online {
             if same_dir.is_none() {
                 self.listing = None;
+                self.stale = None;
             }
             return None;
         }
@@ -69,6 +76,21 @@ impl Completer {
         *last_req += 1;
         let req = *last_req;
         let result = same_dir.and_then(|l| l.result.clone());
+        if same_dir.is_none() {
+            // The last answered listing stays on screen, for the input it
+            // was shown for, while the new directory loads. A listing still
+            // waiting for its answer leaves the older one in place.
+            if let (
+                Some(previous),
+                Some(Listing {
+                    result: Some(answered),
+                    ..
+                }),
+            ) = (previous, &self.listing)
+            {
+                self.stale = Some((previous, answered.clone()));
+            }
+        }
         self.listing = Some(Listing {
             dir: dir.clone(),
             req,
@@ -82,6 +104,7 @@ impl Completer {
     pub(crate) fn end(&mut self) {
         self.input = None;
         self.listing = None;
+        self.stale = None;
     }
 
     /// The server's answer to request `req`; a stale one is ignored.
@@ -97,80 +120,38 @@ impl Completer {
                 None
             }
         };
+        self.stale = None;
     }
 
     /// The candidates for the current input; `recents` are the replica's
     /// workdirs, most recently active first.
     pub(crate) fn view<'a>(&self, recents: impl Iterator<Item = &'a str>) -> Option<Completion> {
         let input = self.input.as_deref()?;
-        let mut recent: Vec<&str> = Vec::new();
-        for path in recents.filter(|path| matches(input, path)) {
-            if !recent.contains(&path) {
-                recent.push(path);
-            }
-        }
-        let candidates = |paths: Vec<String>, source| {
-            paths
-                .into_iter()
-                .map(|path| Candidate { path, source })
-                .collect::<Vec<_>>()
-        };
-        let recent_only = || {
-            candidates(
-                recent.iter().map(|&p| p.to_owned()).collect(),
-                CandidateSource::Recent,
-            )
-        };
-        let (candidates, status) = match &self.listing {
-            None => (recent_only(), CompletionStatus::Unavailable),
+        let recents: Vec<&str> = recents.collect();
+        let (input, candidates, status) = match &self.listing {
+            None => (
+                input,
+                recent_candidates(input, &recents),
+                CompletionStatus::Unavailable,
+            ),
             Some(listing) => {
                 let status = |truncated| match (listing.pending, &listing.result) {
                     (true, _) => CompletionStatus::Loading,
                     (false, None) => CompletionStatus::Unavailable,
                     (false, Some(_)) => CompletionStatus::Ready { truncated },
                 };
-                match &listing.result {
-                    None => (recent_only(), status(false)),
-                    Some(DirsResult::Roots { roots } | DirsResult::NotAllowed { roots }) => {
-                        let roots: Vec<String> = roots
-                            .iter()
-                            .filter(|root| matches(input, root))
-                            .cloned()
-                            .collect();
-                        let mut list = candidates(roots, CandidateSource::Server);
-                        // A relative input has no directory to list: the
-                        // roots and the recent workdirs are all it matches.
-                        if !input.starts_with('/') {
-                            for path in &recent {
-                                if !list.iter().any(|c| c.path == *path) {
-                                    list.push(Candidate {
-                                        path: (*path).to_owned(),
-                                        source: CandidateSource::Recent,
-                                    });
-                                }
-                            }
-                        }
-                        (list, status(false))
+                match (&listing.result, &self.stale) {
+                    (Some(result), _) => {
+                        let (candidates, truncated) = offered(input, result, &recents);
+                        (input, candidates, status(truncated))
                     }
-                    Some(DirsResult::Listed {
-                        names, truncated, ..
-                    }) => {
-                        let (dir, prefix) = input.split_at(dir_of(input).len());
-                        let shown = |name: &&String| {
-                            name.starts_with(prefix)
-                                && (!name.starts_with('.') || prefix.starts_with('.'))
-                        };
-                        let paths = names
-                            .iter()
-                            .filter(shown)
-                            .map(|name| format!("{dir}{name}"))
-                            .collect();
-                        (
-                            candidates(paths, CandidateSource::Server),
-                            status(*truncated),
-                        )
+                    // A new directory loads: the last answered listing stands
+                    // in, as it was for the input it was listed for.
+                    (None, Some((stale_input, result))) => {
+                        let (candidates, _) = offered(stale_input, result, &recents);
+                        (stale_input.as_str(), candidates, CompletionStatus::Loading)
                     }
-                    Some(DirsResult::NotFound) => (Vec::new(), status(false)),
+                    (None, None) => (input, recent_candidates(input, &recents), status(false)),
                 }
             }
         };
@@ -180,6 +161,67 @@ impl Completer {
             status,
         })
     }
+}
+
+/// The candidates `result` offers for `input`, and whether the server cut
+/// its listing short; `recents` are the replica's workdirs.
+fn offered(input: &str, result: &DirsResult, recents: &[&str]) -> (Vec<Candidate>, bool) {
+    match result {
+        DirsResult::Roots { roots } | DirsResult::NotAllowed { roots } => {
+            // A relative input has no directory to list: the recent workdirs
+            // come first, then the roots it matches that are not recent.
+            let mut list = if input.starts_with('/') {
+                Vec::new()
+            } else {
+                recent_candidates(input, recents)
+            };
+            for root in roots.iter().filter(|root| matches(input, root)) {
+                if !list.iter().any(|c| c.path == *root) {
+                    list.push(Candidate {
+                        path: root.clone(),
+                        source: CandidateSource::Server,
+                    });
+                }
+            }
+            (list, false)
+        }
+        DirsResult::Listed {
+            names, truncated, ..
+        } => {
+            let (dir, prefix) = input.split_at(dir_of(input).len());
+            let shown = |name: &&String| {
+                name.starts_with(prefix) && (!name.starts_with('.') || prefix.starts_with('.'))
+            };
+            let paths = names
+                .iter()
+                .filter(shown)
+                .map(|name| format!("{dir}{name}"))
+                .collect();
+            (candidates(paths, CandidateSource::Server), *truncated)
+        }
+        DirsResult::NotFound => (Vec::new(), false),
+    }
+}
+
+/// The recent workdirs `input` matches, most recently active first, each once.
+fn recent_candidates(input: &str, recents: &[&str]) -> Vec<Candidate> {
+    let mut list: Vec<Candidate> = Vec::new();
+    for &path in recents.iter().filter(|path| matches(input, path)) {
+        if !list.iter().any(|c| c.path == path) {
+            list.push(Candidate {
+                path: path.to_owned(),
+                source: CandidateSource::Recent,
+            });
+        }
+    }
+    list
+}
+
+fn candidates(paths: Vec<String>, source: CandidateSource) -> Vec<Candidate> {
+    paths
+        .into_iter()
+        .map(|path| Candidate { path, source })
+        .collect()
 }
 
 /// The directory part of `input`: up to and including its last `/` if it
@@ -298,6 +340,147 @@ mod tests {
             completion("/é", &["/éa", "/éb"]).fill(),
             None,
             "multi-byte characters split cleanly"
+        );
+    }
+
+    #[test]
+    fn a_new_directory_keeps_the_previous_candidates_until_listed() {
+        let mut c = Completer::default();
+        let mut last_req = 0;
+        let Some(Request::ListDirs { req, .. }) = c.complete("/srv/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server");
+        };
+        c.listed(req, Ok(listed("/srv", &["api", "web"])));
+
+        let Some(Request::ListDirs { req, dir }) =
+            c.complete("/srv/api/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server for the new directory");
+        };
+        assert_eq!(dir, "/srv/api/");
+        let view = c.view(std::iter::empty()).unwrap();
+        assert_eq!(view.input, "/srv/");
+        assert_eq!(view.status, CompletionStatus::Loading);
+        assert_eq!(
+            paths(&view),
+            [
+                ("/srv/api", CandidateSource::Server),
+                ("/srv/web", CandidateSource::Server),
+            ]
+        );
+
+        c.listed(req, Ok(listed("/srv/api", &["src"])));
+        let view = c.view(std::iter::empty()).unwrap();
+        assert_eq!(view.input, "/srv/api/");
+        assert_eq!(view.status, CompletionStatus::Ready { truncated: false });
+        assert_eq!(paths(&view), [("/srv/api/src", CandidateSource::Server)]);
+    }
+
+    #[test]
+    fn a_failed_new_directory_ends_the_kept_candidates() {
+        let mut c = Completer::default();
+        let mut last_req = 0;
+        let Some(Request::ListDirs { req, .. }) = c.complete("/srv/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server");
+        };
+        c.listed(req, Ok(listed("/srv", &["api"])));
+        let Some(Request::ListDirs { req, .. }) =
+            c.complete("/srv/api/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server for the new directory");
+        };
+        c.listed(req, Err(TransportError::NotFound));
+
+        let view = c.view(std::iter::once("/srv/api/x")).unwrap();
+        assert_eq!(view.input, "/srv/api/");
+        assert_eq!(view.status, CompletionStatus::Unavailable);
+        assert_eq!(paths(&view), [("/srv/api/x", CandidateSource::Recent)]);
+    }
+
+    #[test]
+    fn two_quick_moves_keep_the_last_answered_listing() {
+        let mut c = Completer::default();
+        let mut last_req = 0;
+        let Some(Request::ListDirs { req, .. }) = c.complete("/srv/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server");
+        };
+        c.listed(req, Ok(listed("/srv", &["api", "web"])));
+        let Some(Request::ListDirs { req: first, .. }) =
+            c.complete("/srv/a/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server for /srv/a/");
+        };
+        let Some(Request::ListDirs { req: second, .. }) =
+            c.complete("/srv/a/b/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server for /srv/a/b/");
+        };
+
+        let kept = [
+            ("/srv/api", CandidateSource::Server),
+            ("/srv/web", CandidateSource::Server),
+        ];
+        let view = c.view(std::iter::empty()).unwrap();
+        assert_eq!(view.input, "/srv/");
+        assert_eq!(view.status, CompletionStatus::Loading);
+        assert_eq!(paths(&view), kept);
+
+        c.listed(first, Ok(listed("/srv/a", &["x"])));
+        let view = c.view(std::iter::empty()).unwrap();
+        assert_eq!(view.input, "/srv/");
+        assert_eq!(paths(&view), kept, "a late answer for /srv/a/ is ignored");
+
+        c.listed(second, Ok(listed("/srv/a/b", &["y"])));
+        let view = c.view(std::iter::empty()).unwrap();
+        assert_eq!(view.input, "/srv/a/b/");
+        assert_eq!(paths(&view), [("/srv/a/b/y", CandidateSource::Server)]);
+    }
+
+    #[test]
+    fn end_forgets_the_kept_candidates() {
+        let mut c = Completer::default();
+        let mut last_req = 0;
+        let Some(Request::ListDirs { req, .. }) = c.complete("/srv/".into(), true, &mut last_req)
+        else {
+            panic!("asks the server");
+        };
+        c.listed(req, Ok(listed("/srv", &["api"])));
+        assert!(c.complete("/srv/x/".into(), true, &mut last_req).is_some());
+
+        c.end();
+        assert!(c.complete("/srv/x/".into(), true, &mut last_req).is_some());
+        let view = c.view(std::iter::empty()).unwrap();
+        assert_eq!(view.input, "/srv/x/");
+        assert_eq!(view.status, CompletionStatus::Loading);
+        assert!(view.candidates.is_empty());
+    }
+
+    #[test]
+    fn a_relative_input_lists_recent_workdirs_before_the_roots() {
+        let mut c = Completer::default();
+        let mut last_req = 0;
+        let Some(Request::ListDirs { req, dir }) = c.complete("co".into(), true, &mut last_req)
+        else {
+            panic!("asks the server");
+        };
+        assert_eq!(dir, "");
+        c.listed(
+            req,
+            Ok(DirsResult::Roots {
+                roots: vec!["/srv/code".into(), "/opt/code".into()],
+            }),
+        );
+        let view = c.view(["/srv/code/web", "/srv/code"].into_iter()).unwrap();
+        assert_eq!(
+            paths(&view),
+            [
+                ("/srv/code/web", CandidateSource::Recent),
+                ("/srv/code", CandidateSource::Recent),
+                ("/opt/code", CandidateSource::Server),
+            ]
         );
     }
 }

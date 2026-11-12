@@ -19,9 +19,8 @@ use skywave_core::{
 use skywave_present::crop::toggle;
 use skywave_present::format;
 use skywave_present::policy::{
-    AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
-    ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
-    shell_stop,
+    AlertWatcher, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
+    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::storage::Grouping as StorageGrouping;
@@ -502,12 +501,8 @@ impl Head {
             (&mut self.create, self.view.as_ref().map(|v| &v.screen))
             && let Some(completion) = &list.completion
         {
-            let before = create.input.clone();
-            create.settle.settle(&mut create.input, completion);
-            if create.input != before {
-                self.revs += 1;
-                create.rev = self.revs;
-            }
+            // A reply never rewrites the input: only user actions do.
+            create.picker.settle(&create.input, Some(completion));
         }
         self.follow_session();
         let switched = open_session(&self.view)
@@ -1063,18 +1058,19 @@ impl Head {
                 if let Some(Screen::SessionList(list)) = self.view.as_ref().map(|v| &v.screen)
                     && list.kind == skywave_core::ListKind::Active
                 {
-                    self.create = Some(CreateUi::default());
+                    let mut create = CreateUi::default();
+                    let action = create.picker.start(&create.input);
+                    self.create = Some(create);
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
                 }
             }
             GuiIntent::CompletionTyped { input } => {
                 let Some(create) = &mut self.create else {
                     return Ok(());
                 };
-                create.settle.input();
                 create.input = input.chars().filter(|c| !c.is_control()).collect();
-                if let Some(action) = create.settle.edited(&create.input) {
-                    self.dispatch_user(action, Purpose::Plain, clock, out);
-                }
+                let action = create.picker.edited(&create.input);
+                self.dispatch_user(action, Purpose::Plain, clock, out);
             }
             GuiIntent::CreateConversationTyped { conversation } => {
                 if let Some(create) = &mut self.create {
@@ -1083,38 +1079,41 @@ impl Head {
                 }
             }
             GuiIntent::CompletionComplete => {
-                let candidates = self.candidates();
+                let completion = self.completion();
                 let Some(create) = &mut self.create else {
                     return Ok(());
                 };
-                create.settle.input();
-                if candidates.is_empty() {
-                    let action = create.settle.complete(&create.input);
-                    self.dispatch_user(action, Purpose::Plain, clock, out);
-                } else if let Some(chosen) = create.settle.choose(&candidates) {
+                let (next, action) = create.picker.complete(&create.input, completion.as_ref());
+                if let Some(next) = next {
                     self.revs += 1;
-                    create.input = chosen;
+                    create.input = next;
                     create.rev = self.revs;
                 }
+                self.dispatch_user(action, Purpose::Plain, clock, out);
             }
             GuiIntent::CompletionMove { up } => {
-                let len = self.candidates().len();
-                if let Some(create) = self.create.as_mut().filter(|_| len > 0) {
-                    create.settle.input();
+                let completion = self.completion();
+                if let Some(create) = &mut self.create {
                     if up {
-                        create.settle.up();
+                        create.picker.up();
                     } else {
-                        create.settle.down(len);
+                        create.picker.down(&create.input, completion.as_ref());
                     }
                 }
             }
             GuiIntent::CompletionAccept => {
-                let candidates = self.candidates();
+                let completion = self.completion();
                 let Some(create) = &mut self.create else {
                     return Ok(());
                 };
-                create.settle.input();
-                if candidates.is_empty() {
+                if let Some((next, action)) =
+                    create.picker.choose(&create.input, completion.as_ref())
+                {
+                    self.revs += 1;
+                    create.input = next;
+                    create.rev = self.revs;
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
+                } else {
                     // Blank or unacceptable paths are refused by the core
                     // or the server, not here.
                     let action = Action::CreateSession {
@@ -1123,35 +1122,25 @@ impl Head {
                     };
                     let tag = self.dispatch_user(action, Purpose::Create, clock, out);
                     self.create_tag = Some(tag);
-                } else if let Some(chosen) = create.settle.choose(&candidates) {
-                    self.revs += 1;
-                    create.input = chosen;
-                    create.rev = self.revs;
                 }
             }
             GuiIntent::CompletionPick { index } => {
-                let candidates = self.candidates();
+                let completion = self.completion();
                 let Some(create) = &mut self.create else {
                     return Ok(());
                 };
-                let Some(index) = usize::try_from(index)
-                    .ok()
-                    .filter(|&index| index < candidates.len())
-                else {
+                let Ok(index) = usize::try_from(index) else {
                     return Ok(());
                 };
-                create.settle.input();
-                // Highlight it, then take it as Enter would.
-                for _ in 0..create.settle.selected() {
-                    create.settle.up();
-                }
-                for _ in 0..index {
-                    create.settle.down(candidates.len());
-                }
-                if let Some(chosen) = create.settle.choose(&candidates) {
+                if let Some((next, action)) =
+                    create
+                        .picker
+                        .pick(index, &create.input, completion.as_ref())
+                {
                     self.revs += 1;
-                    create.input = chosen;
+                    create.input = next;
                     create.rev = self.revs;
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
                 }
             }
             GuiIntent::ConversationsOpen => {
@@ -1199,15 +1188,13 @@ impl Head {
                 let Some(create) = &mut self.create else {
                     return Ok(());
                 };
-                create.settle.input();
-                if create.settle.open() {
-                    create.settle.close();
-                } else {
-                    let end = create.settle.cancel(completing);
-                    self.create = None;
-                    if let Some(end) = end {
-                        self.dispatch_user(end, Purpose::Plain, clock, out);
-                    }
+                if create.picker.unhighlight() {
+                    return Ok(());
+                }
+                let end = create.picker.cancel(completing);
+                self.create = None;
+                if let Some(end) = end {
+                    self.dispatch_user(end, Purpose::Plain, clock, out);
                 }
             }
             GuiIntent::RenameOpen { session_id } => {
@@ -1795,19 +1782,12 @@ impl Head {
             })
     }
 
-    /// The candidates the new-session prompt lists, while its list is open.
-    fn candidates(&self) -> Vec<skywave_core::Candidate> {
-        let open = self
-            .create
-            .as_ref()
-            .is_some_and(|c| CompletionSettle::open(&c.settle));
+    /// The completion the new-session prompt shows, if the session list is
+    /// on screen with one.
+    fn completion(&self) -> Option<skywave_core::Completion> {
         match self.view.as_ref().map(|v| &v.screen) {
-            Some(Screen::SessionList(list)) if open => list
-                .completion
-                .as_ref()
-                .map(|c| c.candidates.clone())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+            Some(Screen::SessionList(list)) => list.completion.clone(),
+            _ => None,
         }
     }
 

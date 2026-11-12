@@ -287,8 +287,12 @@ void main() {
           input: '/srv/',
           inputRev: 1,
           popup: CompletionPopup(
-            candidates: [CandidateView(path: '/srv/one', recent: true)],
+            candidates: [
+              CandidateView(path: '/srv/one', label: '/srv/one', recent: true),
+            ],
             selected: 0,
+            stale: false,
+            loading: false,
             statusLabel: 'offline · recent only',
           ),
         ),
