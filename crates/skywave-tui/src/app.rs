@@ -25,8 +25,8 @@ use skywave_present::format::{
 };
 use skywave_present::output::{WholeOutput, output_download, whole_output};
 use skywave_present::policy::{
-    AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
-    ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
+    AlertWatcher, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
+    ShellAlertWatcher, TimelineSearch, WorkdirPicker, looks_like_pair_uri, message_refusal,
     question_unanswered, shell_stop, stop_needs_confirmation, unanswered,
 };
 use skywave_present::question::QuestionDraft;
@@ -178,9 +178,9 @@ pub struct Prompt {
     /// Enter was pressed; the prompt closes once the core takes the action
     /// and stays open with the text if dispatching fails.
     submitted: bool,
-    /// [`PromptKind::Create`]: Tab completion of the workdir; its popup
-    /// shows the core's [`Completion`].
-    completion: CompletionSettle,
+    /// [`PromptKind::Create`] and the adopt workdir step: the always-shown
+    /// candidate list's highlight.
+    picker: WorkdirPicker,
     /// [`PromptKind::Adopt`]: the workdir chosen in the first step, once
     /// the prompt asks for the conversation id; `None` while it still asks
     /// for the workdir.
@@ -193,7 +193,7 @@ impl Prompt {
             kind,
             text,
             submitted: false,
-            completion: CompletionSettle::new(),
+            picker: WorkdirPicker::new(),
             workdir: None,
         }
     }
@@ -212,9 +212,12 @@ impl Prompt {
         self.text.extend(text.chars().filter(|c| !c.is_control()));
     }
 
-    /// The workdir changed: while the popup is open, complete it again.
+    /// The workdir changed: while the prompt asks for one, complete it again.
     fn edited(&mut self) -> Option<Action> {
-        self.completion.edited(&self.text)
+        if !self.asks_workdir() {
+            return None;
+        }
+        Some(self.picker.edited(&self.text))
     }
 
     /// Whether the prompt still belongs on `screen`: a new-session prompt
@@ -1567,7 +1570,7 @@ impl App {
             && create.asks_workdir()
             && let Some(completion) = &list.completion
         {
-            create.completion.settle(&mut create.text, completion);
+            create.picker.settle(&create.text, Some(completion));
         }
         // The question goes with its row, e.g. when a message brings the
         // session back.
@@ -1977,7 +1980,7 @@ impl App {
         }
         if let Some(prompt) = &mut self.ui.prompt {
             prompt.insert(text.trim());
-            prompt.completion.pasted();
+            prompt.picker.unhighlight();
             return;
         }
         // A model name; the mode list takes no text.
@@ -2123,10 +2126,13 @@ impl App {
                 KeyCode::Enter => self
                     .selected_index(list)
                     .map(|i| Action::OpenSession(list.sessions[i].id)),
-                // A new session is active: created from the active list.
+                // A new session is active: created from the active list. Its
+                // candidate list (recents, then roots) shows at once.
                 KeyCode::Char('n') if list.kind == ListKind::Active => {
-                    self.ui.prompt = Some(Prompt::new(PromptKind::Create, String::new()));
-                    None
+                    let mut prompt = Prompt::new(PromptKind::Create, String::new());
+                    let action = prompt.picker.start("");
+                    self.ui.prompt = Some(prompt);
+                    Some(action)
                 }
                 // A conversation started outside Skywave continues in a new
                 // session, so also from the active list: the core asks the
@@ -2323,15 +2329,19 @@ impl App {
         None
     }
 
-    /// The completion popup of the new-session prompt, if it is open and
-    /// has something to show, with the highlighted row.
-    pub fn completion_popup(&self) -> Option<(&Completion, usize)> {
-        let create = self.ui.prompt.as_ref().filter(|c| c.completion.open())?;
+    /// The candidate list of a prompt that asks for a workdir, whenever the
+    /// session list has a completion: the completion, its highlighted row
+    /// (none by default), and whether it is `stale`, that is for an earlier
+    /// input while a new directory loads. Stale rows are shown but cannot be
+    /// chosen.
+    pub fn completion_popup(&self) -> Option<(&Completion, Option<usize>, bool)> {
+        let create = self.ui.prompt.as_ref().filter(|c| c.asks_workdir())?;
         let Screen::SessionList(list) = &self.view.screen else {
             return None;
         };
         let completion = list.completion.as_ref()?;
-        Some((completion, create.completion.selected()))
+        let stale = completion.input != create.text;
+        Some((completion, create.picker.highlighted(), stale))
     }
 
     /// The conversation picker, while the core has it open on the session
@@ -2397,6 +2407,8 @@ impl App {
                     None
                 }
             },
+            // The picker closes with this key, so one action only: the
+            // workdir's candidate list starts on the first edit or Tab.
             KeyCode::Char('p') => {
                 self.ui.prompt = Some(Prompt::new(PromptKind::Adopt, String::new()));
                 Some(Action::EndConversations)
@@ -2407,42 +2419,51 @@ impl App {
         }
     }
 
-    /// Keys while the new-session prompt is open. Tab completes the
-    /// workdir; while the popup lists candidates, ↑↓ pick one and Tab or
-    /// Enter take it, and every edit completes again.
+    /// Keys while the new-session prompt is open, or the adopt prompt's
+    /// workdir step. The candidate list is always shown: ↓ highlights a row,
+    /// Enter or Tab on a highlighted row opens that directory, and Enter
+    /// without one creates the session (or settles the workdir). Esc clears
+    /// the highlight before it cancels; every edit completes again.
     fn create_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
-        let candidates = self
+        let completion = self
             .completion_popup()
-            .map(|(completion, _)| completion.candidates.clone())
-            .unwrap_or_default();
+            .map(|(completion, _, _)| completion.clone());
         let completing =
             matches!(&self.view.screen, Screen::SessionList(list) if list.completion.is_some());
         let create = self.ui.prompt.as_mut()?;
-        create.completion.input();
         match key.code {
-            KeyCode::Esc if create.completion.open() => create.completion.close(),
             KeyCode::Esc => {
-                let end = create.completion.cancel(completing);
+                if create.picker.unhighlight() {
+                    return None;
+                }
+                let end = create.picker.cancel(completing);
                 self.ui.prompt = None;
                 return end;
             }
-            KeyCode::Up if !candidates.is_empty() => create.completion.up(),
-            KeyCode::Down if !candidates.is_empty() => create.completion.down(candidates.len()),
-            KeyCode::Tab | KeyCode::Enter if !candidates.is_empty() => {
-                if let Some(chosen) = create.completion.choose(&candidates) {
-                    create.text = chosen;
+            KeyCode::Up => create.picker.up(),
+            KeyCode::Down => create.picker.down(&create.text, completion.as_ref()),
+            KeyCode::Tab => {
+                let (text, action) = create.picker.complete(&create.text, completion.as_ref());
+                if let Some(text) = text {
+                    create.text = text;
                 }
-            }
-            KeyCode::Tab => return Some(create.completion.complete(&create.text)),
-            // Blank or unacceptable paths are refused by the core or the
-            // server, not here.
-            // Adopting: the workdir is settled, the conversation id is next.
-            KeyCode::Enter if create.kind == PromptKind::Adopt => {
-                create.workdir = Some(create.text.trim().to_owned());
-                create.text.clear();
-                return create.completion.cancel(completing);
+                return Some(action);
             }
             KeyCode::Enter => {
+                if let Some((text, action)) =
+                    create.picker.choose(&create.text, completion.as_ref())
+                {
+                    create.text = text;
+                    return Some(action);
+                }
+                // Blank or unacceptable paths are refused by the core or the
+                // server, not here.
+                // Adopting: the workdir is settled, the conversation id is next.
+                if create.kind == PromptKind::Adopt {
+                    create.workdir = Some(create.text.trim().to_owned());
+                    create.text.clear();
+                    return create.picker.cancel(completing);
+                }
                 create.submitted = true;
                 return Some(Action::CreateSession {
                     conversation: None,

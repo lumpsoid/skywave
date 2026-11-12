@@ -181,6 +181,19 @@ impl Harness {
         }
     }
 
+    /// Types `text` into a workdir prompt: each key asks the core to
+    /// complete the input so far.
+    fn type_workdir(&mut self, text: &str) {
+        for c in text.chars() {
+            let mut input = workdir_input(self);
+            input.push(c);
+            assert_eq!(
+                self.key(KeyCode::Char(c)),
+                Some(Action::CompleteWorkdir { input })
+            );
+        }
+    }
+
     fn type_pairing(&mut self, address: &str, code: &str, fingerprint: &str) -> Option<Action> {
         self.type_text(address);
         self.key(KeyCode::Tab);
@@ -845,10 +858,7 @@ fn every_help_key_is_reachable_on_an_80x24_terminal() {
     );
 
     h.key(KeyCode::Char('n'));
-    assert_keys(
-        &read_help(&mut h),
-        &["Tab", "↑↓ Tab/Enter", "Ctrl-U", "Esc"],
-    );
+    assert_keys(&read_help(&mut h), &["Tab", "↓ Enter/Tab", "Ctrl-U", "Esc"]);
     h.key(KeyCode::Esc);
     h.key(KeyCode::Esc);
     h.key(KeyCode::Char('r'));
@@ -1155,20 +1165,28 @@ fn a_session_error_shows_bidi_controls_and_drops_escapes() {
 #[test]
 fn create_session_goes_from_queued_to_the_real_row() {
     let mut h = Harness::paired();
-    assert_eq!(h.key(KeyCode::Char('n')), None);
+    // The workdir list (recents, then roots) is asked for at once.
+    assert_eq!(
+        h.key(KeyCode::Char('n')),
+        Some(Action::CompleteWorkdir {
+            input: String::new()
+        })
+    );
     assert!(h.app.typing());
     let screen = h.screen();
     assert_contains(&screen, "New session · workdir on the server");
     assert_contains(&screen, "Enter create · Esc cancel");
 
     // Letters are text in the prompt, not commands.
-    h.type_text("/srv/quiet");
+    h.type_workdir("/srv/quiet");
     assert!(!h.app.ui().quit);
     for _ in 0.."quiet".len() {
         h.key(KeyCode::Backspace);
     }
-    h.type_text("new");
+    h.type_workdir("new");
     assert_contains(&h.screen(), "> /srv/new");
+    // The listings the typing asked for; Enter asks for none.
+    h.drain_requests();
     assert_eq!(
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
@@ -1244,10 +1262,10 @@ fn refused_creations_say_why() {
 fn esc_cancels_the_new_session_prompt() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('n'));
-    h.type_text("/srv/a");
+    h.type_workdir("/srv/a");
     h.key_with(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "");
-    h.type_text("/srv/b");
+    h.type_workdir("/srv/b");
     // `?` is text here; F1 still opens help, which lists the prompt's keys.
     h.key(KeyCode::Char('?'));
     assert!(!h.app.ui().help);
@@ -1258,7 +1276,10 @@ fn esc_cancels_the_new_session_prompt() {
     assert!(!h.app.ui().help);
     assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "/srv/b");
 
-    assert_eq!(h.key(KeyCode::Esc), None);
+    // Nothing is highlighted, so Esc cancels, and the list ends. The
+    // listings the typing asked for are drained first.
+    h.drain_requests();
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::EndCompletion));
     assert!(h.app.ui().prompt.is_none());
     assert!(h.drain_requests().is_empty());
     assert!(h.seam.pending_outbox().unwrap().is_empty());
@@ -1268,11 +1289,20 @@ fn esc_cancels_the_new_session_prompt() {
     assert!(h.app.ui().quit);
 }
 
-/// The listing the core asked the engine for: its id and directory.
+/// The last listing the core asked the engine for: its id and directory.
+/// Typing a path asks for each directory it passes (the roots, then `/`,
+/// then `/srv/`), so the last one is the directory typed.
 fn list_dirs_request(h: &Harness) -> (u64, String) {
-    match h.drain_requests().as_slice() {
-        [Request::ListDirs { req, dir }] => (*req, dir.clone()),
-        other => panic!("expected one listing request, got {other:?}"),
+    let mut listings = h
+        .drain_requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            Request::ListDirs { req, dir } => Some((req, dir)),
+            _ => None,
+        });
+    match listings.next_back() {
+        Some(listing) => listing,
+        None => panic!("expected a listing request"),
     }
 }
 
@@ -1310,23 +1340,24 @@ fn tab_fills_in_the_only_directory() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('n'));
     assert_contains(&h.screen(), "Tab complete");
-    h.type_text("/srv/a");
-    assert_eq!(
-        h.key(KeyCode::Tab),
-        Some(Action::CompleteWorkdir {
-            input: "/srv/a".into()
-        })
-    );
+    h.type_workdir("/srv/a");
     let (req, dir) = list_dirs_request(&h);
     assert_eq!(dir, "/srv/");
     assert_contains(&h.screen(), "listing…");
 
+    // The reply does not rewrite the input; Tab fills in the only match.
     answer_listing(&mut h, req, "/srv", &[".git", "api", "web"]);
+    assert_eq!(workdir_input(&h), "/srv/a");
+    assert_eq!(
+        h.key(KeyCode::Tab),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/api/".into()
+        })
+    );
     assert_eq!(workdir_input(&h), "/srv/api/");
-    let screen = h.screen();
-    assert!(!screen.contains("Directories"), "{screen}");
-    assert_contains(&screen, "> /srv/api/");
-    // Enter creates the session as usual.
+    // The list stays, whatever Tab did.
+    assert!(!popup(&h.screen()).is_empty());
+    // Enter, with no row highlighted, creates the session as usual.
     assert_eq!(
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
@@ -1351,16 +1382,16 @@ fn pasting_an_outside_conversation_asks_the_workdir_then_the_id() {
     let hint = h.screen();
     assert_contains(&hint, "Enter next: the id");
     assert!(!hint.contains("Enter create"), "{hint}");
-    h.type_text("/srv/a");
-    // Positive control: step one completes like the create prompt.
+    h.type_workdir("/srv/a");
+    let (req, _) = list_dirs_request(&h);
+    answer_listing(&mut h, req, "/srv", &["api"]);
+    // Positive control: step one fills in like the create prompt does.
     assert_eq!(
         h.key(KeyCode::Tab),
         Some(Action::CompleteWorkdir {
-            input: "/srv/a".into()
+            input: "/srv/api/".into()
         })
     );
-    let (req, _) = list_dirs_request(&h);
-    answer_listing(&mut h, req, "/srv", &["api"]);
     assert_eq!(workdir_input(&h), "/srv/api/");
 
     // Enter moves to the id; nothing is dispatched and the prompt stays.
@@ -1371,6 +1402,8 @@ fn pasting_an_outside_conversation_asks_the_workdir_then_the_id() {
     assert!(h.app.ui().prompt.is_some());
     assert_eq!(workdir_input(&h), "");
     assert_contains(&h.screen(), "agent session id (paste it)");
+    // The workdir step's listings are done with; the id step asks for none.
+    h.drain_requests();
 
     // Tab is not completion here; the text is untouched.
     h.type_text("ab");
@@ -1398,15 +1431,21 @@ fn escape_at_the_id_step_cancels_without_creating() {
     let mut h = Harness::paired();
     open_conversations(&mut h);
     h.key(KeyCode::Char('p'));
-    h.type_text("/srv/x");
+    h.type_workdir("/srv/x");
     h.key(KeyCode::Enter);
     h.type_text("some-id");
     assert_eq!(h.key(KeyCode::Esc), None);
     assert!(h.app.ui().prompt.is_none());
     assert!(!h.app.typing());
     assert!(!h.screen().contains("Continue an outside conversation"));
-    // The session list takes keys again, and nothing was queued.
-    assert_eq!(h.key(KeyCode::Char('n')), None);
+    // The session list takes keys again (`n` opens the workdir list), and
+    // nothing was queued.
+    assert_eq!(
+        h.key(KeyCode::Char('n')),
+        Some(Action::CompleteWorkdir {
+            input: String::new()
+        })
+    );
     assert_contains(&h.screen(), "New session");
 }
 
@@ -1629,7 +1668,7 @@ fn the_picker_says_when_it_cannot_list() {
 }
 
 #[test]
-fn several_directories_open_a_popup_to_pick_from() {
+fn the_list_shows_at_once_and_enter_descends() {
     let mut h = Harness::paired();
     let [a, b] = std::array::from_fn(|_| SessionId::new());
     pull(
@@ -1637,8 +1676,12 @@ fn several_directories_open_a_popup_to_pick_from() {
         vec![created(a, 0, "/srv/project-a"), created(b, 1, "/srv/web")],
     );
     h.key(KeyCode::Char('n'));
-    h.type_text("/srv/p");
-    h.key(KeyCode::Tab);
+    // The recent workdirs show before anything is typed.
+    let screen = popup(&h.screen());
+    assert_contains(&line_with(&screen, "/srv/project-a"), "recent");
+    assert_contains(&line_with(&screen, "/srv/web"), "recent");
+
+    h.type_workdir("/srv/p");
     let (req, _) = list_dirs_request(&h);
     // Recent workdirs show at once, while the server is asked.
     let screen = popup(&h.screen());
@@ -1647,35 +1690,39 @@ fn several_directories_open_a_popup_to_pick_from() {
     assert!(!screen.contains("/srv/web"), "{screen}");
 
     answer_listing(&mut h, req, "/srv", &["project-a", "project-b", "web"]);
-    assert_eq!(workdir_input(&h), "/srv/project-", "the common prefix");
-    assert_contains(&h.screen(), "Tab/Enter accept");
+    assert_eq!(
+        workdir_input(&h),
+        "/srv/p",
+        "the reply does not rewrite the input"
+    );
+    assert_contains(&h.screen(), "↓ choose");
     let screen = popup(&h.screen());
     assert!(!line_with(&screen, "/srv/project-a").contains("recent"));
     assert_contains(&screen, "/srv/project-b");
     assert!(!screen.contains("listing…"));
 
     // Typing filters the same listing without asking again.
-    assert_eq!(
-        h.key(KeyCode::Char('b')),
-        Some(Action::CompleteWorkdir {
-            input: "/srv/project-b".into()
-        })
-    );
+    h.type_workdir("roject-b");
     assert!(h.drain_requests().is_empty());
     assert!(!popup(&h.screen()).contains("/srv/project-a"));
-    h.key(KeyCode::Backspace);
 
-    // ↓ then Enter takes the second row and does not create anything.
+    // ↓ highlights the one row; Enter on it descends and creates nothing.
     h.key(KeyCode::Down);
     assert_contains(&line_with(&popup(&h.screen()), "/srv/project-b"), "> ");
-    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), "Enter/Tab open");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/project-b/".into()
+        })
+    );
     assert_eq!(workdir_input(&h), "/srv/project-b/");
-    assert!(!h.screen().contains("Directories"));
+    assert!(!popup(&h.screen()).is_empty(), "the list is still shown");
     assert!(h.seam.pending_outbox().unwrap().is_empty());
 }
 
 #[test]
-fn esc_closes_the_popup_then_the_prompt() {
+fn esc_unselects_then_cancels() {
     let mut h = Harness::paired();
     let [a, b] = std::array::from_fn(|_| SessionId::new());
     pull(
@@ -1690,25 +1737,75 @@ fn esc_closes_the_popup_then_the_prompt() {
     });
     h.sync();
     h.key(KeyCode::Char('n'));
-    h.type_text("/srv/o");
-    h.key(KeyCode::Tab);
+    h.type_workdir("/srv/o");
     assert!(h.drain_requests().is_empty(), "nothing is asked offline");
-    // Offline, recent workdirs are all there is: the only match fills in.
+    // Tab offline: recent workdirs are all there is, and the only match fills in.
+    assert_eq!(
+        h.key(KeyCode::Tab),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/one/".into()
+        })
+    );
     assert_eq!(workdir_input(&h), "/srv/one/");
 
     h.key_with(ctrl('u'));
-    h.type_text("/srv/");
-    h.key(KeyCode::Tab);
+    h.type_workdir("/srv/");
     let screen = popup(&h.screen());
     assert_contains(&screen, "offline · recent only");
     assert_contains(&line_with(&screen, "/srv/two"), "recent");
     assert_contains(&line_with(&screen, "/srv/one"), "recent");
 
+    // ↓ highlights a row; the first Esc clears that and keeps the prompt.
+    h.key(KeyCode::Down);
+    assert_contains(&h.screen(), "Esc unselect");
     assert_eq!(h.key(KeyCode::Esc), None);
-    assert!(!h.screen().contains("Directories"));
+    assert!(!h.screen().contains("Esc unselect"));
+    assert!(!popup(&h.screen()).is_empty(), "the list stays");
     assert_eq!(workdir_input(&h), "/srv/");
+    // With nothing highlighted, the next Esc cancels.
     assert_eq!(h.key(KeyCode::Esc), Some(Action::EndCompletion));
     assert!(h.app.ui().prompt.is_none());
+}
+
+#[test]
+fn stale_rows_cannot_be_chosen_while_a_new_directory_loads() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('n'));
+    h.type_workdir("/srv/");
+    let (req, _) = list_dirs_request(&h);
+    answer_listing(&mut h, req, "/srv", &["api", "web"]);
+    // Positive control: a fresh row is not dimmed, and can be highlighted.
+    assert_ne!(
+        colour_of(&h.frame(100, 24, mockup_now()), "/srv/api"),
+        Color::DarkGray
+    );
+    h.key(KeyCode::Down);
+    assert_contains(&h.screen(), "Esc unselect");
+    h.key(KeyCode::Up);
+
+    // Typing `api/` asks for a new listing, which is not answered. The rows
+    // still shown are the last answer's, for `/srv/api` (the input before the
+    // directory changed): dimmed, and not choosable.
+    h.type_workdir("api/");
+    let (_, dir) = list_dirs_request(&h);
+    assert_eq!(dir, "/srv/api/");
+    assert_contains(&popup(&h.screen()), "/srv/api");
+    assert_contains(&h.screen(), "listing…");
+    assert_eq!(
+        colour_of(&h.frame(100, 24, mockup_now()), "/srv/api"),
+        Color::DarkGray
+    );
+    // Down highlights nothing, so Enter creates in the typed directory
+    // instead of descending into the stale row.
+    h.key(KeyCode::Down);
+    assert!(!h.screen().contains("Esc unselect"));
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/api/".into()
+        })
+    );
 }
 
 // ---- session view -----------------------------------------------------------
