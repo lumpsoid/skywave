@@ -120,6 +120,8 @@ void main() {
       sent: sent,
     );
     pickImages = (_) async => ['/a.png', '/b.jpg'];
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('attach-image')));
     await tester.pumpAndSettle();
     expect(sent.whereType<GuiIntentAttachImageFile>(), [
@@ -130,6 +132,8 @@ void main() {
     // Control: a cancelled pick attaches nothing.
     sent.clear();
     pickImages = (_) async => [];
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('attach-image')));
     await tester.pumpAndSettle();
     expect(sent.whereType<GuiIntentAttachImageFile>(), isEmpty);
@@ -189,15 +193,21 @@ void main() {
       timeline: _holding(),
       sent: sent,
     );
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
     expect(find.byKey(const Key('attach-image')), findsNothing);
 
-    // Control: the agent composer has it.
+    // Control: the agent composer has it. Close the menu first.
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
     await pumpSession(
       tester,
       screen: screenWith(composer: _draft(rev: 2)),
       timeline: _holding(),
       sent: sent,
     );
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
     expect(find.byKey(const Key('attach-image')), findsOneWidget);
   });
 
