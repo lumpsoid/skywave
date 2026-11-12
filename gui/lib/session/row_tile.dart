@@ -608,11 +608,18 @@ class _ImageThumb extends StatelessWidget {
           ? _ImagePlaceholder(image: image)
           : ClipRRect(
               borderRadius: BorderRadius.circular(8),
+              // Until a frame decodes, the placeholder holds the image's
+              // place, so the row does not shift and the tap target exists
+              // from the first layout.
               child: Image.file(
                 File(path),
                 height: 160,
                 fit: BoxFit.contain,
                 cacheHeight: 320,
+                frameBuilder: (context, child, frame, wasSynchronouslyLoaded) =>
+                    frame == null && !wasSynchronouslyLoaded
+                    ? _ImagePlaceholder(image: image)
+                    : child,
                 errorBuilder: (context, error, stackTrace) =>
                     _ImagePlaceholder(image: image),
               ),
