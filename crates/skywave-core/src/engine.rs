@@ -1423,7 +1423,7 @@ mod tests {
     use crate::backoff::Jitter;
     use crate::blobs::blob_dir;
     use crate::identity::PairedCredentials;
-    use crate::store::{BlobStatus, OutboxStatus};
+    use crate::store::{BlobStatus, OutboxStatus, Store};
     use crate::transport::{BlobDownload, BoxFuture};
     use crate::view::{DeviceId, FailReason, Link, Outgoing, Screen};
 
@@ -3323,6 +3323,42 @@ mod tests {
         );
         assert!(!blob_dir(dir.path()).join(blob.0.to_string()).exists());
         assert_eq!(applied.blobs, [blob]);
+    }
+
+    /// A batch leaves the file of an image detached from a draft alone: its
+    /// row and file stay until the store opens again, so an attach of the
+    /// same image that lands after the batch still finds both.
+    #[test]
+    fn an_applied_batch_keeps_a_detached_images_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let session = SessionId::new();
+        let image = b"an image attached, then detached";
+        let sha256 = put_file(dir.path(), image);
+        attach_draft_image(&seam, session, image);
+        crate::client::lock(&seam.core.shared.state)
+            .store
+            .detach_from_draft(session, sha256)
+            .unwrap();
+        let path = attachment_path(dir.path(), sha256);
+
+        seam.apply_events(&message_with_images(session, &[]))
+            .unwrap();
+
+        assert!(path.exists(), "a batch removed the image's file");
+        let rows = crate::client::lock(&seam.core.shared.state)
+            .store
+            .attachments()
+            .unwrap();
+        assert!(
+            rows.contains_key(&sha256),
+            "a batch removed the image's row"
+        );
+
+        drop(seam);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!path.exists(), "opening the store kept the image's file");
+        assert!(!store.attachments().unwrap().contains_key(&sha256));
     }
 
     /// Runs the stager for a minute of paused time. It only ends on an
