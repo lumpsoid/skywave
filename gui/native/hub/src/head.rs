@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use skywave_core::attachment::{self, AttachedImage};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, BlobState, CallId, CommandId, ComposerMode, ContentHash, Entry, PairUri, PairingView,
-    RunWhen, Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState,
+    Action, BlobState, BlobView, CallId, CommandId, ComposerMode, ContentHash, Entry, PairUri,
+    PairingView, RunWhen, Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState,
     parse_pair_uri,
 };
 use skywave_present::crop::toggle;
@@ -992,6 +992,7 @@ impl Head {
                             TimelineItem::Logged { entry, .. } => sections(entry)
                                 .into_iter()
                                 .filter_map(|s| s.blob())
+                                .chain(message_image_blobs(entry))
                                 .find(|b| b.id == id)
                                 .map(|b| b.state.clone()),
                             TimelineItem::Pending { .. } => None,
@@ -1584,7 +1585,13 @@ impl Head {
             (Some(view), Some(session)) => (
                 Some(view.id),
                 view.subagent.as_ref().map(|s| s.call),
-                timeline::rows(view, &session.expanded, &mut session.heads, clock.wall_ms),
+                timeline::rows(
+                    view,
+                    &session.expanded,
+                    &mut session.heads,
+                    &self.data_dir,
+                    clock.wall_ms,
+                ),
             ),
             _ => (None, None, Rows::default()),
         };
@@ -1837,6 +1844,17 @@ fn images_full() -> Out {
     Out::Effect(PlatformEffect::Notice {
         text: format!("at most {ATTACHMENTS_MAX} images per message"),
     })
+}
+
+/// The blobs of a logged user message's images; none for any other entry.
+fn message_image_blobs(entry: &Entry) -> Vec<&BlobView> {
+    match entry {
+        Entry::UserMessage { images, .. } => images
+            .iter()
+            .filter_map(|image| image.content.blob())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The open session in `view`, if a session is the screen.

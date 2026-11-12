@@ -319,6 +319,22 @@ async fn serve(
     }
 }
 
+/// An intent as the log says it. Image bytes stand as a count: a paste's
+/// megabytes do not go into the log.
+fn intent_summary(intent: &GuiIntent) -> String {
+    match intent {
+        GuiIntent::AttachImageBytes {
+            session_id,
+            bytes,
+            mime,
+        } => format!(
+            "AttachImageBytes {{ session_id: {session_id:?}, bytes: {} bytes, mime: {mime:?} }}",
+            bytes.len()
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
 /// The loop. `Err`: the dispatch thread or the core's own threads failed,
 /// with this message.
 async fn run(
@@ -348,7 +364,10 @@ async fn run(
             }
             Some(pack) = intents.recv() => {
                 if !gate.admit(&pack.message) {
-                    tracing::debug!(intent = ?pack.message, "intent for a failed hub dropped");
+                    tracing::debug!(
+                        intent = %intent_summary(&pack.message),
+                        "intent for a failed hub dropped"
+                    );
                     continue;
                 }
                 head.on_intent(pack.message, Clock::read())
@@ -856,5 +875,22 @@ mod tests {
         let caught = catching(async { panic!("index {} out of range", 3) }).await;
         assert_eq!(caught.err().unwrap(), "index 3 out of range");
         assert_eq!(catching(async { 7 }).await.unwrap(), 7);
+    }
+
+    #[test]
+    fn a_dropped_image_intent_logs_its_size_not_its_bytes() {
+        let paste = GuiIntent::AttachImageBytes {
+            session_id: "s".into(),
+            bytes: vec![7; 1_000_000],
+            mime: "image/png".into(),
+        };
+        let summary = intent_summary(&paste);
+        assert!(summary.len() < 200, "{summary}");
+        assert!(summary.contains("1000000 bytes"), "{summary}");
+        // Control: any other intent is logged as it always was.
+        assert_eq!(
+            intent_summary(&GuiIntent::AppReady),
+            format!("{:?}", GuiIntent::AppReady)
+        );
     }
 }
