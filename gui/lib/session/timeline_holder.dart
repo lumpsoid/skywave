@@ -17,6 +17,11 @@ class TimelineHolder extends ChangeNotifier {
   List<TimelineRow> get rows => List.unmodifiable(_rows);
   List<TimelineRow> _rows = [];
 
+  /// Bumped by every [apply], so a reader can tell the rows changed without
+  /// comparing them.
+  int get revision => _revision;
+  int _revision = 0;
+
   /// Where the row keyed [key] is, or -1; for a keyed list's
   /// `findChildIndexCallback`.
   int indexOf(String key) => _rows.indexWhere((row) => row.key == key);
@@ -42,6 +47,7 @@ class TimelineHolder extends ChangeNotifier {
     } else if (update is TimelineUpdateRemoved) {
       _rows.removeWhere((row) => row.key == update.key);
     }
+    _revision++;
     notifyListeners();
   }
 

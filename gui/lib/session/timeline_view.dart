@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -68,6 +69,13 @@ class TimelineViewState extends State<TimelineView> {
   /// the text wraps at, so the cache is cleared when that width changes.
   final _heights = _Heights();
   double? _heightsWidth;
+
+  /// The rows as of the holder's [TimelineHolder.revision] `_rowsRevision`,
+  /// copied once per change rather than once per build; [_heights] is indexed
+  /// to them.
+  List<TimelineRow> _rows = const [];
+  TimelineHolder? _rowsOf;
+  int _rowsRevision = -1;
 
   bool _following = true;
   String? _sessionId;
@@ -407,7 +415,14 @@ class TimelineViewState extends State<TimelineView> {
 
   @override
   Widget build(BuildContext context) {
-    final rows = widget.timeline.rows;
+    if (!identical(widget.timeline, _rowsOf) ||
+        widget.timeline.revision != _rowsRevision) {
+      _rows = widget.timeline.rows;
+      _rowsOf = widget.timeline;
+      _rowsRevision = widget.timeline.revision;
+      _heights.index(_rows);
+    }
+    final rows = _rows;
     final search = widget.search.search;
     final currentKey = search != null && search.open ? search.currentKey : null;
     final searching = search != null && search.open;
@@ -549,26 +564,81 @@ class _HoldPhysics extends ScrollPhysics {
 }
 
 /// The measured height of each row seen, by row key, with their running total
-/// so the mean costs nothing per layout.
+/// so the mean costs nothing per layout. For the current rows it also keeps
+/// Fenwick trees (binary indexed trees) over their positions, so the sum of the
+/// heights of the oldest rows costs O(log n) per layout.
 class _Heights {
-  final _byKey = <String, double>{};
+  final Map<String, double> _byKey = {};
   double _sum = 0;
 
-  double? operator [](String key) => _byKey[key];
+  /// The position of each current row's key, oldest first.
+  Map<String, int> _at = {};
+
+  /// Fenwick trees over the positions, 1-based: the recorded height of each row
+  /// (0 when none), and 1 for each row with a recorded height.
+  Float64List _knownSum = Float64List(1);
+  Int32List _knownCount = Int32List(1);
 
   bool get isEmpty => _byKey.isEmpty;
 
   double get mean => _sum / _byKey.length;
 
+  /// Indexes the trees to [rows], oldest first. Called when the rows change.
+  void index(List<TimelineRow> rows) {
+    final n = rows.length;
+    _at = {for (var i = 0; i < n; i++) rows[i].key: i};
+    _knownSum = Float64List(n + 1);
+    _knownCount = Int32List(n + 1);
+    for (var i = 0; i < n; i++) {
+      final height = _byKey[rows[i].key];
+      if (height == null) continue;
+      _knownSum[i + 1] = height;
+      _knownCount[i + 1] = 1;
+    }
+    for (var i = 1; i <= n; i++) {
+      final j = i + (i & -i);
+      if (j <= n) {
+        _knownSum[j] += _knownSum[i];
+        _knownCount[j] += _knownCount[i];
+      }
+    }
+  }
+
   void record(String key, double height) {
     final old = _byKey[key];
     _byKey[key] = height;
     _sum += height - (old ?? 0);
+    final at = _at[key];
+    if (at == null) return;
+    _add(at, height - (old ?? 0), old == null ? 1 : 0);
   }
 
   void clear() {
     _byKey.clear();
     _sum = 0;
+    _knownSum.fillRange(0, _knownSum.length, 0);
+    _knownCount.fillRange(0, _knownCount.length, 0);
+  }
+
+  /// The sum of the recorded heights of the oldest [m] rows, and how many of
+  /// them have one. [m] is clamped to the rows indexed.
+  (double, int) oldest(int m) {
+    var sum = 0.0;
+    var count = 0;
+    final n = _knownSum.length - 1;
+    for (var i = math.min(math.max(m, 0), n); i > 0; i -= i & -i) {
+      sum += _knownSum[i];
+      count += _knownCount[i];
+    }
+    return (sum, count);
+  }
+
+  /// Adds to the trees at the 0-based position [at].
+  void _add(int at, double height, int count) {
+    for (var i = at + 1; i < _knownSum.length; i += i & -i) {
+      _knownSum[i] += height;
+      _knownCount[i] += count;
+    }
   }
 }
 
@@ -617,11 +687,9 @@ class _RowsDelegate extends SliverChildBuilderDelegate {
         ? (trailingScrollOffset - leadingScrollOffset) /
               (lastIndex - firstIndex + 1)
         : heights.mean;
-    var extent = trailingScrollOffset;
-    for (var i = lastIndex + 1; i < count; i++) {
-      extent += heights[rows[rows.length - 1 - i].key] ?? mean;
-    }
-    return extent;
+    final unbuilt = count - 1 - lastIndex;
+    final (known, recorded) = heights.oldest(unbuilt);
+    return trailingScrollOffset + known + (unbuilt - recorded) * mean;
   }
 }
 
