@@ -1,5 +1,8 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
+use skywave_proto::ContentHash;
+
+use crate::attachment::AttachedImage;
 use crate::login::LoginCode;
 use crate::store::BlobPolicy;
 use crate::view::{
@@ -101,7 +104,13 @@ pub enum Action {
     /// answer still on its way is dropped.
     DismissAgentLogin,
     /// Queue a message, written for the session view's
-    /// [`context`](crate::SessionView::context).
+    /// [`context`](crate::SessionView::context), with the session's draft
+    /// images ([`SessionView::draft_images`](crate::SessionView::draft_images))
+    /// as its attachments, in order. Sent when the text is not blank or the
+    /// draft holds images, so a blank message with images goes as it is.
+    /// Past either cap the draft's images allow (see [`Action::Attach`]) it
+    /// queues nothing. Queuing drops the session's agent draft, text and
+    /// images.
     SendMessage {
         session_id: SessionId,
         text: String,
@@ -142,6 +151,25 @@ pub enum Action {
         cursor: usize,
         when: RunWhen,
     },
+    /// Add an image to the session's agent draft, after the images it holds.
+    /// The head prepares the picked or pasted file and stores it first
+    /// (`attachment::prepare`, `attachment::store`); the action carries
+    /// metadata only. A no-op for an unknown session, for an image the draft
+    /// already holds (a draft holds each image once), and for one that would
+    /// take the draft past `skywave_proto::limits::ATTACHMENTS_MAX` images or
+    /// `skywave_proto::limits::ATTACHMENTS_MAX_TOTAL_BYTES` bytes together.
+    /// There is no notice from the core: the head counts the images its view
+    /// shows and words the refusal.
+    Attach {
+        session_id: SessionId,
+        image: AttachedImage,
+    },
+    /// Take the image with `sha256` off the session's agent draft. A no-op
+    /// when the draft does not hold it.
+    Detach {
+        session_id: SessionId,
+        sha256: ContentHash,
+    },
     /// Keep `text` on this device as a snippet of `kind`, to use again in
     /// any session, named `name` (blank for none; normalised as a session
     /// name). It lists first. Saving a text saved already as that kind
@@ -169,7 +197,8 @@ pub enum Action {
     /// items shown as `discardable` can be; anything else is a no-op.
     Discard(CommandId),
     /// Take back a `discardable` message into its session's draft, ahead of
-    /// what the draft held, to edit and send again; a shell run likewise
+    /// what the draft held, its images ahead of the draft's, to edit and send
+    /// again; a shell run likewise
     /// into the shell draft, with its `when`. The session view's
     /// `draft_rev` changes so heads refill their composer.
     EditQueued(CommandId),

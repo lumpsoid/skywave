@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use chrono::{TimeZone, Utc};
+use skywave_core::attachment::AttachedImage;
 use skywave_core::{
-    Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
-    Draft, Entry, FailReason, Fingerprint, FullView, Link, OutboxStatus, Outgoing,
-    PairedCredentials, PairedLink, PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam,
-    ServerAddress, SessionView, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
+    Action, Attention, BlobState, BlobStatus, ComposerMode, ContentHash, Core, CoreError, Delivery,
+    DeviceRef, Draft, Entry, FailReason, Fingerprint, FullView, ImageType, Link, OutboxStatus,
+    Outgoing, PairedCredentials, PairedLink, PairingStatus, Pause, Request, Route, RunWhen, Screen,
+    Seam, ServerAddress, SessionView, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
     ShellView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
@@ -569,6 +570,67 @@ fn draft_survives_restart() {
         None,
         "sent with the message"
     );
+}
+
+#[test]
+fn draft_images_survive_a_restart_and_an_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _, _) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![event(
+            sid,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+                context_name: "start".into(),
+                from: None,
+            },
+        )],
+    })
+    .unwrap();
+    let image = AttachedImage {
+        sha256: ContentHash::of(b"a picture"),
+        media_type: ImageType::Png,
+        size: 9,
+        width: 2,
+        height: 2,
+    };
+    core.dispatch(Action::Attach {
+        session_id: sid,
+        image: image.clone(),
+    })
+    .unwrap();
+    drop((core, seam));
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(session_view(&core.view()).draft_images, vec![image.clone()]);
+
+    // A blank message with the image goes, and takes the draft's images.
+    core.dispatch(Action::SendMessage {
+        session_id: sid,
+        text: " ".into(),
+    })
+    .unwrap();
+    assert!(session_view(&core.view()).draft_images.is_empty());
+    let queued = Store::open(dir.path()).unwrap().pending_outbox().unwrap();
+    assert_eq!(queued.len(), 1);
+    let CommandKind::SendMessage { attachments, .. } = &queued[0].command.kind else {
+        panic!("expected a message: {:?}", queued[0].command.kind);
+    };
+    assert_eq!(attachments, &vec![image.sha256]);
+
+    // Taken back, the image is the draft's again, across a restart too.
+    core.dispatch(Action::EditQueued(queued[0].command.id))
+        .unwrap();
+    assert_eq!(session_view(&core.view()).draft_images, vec![image.clone()]);
+    drop(core);
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(session_view(&core.view()).draft_images, vec![image]);
 }
 
 #[test]

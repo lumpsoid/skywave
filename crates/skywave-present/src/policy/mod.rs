@@ -170,6 +170,7 @@ pub(crate) mod tests {
             task_stops: Vec::new(),
             mode: skywave_core::ComposerMode::Agent,
             draft: None,
+            draft_images: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),

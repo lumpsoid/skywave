@@ -860,8 +860,9 @@ logs) an event that no longer decodes rather than failing.
   projection from the stored events. `draft_attachments` keeps a session's
   agent draft's images in order, and `attachments` each image once by
   sha256 (its bytes are the file under `<data>/attachments/`); a blank
-  text leaves them, and sending the message or deleting the session drops
-  them (the files are not collected yet). `workdir_snapshots` keeps the latest
+  text leaves them, sending the message or deleting the session drops
+  them, and editing a queued message puts its images back before the
+  draft's (the files are not collected yet). `workdir_snapshots` keeps the latest
   stored answer per workdir read (session, kind, requested path), so a
   workdir already browsed reads offline; `workdir_blob_refs` names the
   blobs each answer holds. A refresh replaces the answer, and a blob row
