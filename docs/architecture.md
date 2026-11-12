@@ -360,7 +360,7 @@ the daemon's appends, which would otherwise stop `serve` (below).
   run finds its output by its `ShellFinished` seq) and a later crop or
   delete is stamped like the first. Taken while the disk is low and while
   `serve` stops, like a delete.
-- **Images on a message** (v30): `SendMessage { attachments }` names staged
+- **Images on a message** (v30, D50): `SendMessage { attachments }` names staged
   images (`PUT /v1/attachments/{sha256}`) by hash, and is prepared like a
   crop, before its transaction. Each staged image is hard-linked into a
   fresh blob (`BlobStore::link`, a copy across file systems), not adopted,
@@ -377,7 +377,12 @@ the daemon's appends, which would otherwise stop `serve` (below).
   crash between a link and the commit leaves blob files without rows, which
   the startup sweep removes; one between the commit and the staged file's
   removal leaves that file, which eviction removes. `DeleteBlob` takes an
-  attachment's blob; `CropBlob` answers `NotCroppable`.
+  attachment's blob; `CropBlob` answers `NotCroppable`. Delivery (the
+  supervisor's hand-over, `user_input`) opens each image's blob before the
+  agent gets the message: one that is gone or cannot be opened is left out,
+  `[image removed before delivery]` is appended to the text, and the message
+  is still delivered. An open file keeps its bytes if the blob is deleted
+  after, so the agent's copy outlives a delete that lands in the hand-over.
 - **Restart cost**: nothing prunes the log yet, so what a daemon start
   reads must not grow with it. Each lookup it makes, per session or over
   the log, reads a projection (`open_calls`: a `ToolCall` adds its call,
@@ -862,7 +867,7 @@ logs) an event that no longer decodes rather than failing.
   sha256 (its bytes are the file under `<data>/attachments/`); a blank
   text leaves them, sending the message or deleting the session drops
   them, and editing a queued message puts its images back before the
-  draft's. An image's row and file go once no draft holds it, no queued or
+  draft's. An image's row and file go once no draft holds it (D50), no queued or
   failed (still editable) message names it, and no accepted message the
   replica has not applied names it; this runs when the store opens (which
   also clears files without a row), and not after each batch: a detached
@@ -907,7 +912,7 @@ logs) an event that no longer decodes rather than failing.
   either: the pull goes on, and the command is resent, same id, after a
   backoff for the failures in a row, as often as it takes. A link that
   is really down fails the pull, which ends the connection. Before a message
-  with images is posted, the outbox stages them: each image is checked with a
+  with images is posted (D50), the outbox stages them: each image is checked with a
   HEAD on every attempt and PUT from its local file when the server does not
   hold it, since the server unlinks the staged files a message used, so
   nothing is cached. A missing or too-large local file, or an upload the
@@ -1021,7 +1026,7 @@ logs) an event that no longer decodes rather than failing.
   renamed when complete. A blob already whole on disk (an empty one always
   is) is checked the same way without a request. A newly registered blob
   whose hash is an attachment this device holds (the image of its own
-  message) is not downloaded, under any policy: after the batch commits it
+  message, D50) is not downloaded, under any policy: after the batch commits it
   is hard-linked (copied, and synced, where linking fails) from `attachments/`
   to `blobs/<id>` and marked available, so a replica rebuilt from the log
   while those files exist reads them too. A hard link outlives the
@@ -1518,6 +1523,18 @@ skywave-core                 all logic, sync, replica
   only. The head counts each session's preparations in flight: a send waits
   for them, and the image cap counts the draft's images and those still
   being prepared.
+- **Image input and display** (D50). The attach button sends file paths
+  (`AttachImageFile`): `file_selector` on desktop, the `image_picker` gallery
+  or camera sheet on Android and iOS. Desktop paste (Ctrl/Cmd+V) reads a
+  clipboard image with `pasteboard`, which wins over text (text alone is a
+  normal paste), and mobile keyboard insertion (the TextField's
+  `contentInsertionConfiguration`) sends bytes (`AttachImageBytes`), as paste
+  does. Desktop drop (`desktop_drop`) sends one `AttachImageFile` per dropped
+  path, and the hub refuses a non-image with a notice. Each goes through the
+  preparation above. The timeline shows an image as a thumbnail (160 px high)
+  above the text; while it loads, or until it is downloaded, a placeholder
+  shows its size. A tap downloads it (`DownloadBlob`) or, once loaded, opens
+  it (`OpenFull`, or the local file for a message still queued).
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.
