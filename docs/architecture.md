@@ -865,8 +865,9 @@ logs) an event that no longer decodes rather than failing.
   draft's. An image's row and file go once no draft holds it, no queued or
   failed (still editable) message names it, and no accepted message the
   replica has not applied names it; this runs when the store opens (which
-  also clears files without a row) and after each applied batch, once the
-  device's own copies are linked. `workdir_snapshots` keeps the latest
+  also clears files without a row), and not after each batch: a detached
+  image keeps its row and file until the next open, so attaching it again
+  in the meantime finds both. `workdir_snapshots` keeps the latest
   stored answer per workdir read (session, kind, requested path), so a
   workdir already browsed reads offline; `workdir_blob_refs` names the
   blobs each answer holds. A refresh replaces the answer, and a blob row
@@ -1021,9 +1022,11 @@ logs) an event that no longer decodes rather than failing.
   is) is checked the same way without a request. A newly registered blob
   whose hash is an attachment this device holds (the image of its own
   message) is not downloaded, under any policy: after the batch commits it
-  is hard-linked (copied where linking fails) from `attachments/` to
-  `blobs/<id>` and marked available, so a replica rebuilt from the log while
-  those files exist reads them too. A wrong hash deletes the file; the first
+  is hard-linked (copied, and synced, where linking fails) from `attachments/`
+  to `blobs/<id>` and marked available, so a replica rebuilt from the log
+  while those files exist reads them too. A hard link outlives the
+  attachment's file, which only the next store open removes.
+  A wrong hash deletes the file; the first
   one a worker sees while it holds the blob refetches it from zero at once (the
   bytes may be the device's own, kept from an earlier try), a second is
   the server's (every byte came from it since) and leaves the blob

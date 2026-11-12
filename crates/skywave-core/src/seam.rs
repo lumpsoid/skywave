@@ -19,7 +19,7 @@ use skywave_proto::{
 };
 
 use crate::address::ServerAddress;
-use crate::attachment::{self, attachment_path};
+use crate::attachment::attachment_path;
 use crate::blobs::{blob_dir, remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
@@ -342,19 +342,14 @@ impl Seam {
                 state.model.session_loaded(id, events);
             }
             mark_alerted(state, &alerted);
-            // After the model took the batch: it registers the blobs there.
-            own_images_available(state, &data_dir, &mut applied)?;
-            // After the own copies: they are hard links, so a removed
-            // attachment file leaves the blob intact.
-            for sha256 in state.store.collect_attachments()? {
-                attachment::remove(&data_dir, sha256);
-            }
             for blob in &applied.purged {
                 remove_blob_files(&data_dir, *blob);
             }
             if !applied.purged.is_empty() {
                 requests.push(Request::BlobsPurged(applied.purged.clone()));
             }
+            // After the model took the batch: it registers the blobs there.
+            own_images_available(state, &data_dir, &mut applied);
             Ok(applied)
         })
     }
@@ -903,13 +898,17 @@ fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
 /// rather than downloading them: each blob the batch registered whose hash
 /// is an attachment here. Those are taken out of `applied.blobs`, so the
 /// engine does not queue them. A blob whose file cannot be had stays as it
-/// is and downloads as normal.
-fn own_images_available(
-    state: &mut State,
-    data_dir: &Path,
-    applied: &mut Applied,
-) -> Result<(), CoreError> {
-    for (id, sha256) in state.store.own_images(&applied.blobs)? {
+/// is and downloads as normal. A store error is logged, and the blobs it
+/// touches download as normal.
+fn own_images_available(state: &mut State, data_dir: &Path, applied: &mut Applied) {
+    let own = match state.store.own_images(&applied.blobs) {
+        Ok(own) => own,
+        Err(error) => {
+            tracing::warn!(%error, "cannot look up the device's own images; they download");
+            return;
+        }
+    };
+    for (id, sha256) in own {
         let path = match own_image_file(data_dir, id, sha256) {
             Ok(path) => path,
             Err(error) => {
@@ -918,16 +917,18 @@ fn own_images_available(
             }
         };
         let status = BlobStatus::Available { path };
-        state.store.set_blob_status(id, &status)?;
+        if let Err(error) = state.store.set_blob_status(id, &status) {
+            tracing::warn!(?id, %error, "cannot store the local image; it downloads");
+            continue;
+        }
         state.model.blob_status(id, status);
         applied.blobs.retain(|blob| *blob != id);
     }
-    Ok(())
 }
 
 /// Puts the attachment `sha256` at the blob file of `id`: a hard link, or a
-/// copy where linking fails. A file already at that path is replaced, as it
-/// is no proof of the content.
+/// copy where linking fails, synced before it is used. A file already at
+/// that path is replaced, as it is no proof of the content.
 fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<PathBuf> {
     let dir = blob_dir(data_dir);
     std::fs::create_dir_all(&dir)?;
@@ -940,6 +941,10 @@ fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::
     let src = attachment_path(data_dir, sha256);
     if std::fs::hard_link(&src, &dst).is_err() {
         std::fs::copy(&src, &dst)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dst)?
+            .sync_all()?;
     }
     Ok(dst)
 }
