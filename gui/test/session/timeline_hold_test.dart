@@ -183,8 +183,8 @@ void expectInView(WidgetTester tester, String text) {
 
 /// Pumps [count] rows in the scrollbar test's mix, then scrolls them from the
 /// newest end toward the oldest: 150 steps of 400 px, one frame each. Prints a
-/// summary of the frame times, which are never asserted: they depend on the
-/// machine.
+/// summary of the frame times, then times one call of the list's extent
+/// estimate. Nothing is asserted about the times: they depend on the machine.
 Future<void> measureScroll(WidgetTester tester, int count) async {
   await pumpRows(tester, [
     for (var i = 0; i < count; i++)
@@ -210,6 +210,32 @@ Future<void> measureScroll(WidgetTester tester, int count) async {
     'estimate cost: rows=$count frames=${timed.length} (5 warm-up dropped) '
     'mean=$meanµs p50=${nearestRank(0.5)}µs p90=${nearestRank(0.9)}µs '
     'max=${timed.last}µs',
+  );
+
+  // The list's own delegate, whose estimate runs on every sliver layout, timed
+  // alone: the frame times above cannot resolve it. The call is a viewport at
+  // the newest end: rows 0 to 9 built, 1000 px of them, the rest estimated.
+  // The ListView's childrenDelegate is the one its sliver lays out with. A
+  // finder for the SliverList found nothing in the 500-row run, so it is not
+  // used.
+  final delegate = tester
+      .widget<ListView>(find.byType(ListView))
+      .childrenDelegate;
+  double? estimate;
+  for (var i = 0; i < 20; i++) {
+    estimate = delegate.estimateMaxScrollOffset(0, 9, 0, 1000);
+  }
+  final callWatch = Stopwatch()..start();
+  for (var i = 0; i < 1000; i++) {
+    estimate = delegate.estimateMaxScrollOffset(0, 9, 0, 1000);
+  }
+  callWatch.stop();
+  // Both passes ran, and the calls were not optimized away.
+  expect(estimate, greaterThan(1000), reason: 'the estimate covered the rows');
+  final perCall = callWatch.elapsedMicroseconds / 1000;
+  debugPrint(
+    'estimate call: rows=$count calls=1000 '
+    'mean=${perCall.toStringAsFixed(1)}µs per call',
   );
 }
 
