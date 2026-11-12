@@ -445,6 +445,38 @@ void main() {
     });
   });
 
+  group('scroll hold, mixed heights', () {
+    testWidgets('newer rows removed out of sight with mixed heights keeps '
+        'the rows in view still', (tester) async {
+      // From the newest: two short rows, a medium one, a tall one, then plain.
+      final timeline = await pumpRows(tester, [
+        for (var i = 0; i < 60; i++)
+          if (i == 56)
+            detailed(i, count: 15)
+          else if (i == 57)
+            detailed(i, count: 6)
+          else if (i >= 58)
+            detailed(i, count: 1)
+          else
+            row('s:$i', 'row $i'),
+      ]);
+      await scrollTo(tester, 600);
+      expect(find.text('row 58'), findsNothing, reason: 'out of the build');
+      expect(find.text('row 56'), findsOneWidget, reason: 'the tall row');
+
+      final n = wholeRowInView(tester);
+      final before = rowTopOf(tester, n);
+
+      timeline
+        ..apply(TimelineUpdateRemoved(key: 's:59'))
+        ..apply(TimelineUpdateRemoved(key: 's:58'));
+      await tester.pumpAndSettle();
+
+      expect(rowTopOf(tester, n), closeTo(before, 0.5));
+      expect(tester.takeException(), isNull);
+    });
+  });
+
   group('scroll hold, snapshots and the end', () {
     testWidgets('a snapshot of the same session keeps the held row still', (
       tester,
