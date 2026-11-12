@@ -70,11 +70,12 @@ class TimelineViewState extends State<TimelineView> {
   /// until it is in view or the user scrolls.
   ({String key, bool line})? _reveal;
 
-  /// The rows in view, newest first, and where each one's top edge sits in
-  /// the list, taken when the rows change while the user reads older ones,
-  /// until they are laid out. The newest of them still in the list stays
-  /// put; only if all of them left does the view keep its offset.
-  List<({String key, double top})>? _held;
+  /// The rows in view, newest first, and where each one's top edge sat on
+  /// screen, its distance up from the bottom edge of the view, taken when the
+  /// rows change while the user reads older ones, until they are laid out.
+  /// The newest of them still in the list stays put; only if all of them left
+  /// does the view keep its offset.
+  List<({String key, double screen})>? _held;
 
   late final _physics = _HoldPhysics(shift: _heldShift);
 
@@ -139,7 +140,8 @@ class TimelineViewState extends State<TimelineView> {
     if (!_following && _reveal == null && _held == null) {
       final held = [
         for (final key in _keysInView())
-          if (_topOf(key) case final top?) (key: key, top: top),
+          if (_topOf(key) case final top?)
+            (key: key, screen: top - _scroll.position.pixels),
       ];
       if (held.isNotEmpty) _held = held;
     }
@@ -176,21 +178,20 @@ class TimelineViewState extends State<TimelineView> {
     return null;
   }
 
-  /// How far the newest held row still in the list moved in this layout, so
-  /// the view scrolls with it and keeps it in place.
-  double _heldShift() {
+  /// How far to scroll from the [pixels] the physics is about to return, so
+  /// the newest held row still in the list is back where it was on screen. It
+  /// measures on screen, not in the list: a correction the list makes during
+  /// layout moves every row in the list but none on screen. With every held
+  /// row gone, the view keeps its offset.
+  double _heldShift(double pixels) {
     final held = _held;
     if (held == null) return 0;
-    final kept = <({String key, double top})>[];
-    var shift = 0.0;
     for (final row in held) {
       final top = _topOf(row.key);
       if (top == null) continue;
-      if (kept.isEmpty) shift = top - row.top;
-      kept.add((key: row.key, top: top));
+      return top - row.screen - pixels;
     }
-    _held = kept;
-    return shift;
+    return 0;
   }
 
   (String?, int?) _targetOf(SearchUpdate? search) =>
@@ -474,7 +475,7 @@ class TimelineViewState extends State<TimelineView> {
 class _HoldPhysics extends ScrollPhysics {
   const _HoldPhysics({required this.shift, super.parent});
 
-  final double Function() shift;
+  final double Function(double pixels) shift;
 
   @override
   _HoldPhysics applyTo(ScrollPhysics? ancestor) =>
@@ -486,14 +487,15 @@ class _HoldPhysics extends ScrollPhysics {
     required ScrollMetrics newPosition,
     required bool isScrolling,
     required double velocity,
-  }) =>
-      super.adjustPositionForNewDimensions(
-        oldPosition: oldPosition,
-        newPosition: newPosition,
-        isScrolling: isScrolling,
-        velocity: velocity,
-      ) +
-      shift();
+  }) {
+    final position = super.adjustPositionForNewDimensions(
+      oldPosition: oldPosition,
+      newPosition: newPosition,
+      isScrolling: isScrolling,
+      velocity: velocity,
+    );
+    return position + shift(position);
+  }
 }
 
 /// A built row, registered by key while it is in the tree so the timeline
