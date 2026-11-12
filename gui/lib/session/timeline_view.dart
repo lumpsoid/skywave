@@ -147,6 +147,11 @@ class TimelineViewState extends State<TimelineView> {
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      // The hold moves the view with no scroll notification, so following is
+      // read again from where the view landed.
+      if (_held != null && _scroll.hasClients) {
+        _setFollowing(_scroll.position.extentBefore <= _endSlack);
+      }
       _held = null;
       if (_reveal != null) {
         _stepReveal(4);
@@ -182,10 +187,11 @@ class TimelineViewState extends State<TimelineView> {
   /// the newest held row still in the list is back where it was on screen. It
   /// measures on screen, not in the list: a correction the list makes during
   /// layout moves every row in the list but none on screen. With every held
-  /// row gone, the view keeps its offset.
+  /// row gone, the view keeps its offset. A following view takes no hold: it
+  /// stays at the newest end.
   double _heldShift(double pixels) {
     final held = _held;
-    if (held == null) return 0;
+    if (_following || held == null) return 0;
     for (final row in held) {
       final top = _topOf(row.key);
       if (top == null) continue;
