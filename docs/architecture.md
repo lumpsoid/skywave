@@ -170,6 +170,7 @@ every version.
 | `POST /v1/agent-login/start` | No body. Starts logging the agent in from a device (D49), as a `LoginStartResult`: `Open { flow, url }` (the user signs in at `url`, at most `LOGIN_URL_MAX_BYTES`; a longer one is `Failed`, never cut), the same flow and URL to a start while one is starting or open, `Busy` while a finish runs, `Unavailable` when `agent_login_offered` is false, or `Failed { reason }`. The agent gets 15 s; 503 at 20 s. See "The agent's login". Since v29. |
 | `POST /v1/agent-login/finish` | A `LoginFinish { flow, code }` (the code the sign-in page showed; over `LOGIN_CODE_MAX_BYTES` a 400). Answers `LoggedIn { expires }`, `NoFlow` (no such flow, or given up on) or `Failed { reason }`. The first finish of a flow is the only one the agent sees: every later one gets its outcome, whatever code it carries. 503 after 20 s of waiting for the agent, while the finish goes on; a retry collects it. Since v29. |
 | `GET /v1/workdir/changes?session=` | A session's git changes (D36) as a `ChangesResult`: every file changed against `HEAD` (staged and unstaged together) plus untracked ones, sorted by path and capped, each with its own diff blob (or `Binary` / `TooLarge` / `Omitted`). `NotGit` outside a work tree; `Failed { reason }` when git is missing, refuses, or runs past the deadline. |
+| `GET /v1/workdir/log?session=` | A session's commit log (the repo's `HEAD` history, not narrowed to the workdir) as a `LogResult`: `Log(CommitLog)` with at most `limits::WORKDIR_LOG_MAX` commits, newest first, and `more` past them; `branch` is `None` when detached and `commits` empty on an unborn branch. `NotGit` outside a work tree, `Failed { reason }` as for changes. Since v31. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
 
@@ -717,7 +718,13 @@ collects one. `serve`,
   with fixed flags (`core.fsmonitor=false`, no external diff, no textconv,
   no pager, `--submodule=short`), the repository's own filter drivers emptied, inherited `GIT_*`
   variables removed, stdin closed, and leads a process group killed at the
-  deadline.
+  deadline. The commit log (`GET /v1/workdir/log`) runs `git log` on the
+  commit the branch names, by its full ref (never the bare `HEAD`, which a
+  ref named `HEAD` could shadow on an unborn branch), with
+  `--no-show-signature`, since a repo's `log.showSignature` with its
+  `gpg.program` would run a program; it lists at most `WORKDIR_LOG_MAX` (50)
+  commits plus `more`, an unborn branch is an empty log, a bad author date
+  is no time, and nothing is recorded, as the answer names no blob.
 
 ## Pairing
 

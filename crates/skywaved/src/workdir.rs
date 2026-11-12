@@ -1,6 +1,7 @@
 //! Read-only views of a session's workdir (`GET /v1/workdir/changes`,
-//! `/v1/workdir/list` and `/v1/workdir/file`, D36): git changes, listings,
-//! file contents, and the content-deduplicated store their blobs go to.
+//! `/v1/workdir/log`, `/v1/workdir/list` and `/v1/workdir/file`, D36): git
+//! changes, the commit log, listings, file contents, and the
+//! content-deduplicated store their blobs go to.
 //!
 //! **One snapshot at a time.** [`WorkdirReader`] owns its own database
 //! connection behind a mutex, apart from the API's, and a whole snapshot
@@ -150,6 +151,24 @@
 //!    [`limits::WORKDIR_DIFFS_MAX_BYTES`]; from there on every text diff is
 //!    `Omitted`.
 //!
+//! **Log** ([`Snapshot::log`]) resolves the workdir by steps 1 and 2 (there
+//! is no `path`), then runs `git` there with the same environment and
+//! deadline as changes. The work tree is decided as in Changes step 1
+//! (`NotGit`) and the branch as in Changes step 3 (`None` when detached).
+//! `symbolic-ref -q HEAD` names the branch's full ref (`HEAD` when detached),
+//! and `rev-parse -q --verify <that>^{commit}` its commit: exit 1 is an unborn
+//! branch, an empty log, not a failure. The bare name `HEAD` is never passed
+//! on, since on an unborn branch a ref called `HEAD` elsewhere would answer
+//! it. Then `git log -z --no-show-signature --no-color --encoding=UTF-8
+//! -n<cap + 1> --format=%H%n%h%n%at%n%an%n%s <sha> --` lists the newest
+//! commits of the whole repo (a workdir below its top does not narrow it): at
+//! most [`limits::WORKDIR_LOG_MAX`], with `more` when one more came back. The
+//! fields are one per line (an ident holds no newline), and a bad author date
+//! is no time rather than a failure.
+//! `--no-show-signature` matters: a repo's `log.showSignature` with its
+//! `gpg.program` would run that program. The answer names no blob, so nothing
+//! is recorded (**Garbage**, above).
+//!
 //! The snapshot is not atomic (the agent may edit between git calls). The
 //! header pairing keeps each diff its own file's for edits made in passing.
 //! An agent that swaps renames between the raw call and the patch call on
@@ -210,6 +229,7 @@ use crate::event_log::{self, parse_id};
 
 mod changes;
 mod git;
+mod log;
 
 pub use git::Git;
 

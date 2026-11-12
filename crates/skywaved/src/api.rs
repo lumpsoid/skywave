@@ -74,9 +74,10 @@
 //! to one line of `REFUSAL_MAX_CHARS`. Neither the URL nor the code is
 //! logged or stored. Each `hello` drops a flow left open too long.
 //!
-//! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/list` and
-//! `/v1/workdir/file`, D36): reads of a session's workdir, every outcome a
-//! 200 [`ChangesResult`](skywave_proto::ChangesResult),
+//! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/log`,
+//! `/v1/workdir/list` and `/v1/workdir/file`, D36): reads of a session's
+//! workdir, every outcome a 200 [`ChangesResult`](skywave_proto::ChangesResult),
+//! [`LogResult`](skywave_proto::LogResult),
 //! [`ListResult`](skywave_proto::ListResult) or
 //! [`FileResult`](skywave_proto::FileResult). They run on a blocking thread
 //! through [`crate::workdir::WorkdirReader`], on its own database connection
@@ -372,6 +373,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::AGENT_LOGIN_START, post(agent_login_start))
         .route(path::AGENT_LOGIN_FINISH, post(agent_login_finish))
         .route(path::WORKDIR_CHANGES, get(workdir_changes))
+        .route(path::WORKDIR_LOG, get(workdir_log))
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::BLOB_ROUTE, get(blob))
@@ -1017,6 +1019,17 @@ async fn workdir_changes(
         return StatusCode::BAD_REQUEST.into_response();
     };
     workdir_snapshot(&api, deadline, move |s| s.changes(&query)).await
+}
+
+async fn workdir_log(
+    State(api): State<Arc<Api>>,
+    query: std::result::Result<Query<WorkdirQuery>, QueryRejection>,
+) -> Response {
+    let deadline = Instant::now() + workdir::SNAPSHOT_DEADLINE;
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    workdir_snapshot(&api, deadline, move |s| s.log(&query)).await
 }
 
 async fn workdir_list(

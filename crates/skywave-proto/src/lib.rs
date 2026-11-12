@@ -2911,8 +2911,8 @@ pub struct Commit {
     pub short: String,
     /// Author name.
     pub author: String,
-    /// Author date.
-    pub time: DateTime<Utc>,
+    /// Author date; `None` when the commit's is missing or out of range.
+    pub time: Option<DateTime<Utc>>,
     /// First line of the message.
     pub subject: String,
 }
