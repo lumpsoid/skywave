@@ -19,19 +19,6 @@ void _tall(WidgetTester tester) {
   addTearDown(tester.view.reset);
 }
 
-/// A file-backed image loads in real I/O, which the fake clock of a widget
-/// test never runs. Let the missing file fail to load, so the image shows
-/// its placeholder with [label] (until then it has no size to tap).
-Future<void> _failLoad(WidgetTester tester, String label) async {
-  for (var i = 0; i < 100 && find.text(label).evaluate().isEmpty; i++) {
-    await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 10)),
-    );
-    await tester.pump();
-  }
-  expect(find.text(label), findsOneWidget);
-}
-
 void main() {
   final opened = <String>[];
 
@@ -67,7 +54,41 @@ void main() {
     );
     sent.clear();
 
-    await _failLoad(tester, '1.0 KiB');
+    await tester.tap(find.byKey(const Key('row-image-0')));
+    expect(sent, [const GuiIntentOpenFull(blobId: 'b1')]);
+  });
+
+  testWidgets('a loading image keeps its tap target', (tester) async {
+    _tall(tester);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: _holding([
+        anyRow(
+          'm:4',
+          RowKind.userMessage,
+          'still loading',
+          author: 'me',
+          own: true,
+          images: const [
+            RowImage(
+              blobId: 'b1',
+              path: '/nope.png',
+              label: '1.0 KiB',
+              canDownload: false,
+            ),
+          ],
+        ),
+      ]),
+      sent: sent,
+    );
+    sent.clear();
+
+    expect(
+      tester.getSize(find.byKey(const Key('row-image-0'))).width,
+      greaterThan(0),
+    );
     await tester.tap(find.byKey(const Key('row-image-0')));
     expect(sent, [const GuiIntentOpenFull(blobId: 'b1')]);
   });
@@ -126,7 +147,6 @@ void main() {
     );
     sent.clear();
 
-    await _failLoad(tester, '2.0 KiB');
     await tester.tap(find.byKey(const Key('row-image-0')));
     expect(opened, ['/q.png']);
     expect(sent, isEmpty);
