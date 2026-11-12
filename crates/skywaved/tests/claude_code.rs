@@ -5758,6 +5758,17 @@ async fn dropping_an_open_login_attempt_stops_its_process() {
     assert_eq!(rig.lines("callbacks.txt"), 0);
 }
 
+/// The CLI's SIGTERM handling writes more than a pipe holds, so the kill
+/// must read its stdout or the CLI never gets to write its term marker.
+#[tokio::test]
+async fn a_login_process_that_writes_on_its_way_out_is_read_until_it_exits() {
+    let rig = LoginRig::new();
+    std::fs::write(rig.work.join("term-writes"), "").unwrap();
+    let attempt = rig.begin().await.unwrap();
+    drop(attempt);
+    terminated(&rig.work).await;
+}
+
 #[tokio::test]
 async fn a_refused_or_failed_login_start_says_why() {
     let rig = LoginRig::new();

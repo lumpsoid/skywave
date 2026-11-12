@@ -81,6 +81,8 @@
 //! stdout until it ends, so the log gets those reports, which the CLI also
 //! keeps in its conversation. On SIGTERM the CLI reports no turn end and
 //! cancels no approvals, so an abandoned turn and its approvals stay open.
+//! Through the term grace stdout is read into the backlog too, so a CLI
+//! writing on its way out is not stuck on a full pipe until its SIGKILL.
 //! A CLI that stops reading stdin for the write timeout is killed and
 //! reported as an `Exited` error, so a wedged process cannot block its
 //! session. A supervisor paused on a low disk stops reading the events
@@ -807,14 +809,26 @@ impl Process {
 
     /// Kills the process with its group and reaps it: SIGTERM unless sent
     /// already, then SIGKILL for whatever is left at the term grace's end.
-    /// The CLI is reaped if it exits in time; until then its group id
-    /// cannot be reused.
+    /// Stdout is read into the backlog meanwhile: a CLI whose stdout writes
+    /// block (Node on a pipe) would otherwise never finish its SIGTERM
+    /// handling, and be SIGKILLed at the grace's end. The CLI is reaped if
+    /// it exits in time; until then its group id cannot be reused.
     async fn kill(&mut self) {
         self.terminate();
         let _ = timeout_at(self.kill_deadline(), async {
-            let _ = self.child.wait().await;
-            while !self.group.is_empty() {
-                tokio::time::sleep(GROUP_POLL).await;
+            let mut exited = false;
+            loop {
+                if exited && self.group.is_empty() {
+                    break;
+                }
+                tokio::select! {
+                    _ = self.child.wait(), if !exited => exited = true,
+                    () = tokio::time::sleep(GROUP_POLL), if exited => {}
+                    line = self.stdout.next_line(), if !self.stdout_ended => {
+                        self.stdout_ended = !matches!(line, Ok(Some(_)));
+                        self.backlog.push_back(line);
+                    }
+                }
             }
         })
         .await;
