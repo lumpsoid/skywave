@@ -119,7 +119,7 @@ fn delivered_messages(agent: &FakeAgent, session: SessionId) -> Vec<String> {
         .inputs(session)
         .into_iter()
         .filter_map(|input| match input {
-            FakeInput::Message(text) => Some(text),
+            FakeInput::Message { text, .. } => Some(text),
             _ => None,
         })
         .collect()

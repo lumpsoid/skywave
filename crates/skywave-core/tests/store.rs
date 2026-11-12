@@ -1,21 +1,23 @@
 //! Local replica behaviour: idempotent apply, gap rejection, and state that
 //! survives a reopen (cold start == normal start).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
+use skywave_core::attachment::{AttachedImage, attachment_dir};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
-    Action, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
-    OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen, ServerAddress,
-    ServerFacts, Settings, Snippet, SnippetId, Store, StoreError,
+    Action, AttachmentRefusal, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError,
+    Draft, LockError, OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen,
+    ServerAddress, ServerFacts, Settings, Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
     ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     Decision, DeviceId, DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange,
-    FileResult, Full, ImportOutcome, ImportedItem, LimitSeverity, LimitWindow, LineSpan,
+    FileResult, Full, ImageType, ImportOutcome, ImportedItem, LimitSeverity, LimitWindow, LineSpan,
     RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
     TaskKind, ToolResult, TurnUsage, UsageLimit, UsageLimitsResult,
 };
@@ -102,6 +104,7 @@ impl Log {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "hi".into(),
+                    attachments: Vec::new(),
                 },
             ),
             event(
@@ -417,6 +420,7 @@ fn send(session_id: SessionId, text: &str) -> Command {
             session_id,
             context: ContextId::first_of(session_id),
             text: text.into(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -639,6 +643,15 @@ fn drop_drafts(dir: &Path) {
     conn.execute_batch("DROP TABLE drafts").unwrap();
 }
 
+fn drop_attachments(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "DROP TABLE draft_attachments;
+         DROP TABLE attachments;",
+    )
+    .unwrap();
+}
+
 fn drop_unread(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch(
@@ -816,7 +829,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -946,7 +959,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -992,6 +1005,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "back".into(),
+                    attachments: Vec::new(),
                 },
             ),
         ],
@@ -1048,6 +1062,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: text.into(),
+                attachments: Vec::new(),
             },
         )
     };
@@ -1149,6 +1164,7 @@ fn notable_count_is_projected_and_backfilled() {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "hi".into(),
+                    attachments: Vec::new(),
                 },
             ),
             event(
@@ -1282,6 +1298,7 @@ fn events_settle_the_commands_they_name() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "x".into(),
+                attachments: Vec::new(),
             },
         )
     };
@@ -1620,7 +1637,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -1727,6 +1744,46 @@ fn v29_opens_a_v28_replica_without_the_agent_login_flags() {
     assert_eq!(store.settings().unwrap().server, logged_out);
 }
 
+/// A v29 replica opens as v30 with its user messages as they were: v30's
+/// `attachments` field is absent from v29 JSON and reads as none.
+#[test]
+fn v30_opens_a_v29_replica_with_its_user_messages() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/x".into(),
+        context_name: "start".into(),
+        from: None,
+    };
+    let message = EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "look".into(),
+        attachments: Vec::new(),
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![event(id, 0, created.clone()), event(id, 1, message.clone())],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+    // What v29 left: stamped 29.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 29", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events, [created, message]);
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
@@ -1789,7 +1846,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -1816,6 +1873,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             },
         )
     };
@@ -1888,6 +1946,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             },
         )
     };
@@ -1930,7 +1989,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
     drop(store);
 
     // A replica from before the column: the migration derives it from the log.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!(order(&store), vec![c, b, a]);
     assert_eq!(store.session(c).unwrap().unwrap().last_message_seq, Seq(5));
@@ -1940,12 +1999,12 @@ const AGENT: ComposerMode = ComposerMode::Agent;
 const SHELL: ComposerMode = ComposerMode::Shell;
 
 /// Rewinds the schema to `version`. A rewind past the list-order column's
-/// migration reruns it, so this undoes it here; the last two, moving the
-/// server facts and canonicalizing the server addresses, rerun over a
-/// current schema as is.
+/// migration reruns it, so this undoes it here; the last three, moving the
+/// server facts, canonicalizing the server addresses and creating the
+/// attachment tables, rerun over a current schema as is.
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
-    if version < skywave_core::store::SCHEMA_VERSION - 2 {
+    if version < skywave_core::store::SCHEMA_VERSION - 3 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN last_message_seq;")
             .unwrap();
     }
@@ -1967,7 +2026,7 @@ fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
         ))
         .unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 2);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 3);
     };
     let settings_keys = |dir: &Path| -> Vec<String> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2029,7 +2088,7 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
         conn.execute_batch(rows).unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 1);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 2);
     };
     let stored = |dir: &Path| -> Vec<(String, String)> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2167,6 +2226,120 @@ fn enqueue_message_clears_its_draft_atomically() {
     assert_eq!(store.pending_outbox().unwrap().len(), 2);
 }
 
+/// An image for a draft; each `seed` is an image of its own.
+fn image(seed: &str) -> AttachedImage {
+    AttachedImage {
+        sha256: ContentHash::of(seed.as_bytes()),
+        media_type: ImageType::Png,
+        size: seed.len() as u64,
+        width: 4,
+        height: 3,
+    }
+}
+
+#[test]
+fn draft_images_keep_their_order_over_a_reopen() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b) = (image("a"), image("b"));
+    {
+        let store = Store::open(&dir).unwrap();
+        store.attach_to_draft(session, &a, at(0)).unwrap();
+        store.attach_to_draft(session, &b, at(1)).unwrap();
+        // Already held: a no-op.
+        store.attach_to_draft(session, &a, at(2)).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.load().unwrap().draft_images[&session],
+        [a.clone(), b.clone()]
+    );
+
+    store.detach_from_draft(session, a.sha256).unwrap();
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        std::slice::from_ref(&b)
+    );
+
+    // Blank text no longer hides the images: the draft row goes, they stay.
+    let draft = Draft {
+        text: "half typed".into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    };
+    store.set_draft(session, AGENT, Some(&draft)).unwrap();
+    store.set_draft(session, AGENT, None).unwrap();
+    assert!(store.drafts().unwrap().is_empty());
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        std::slice::from_ref(&b)
+    );
+
+    // A detached image comes back after the others, not in its old place.
+    store.attach_to_draft(session, &a, at(3)).unwrap();
+    assert_eq!(store.draft_images().unwrap()[&session], [b, a]);
+}
+
+#[test]
+fn sending_a_message_drops_its_draft_images() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(a, &image("to a"), at(0)).unwrap();
+    store.attach_to_draft(b, &image("to b"), at(1)).unwrap();
+    assert_eq!(store.draft_images().unwrap()[&a], [image("to a")]);
+
+    store.enqueue(&send(a, "with a picture")).unwrap();
+    let images = store.draft_images().unwrap();
+    assert!(!images.contains_key(&a));
+    assert_eq!(images[&b], [image("to b")]);
+}
+
+#[test]
+fn deleting_a_session_drops_its_draft_images() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store.attach_to_draft(a, &image("to a"), at(0)).unwrap();
+    store.attach_to_draft(b, &image("to b"), at(1)).unwrap();
+    assert!(store.draft_images().unwrap().contains_key(&a));
+
+    store.delete_session_locally(a, at(2)).unwrap();
+    let images = store.draft_images().unwrap();
+    assert!(!images.contains_key(&a));
+    assert_eq!(images[&b], [image("to b")]);
+}
+
+#[test]
+fn resetting_for_another_server_drops_every_draft_image() {
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .attach_to_draft(SessionId::new(), &image("a"), at(0))
+        .unwrap();
+    store
+        .attach_to_draft(SessionId::new(), &image("b"), at(1))
+        .unwrap();
+    assert_eq!(store.draft_images().unwrap().len(), 2);
+
+    store.reset_for_server().unwrap();
+    assert!(store.draft_images().unwrap().is_empty());
+}
+
+#[test]
+fn the_attachment_tables_come_with_the_migration() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    drop_attachments(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let store = Store::open(&dir).unwrap();
+    store
+        .attach_to_draft(SessionId::new(), &image("a"), at(0))
+        .unwrap();
+    assert_eq!(store.draft_images().unwrap().len(), 1);
+}
+
 #[test]
 fn withdraw_anything_not_accepted() {
     let (_tmp, dir) = data_dir();
@@ -2231,15 +2404,15 @@ fn withdraw_anything_not_accepted() {
 
     // Only what was accepted stays.
     assert!(matches!(
-        store.withdraw(accepted.id, None),
+        store.withdraw(accepted.id, None, None),
         Err(StoreError::NotWithdrawable(id)) if id == accepted.id
     ));
     assert!(matches!(
-        store.withdraw(CommandId::new(), None),
+        store.withdraw(CommandId::new(), None, None),
         Err(StoreError::NotWithdrawable(_))
     ));
     for command in [&fresh, &claimed, &requeued, &refused, &undeliverable] {
-        store.withdraw(command.id, None).unwrap();
+        store.withdraw(command.id, None, None).unwrap();
     }
     let left: Vec<CommandId> = store
         .outbox()
@@ -2277,7 +2450,53 @@ fn withdraw_anything_not_accepted() {
     let outbox = store.outbox().unwrap();
     assert!(outbox[1].discardable());
     assert!(!outbox[2].discardable());
-    store.withdraw(create.id, None).unwrap();
+    store.withdraw(create.id, None, None).unwrap();
+}
+
+#[test]
+fn attachment_refused_settles_and_withdraws() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    let command = send(SessionId::new(), "with an image");
+    store.enqueue(&command).unwrap();
+
+    assert!(
+        store
+            .record_attachment_refused(command.id, AttachmentRefusal::NotAnImage, at(1))
+            .unwrap()
+    );
+    // The first refusal is kept.
+    assert!(
+        !store
+            .record_attachment_refused(command.id, AttachmentRefusal::Missing, at(2))
+            .unwrap()
+    );
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(
+        entry.status,
+        OutboxStatus::AttachmentRefused(AttachmentRefusal::NotAnImage)
+    );
+    assert!(entry.status.is_settled());
+    assert!(entry.discardable());
+    // Settled, so it is never claimed for sending.
+    assert!(!store.claim_send(command.id, at(3)).unwrap());
+
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let result: String = conn
+        .query_row(
+            "SELECT result FROM outbox WHERE command_id = ?1",
+            [command.id.0.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"result":"attachment_refused","reason":"not_an_image"}"#
+    );
+    drop(conn);
+
+    store.withdraw(command.id, None, None).unwrap();
+    assert!(store.outbox().unwrap().is_empty());
 }
 
 #[test]
@@ -2308,7 +2527,7 @@ fn withdraw_into_draft_is_one_transaction() {
     .unwrap();
     assert!(
         store
-            .withdraw(command.id, Some(((session, AGENT), &draft)))
+            .withdraw(command.id, Some(((session, AGENT), &draft)), None)
             .is_err()
     );
     assert_eq!(store.pending_outbox().unwrap().len(), 1);
@@ -2317,7 +2536,7 @@ fn withdraw_into_draft_is_one_transaction() {
     // Once it succeeds the text is in the draft only, never in both.
     conn.execute_batch("DROP TRIGGER full").unwrap();
     store
-        .withdraw(command.id, Some(((session, AGENT), &draft)))
+        .withdraw(command.id, Some(((session, AGENT), &draft)), None)
         .unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
@@ -2328,10 +2547,143 @@ fn withdraw_into_draft_is_one_transaction() {
     let other = SessionId::new();
     assert!(
         store
-            .withdraw(command.id, Some(((other, AGENT), &draft)))
+            .withdraw(command.id, Some(((other, AGENT), &draft)), None)
             .is_err()
     );
     assert!(!store.drafts().unwrap().contains_key(&(other, AGENT)));
+}
+
+#[test]
+fn withdrawing_a_message_puts_its_images_back_in_one_transaction() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b, c) = (image("a"), image("b"), image("c"));
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SendMessage {
+            session_id: session,
+            context: ContextId::first_of(session),
+            text: "with pictures".into(),
+            attachments: vec![a.sha256, b.sha256],
+        },
+    };
+    let draft = Draft {
+        text: "with pictures".into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    };
+    let hashes = [a.sha256, b.sha256, c.sha256];
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(session, &a, at(0)).unwrap();
+    store.attach_to_draft(session, &b, at(1)).unwrap();
+    store.enqueue(&command).unwrap();
+    assert!(!store.draft_images().unwrap().contains_key(&session));
+    store.attach_to_draft(session, &c, at(2)).unwrap();
+
+    // A write that fails after the delete keeps the message queued and the
+    // draft's images as they were.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER full BEFORE INSERT ON draft_attachments BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    assert!(
+        store
+            .withdraw(
+                command.id,
+                Some(((session, AGENT), &draft)),
+                Some((session, &hashes))
+            )
+            .is_err()
+    );
+    assert_eq!(store.pending_outbox().unwrap().len(), 1);
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        std::slice::from_ref(&c)
+    );
+    assert!(!store.drafts().unwrap().contains_key(&(session, AGENT)));
+
+    // Once it succeeds the images are back in the draft, in order.
+    conn.execute_batch("DROP TRIGGER full").unwrap();
+    store
+        .withdraw(
+            command.id,
+            Some(((session, AGENT), &draft)),
+            Some((session, &hashes)),
+        )
+        .unwrap();
+    assert!(store.outbox().unwrap().is_empty());
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        [a.clone(), b.clone(), c.clone()]
+    );
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert!(store.outbox().unwrap().is_empty());
+    assert_eq!(store.drafts().unwrap()[&(session, AGENT)], draft);
+    assert_eq!(store.draft_images().unwrap()[&session], [a, b, c]);
+}
+
+#[test]
+fn a_refused_withdraw_writes_no_images() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b, c) = (image("a"), image("b"), image("c"));
+    let fresh = send(session, "not sent yet");
+    let accepted = send(session, "sent");
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(session, &a, at(0)).unwrap();
+    store.attach_to_draft(session, &b, at(1)).unwrap();
+    store.enqueue(&fresh).unwrap();
+
+    // Positive control: the same call writes the images of a command it may
+    // take back.
+    store
+        .withdraw(fresh.id, None, Some((session, &[a.sha256, b.sha256])))
+        .unwrap();
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        [a.clone(), b.clone()]
+    );
+
+    store.enqueue(&accepted).unwrap();
+    assert!(store.claim_send(accepted.id, at(1)).unwrap());
+    store
+        .record_result(accepted.id, &CommandResult::Accepted { seq: Seq(1) }, at(2))
+        .unwrap();
+    store.attach_to_draft(session, &c, at(3)).unwrap();
+
+    assert!(matches!(
+        store.withdraw(accepted.id, None, Some((session, &[a.sha256]))),
+        Err(StoreError::NotWithdrawable(id)) if id == accepted.id
+    ));
+    assert_eq!(store.draft_images().unwrap()[&session], [c]);
+    assert!(!store.drafts().unwrap().contains_key(&(session, AGENT)));
+}
+
+#[test]
+fn load_returns_every_attachment_even_after_it_is_detached() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b) = (image("a"), image("b"));
+    let other = SessionId::new();
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(session, &a, at(0)).unwrap();
+    store.attach_to_draft(session, &b, at(1)).unwrap();
+    store.detach_from_draft(session, a.sha256).unwrap();
+    // A queued message still names `a`, so its row outlives the detach; an
+    // image nothing names is collected when the store opens.
+    store
+        .enqueue(&send_with_images(other, vec![a.sha256]))
+        .unwrap();
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.attachments.len(), 2);
+    assert_eq!(snapshot.attachments[&a.sha256], a);
+    assert_eq!(snapshot.attachments[&b.sha256], b);
+    assert_eq!(store.attachments().unwrap(), snapshot.attachments);
 }
 
 // ---- local delete ---------------------------------------------------------------
@@ -2935,7 +3287,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -3314,7 +3666,7 @@ fn withdrawing_a_run_keeps_it_as_the_shell_draft() {
     store.set_draft(session, AGENT, Some(&agent)).unwrap();
     store.enqueue(&run).unwrap();
     store
-        .withdraw(run.id, Some(((session, SHELL), &draft)))
+        .withdraw(run.id, Some(((session, SHELL), &draft)), None)
         .unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
@@ -3705,7 +4057,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -3987,7 +4339,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -4114,7 +4466,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -4153,7 +4505,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -4566,7 +4918,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -4694,7 +5046,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);
@@ -4709,4 +5061,142 @@ fn the_failures_migration_keeps_a_populated_replica() {
         .query_row("SELECT count(*) FROM blob_failures", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0, "the trigger is back");
+}
+
+/// A message that names `attachments`, as the composer sends it.
+fn send_with_images(session_id: SessionId, attachments: Vec<ContentHash>) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::SendMessage {
+            session_id,
+            context: ContextId::first_of(session_id),
+            text: "pictures".into(),
+            attachments,
+        },
+    }
+}
+
+/// Queues a message with `image` attached, as the composer does: the image
+/// goes into the session's draft, and queuing the message takes it out again.
+/// The image's row stays.
+fn queue_with_image(store: &Store, session_id: SessionId, image: &AttachedImage) -> CommandId {
+    store.attach_to_draft(session_id, image, at(0)).unwrap();
+    let command = send_with_images(session_id, vec![image.sha256]);
+    store.enqueue(&command).unwrap();
+    command.id
+}
+
+#[test]
+fn attachments_are_collected_once_nothing_needs_them() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let (session, drafting) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    let (d, x, q, r, u, a1, a2) = (
+        image("d"),
+        image("x"),
+        image("q"),
+        image("r"),
+        image("u"),
+        image("a1"),
+        image("a2"),
+    );
+
+    // Still in a draft: kept.
+    store.attach_to_draft(drafting, &d, at(0)).unwrap();
+    // Attached, then detached: its row stays, and nothing needs it.
+    store.attach_to_draft(drafting, &x, at(1)).unwrap();
+    store.detach_from_draft(drafting, x.sha256).unwrap();
+
+    // Unsettled: kept.
+    queue_with_image(&store, session, &q);
+    // Rejected, undeliverable: kept, as Edit puts their images back.
+    let rejected = queue_with_image(&store, session, &r);
+    let undeliverable = queue_with_image(&store, session, &u);
+    // Accepted at seq 2 (applied below) and at seq 6 (not applied yet).
+    let accepted_early = queue_with_image(&store, session, &a1);
+    let accepted_late = queue_with_image(&store, session, &a2);
+    store
+        .record_result(
+            rejected,
+            &CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            at(2),
+        )
+        .unwrap();
+    assert!(store.record_undeliverable(undeliverable, at(3)).unwrap());
+    store
+        .record_result(
+            accepted_early,
+            &CommandResult::Accepted { seq: Seq(2) },
+            at(4),
+        )
+        .unwrap();
+    store
+        .record_result(
+            accepted_late,
+            &CommandResult::Accepted { seq: Seq(6) },
+            at(5),
+        )
+        .unwrap();
+    store.apply_batch(&log.batch(1, 3), Utc::now()).unwrap();
+
+    let collected = store.collect_attachments().unwrap();
+    assert_eq!(collected.len(), 2, "{collected:?}");
+    assert_eq!(
+        collected.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([x.sha256, a1.sha256])
+    );
+    assert!(store.collect_attachments().unwrap().is_empty());
+    let kept: HashSet<ContentHash> = store.attachments().unwrap().into_keys().collect();
+    assert_eq!(
+        kept,
+        HashSet::from([d.sha256, q.sha256, r.sha256, u.sha256, a2.sha256])
+    );
+
+    // Once the replica has applied the late accept, its image goes too.
+    store.apply_batch(&log.batch(4, 6), Utc::now()).unwrap();
+    assert_eq!(store.collect_attachments().unwrap(), [a2.sha256]);
+}
+
+#[test]
+fn opening_the_store_removes_unneeded_image_files() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (kept, gone) = (image("kept"), image("gone"));
+    let orphan = ContentHash::of(b"no row");
+    {
+        let store = Store::open(&dir).unwrap();
+        store.attach_to_draft(session, &kept, at(0)).unwrap();
+        store.attach_to_draft(session, &gone, at(1)).unwrap();
+        store.detach_from_draft(session, gone.sha256).unwrap();
+    }
+
+    let files = attachment_dir(&dir);
+    std::fs::create_dir_all(&files).unwrap();
+    for name in [
+        kept.sha256.to_hex(),
+        gone.sha256.to_hex(),
+        orphan.to_hex(),
+        ".tmp-abc".to_owned(),
+    ] {
+        std::fs::write(files.join(name), b"bytes").unwrap();
+    }
+    let present = |name: &str| files.join(name).exists();
+    assert!(present(&gone.sha256.to_hex()), "written, before the open");
+
+    let store = Store::open(&dir).unwrap();
+    assert!(
+        present(&kept.sha256.to_hex()),
+        "a file still in a draft stays"
+    );
+    assert!(
+        !present(&gone.sha256.to_hex()),
+        "a detached image's file goes"
+    );
+    assert!(!present(&orphan.to_hex()), "a file without a row goes");
+    assert!(!present(".tmp-abc"), "a temporary file goes");
+    let rows: HashSet<ContentHash> = store.attachments().unwrap().into_keys().collect();
+    assert_eq!(rows, HashSet::from([kept.sha256]));
 }

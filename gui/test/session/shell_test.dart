@@ -25,6 +25,8 @@ ComposerView shellComposer({
       ? ShellPromptView(cwd: 'work', whenLabel: whenLabel, sigil: r'$')
       : null,
   canStop: canStop,
+  images: const [],
+  preparing: 0,
 );
 
 ShellRunRow shellRun(

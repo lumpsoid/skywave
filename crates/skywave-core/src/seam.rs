@@ -8,24 +8,25 @@
 
 use std::collections::HashSet;
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use chrono::Utc;
 use skywave_proto::{
-    ChangesResult, CommandResult, ConversationsResult, DirsResult, EventBatch, HelloResponse,
-    LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
+    ChangesResult, CommandResult, ContentHash, ConversationsResult, DirsResult, EventBatch,
+    HelloResponse, LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
 };
 
 use crate::address::ServerAddress;
-use crate::blobs::{remove_all_blob_files, remove_blob_files};
+use crate::attachment::attachment_path;
+use crate::blobs::{blob_dir, remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
 use crate::projection::BlobFate;
 use crate::store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, PendingCrop, ServerFacts,
-    Settings, StoreError,
+    Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
+    PendingCrop, ServerFacts, Settings, StoreError,
 };
 use crate::transport::TransportError;
 use crate::view::{
@@ -60,6 +61,9 @@ pub enum Request {
     Connect,
     /// A command was queued; the sender should drain the outbox.
     OutboxChanged,
+    /// A draft gained images: the stager should upload the ones the server
+    /// lacks.
+    DraftImagesChanged,
     /// The user wants this blob's content.
     DownloadBlob(BlobId),
     BlobPolicyChanged(BlobPolicy),
@@ -205,6 +209,19 @@ impl Seam {
         Ok(lock(&self.core.shared.state).store.pending_outbox()?)
     }
 
+    /// The images agent drafts hold, each hash once: a session's in the
+    /// order they were attached.
+    pub fn draft_image_hashes(&self) -> Result<Vec<ContentHash>, CoreError> {
+        let drafts = lock(&self.core.shared.state).store.draft_images()?;
+        let mut seen = HashSet::new();
+        Ok(drafts
+            .values()
+            .flatten()
+            .map(|image| image.sha256)
+            .filter(|sha256| seen.insert(*sha256))
+            .collect())
+    }
+
     pub fn blobs(&self) -> Result<Vec<BlobRecord>, CoreError> {
         Ok(lock(&self.core.shared.state).store.blobs()?)
     }
@@ -310,7 +327,7 @@ impl Seam {
         let now = Utc::now();
         let data_dir = self.data_dir();
         self.update(|state, requests| {
-            let applied = state.store.apply_batch(batch, now)?;
+            let mut applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
             for (id, seq) in &applied.settled {
@@ -331,6 +348,8 @@ impl Seam {
             if !applied.purged.is_empty() {
                 requests.push(Request::BlobsPurged(applied.purged.clone()));
             }
+            // After the model took the batch: it registers the blobs there.
+            own_images_available(state, &data_dir, &mut applied);
             Ok(applied)
         })
     }
@@ -410,6 +429,24 @@ impl Seam {
         self.update(|state, _| {
             if state.store.record_undeliverable(id, now)? {
                 state.model.command_undeliverable(id, now);
+            }
+            Ok(())
+        })
+    }
+
+    /// The device gave up on the image of the message `id` before posting
+    /// it: the server refused its upload, or the local file is gone. The
+    /// message is never sent; a command already settled (or gone) stays as
+    /// it is.
+    pub fn command_attachment_refused(
+        &self,
+        id: CommandId,
+        reason: AttachmentRefusal,
+    ) -> Result<(), CoreError> {
+        let now = Utc::now();
+        self.update(|state, _| {
+            if state.store.record_attachment_refused(id, reason, now)? {
+                state.model.command_attachment_refused(id, reason, now);
             }
             Ok(())
         })
@@ -855,6 +892,61 @@ fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
     if let Err(error) = state.store.mark_alerted(approvals) {
         tracing::warn!(%error, "cannot store alerted approvals");
     }
+}
+
+/// Makes the device's own message images available from their local files,
+/// rather than downloading them: each blob the batch registered whose hash
+/// is an attachment here. Those are taken out of `applied.blobs`, so the
+/// engine does not queue them. A blob whose file cannot be had stays as it
+/// is and downloads as normal. A store error is logged, and the blobs it
+/// touches download as normal.
+fn own_images_available(state: &mut State, data_dir: &Path, applied: &mut Applied) {
+    let own = match state.store.own_images(&applied.blobs) {
+        Ok(own) => own,
+        Err(error) => {
+            tracing::warn!(%error, "cannot look up the device's own images; they download");
+            return;
+        }
+    };
+    for (id, sha256) in own {
+        let path = match own_image_file(data_dir, id, sha256) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::debug!(?id, %error, "cannot use the local image; it downloads");
+                continue;
+            }
+        };
+        let status = BlobStatus::Available { path };
+        if let Err(error) = state.store.set_blob_status(id, &status) {
+            tracing::warn!(?id, %error, "cannot store the local image; it downloads");
+            continue;
+        }
+        state.model.blob_status(id, status);
+        applied.blobs.retain(|blob| *blob != id);
+    }
+}
+
+/// Puts the attachment `sha256` at the blob file of `id`: a hard link, or a
+/// copy where linking fails, synced before it is used. A file already at
+/// that path is replaced, as it is no proof of the content.
+fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<PathBuf> {
+    let dir = blob_dir(data_dir);
+    std::fs::create_dir_all(&dir)?;
+    let dst = dir.join(id.0.to_string());
+    match std::fs::remove_file(&dst) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let src = attachment_path(data_dir, sha256);
+    if std::fs::hard_link(&src, &dst).is_err() {
+        std::fs::copy(&src, &dst)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dst)?
+            .sync_all()?;
+    }
+    Ok(dst)
 }
 
 #[cfg(test)]

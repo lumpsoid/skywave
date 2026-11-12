@@ -40,10 +40,10 @@ use rustls::ClientConfig;
 use serde::de::DeserializeOwned;
 use skywave_proto::encoding::{DECODED_LENGTH_HEADER, ZSTD};
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
-    LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport, UsageLimitsResult,
-    WorkdirQuery, path,
+    BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
+    EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
+    LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport, UploadResult,
+    UsageLimitsResult, WorkdirQuery, path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -388,6 +388,11 @@ impl Http {
         body: Bytes,
         stall: Option<Duration>,
     ) -> Result<Head, TransportError> {
+        // A caller's own Content-Type replaces the JSON default; a second
+        // one would be sent as well.
+        let caller_sets_type = headers
+            .iter()
+            .any(|(name, _)| *name == header::CONTENT_TYPE);
         let build = || {
             let mut req = Request::builder()
                 .method(method.clone())
@@ -396,7 +401,7 @@ impl Http {
                 // Event batches and blobs come compressed (D45); every
                 // reply is decoded ([`encoding`]), so every request asks.
                 .header(header::ACCEPT_ENCODING, ZSTD);
-            if !body.is_empty() {
+            if !body.is_empty() && !caller_sets_type {
                 req = req.header(header::CONTENT_TYPE, "application/json");
             }
             for (name, value) in headers {
@@ -698,6 +703,45 @@ impl HttpsTransport {
                 &self.run_header(),
                 body.into(),
             )
+            .await?;
+        ok_json(reply)
+    }
+
+    /// `HEAD /v1/attachments/{sha256}`: `204` when the server holds the
+    /// staged upload, `404` when it does not.
+    async fn attachment_staged(&self, sha256: ContentHash) -> Result<bool, TransportError> {
+        let reply = self
+            .http
+            .request(
+                Method::HEAD,
+                &path::attachment(sha256),
+                &self.run_header(),
+                Bytes::new(),
+                self.http.request_timeout(),
+            )
+            .await?;
+        match reply.status {
+            StatusCode::NO_CONTENT => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            status => Err(status_error(status, &reply.headers)),
+        }
+    }
+
+    /// `PUT /v1/attachments/{sha256}` with the image's bytes. Every outcome
+    /// the server decides is a 200 [`UploadResult`], refusals included.
+    async fn upload_attachment(
+        &self,
+        sha256: ContentHash,
+        bytes: Bytes,
+    ) -> Result<UploadResult, TransportError> {
+        let mut headers = self.run_header();
+        headers.push((
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        ));
+        let reply = self
+            .http
+            .upload(Method::PUT, &path::attachment(sha256), &headers, bytes)
             .await?;
         ok_json(reply)
     }
@@ -1020,6 +1064,21 @@ impl Transport for HttpsTransport {
         query: &'a WorkdirQuery,
     ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
         Box::pin(self.workdir(path::WORKDIR_FILE, query))
+    }
+
+    fn attachment_staged(
+        &self,
+        sha256: ContentHash,
+    ) -> BoxFuture<'_, Result<bool, TransportError>> {
+        Box::pin(HttpsTransport::attachment_staged(self, sha256))
+    }
+
+    fn upload_attachment(
+        &self,
+        sha256: ContentHash,
+        bytes: Bytes,
+    ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
+        Box::pin(HttpsTransport::upload_attachment(self, sha256, bytes))
     }
 }
 

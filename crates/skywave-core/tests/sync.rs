@@ -187,7 +187,7 @@ async fn offline_queue_drains_exactly_once() {
         .inputs(session)
         .into_iter()
         .filter_map(|input| match input {
-            skywaved::agent::fake::FakeInput::Message(text) => Some(text),
+            skywaved::agent::fake::FakeInput::Message { text, .. } => Some(text),
             _ => None,
         })
         .collect();
@@ -542,7 +542,7 @@ async fn withdrawn_message_never_reaches_the_server() {
         .inputs(session)
         .into_iter()
         .filter_map(|input| match input {
-            skywaved::agent::fake::FakeInput::Message(text) => Some(text),
+            skywaved::agent::fake::FakeInput::Message { text, .. } => Some(text),
             _ => None,
         })
         .collect();

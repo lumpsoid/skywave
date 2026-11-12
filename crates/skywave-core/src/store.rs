@@ -22,13 +22,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
-    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, HelloResponse, LogId, LogRun,
-    MIGRATED_SINCE, ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
+    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, HelloResponse, ImageType, LogId,
+    LogRun, MIGRATED_SINCE, ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
     UsageLimitsResult,
 };
 use uuid::Uuid;
 
 use crate::address::{ServerAddress, ServerAddresses};
+use crate::attachment::{self, AttachedImage};
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
@@ -439,6 +440,30 @@ DELETE FROM settings WHERE key IN ('shell_enabled', 'bypass_allowed', 'login_exp
 "#),
     // The server addresses in their canonical form (`ServerAddress`).
     Code(canonicalize_server_addresses),
+    Sql(r#"
+-- The images a draft holds (`Store::attach_to_draft`). `attachments` keeps
+-- each image once, by its sha256, with what the composer and the model need
+-- of it; its bytes are its file under the data dir (`attachment_path`).
+-- `draft_attachments` keeps a session's agent draft's images in `position`
+-- order. A table of its own, not a column of `drafts`: a blank text deletes
+-- the `drafts` row, and the images stay. A replica from before this held no
+-- images: nothing to backfill. `IF NOT EXISTS` as above.
+CREATE TABLE IF NOT EXISTS attachments (
+    sha256 TEXT PRIMARY KEY,
+    media_type TEXT NOT NULL CHECK (media_type IN ('png', 'jpeg', 'gif', 'webp')),
+    size INTEGER NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS draft_attachments (
+    session_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode = 'agent'),
+    position INTEGER NOT NULL,
+    sha256 TEXT NOT NULL REFERENCES attachments (sha256),
+    PRIMARY KEY (session_id, mode, position)
+);
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -510,7 +535,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
-    v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29,
+    v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -574,6 +599,14 @@ fn v27_to_v28(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// `false` until the next `hello` says otherwise. The agent login's URL and
 /// code are never stored. Nothing stored changes.
 fn v28_to_v29(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v29 to v30, as the server's step of the same name. v30 added image
+/// attachments: outbox `send_message` commands and replica `user_message`
+/// events read as no attachments, as their JSON lacks the field. Nothing
+/// stored changes.
+fn v29_to_v30(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -781,6 +814,21 @@ pub enum LogCheck {
     Lost { seen: Seq },
 }
 
+/// Why the outbox gave up on a message's image before posting it: the
+/// server refused the upload, or the local file is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentRefusal {
+    /// The server refused the upload as larger than it takes.
+    TooLarge,
+    /// The server did not read the upload as an image.
+    NotAnImage,
+    /// The server's hash of the upload differs from the one asked for.
+    HashMismatch,
+    /// The local file under the attachments directory is gone or unreadable.
+    Missing,
+}
+
 /// Delivery state of a queued command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboxStatus {
@@ -796,6 +844,9 @@ pub enum OutboxStatus {
     /// [`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS) server errors;
     /// final, never sent again.
     Undeliverable,
+    /// The message was never posted: its image could not be staged
+    /// ([`AttachmentRefusal`]). Final, never sent again.
+    AttachmentRefused(AttachmentRefusal),
 }
 
 /// What the outbox `result` column holds once a command is settled: the
@@ -812,18 +863,21 @@ enum Settled {
 #[serde(tag = "result", rename_all = "snake_case")]
 enum LocalResult {
     Undeliverable,
+    AttachmentRefused { reason: AttachmentRefusal },
 }
 
 impl OutboxStatus {
     /// Whether the command has its final outcome: the server's answer, or
-    /// given up on as [`Undeliverable`](OutboxStatus::Undeliverable). Only
+    /// given up on as [`Undeliverable`](OutboxStatus::Undeliverable) or
+    /// [`AttachmentRefused`](OutboxStatus::AttachmentRefused). Only
     /// an unsettled command (the outbox's `result IS NULL`) is still sent,
     /// claimed ([`Store::claim_send`]) or settled ([`Store::record_result`],
-    /// [`Store::record_undeliverable`]).
+    /// [`Store::record_undeliverable`], [`Store::record_attachment_refused`]).
     pub fn is_settled(&self) -> bool {
         match self {
             OutboxStatus::Queued | OutboxStatus::Sending => false,
             OutboxStatus::Done(_) | OutboxStatus::Undeliverable => true,
+            OutboxStatus::AttachmentRefused(_) => true,
         }
     }
 }
@@ -864,7 +918,7 @@ impl OutboxEntry {
         );
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
-            OutboxStatus::Undeliverable => true,
+            OutboxStatus::Undeliverable | OutboxStatus::AttachmentRefused(_) => true,
             OutboxStatus::Queued | OutboxStatus::Sending => true,
         }
     }
@@ -989,6 +1043,11 @@ pub struct Snapshot {
     pub pending_crops: Vec<PendingCrop>,
     pub settings: Settings,
     pub drafts: HashMap<(SessionId, ComposerMode), Draft>,
+    /// The images each session's agent draft holds, in order
+    /// ([`Store::draft_images`]).
+    pub draft_images: HashMap<SessionId, Vec<AttachedImage>>,
+    /// Every known image's metadata, by its sha256 ([`Store::attachments`]).
+    pub attachments: HashMap<ContentHash, AttachedImage>,
     /// Sessions whose composer does not write to the agent
     /// ([`Store::set_composer_mode`]).
     pub composer_modes: HashMap<SessionId, ComposerMode>,
@@ -1035,8 +1094,14 @@ impl Store {
     /// A replica stamped with an older `PROTOCOL_VERSION` since
     /// `MIGRATED_SINCE` is migrated to this build's; any other is refused
     /// with [`StoreError::ProtocolMismatch`] before anything reads it.
+    ///
+    /// Then collects the images nothing needs any more, and the files without
+    /// a row ([`Store::collect_attachments`]). A failure there is logged and
+    /// the open goes on.
     pub fn open(data_dir: &Path) -> Result<Store, StoreError> {
-        Store::init(connect(data_dir)?)
+        let store = Store::init(connect(data_dir)?)?;
+        store.collect_image_files(data_dir);
+        Ok(store)
     }
 
     /// A replica that lives only in memory, for tests of components above
@@ -1091,6 +1156,8 @@ impl Store {
             pending_crops: self.pending_crops()?,
             settings: self.settings()?,
             drafts: self.drafts()?,
+            draft_images: self.draft_images()?,
+            attachments: self.attachments()?,
             composer_modes: self.composer_modes()?,
             read_marks: self.read_marks()?,
             deleted: read_deleted(&self.conn)?,
@@ -1401,7 +1468,8 @@ impl Store {
     }
 
     /// Deletes a session from this device only, in one transaction: its
-    /// events, summary, blob rows, draft, read mark and alerted approvals,
+    /// events, summary, blob rows, draft and the draft's images (the image
+    /// files stay), read mark and alerted approvals,
     /// its stored workdir answers, and the answered
     /// commands naming it. A tombstone keeps it out of the replica for good
     /// ([`apply_batch`](Store::apply_batch), [`put_workdir`](Store::put_workdir)).
@@ -1465,6 +1533,10 @@ impl Store {
         tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
         tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
         tx.execute(
+            "DELETE FROM draft_attachments WHERE session_id = ?1",
+            [&session],
+        )?;
+        tx.execute(
             "DELETE FROM composer_modes WHERE session_id = ?1",
             [&session],
         )?;
@@ -1492,11 +1564,11 @@ impl Store {
     /// stored workdir answers and blob rows the old server produced go, as
     /// do its device names, offered models and everything its `hello` said
     /// ([`ServerFacts`]), and so does what this device kept beside them —
-    /// drafts, composer modes, read marks, locally deleted sessions and
-    /// alerted approvals. The settings — the blob policy, a preference of
-    /// this device, and keys a newer build wrote — stay, as do snippets,
-    /// this device's too. Returns the blobs that were known, whose files
-    /// the caller removes.
+    /// drafts and their images, composer modes, read marks, locally deleted
+    /// sessions and alerted approvals. The settings — the blob policy, a
+    /// preference of this device, and keys a newer build wrote — stay, as do
+    /// snippets, this device's too. Returns the blobs that were known, whose
+    /// files the caller removes.
     pub fn reset_for_server(&mut self) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
         let blobs = {
@@ -1507,6 +1579,7 @@ impl Store {
         clear_replica(&tx)?;
         tx.execute_batch(
             "DELETE FROM drafts;
+             DELETE FROM draft_attachments;
              DELETE FROM composer_modes;
              DELETE FROM read_marks;
              DELETE FROM deleted_sessions;
@@ -1548,10 +1621,12 @@ impl Store {
     /// Persists a command as `Queued`. Enqueuing a [`CommandId`] that is
     /// already in the outbox changes nothing.
     ///
-    /// A message also deletes its session's agent draft, and a shell run its
-    /// shell draft, in the same transaction: a crash never leaves both the
-    /// queued command and the draft it was written in, which would invite
-    /// sending it twice.
+    /// A message also deletes its session's agent draft and the draft's
+    /// images (their rows and files stay until nothing needs them, see
+    /// [`Store::collect_attachments`]), and a
+    /// shell run its shell draft, in the same transaction: a crash never
+    /// leaves both the queued command and the draft it was written in, which
+    /// would invite sending it twice.
     pub fn enqueue(&self, command: &Command) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
@@ -1565,6 +1640,12 @@ impl Store {
                 "DELETE FROM drafts WHERE session_id = ?1 AND mode = ?2",
                 params![session_id.0.to_string(), mode_sql(mode)],
             )?;
+            if mode == ComposerMode::Agent {
+                tx.execute(
+                    "DELETE FROM draft_attachments WHERE session_id = ?1",
+                    [session_id.0.to_string()],
+                )?;
+            }
         }
         tx.execute(
             "INSERT INTO outbox (command_id, command) VALUES (?1, ?2)
@@ -1598,6 +1679,9 @@ impl Store {
                 (Some(Settled::Answered(result)), _) => OutboxStatus::Done(result),
                 (Some(Settled::Local(LocalResult::Undeliverable)), _) => {
                     OutboxStatus::Undeliverable
+                }
+                (Some(Settled::Local(LocalResult::AttachmentRefused { reason })), _) => {
+                    OutboxStatus::AttachmentRefused(reason)
                 }
                 (None, true) => OutboxStatus::Sending,
                 (None, false) => OutboxStatus::Queued,
@@ -1659,24 +1743,45 @@ impl Store {
         )
     }
 
+    /// Gives up on a message whose image the outbox could not stage, at
+    /// `now` ([`OutboxStatus::AttachmentRefused`]). Like an answer, it is
+    /// final and the first one is kept; `false` when nothing changed, as for
+    /// [`record_result`](Store::record_result).
+    pub fn record_attachment_refused(
+        &self,
+        id: CommandId,
+        reason: AttachmentRefusal,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        settle_in(
+            &self.conn,
+            id,
+            &Settled::Local(LocalResult::AttachmentRefused { reason }),
+            now,
+        )
+    }
+
     /// Takes a command back: deletes it from the outbox if the server has
     /// not answered it or refused it (or its request), and keeps `draft` as
-    /// its session's draft in that mode, in one transaction, so a crash
-    /// keeps the text in exactly one place. An accepted command stays and
-    /// the call fails with [`StoreError::NotWithdrawable`], writing nothing.
-    /// One already sent may still reach the server
-    /// ([`OutboxEntry::discardable`]).
+    /// its session's draft in that mode. With `images`, the session's agent
+    /// draft images become these hashes, in order, too. All of it is one
+    /// transaction, so a crash keeps the text and the images in exactly one
+    /// place. An accepted command stays and the call fails with
+    /// [`StoreError::NotWithdrawable`], writing nothing. One already sent may
+    /// still reach the server ([`OutboxEntry::discardable`]).
     pub fn withdraw(
         &self,
         id: CommandId,
         draft: Option<((SessionId, ComposerMode), &Draft)>,
+        images: Option<(SessionId, &[ContentHash])>,
     ) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
         let deleted = tx.execute(
             "DELETE FROM outbox WHERE command_id = ?1
                 AND (result IS NULL
-                    OR json_extract(result, '$.result') IN ('rejected', 'undeliverable'))",
+                    OR json_extract(result, '$.result')
+                        IN ('rejected', 'undeliverable', 'attachment_refused'))",
             [id.0.to_string()],
         )?;
         if deleted == 0 {
@@ -1684,6 +1789,20 @@ impl Store {
         }
         if let Some((key, draft)) = draft {
             upsert_draft(&tx, key, draft)?;
+        }
+        if let Some((session_id, hashes)) = images {
+            let session = session_id.0.to_string();
+            tx.execute(
+                "DELETE FROM draft_attachments WHERE session_id = ?1 AND mode = 'agent'",
+                [&session],
+            )?;
+            for (position, hash) in hashes.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO draft_attachments (session_id, mode, position, sha256)
+                     VALUES (?1, 'agent', ?2, ?3)",
+                    params![session, u64_sql(position as u64)?, hash.to_hex()],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1820,6 +1939,27 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Of these blobs, the ones not downloaded yet whose content is an image
+    /// this device attached (its hash is an `attachments` row), with that
+    /// image's hash: their bytes are on this device already.
+    pub fn own_images(&self, ids: &[BlobId]) -> Result<Vec<(BlobId, ContentHash)>, StoreError> {
+        let ids: Vec<String> = ids.iter().map(|id| id.0.to_string()).collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, h.sha256 FROM blobs b
+                JOIN blob_hashes h ON h.blob_id = b.id
+                JOIN attachments a ON a.sha256 = h.sha256
+             WHERE b.state = 'not_downloaded' AND b.id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = stmt.query_map([to_json(&ids)?], |row| {
+            let sha256: String = row.get(1)?;
+            Ok((
+                BlobId(uuid_col(row, 0)?),
+                sha256.parse().map_err(|e| bad_value(1, Type::Text, e))?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // ---- workdir answers ------------------------------------------------------
@@ -1971,7 +2111,8 @@ impl Store {
     }
 
     /// Keeps `draft` as the session's unsent text in `mode`; `None` deletes
-    /// it.
+    /// it. The images of an agent draft stay either way
+    /// ([`Store::attach_to_draft`]).
     pub fn set_draft(
         &self,
         session_id: SessionId,
@@ -1987,6 +2128,170 @@ impl Store {
                 )?;
                 Ok(())
             }
+        }
+    }
+
+    /// The images each session's agent draft holds, in the order they were
+    /// attached.
+    pub fn draft_images(&self) -> Result<HashMap<SessionId, Vec<AttachedImage>>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.session_id, a.sha256, a.media_type, a.size, a.width, a.height
+             FROM draft_attachments d JOIN attachments a ON a.sha256 = d.sha256
+             WHERE d.mode = 'agent' ORDER BY d.session_id, d.position",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((SessionId(uuid_col(row, 0)?), attached_image_cols(row, 1)?))
+        })?;
+        let mut images: HashMap<SessionId, Vec<AttachedImage>> = HashMap::new();
+        for row in rows {
+            let (session_id, image) = row?;
+            images.entry(session_id).or_default().push(image);
+        }
+        Ok(images)
+    }
+
+    /// Every image row, by sha256. A row outlives its draft: a queued
+    /// message names its images by hash, so the model can show them again.
+    pub fn attachments(&self) -> Result<HashMap<ContentHash, AttachedImage>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sha256, media_type, size, width, height FROM attachments")?;
+        let rows = stmt.query_map([], |row| attached_image_cols(row, 0))?;
+        let mut images = HashMap::new();
+        for row in rows {
+            let image = row?;
+            images.insert(image.sha256, image);
+        }
+        Ok(images)
+    }
+
+    /// Attaches `image` to the session's agent draft, after its images, in
+    /// one transaction. A draft holds an image at most once: one it already
+    /// holds changes nothing. The image's row is made on first sight, at
+    /// `now`; its file is the caller's to store (`attachment::store`).
+    pub fn attach_to_draft(
+        &self,
+        session_id: SessionId,
+        image: &AttachedImage,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        let sha256 = image.sha256.to_hex();
+        tx.execute(
+            "INSERT INTO attachments (sha256, media_type, size, width, height, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (sha256) DO NOTHING",
+            params![
+                sha256,
+                image_type_sql(image.media_type),
+                u64_sql(image.size)?,
+                i64::from(image.width),
+                i64::from(image.height),
+                now.to_rfc3339()
+            ],
+        )?;
+        let session = session_id.0.to_string();
+        let held: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM draft_attachments
+                WHERE session_id = ?1 AND mode = 'agent' AND sha256 = ?2)",
+            params![session, sha256],
+            |row| row.get(0),
+        )?;
+        if !held {
+            tx.execute(
+                "INSERT INTO draft_attachments (session_id, mode, position, sha256)
+                 VALUES (?1, 'agent',
+                    (SELECT COALESCE(MAX(position), -1) + 1 FROM draft_attachments
+                        WHERE session_id = ?1 AND mode = 'agent'),
+                    ?2)",
+                params![session, sha256],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Takes the image with `sha256` off the session's agent draft. The
+    /// other images keep their positions, and the image's row and file stay.
+    pub fn detach_from_draft(
+        &self,
+        session_id: SessionId,
+        sha256: ContentHash,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM draft_attachments
+             WHERE session_id = ?1 AND mode = 'agent' AND sha256 = ?2",
+            params![session_id.0.to_string(), sha256.to_hex()],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes, in one transaction, the rows of the images nothing needs any
+    /// more, and returns their hashes; their files are the caller's to remove.
+    /// An image is still needed while one of these holds:
+    /// - a draft holds it: it is one of the draft's images;
+    /// - a message naming it is unsettled (`result` NULL): it may still be
+    ///   posted;
+    /// - a message naming it was rejected, undeliverable or refused its
+    ///   attachment: Edit puts its images back into the draft;
+    /// - a message naming it was accepted at a `seq` past the cursor: the
+    ///   reply can settle it before the pull applies its event, and the
+    ///   event's own-copy step needs the file.
+    ///
+    /// Nothing else keeps an image, so an image no longer needed is collected
+    /// when the store opens, not by the detach or settle that freed it.
+    pub fn collect_attachments(&self) -> Result<Vec<ContentHash>, StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        let hashes = {
+            let mut stmt = tx.prepare(
+                "SELECT a.sha256 FROM attachments a
+                 WHERE NOT EXISTS (SELECT 1 FROM draft_attachments d WHERE d.sha256 = a.sha256)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM outbox o, json_each(o.command, '$.kind.attachments') j
+                     WHERE j.value = a.sha256
+                       AND (o.result IS NULL
+                         OR json_extract(o.result, '$.result')
+                             IN ('rejected', 'undeliverable', 'attachment_refused')
+                         OR (json_extract(o.result, '$.result') = 'accepted'
+                             AND json_extract(o.result, '$.seq')
+                                 > (SELECT seq FROM cursor WHERE id = 0))))",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let sha256: String = row.get(0)?;
+                sha256.parse().map_err(|e| bad_value(0, Type::Text, e))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<ContentHash>>>()?
+        };
+        for hash in &hashes {
+            tx.execute("DELETE FROM attachments WHERE sha256 = ?1", [hash.to_hex()])?;
+        }
+        tx.commit()?;
+        Ok(hashes)
+    }
+
+    /// At open, with the data dir's lock held: removes the files of the
+    /// images [`Store::collect_attachments`] frees, then every file without
+    /// a row left, the `.tmp-*` files included. Only at open: a row-less
+    /// file may be a write whose row is still to come. A failure is logged;
+    /// the sweep runs only when the rows could be read, as they are its keep
+    /// set.
+    fn collect_image_files(&self, data_dir: &Path) {
+        match self.collect_attachments() {
+            Ok(collected) => {
+                for hash in collected {
+                    attachment::remove(data_dir, hash);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "cannot collect the replica's images"),
+        }
+        match self.attachments() {
+            Ok(rows) => {
+                let keep = rows.into_keys().collect::<HashSet<_>>();
+                attachment::sweep(data_dir, &keep);
+            }
+            Err(error) => tracing::warn!(%error, "cannot read the replica's images"),
         }
     }
 
@@ -2608,6 +2913,42 @@ fn mode_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<ComposerMode> {
     }
 }
 
+/// The serde name of `media_type`, as the `attachments` CHECK lists it.
+fn image_type_sql(media_type: ImageType) -> &'static str {
+    match media_type {
+        ImageType::Png => "png",
+        ImageType::Jpeg => "jpeg",
+        ImageType::Gif => "gif",
+        ImageType::Webp => "webp",
+    }
+}
+
+fn image_type_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<ImageType> {
+    let text: String = row.get(idx)?;
+    match text.as_str() {
+        "png" => Ok(ImageType::Png),
+        "jpeg" => Ok(ImageType::Jpeg),
+        "gif" => Ok(ImageType::Gif),
+        "webp" => Ok(ImageType::Webp),
+        _ => Err(bad_value(idx, Type::Text, format!("image type {text:?}"))),
+    }
+}
+
+/// An [`AttachedImage`] from the five columns of `attachments` from `first`
+/// on: sha256, media_type, size, width, height.
+fn attached_image_cols(row: &Row<'_>, first: usize) -> rusqlite::Result<AttachedImage> {
+    let sha256: String = row.get(first)?;
+    Ok(AttachedImage {
+        sha256: sha256
+            .parse()
+            .map_err(|e| bad_value(first, Type::Text, e))?,
+        media_type: image_type_col(row, first + 1)?,
+        size: u64_col(row, first + 2)?,
+        width: u32_col(row, first + 3)?,
+        height: u32_col(row, first + 4)?,
+    })
+}
+
 fn when_sql(when: RunWhen) -> &'static str {
     match when {
         RunWhen::Always => "always",
@@ -2887,6 +3228,11 @@ fn seq_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Seq> {
 fn u64_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(idx)?;
     u64::try_from(value).map_err(|e| bad_value(idx, Type::Integer, e))
+}
+
+fn u32_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<u32> {
+    let value: i64 = row.get(idx)?;
+    u32::try_from(value).map_err(|e| bad_value(idx, Type::Integer, e))
 }
 
 fn json_col<T: DeserializeOwned>(row: &Row<'_>, idx: usize) -> rusqlite::Result<T> {

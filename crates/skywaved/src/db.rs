@@ -443,6 +443,23 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE approvals ADD COLUMN
         questions TEXT CHECK (questions IS NULL OR json_valid(questions));
     "#,
+    // v23: an image on a user message (protocol v30, `BlobUse::Attachment`).
+    // Made again as in v21: SQLite cannot change a CHECK in place.
+    r#"
+    CREATE TABLE event_blobs_v23 (
+        blob_id    TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        holds      TEXT NOT NULL CHECK (holds IN
+            ('tool_input', 'tool_body', 'tool_output', 'approval_input', 'shell_output',
+             'message', 'attachment'))
+    ) STRICT;
+    INSERT INTO event_blobs_v23 (blob_id, session_id, seq, holds)
+        SELECT blob_id, session_id, seq, holds FROM event_blobs;
+    DROP TABLE event_blobs;
+    ALTER TABLE event_blobs_v23 RENAME TO event_blobs;
+    CREATE INDEX event_blobs_seq ON event_blobs (seq);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -461,7 +478,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// saying so if nothing stored changed; the length makes a bump without one
 /// fail to compile. Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
-    v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29,
+    v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30,
 ];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
@@ -516,6 +533,14 @@ fn v27_to_v28(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// agent-login endpoints, which store nothing (the login's URL and code
 /// live in memory only): nothing stored changes.
 fn v28_to_v29(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v29 to v30. v30 added image attachments: `attachments` on `UserMessage`
+/// and `SendMessage`, which v29 JSON lacks and reads as empty, so no event
+/// or stored command result is rewritten; staged uploads are files, not
+/// rows. Nothing stored changes.
+fn v29_to_v30(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -1109,6 +1134,71 @@ mod tests {
             .unwrap();
     }
 
+    /// v23 lets an image on a user message have a blob row: the table made
+    /// again keeps v22's rows and its `event_blobs_seq` index.
+    #[test]
+    fn v23_schema_lets_an_attachment_blob_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..22] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 22).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, ?1)",
+                [PROTOCOL_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('m1', 's', 1, 'message')",
+                [],
+            )
+            .unwrap();
+            // v22 refuses an image's blob.
+            assert!(
+                conn.execute(
+                    "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                     VALUES ('a1', 's', 1, 'attachment')",
+                    [],
+                )
+                .is_err()
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows: Vec<(String, String, i64, String)> = db
+            .conn()
+            .prepare("SELECT blob_id, session_id, seq, holds FROM event_blobs ORDER BY blob_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [("m1".to_owned(), "s".to_owned(), 1, "message".to_owned())]
+        );
+        let index: String = db
+            .conn()
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'event_blobs_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, "event_blobs_seq");
+        db.conn()
+            .execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('a1', 's', 1, 'attachment')",
+                [],
+            )
+            .unwrap();
+    }
+
     /// The turn usage v24 wrote (its wire snapshot's) reads once v25's
     /// step ran, with no context fill: a v24 turn reported none.
     #[test]
@@ -1342,6 +1432,46 @@ mod tests {
         assert!(matches!(
             serde_json::from_str(&kind).unwrap(),
             EventKind::AgentMessage { .. }
+        ));
+    }
+
+    /// A database a v29 build wrote reads unchanged once v30's step ran.
+    #[test]
+    fn v30_reads_what_v29_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v29 = r#"{"type":"user_message","device_id":"0192f0a0-0000-7000-8000-000000000003","text":"look"}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 29)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, 's', 't', 'c', ?1)",
+                [v29],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let kind: String = db
+            .conn()
+            .query_row("SELECT kind FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, v29);
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::UserMessage { attachments, .. } if attachments.is_empty()
         ));
     }
 

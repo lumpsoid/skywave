@@ -107,6 +107,27 @@ pub enum GuiIntent {
         session_id: String,
         snippet_id: String,
     },
+    /// Attach an image file at `path` (the picker's or a drop's) to the
+    /// session's agent draft. The hub prepares it off the dispatch path and
+    /// answers a refusal as a notice; a session not open is ignored.
+    AttachImageFile {
+        session_id: String,
+        path: String,
+    },
+    /// Attach image bytes (a paste's or a keyboard insert's), as
+    /// `AttachImageFile`. `mime` is what the platform said; the hub sniffs
+    /// the bytes itself.
+    AttachImageBytes {
+        session_id: String,
+        bytes: Vec<u8>,
+        mime: String,
+    },
+    /// Take the image with `sha256` (64 hex digits) off the session's agent
+    /// draft.
+    DetachImage {
+        session_id: String,
+        sha256: String,
+    },
     /// Show only the conversation, tool calls hidden, in every session; or
     /// every row again.
     ToggleConversationOnly,

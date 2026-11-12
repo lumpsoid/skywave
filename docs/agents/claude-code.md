@@ -128,8 +128,28 @@ after it. No flag is needed. A line without a `uuid` gets none (every
 recording before 2026-11-05). **[C]** (§3.11, "A message meets a turn of
 the CLI's own".)
 
-`content` can also be an array of Anthropic content blocks, which is how the
-SDK sends images and blobs. **[U]**
+`content` can also be an array of Anthropic content blocks. **[C]** (fixture
+`image.ndjson`, and a probe on 2.1.310 with haiku.) The adapter writes one
+`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"…"}}`
+block per image, in order, then a `{"type":"text","text":…}` block unless the
+text is blank. Without images `content` stays a string (`protocol::user_message`).
+The probe found:
+
+- Image blocks followed by a text block start a turn. The line's `uuid` gets
+  the same `queued`/`started`/`completed` `command_lifecycle` lines as a string
+  does. Image-only content (no text block) works too.
+- Nothing echoes the base64 on stdout.
+- The CLI re-encodes every image to JPEG before it sends it (about 675K base64
+  characters for a large noisy image). Even 12 MB of base64 was accepted, and
+  the API's 5 MiB per-image limit was never reached. Ten turns of about 3.7 MB
+  images and 105 turns of small images all completed.
+- A corrupt image (`image/png` with random bytes) does not fail the turn. The
+  CLI replaces it with a text block, `[Image could not be processed: …]`, and
+  the turn completes. The adapter gets no error for it, so a bad image has to
+  be caught before it is sent.
+- The session transcript stores the user line with the base64 inline, and the
+  line's `uuid` is ours. It also writes an extra `isMeta` user line per image,
+  with the text `[Image: source: <cli temp dir>/images/N.png]`.
 
 Control request. `request_id` is any unique string that the host chooses. **[C]**
 
@@ -1778,7 +1798,8 @@ be resumed, §5).
 
 ## 7. Not covered (out of MVP scope or not needed by T09)
 
-- Images and attachments in `user.content`
+- Images in imported transcripts (`transcripts.rs` keeps only text blocks; an
+  image-only message is dropped)
 - removing rules granted with "always allow" (they live in the CLI's
   settings, out of Skywave's sight)
 - hooks over the control channel

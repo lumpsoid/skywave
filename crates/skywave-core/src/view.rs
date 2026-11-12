@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use skywave_proto::Fingerprint;
+use skywave_proto::{Fingerprint, ImageType};
 use uuid::Uuid;
 
 pub use skywave_proto::{
@@ -28,7 +28,8 @@ pub use skywave_proto::{LimitSeverity, LimitWindow, UsageLimit, UsageLimitsResul
 pub use crate::projection::{SessionUsage, TurnRecord};
 
 use crate::address::ServerAddress;
-use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
+use crate::attachment::AttachedImage;
+use crate::store::{AttachmentRefusal, BlobPolicy, OutboxEntry, OutboxStatus};
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.
@@ -329,6 +330,9 @@ impl From<&OutboxStatus> for Outgoing {
                 Outgoing::Failed(FailReason::Rejected(*reason))
             }
             OutboxStatus::Undeliverable => Outgoing::Failed(FailReason::Undeliverable),
+            OutboxStatus::AttachmentRefused(reason) => {
+                Outgoing::Failed(FailReason::AttachmentRefused(*reason))
+            }
         }
     }
 }
@@ -344,6 +348,9 @@ pub enum FailReason {
     /// logged a command whose reply was unreadable. It never applied, and
     /// it is not sent again.
     Undeliverable,
+    /// The device gave up on the message's image before sending it; it
+    /// never applied.
+    AttachmentRefused(AttachmentRefusal),
 }
 
 impl FailReason {
@@ -352,7 +359,7 @@ impl FailReason {
     pub fn rules_out_answers(self) -> bool {
         match self {
             FailReason::Rejected(reason) => reason.rules_out_answers(),
-            FailReason::Undeliverable => false,
+            FailReason::Undeliverable | FailReason::AttachmentRefused(_) => false,
         }
     }
 }
@@ -453,6 +460,14 @@ pub struct BlobView {
     /// This device's latest delete or crop of this blob until its effect is
     /// in the replica; a refusal stays until discarded.
     pub pending: Option<BlobPending>,
+}
+
+/// An image on a user message: its type, and the image's blob as it stands:
+/// downloadable (or this device's own file), deleted, or cropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageImage {
+    pub media_type: ImageType,
+    pub content: FullView,
 }
 
 /// This device's own delete or crop of a blob
@@ -850,7 +865,8 @@ pub struct SessionRow {
     pub pending_approvals: usize,
     pub last_activity: DateTime<Utc>,
     /// This device keeps an unsent message or shell command for the
-    /// session (a shell draft holding only a condition does not count).
+    /// session (a shell draft holding only a condition does not count), or
+    /// images for its next message.
     pub has_draft: bool,
     /// Agent output (messages, approval requests, errors) this device has
     /// not seen yet. Messages from any device never count.
@@ -1178,6 +1194,10 @@ pub struct SessionView {
     pub mode: ComposerMode,
     /// This device's unsent message, as last saved.
     pub draft: Option<Draft>,
+    /// This device's images for the next message, in order
+    /// ([`Action::Attach`](crate::Action::Attach)). The files are at
+    /// [`attachment::attachment_path`](crate::attachment::attachment_path).
+    pub draft_images: Vec<AttachedImage>,
     /// This device's unsent shell command, as last saved, with the
     /// condition picked for it ([`Draft::when`]). Kept even with blank
     /// text when a condition other than [`RunWhen::Always`] was picked.
@@ -1539,6 +1559,9 @@ pub enum TimelineItem {
         /// when it reaches the server.
         context: ContextId,
         text: String,
+        /// The images it carries, in order; each file is at
+        /// [`attachment_path`](crate::attachment::attachment_path).
+        images: Vec<AttachedImage>,
         outgoing: Outgoing,
         /// [`Action::Discard`](crate::Action::Discard) and
         /// [`Action::EditQueued`](crate::Action::EditQueued) take it back:
@@ -1589,6 +1612,8 @@ pub enum Entry {
         /// this id became this message.
         command_id: CommandId,
         text: String,
+        /// The message's images, in the order attached.
+        images: Vec<MessageImage>,
         /// Who sent it; [`DeviceRef::me`] when this device did.
         from: DeviceRef,
         /// Delivery state when this device sent it.
@@ -1984,6 +2009,7 @@ mod tests {
             Entry::UserMessage {
                 command_id: CommandId::new(),
                 text: text.into(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: DeviceId::new(),
                     name: None,
@@ -2000,6 +2026,7 @@ mod tests {
             command_id: CommandId::new(),
             context: ContextId::new(),
             text: text.into(),
+            images: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: None,
@@ -2050,6 +2077,7 @@ mod tests {
             task_stops: Vec::new(),
             mode: ComposerMode::Agent,
             draft: None,
+            draft_images: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: ShellView::default(),

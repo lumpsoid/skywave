@@ -8,6 +8,10 @@
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Skywave connects to your skywaved server, which may be on your local network.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Attach images to messages for the agent.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Attach images to messages for the agent.</string>
 	<key>CFBundleDisplayName</key>
 	<string>Skywave</string>
 	<key>CFBundleExecutable</key>

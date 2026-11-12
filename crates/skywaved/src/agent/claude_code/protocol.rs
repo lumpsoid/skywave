@@ -111,6 +111,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 use skywave_proto::Decision;
 use uuid::Uuid;
@@ -118,9 +120,9 @@ use uuid::Uuid;
 use super::{display, rules, usage};
 use crate::agent::mapper::cut_line;
 use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, LoginSource,
-    ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, ResumeHandle,
-    SubagentFigures, TaskKind, TurnOutcome,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, Image,
+    LoginSource, ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, ReadInput,
+    ResumeHandle, SubagentFigures, TaskKind, TurnOutcome,
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -176,11 +178,35 @@ pub fn parse_resume_handle(handle: &ResumeHandle) -> Result<Uuid, String> {
 }
 
 /// A user message, `id` its `uuid`: the CLI names it in the
-/// `command_lifecycle` lines of the turn that takes it up.
-pub fn user_message(text: &str, id: Uuid) -> Value {
+/// `command_lifecycle` lines of the turn that takes it up. Without images
+/// its `content` is the text as a string; with images it is an array, one
+/// image block per image in order, then the text block unless the text is
+/// blank.
+pub fn user_message(text: &str, images: &[Image], id: Uuid) -> Value {
+    let content = if images.is_empty() {
+        json!(text)
+    } else {
+        let mut blocks: Vec<Value> = images
+            .iter()
+            .map(|image| {
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type.mime(),
+                        "data": STANDARD.encode(&image.bytes),
+                    },
+                })
+            })
+            .collect();
+        if !text.trim().is_empty() {
+            blocks.push(json!({ "type": "text", "text": text }));
+        }
+        Value::Array(blocks)
+    };
     json!({
         "type": "user",
-        "message": { "role": "user", "content": text },
+        "message": { "role": "user", "content": content },
         "parent_tool_use_id": null,
         "session_id": "",
         "uuid": id.to_string(),
@@ -561,7 +587,7 @@ pub struct Protocol {
     /// written once no turn is open and none is [`Protocol::written`]
     /// unstarted, unless the session is shutting down. Kept then, so the
     /// exit can count them ([`Protocol::unsent`]).
-    queued: VecDeque<String>,
+    queued: VecDeque<ReadInput>,
     pending: Vec<Pending>,
     /// Tool name of each call this turn that has no result yet, by
     /// tool-use id: a structured result is read by its tool.
@@ -746,14 +772,22 @@ impl Protocol {
         self.session_id
     }
 
-    /// Writes `text` now if idle, else queues it for the next turn. Its
-    /// turn is reported when the CLI takes it up.
+    /// A text-only message; see [`Protocol::send_input`].
     pub fn send_message(&mut self, text: String) -> Output {
+        self.send_input(ReadInput {
+            text,
+            images: Vec::new(),
+        })
+    }
+
+    /// Writes `input` now if idle, else queues it for the next turn. Its
+    /// turn is reported when the CLI takes it up.
+    pub fn send_input(&mut self, input: ReadInput) -> Output {
         if self.turn_open() {
-            self.queued.push_back(text);
+            self.queued.push_back(input);
             Output::default()
         } else {
-            self.write_message(&text)
+            self.write_message(&input)
         }
     }
 
@@ -876,10 +910,10 @@ impl Protocol {
         out
     }
 
-    /// `text` was accepted for the process but it exited before reading it:
+    /// `input` was accepted for the process but it exited before reading it:
     /// a turn owed that never runs, counted by [`Protocol::unsent`].
-    pub fn undelivered(&mut self, text: String) {
-        self.queued.push_back(text);
+    pub fn undelivered(&mut self, input: ReadInput) {
+        self.queued.push_back(input);
     }
 
     /// The session is stopping: no new turn starts, so the messages queued
@@ -1028,13 +1062,13 @@ impl Protocol {
         self.settings.insert(id, Asked::EffortRead { asked });
     }
 
-    /// Writes `text`; its turn opens when the CLI takes it up
+    /// Writes `input`; its turn opens when the CLI takes it up
     /// ([`Protocol::on_lifecycle`]).
-    fn write_message(&mut self, text: &str) -> Output {
+    fn write_message(&mut self, input: &ReadInput) -> Output {
         let id = Uuid::new_v4();
         self.written = Some(id);
         Output {
-            writes: vec![user_message(text, id)],
+            writes: vec![user_message(&input.text, &input.images, id)],
             events: Vec::new(),
         }
     }

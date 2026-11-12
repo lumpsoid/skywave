@@ -1,7 +1,11 @@
+import 'dart:io';
+
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart' hide listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/session/image_picking.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -9,6 +13,15 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// Whether Enter sends (a hardware keyboard is the norm) or makes a new
 /// line (a soft keyboard, with the send button).
 bool get enterSends => switch (defaultTargetPlatform) {
+  TargetPlatform.linux ||
+  TargetPlatform.macOS ||
+  TargetPlatform.windows => true,
+  _ => false,
+};
+
+/// Whether images can be pasted (Ctrl+V, Cmd+V on macOS) and dropped onto
+/// the composer: the desktops, where the clipboard and drop plugins apply.
+bool get _desktop => switch (defaultTargetPlatform) {
   TargetPlatform.linux ||
   TargetPlatform.macOS ||
   TargetPlatform.windows => true,
@@ -133,17 +146,78 @@ class ComposerState extends State<Composer> {
     );
   }
 
-  /// Nothing to send: the hub refuses blank text, so the button is off
-  /// and Enter does nothing.
   bool get _blank => _field.text.trim().isEmpty;
 
-  /// Sends the field's text, unless it is blank.
+  bool get _shell => widget.composer.mode == ComposerModeView.shell;
+
+  /// Nothing to send: no text and no image. The hub refuses it, so the
+  /// button is off and Enter does nothing.
+  bool get _nothingToSend => _blank && widget.composer.images.isEmpty;
+
+  /// An image is still being prepared (agent mode): the hub refuses Send
+  /// until it is ready.
+  bool get _preparing => !_shell && widget.composer.preparing > 0;
+
+  /// Sends the draft, unless there is nothing to send or it must wait.
   void submit() {
-    if (_blank) return;
+    if (_nothingToSend || _preparing) return;
     widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
   }
 
-  bool get _shell => widget.composer.mode == ComposerModeView.shell;
+  /// Picks images and attaches each one to the draft, in the order picked.
+  Future<void> _attach() async {
+    final paths = await pickImages(context);
+    if (!mounted) return;
+    _attachFiles(paths);
+  }
+
+  /// Attaches each file to the draft, in order. The hub refuses what is not
+  /// an image, with a notice.
+  void _attachFiles(List<String> paths) {
+    for (final path in paths) {
+      widget.send(
+        GuiIntentAttachImageFile(sessionId: widget.sessionId, path: path),
+      );
+    }
+  }
+
+  /// Ctrl+V (Cmd+V on macOS): an image on the clipboard is attached, and
+  /// anything else is pasted as text, as the field would paste it.
+  Future<void> _paste() async {
+    final image = await readClipboardImage();
+    if (!mounted) return;
+    if (image != null) {
+      widget.send(
+        GuiIntentAttachImageBytes(
+          sessionId: widget.sessionId,
+          bytes: image,
+          mime: 'image/png',
+        ),
+      );
+      return;
+    }
+    final text = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
+    if (!mounted || text == null) return;
+    final selection = _field.selection.isValid
+        ? _field.selection
+        : TextSelection.collapsed(offset: _field.text.length);
+    _field.value = _field.value.replaced(selection, text);
+  }
+
+  /// Content the phone keyboard inserts (a GIF from the keyboard's
+  /// picker, say): attached when it came with its bytes. The mime types
+  /// are limited to images by the configuration.
+  void _contentInserted(KeyboardInsertedContent content) {
+    final data = content.data;
+    if (data == null) return;
+    widget.send(
+      GuiIntentAttachImageBytes(
+        sessionId: widget.sessionId,
+        bytes: data,
+        mime: content.mimeType,
+      ),
+    );
+  }
 
   /// Opens the snippets (in shell mode the saved commands); one put in
   /// brings the focus back to the field.
@@ -172,6 +246,16 @@ class ComposerState extends State<Composer> {
     final composing =
         _field.value.composing.isValid && !_field.value.composing.isCollapsed;
     if (composing) return KeyEventResult.ignored;
+
+    final paste = defaultTargetPlatform == TargetPlatform.macOS
+        ? keyboard.isMetaPressed
+        : keyboard.isControlPressed;
+    if (paste && key == LogicalKeyboardKey.keyV && _desktop && !_shell) {
+      // Handled here so the field's own paste does not run as well. Only
+      // the key down pastes: a held key repeats without pasting again.
+      if (event is KeyDownEvent) _paste();
+      return KeyEventResult.handled;
+    }
 
     if (key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter) {
@@ -210,7 +294,7 @@ class ComposerState extends State<Composer> {
     final composer = widget.composer;
     final shell = _shell;
     final notes = [?composer.toLabel, ?composer.historyLabel];
-    return Material(
+    final body = Material(
       color: theme.colorScheme.surfaceContainer,
       child: SafeArea(
         top: false,
@@ -254,6 +338,14 @@ class ComposerState extends State<Composer> {
                     GuiIntentStopShell(sessionId: widget.sessionId),
                   ),
                 ),
+              if (!shell &&
+                  (composer.images.isNotEmpty || composer.preparing > 0))
+                _ImageChips(
+                  sessionId: widget.sessionId,
+                  images: composer.images,
+                  preparing: composer.preparing,
+                  send: widget.send,
+                ),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
@@ -263,6 +355,15 @@ class ComposerState extends State<Composer> {
                     icon: const Icon(Icons.bookmark_outline),
                   ),
                   const SizedBox(width: 2),
+                  if (!shell) ...[
+                    IconButton(
+                      key: const Key('attach-image'),
+                      tooltip: 'Attach image',
+                      onPressed: _attach,
+                      icon: const Icon(Icons.image_outlined),
+                    ),
+                    const SizedBox(width: 2),
+                  ],
                   Expanded(
                     child: TextField(
                       controller: _field,
@@ -276,6 +377,18 @@ class ComposerState extends State<Composer> {
                           : TextCapitalization.sentences,
                       autocorrect: !shell,
                       enableSuggestions: !shell,
+                      // The phone keyboard's images (agent mode only).
+                      contentInsertionConfiguration: shell
+                          ? null
+                          : ContentInsertionConfiguration(
+                              allowedMimeTypes: const [
+                                'image/png',
+                                'image/jpeg',
+                                'image/gif',
+                                'image/webp',
+                              ],
+                              onContentInserted: _contentInserted,
+                            ),
                       style: shell
                           ? const TextStyle(
                               fontFamily: monoFamily,
@@ -325,7 +438,7 @@ class ComposerState extends State<Composer> {
                     valueListenable: _field,
                     builder: (context, _, _) => IconButton.filled(
                       tooltip: shell ? 'Run' : 'Send',
-                      onPressed: _blank ? null : submit,
+                      onPressed: _nothingToSend || _preparing ? null : submit,
                       icon: const Icon(Icons.arrow_upward),
                     ),
                   ),
@@ -335,6 +448,136 @@ class ComposerState extends State<Composer> {
           ),
         ),
       ),
+    );
+    // Files dropped on a desktop window; off in shell mode.
+    if (!_desktop) return body;
+    return DropTarget(
+      enable: !shell,
+      onDragDone: (details) =>
+          _attachFiles([for (final file in details.files) file.path]),
+      child: body,
+    );
+  }
+}
+
+/// Above the field: the draft's images, each with a ✕, and a spinner for
+/// each one still being prepared.
+class _ImageChips extends StatelessWidget {
+  const _ImageChips({
+    required this.sessionId,
+    required this.images,
+    required this.preparing,
+    required this.send,
+  });
+
+  final String sessionId;
+  final List<ComposerImage> images;
+  final int preparing;
+  final SendIntent send;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 64,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        // Room above and below the thumbnails for the ✕ that overhangs.
+        padding: const EdgeInsets.fromLTRB(4, 6, 4, 2),
+        children: [
+          for (final image in images)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: _ImageChip(
+                image: image,
+                onDetach: () => send(
+                  GuiIntentDetachImage(
+                    sessionId: sessionId,
+                    sha256: image.sha256,
+                  ),
+                ),
+              ),
+            ),
+          for (var i = 0; i < preparing; i++)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: SizedBox(
+                key: ValueKey('image-preparing-$i'),
+                width: 56,
+                height: 56,
+                child: const Center(
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// One image of the draft: its thumbnail, or its size where the file
+/// cannot be shown, and a ✕ that takes it off the draft.
+class _ImageChip extends StatelessWidget {
+  const _ImageChip({required this.image, required this.onDetach});
+
+  final ComposerImage image;
+  final VoidCallback onDetach;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = SkyColors.of(context);
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Image.file(
+            File(image.path),
+            width: 56,
+            height: 56,
+            fit: BoxFit.cover,
+            cacheWidth: 112,
+            errorBuilder: (context, error, stackTrace) => Container(
+              width: 56,
+              height: 56,
+              color: theme.colorScheme.surfaceContainerHighest,
+              padding: const EdgeInsets.all(2),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.image_outlined, size: 18),
+                  Text(
+                    image.sizeLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: colors.muted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        Positioned(
+          top: -6,
+          right: -6,
+          child: Material(
+            color: theme.colorScheme.surfaceContainerHighest,
+            shape: const CircleBorder(),
+            child: IconButton(
+              key: Key('detach-${image.sha256}'),
+              tooltip: 'Remove image',
+              onPressed: onDetach,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 24, height: 24),
+              iconSize: 14,
+              icon: const Icon(Icons.close),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

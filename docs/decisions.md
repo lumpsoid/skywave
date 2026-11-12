@@ -1297,3 +1297,65 @@ A device logs the server's agent in with `POST /v1/agent-login/start`
 forever, and a replayed command would resend the code); a flow per device
 (the agent has one login, and two flows would race to write it); a cancel
 endpoint (an abandoned flow costs one idle process until the next touch).
+
+## D50. Images travel apart from their message, staged by hash
+An image is uploaded before the message that names it. The device PUTs each
+image to `/v1/attachments/{sha256}`, and `SendMessage` names the images by
+hash (wire v30), so a message carries no bytes and a resend carries no image.
+The staged file is a cache until a message uses it; the message's own blob
+is what the log keeps.
+- **Staging is not dedup.** D44 still holds: each message image is its own
+  blob. The server hard-links a staged file into the message's blob and
+  unlinks the staged file when the message is accepted, so a later message
+  with the same bytes stages them again.
+- **Eviction is safe.** The staging cap (256 MiB, the oldest evicted on each
+  upload) and its age limit (7 days) can drop a staged file before a message
+  names it. That surfaces as a stored `UnknownAttachment` rejection:
+  discardable, and Edit restores the draft with its images.
+- **Prepared like a crop.** The server prepares a `SendMessage`'s images on
+  the `Preparation` contract (`commands.rs`): the files are linked off the
+  database, the rows are written in the command's transaction, and a refusal
+  removes the links and keeps the staging.
+- **Staged as soon as attached.** A background stager per connection uploads
+  each image when it is attached. That only saves time: the outbox still
+  HEADs every hash on every attempt before posting, and never trusts a cache,
+  since a staged file is unlinked once a message uses it.
+- **Withdrawn is not posted.** A message the user takes back while its images
+  upload is not posted: the outbox checks before each image and again right
+  before posting.
+- **Device refusals settle the message.** A refusal on the device (`TooLarge`,
+  `NotAnImage`, `HashMismatch`, or a missing local file) settles the message
+  `AttachmentRefused`: never posted, discardable.
+- **A low disk refuses, never waits.** A low disk refuses an image message with
+  `DiskLow`, as it does text (D40). The outbox posts it anyway instead of
+  waiting, so control commands keep moving.
+- **Caps.** 3.75 MB per image after shrinking, 8 images and 10 MB per message,
+  because the CLI re-sends the whole conversation's images on every turn.
+- **Shrinking on the device.** The long side is cut to 1568 px. A JPEG or WEBP
+  becomes a JPEG, re-encoded, which strips EXIF and applies orientation. A PNG
+  stays PNG and keeps its original bytes when it was not shrunk and they are
+  no larger than the re-encode. A GIF passes through unchanged when it is under
+  the cap, since resizing it would turn an animation into a still.
+- **Own images stay local.** The device's own images are not downloaded back:
+  when the message's event arrives, the local file is hard-linked from
+  `attachments/` into the blob store.
+- **Collected when the store opens.** Local image files are collected only
+  when the store opens, and only once nothing needs them: no draft, no queued
+  or editable failed message, and no accepted message the replica has not
+  applied names them. Collecting while running races a head re-attaching the
+  same image.
+- **Known outcomes, accepted.**
+  - Two devices sending the same image bytes at once can leave the second
+    message `UnknownAttachment`, since the first unlinked the shared staged
+    file. Edit and send recovers it.
+  - If the disk recovers between a `DiskLow` upload answer and the post, the
+    stored refusal reads `UnknownAttachment`, not `DiskLow`.
+  - A resend whose local file vanished after a lost reply settles
+    `AttachmentRefused(Missing)`, though the first post may have been accepted.
+
+**Rejected:** inline base64 in the command (a 2 MB body, resent on a bad link);
+a path in the workdir (it pollutes the repo, and the agent must choose to read
+it); content-addressed event blobs (D44); auto-resending under a new id on
+`UnknownAttachment` (implicit); `super_clipboard` and `super_drag_and_drop` for
+paste and drop (they do not build for Android with Gradle 9: irondash's
+cargokit calls `project.exec`).

@@ -331,8 +331,8 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use skywave_proto::{
-    CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
-    SessionOrigin, SessionState, TaskId,
+    Attachment, CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq,
+    SessionId, SessionOrigin, SessionState, TaskId,
 };
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -340,8 +340,8 @@ use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation, EventMapper,
-    LoginSeen, LoginSource, LoginState, StartSpec, bounded_models, load_grants, load_origin,
-    load_resume_handle, unsent_notice,
+    ImageInput, LoginSeen, LoginSource, LoginState, StartSpec, UserInput, bounded_models,
+    load_grants, load_origin, load_resume_handle, unsent_notice,
 };
 use crate::db::Db;
 use crate::disk::Disk;
@@ -1446,10 +1446,15 @@ impl<A: AgentAdapter> Supervisor<A> {
     /// new one, once.
     async fn hand_over(&mut self, item: Queued) -> Result<()> {
         let session_id = item.event.session_id;
-        let EventKind::UserMessage { text, .. } = &item.event.kind else {
+        let EventKind::UserMessage {
+            text, attachments, ..
+        } = &item.event.kind
+        else {
             return Err(Error::Supervisor("only a message is handed over".into()));
         };
-        let text = text.clone();
+        // Opened before the at-most-once mark: a blob already gone is noted
+        // in the text, and the open files pin the bytes of the rest.
+        let input = user_input(&self.storage, text, attachments);
         // At most once: stored as handed over before the agent gets it.
         self.owed.entry(session_id).or_default().push(Owed {
             seq: item.seq,
@@ -1464,7 +1469,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         // Read before the agent gets it: a login that succeeds from here
         // on may come after the agent read its own for this message.
         let logins = self.config.login.successes();
-        let error = match running.session.send_message(text).await {
+        let error = match running.session.send_message(input).await {
             Ok(()) => {
                 running.login_seen.handed(logins);
                 running.owed_turns += 1;
@@ -2042,6 +2047,33 @@ fn starts_agent(kind: &EventKind) -> bool {
     matches!(kind, EventKind::UserMessage { .. }) || Setting::of(kind).is_some()
 }
 
+/// The input for a message's `text` and `attachments`. Each image is opened,
+/// never read: reading blocks, and the supervisor runs every session on one
+/// runtime, while an open file keeps its bytes if the blob is deleted after.
+/// An image that cannot be opened is noted in the text
+/// ([`UserInput::note_missing`]) and the rest is still delivered.
+fn user_input(storage: &Storage, text: &str, attachments: &[Attachment]) -> UserInput {
+    let mut input = UserInput::from(text);
+    for attachment in attachments {
+        match storage.open_blob(attachment.blob.id) {
+            Ok(Some(file)) => input.images.push(ImageInput {
+                media_type: attachment.media_type,
+                file: file.into_file(),
+            }),
+            Ok(None) => input.note_missing(),
+            Err(error) => {
+                tracing::warn!(
+                    blob = %attachment.blob.id.0,
+                    %error,
+                    "cannot open image; leaving it out"
+                );
+                input.note_missing();
+            }
+        }
+    }
+    input
+}
+
 /// What starting an agent takes: the adapter's spec, and the new agent's
 /// mapper and the setting requests the start asks for, by command.
 struct Prepared {
@@ -2442,4 +2474,42 @@ fn from_sql(seq: i64) -> Result<Seq> {
 
 fn to_sql(seq: Seq) -> Result<i64> {
     i64::try_from(seq.0).map_err(|_| Error::Corrupt(format!("seq {} too large", seq.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use skywave_proto::ImageType;
+
+    use super::*;
+    use crate::agent::Image;
+
+    #[test]
+    fn a_missing_image_is_noted_and_the_rest_is_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let gone = storage.put_blob(&b"\x89PNG\r\n\x1a\nA"[..]).unwrap();
+        let kept = storage.put_blob(&b"\x89PNG\r\n\x1a\nB"[..]).unwrap();
+        std::fs::remove_file(storage.dir.blobs_dir().join(gone.id.0.to_string())).unwrap();
+        let attachments = [
+            Attachment {
+                blob: gone,
+                media_type: ImageType::Png,
+            },
+            Attachment {
+                blob: kept,
+                media_type: ImageType::Png,
+            },
+        ];
+
+        let read = user_input(&storage, "look", &attachments).read();
+
+        assert_eq!(read.text, "look\n[image removed before delivery]");
+        assert_eq!(
+            read.images,
+            [Image {
+                media_type: ImageType::Png,
+                bytes: b"\x89PNG\r\n\x1a\nB".to_vec(),
+            }]
+        );
+    }
 }

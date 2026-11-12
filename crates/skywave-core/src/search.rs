@@ -465,6 +465,7 @@ mod tests {
             logged(Entry::UserMessage {
                 command_id: commands,
                 text: "find the user".into(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: DeviceId::new(),
                     name: None,
@@ -503,6 +504,7 @@ mod tests {
                 command_id: CommandId::new(),
                 context: ContextId::new(),
                 text: "queued question".into(),
+                images: Vec::new(),
                 outgoing: Outgoing::Queued,
                 discardable: true,
                 delivery: None,

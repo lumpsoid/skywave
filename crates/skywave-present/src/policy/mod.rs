@@ -170,6 +170,7 @@ pub(crate) mod tests {
             task_stops: Vec::new(),
             mode: skywave_core::ComposerMode::Agent,
             draft: None,
+            draft_images: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
@@ -194,6 +195,7 @@ pub(crate) mod tests {
             Entry::UserMessage {
                 command_id: CommandId::new(),
                 text: text.to_owned(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: DeviceId::new(),
                     name: None,

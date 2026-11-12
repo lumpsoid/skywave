@@ -26,6 +26,11 @@
 //! ranges, other units or malformed ranges are ignored and the full blob is
 //! sent (RFC 9110 lets a server do that). Content is streamed from the file.
 //!
+//! **Attachments** (`PUT` and `HEAD /v1/attachments/{sha256}`, v30): an image
+//! a device uploads before the message naming it ([`crate::attachments`]).
+//! `PUT` answers a 200 [`UploadResult`]; `HEAD` is 204 for a staged image,
+//! else 404. Neither takes a file-system permit, like blobs.
+//!
 //! **Compression** (D45, [`crate::encoding`]): an event batch or blob body
 //! of at least `COMPRESS_MIN_BYTES` goes as one zstd frame when the request
 //! accepts zstd. A blob's range counts decoded bytes, so a resumed download
@@ -92,7 +97,7 @@
 //! [`authenticate`], itself on a blocking thread, stops every request. The
 //! permit moves into the blocking closure and is released only when the
 //! work returns: stuck threads hold theirs, so at most [`FS_PERMITS`] can
-//! pile up. Hello, commands, events and blobs never take one.
+//! pile up. Hello, commands, events, blobs and attachments never take one.
 //!
 //! **Prepared commands** (an adopting create and a crop) are prepared off
 //! the API's connection, then handed to [`EventLog::handle_with`]. A
@@ -116,8 +121,8 @@
 //! is handled; the abandoned crop's file goes before its thread ends. An
 //! I/O failure other than a full disk is a 500, also unhandled.
 //!
-//! Errors are bare status codes: 400 malformed request, 404 unknown blob,
-//! 412 another run expected, 500 server fault.
+//! Errors are bare status codes: 400 malformed request, 404 unknown blob or
+//! attachment not staged, 412 another run expected, 500 server fault.
 
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom};
@@ -130,17 +135,18 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use bytes::BytesMut;
 use chrono::Utc;
+use futures_util::StreamExt;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
-    BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
-    DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery, HelloResponse, ImportOutcome,
-    LineSpan, LoginFinish, LoginFinishResult, LoginStartResult, PROTOCOL_VERSION, RUN_HEADER,
-    RunId, ServerId, UsageLimit, UsageLimitsResult, WorkdirQuery, check_conversation_id, limits,
-    path,
+    BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContentHash,
+    ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery,
+    HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult, LoginStartResult,
+    PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, UploadResult, UsageLimit, UsageLimitsResult,
+    WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -151,6 +157,7 @@ use crate::agent::{
     self, AgentLogin, LimitsError, LoginState, LoginStatus, OutsideConversations, SourceError,
     UsageLimitsSource,
 };
+use crate::attachments::{self, Staging};
 use crate::blobs::BlobStore;
 use crate::commands::Preparation;
 use crate::crop::{self, CropHook};
@@ -229,6 +236,8 @@ pub(crate) struct Api {
     storage: StorageReader,
     log: EventLog,
     blobs: BlobStore,
+    /// Images staged for a message (`/v1/attachments/{sha256}`).
+    staging: Staging,
     server_id: ServerId,
     /// Becomes `true` when the server shuts down, ending long-poll waits.
     shutdown: watch::Receiver<bool>,
@@ -291,6 +300,7 @@ impl Api {
             // (a `CropBlob` its own preparation's, the same store).
             log: log.with_blobs(blobs.clone()),
             blobs,
+            staging: Staging::new(dir.attachments_dir()),
             server_id,
             shutdown,
             outside: options.outside,
@@ -365,6 +375,10 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::BLOB_ROUTE, get(blob))
+        .route(
+            path::ATTACHMENT_ROUTE,
+            put(stage_attachment).head(attachment_staged),
+        )
         // The last layer added runs first: authentication, then the run.
         .route_layer(middleware::from_fn_with_state(api.clone(), expected_run))
         .route_layer(middleware::from_fn_with_state(api.clone(), authenticate))
@@ -494,6 +508,9 @@ async fn commands(
             conversation: Some(_),
             ..
         } | CommandKind::CropBlob { .. }
+    ) || matches!(
+        &command.kind,
+        CommandKind::SendMessage { attachments, .. } if !attachments.is_empty()
     );
     let reply = if prepares {
         prepared(&api, device, command).await
@@ -510,10 +527,11 @@ async fn commands(
 
 /// Handles a command prepared before its transaction, outside the API's
 /// connection: an adopting `CreateSession`, whose history is read and
-/// bounded, or a `CropBlob`, whose new blob is written. Slow file work
-/// must not hold up every other device's commands. A resend that arrives
-/// while the command is being prepared waits for that one's reply, so a
-/// command is never prepared twice.
+/// bounded, a `CropBlob`, whose new blob is written, or a `SendMessage`
+/// naming images, whose staged images are linked. Slow file work must not
+/// hold up every other device's commands. A resend that arrives while the
+/// command is being prepared waits for that one's reply, so a command is
+/// never prepared twice.
 async fn prepared(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
     loop {
         let role = {
@@ -576,6 +594,9 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
     }
     let prepared = match &command.kind {
         CommandKind::CropBlob { blob, keep } => prepare_crop(api, id, *blob, keep.clone()).await?,
+        CommandKind::SendMessage { attachments, .. } => {
+            Some(prepare_attachments(api, attachments.clone()).await?)
+        }
         _ => prepare_import(api, &command).await?.map(Preparation::from),
     };
     api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
@@ -638,6 +659,34 @@ async fn prepare_crop(
         Err(_) => {
             tracing::warn!(command = %id.0, "cropping a blob timed out");
             Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
+/// The staged images a `SendMessage` names, linked as new blobs on a blocking
+/// thread ([`attachments::prepare`]), off the API's connection. The disk is
+/// read here, as `prepare_import` reads it: while it is low nothing is
+/// linked, and the command is refused `DiskLow`. A file-system failure is a
+/// 500.
+async fn prepare_attachments(
+    api: &Arc<Api>,
+    hashes: Vec<ContentHash>,
+) -> std::result::Result<Preparation, StatusCode> {
+    let disk_low = api.log.disk().refresh();
+    let (staging, blobs) = (api.staging.clone(), api.blobs.clone());
+    let linked = tokio::task::spawn_blocking(move || {
+        attachments::prepare(&staging, &blobs, disk_low, &hashes)
+    })
+    .await;
+    match linked {
+        Ok(Ok(prepared)) => Ok(prepared.into()),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "linking a message's images failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "a message's image thread failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -1026,6 +1075,79 @@ async fn workdir_snapshot<T: serde::Serialize + Send + 'static>(
         Err(_) => {
             tracing::warn!("workdir read timed out");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+/// The hash a `/v1/attachments/{sha256}` path names; a path that is not one
+/// is a 400.
+fn attachment_hash(
+    sha256: std::result::Result<Path<String>, PathRejection>,
+) -> std::result::Result<ContentHash, StatusCode> {
+    sha256
+        .ok()
+        .and_then(|Path(text)| text.parse().ok())
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
+/// `HEAD /v1/attachments/{sha256}`: 204 if that image is staged, else 404.
+async fn attachment_staged(
+    State(api): State<Arc<Api>>,
+    sha256: std::result::Result<Path<String>, PathRejection>,
+) -> Response {
+    let hash = match attachment_hash(sha256) {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
+    let staging = api.staging.clone();
+    match tokio::task::spawn_blocking(move || staging.contains(hash)).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "attachment lookup task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `PUT /v1/attachments/{sha256}`: stages the body's image and answers an
+/// [`UploadResult`] with 200. The body is read in memory, and the answer is
+/// `TooLarge` as soon as it passes [`limits::ATTACHMENT_MAX_BYTES`], without
+/// reading the rest. A low disk is `DiskLow`, checked before anything is
+/// written.
+async fn stage_attachment(
+    State(api): State<Arc<Api>>,
+    sha256: std::result::Result<Path<String>, PathRejection>,
+    body: Body,
+) -> Response {
+    let hash = match attachment_hash(sha256) {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
+    let mut bytes = Vec::new();
+    let mut chunks = body.into_data_stream();
+    while let Some(chunk) = chunks.next().await {
+        let Ok(chunk) = chunk else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if (bytes.len() + chunk.len()) as u64 > limits::ATTACHMENT_MAX_BYTES {
+            return Json(UploadResult::TooLarge).into_response();
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if api.log.disk().refresh() {
+        return Json(UploadResult::DiskLow).into_response();
+    }
+    let staging = api.staging.clone();
+    match tokio::task::spawn_blocking(move || staging.stage(hash, &bytes)).await {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "staging an attachment failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "attachment staging task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }

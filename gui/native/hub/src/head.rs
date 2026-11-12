@@ -6,14 +6,18 @@
 //! `run` sends what comes out, and time comes in as a [`Clock`].
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use skywave_core::attachment::{self, AttachedImage};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, BlobState, CallId, CommandId, ComposerMode, Entry, PairUri, PairingView, RunWhen,
-    Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
+    Action, BlobState, BlobView, CallId, CommandId, ComposerMode, ContentHash, Entry, PairUri,
+    PairingView, RunWhen, Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState,
+    parse_pair_uri,
 };
 use skywave_present::crop::toggle;
+use skywave_present::format;
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
     ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
@@ -23,7 +27,9 @@ use skywave_present::sections::{ItemKey, call_content, find, main_content, secti
 use skywave_present::storage::Grouping as StorageGrouping;
 use skywave_present::usage::{Grouping, Span};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
+use skywave_proto::limits::{ATTACHMENTS_MAX, ATTACHMENTS_MAX_TOTAL_BYTES};
 
+use crate::attach::ImageSource;
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
 use crate::crop::CropLines;
 use crate::dispatcher::{Dispatched, Tag};
@@ -34,9 +40,10 @@ use crate::notify::{Kind, NotificationIds};
 use crate::prefs::Prefs;
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
-    ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate, GuiIntent, LinkUpdate, PairForm,
-    PlatformEffect, RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate,
-    StorageGroupingView, TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView,
+    ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate, GuiIntent,
+    LinkUpdate, PairForm, PlatformEffect, RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow,
+    ShellUpdate, StorageGroupingView, TimelineRow, TimelineUpdate, UsageGroupingView,
+    UsageSpanView,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
 use crate::workdir::{WorkdirText, shown_blob};
@@ -96,6 +103,12 @@ pub enum Out {
     Effect(PlatformEffect),
     /// Hand `action` to the dispatcher with `tag`.
     Dispatch(Tag, Action),
+    /// Prepare `source` as an image for `session_id`'s draft, off the hub
+    /// task; the result comes back to [`Head::on_prepared`].
+    Prepare {
+        session_id: SessionId,
+        source: ImageSource,
+    },
     /// Pause the engine's network loops (`Core::suspend`).
     Suspend,
     /// Start them again (`Core::resume`).
@@ -146,6 +159,8 @@ impl Composer {
                 shell_enabled: false,
                 prompt: None,
                 can_stop: false,
+                images: Vec::new(),
+                preparing: 0,
             },
             text,
             cursor,
@@ -337,6 +352,12 @@ pub struct Head {
     /// The crop page's line window (`CropLines`).
     crop_lines: CropLines,
     session: Option<SessionHead>,
+    /// The core's data dir, where the attachments are stored; set by `run`
+    /// once the core is open.
+    data_dir: PathBuf,
+    /// Images being prepared for each session's draft, not yet answered by
+    /// [`Head::on_prepared`].
+    preparing: HashMap<SessionId, u32>,
     /// Only the conversation shows, in every session until switched off:
     /// each snapshot of the open session is narrowed as it arrives.
     conversation_only: ConversationOnly,
@@ -388,6 +409,11 @@ impl Head {
             },
             ..Head::default()
         }
+    }
+
+    /// Where the core keeps its data, under which the attachments are stored.
+    pub fn set_data_dir(&mut self, dir: PathBuf) {
+        self.data_dir = dir;
     }
 
     pub(crate) fn awake(&self) -> &Awake {
@@ -581,6 +607,26 @@ impl Head {
         out
     }
 
+    /// The result of the preparation [`Out::Prepare`] asked for: the image
+    /// is attached to `session_id`'s draft, or the words for why not are
+    /// shown. The session need not be open: the draft belongs to it.
+    pub fn on_prepared(
+        &mut self,
+        session_id: SessionId,
+        result: Result<AttachedImage, String>,
+        clock: Clock,
+    ) -> Vec<Out> {
+        let mut out = Vec::new();
+        let count = self.preparing.entry(session_id).or_insert(0);
+        *count = count.saturating_sub(1);
+        match result {
+            Err(text) => out.push(Out::Effect(PlatformEffect::Notice { text })),
+            Ok(image) => self.attach_prepared(session_id, image, clock, &mut out),
+        }
+        self.after(clock, &mut out);
+        out
+    }
+
     /// The wake-up [`Head::next_wake`] asked for (or any other).
     pub fn on_wake(&mut self, clock: Clock) -> Vec<Out> {
         let mut out = Vec::new();
@@ -672,6 +718,12 @@ impl Head {
                         command: text,
                         when: session.when,
                     }
+                } else if self.preparing_of(id) > 0 {
+                    // The message would go without the image being prepared.
+                    out.push(Out::Effect(PlatformEffect::Notice {
+                        text: "an image is still being prepared".to_owned(),
+                    }));
+                    return Ok(());
                 } else if let Some(text) = message_refusal(&text) {
                     // Refused here, not by the server, so it stays in the
                     // composer to cut down.
@@ -852,6 +904,29 @@ impl Head {
                 // Saving the draft first keeps the inserted text too.
                 self.dispatch_user(Action::UseSnippet(id), Purpose::Plain, clock, out);
             }
+            GuiIntent::AttachImageFile { session_id, path } => {
+                self.prepare_attach(&session_id, ImageSource::File(PathBuf::from(path)), out);
+            }
+            GuiIntent::AttachImageBytes {
+                session_id,
+                bytes,
+                mime,
+            } => {
+                tracing::debug!(%mime, bytes = bytes.len(), "image bytes to attach");
+                self.prepare_attach(&session_id, ImageSource::Bytes(bytes), out);
+            }
+            GuiIntent::DetachImage { session_id, sha256 } => {
+                let sha256: ContentHash =
+                    sha256.parse().map_err(|_| "bad image hash".to_owned())?;
+                if let Some(session) = self.open_head(&session_id) {
+                    let id = session.id;
+                    let action = Action::Detach {
+                        session_id: id,
+                        sha256,
+                    };
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
+                }
+            }
             GuiIntent::ToggleConversationOnly => {
                 let open = match self.view.as_mut().map(|v| &mut v.screen) {
                     Some(Screen::Session(view)) => Some(&mut **view),
@@ -917,6 +992,7 @@ impl Head {
                             TimelineItem::Logged { entry, .. } => sections(entry)
                                 .into_iter()
                                 .filter_map(|s| s.blob())
+                                .chain(message_image_blobs(entry))
                                 .find(|b| b.id == id)
                                 .map(|b| b.state.clone()),
                             TimelineItem::Pending { .. } => None,
@@ -1448,6 +1524,21 @@ impl Head {
                 shell_enabled: open.is_some_and(|v| v.shell.enabled),
                 prompt: shell.map(|view| shell::prompt(view, s.when)),
                 can_stop: shell.and_then(shell_stop).is_some(),
+                images: match open.filter(|view| view.id == s.id) {
+                    Some(view) if !s.shell() => view
+                        .draft_images
+                        .iter()
+                        .map(|image| ComposerImage {
+                            sha256: image.sha256.to_string(),
+                            path: attachment::attachment_path(&self.data_dir, image.sha256)
+                                .display()
+                                .to_string(),
+                            size_label: format::bytes(image.size),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                preparing: self.preparing_of(s.id),
                 ..s.composer.shown.clone()
             }
         });
@@ -1494,7 +1585,13 @@ impl Head {
             (Some(view), Some(session)) => (
                 Some(view.id),
                 view.subagent.as_ref().map(|s| s.call),
-                timeline::rows(view, &session.expanded, &mut session.heads, clock.wall_ms),
+                timeline::rows(
+                    view,
+                    &session.expanded,
+                    &mut session.heads,
+                    &self.data_dir,
+                    clock.wall_ms,
+                ),
             ),
             _ => (None, None, Rows::default()),
         };
@@ -1574,6 +1671,76 @@ impl Head {
         self.session
             .as_mut()
             .filter(|s| s.id.0.to_string() == session_id)
+    }
+
+    /// The open session's view, when it is `id`'s.
+    fn view_of(&self, id: SessionId) -> Option<&SessionView> {
+        open_session(&self.view).filter(|view| view.id == id)
+    }
+
+    /// The images being prepared for `id`'s draft.
+    fn preparing_of(&self, id: SessionId) -> u32 {
+        self.preparing.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Asks for `source` to be prepared as an image of the open session's
+    /// draft, unless the draft and the preparations in flight fill its cap:
+    /// then the cap is said, and nothing is prepared.
+    fn prepare_attach(&mut self, session_id: &str, source: ImageSource, out: &mut Vec<Out>) {
+        let Some(id) = self.open_head(session_id).map(|session| session.id) else {
+            return;
+        };
+        let held = self.view_of(id).map_or(0, |view| view.draft_images.len());
+        let preparing = usize::try_from(self.preparing_of(id)).unwrap_or(usize::MAX);
+        if held.saturating_add(preparing) >= ATTACHMENTS_MAX {
+            out.push(images_full());
+            return;
+        }
+        *self.preparing.entry(id).or_insert(0) += 1;
+        out.push(Out::Prepare {
+            session_id: id,
+            source,
+        });
+    }
+
+    /// Attaches a prepared `image` to `id`'s draft, unless the draft holds
+    /// it already or it would pass a cap. The caps are checked where the
+    /// view of `id` is at hand; the core refuses anything else silently.
+    fn attach_prepared(
+        &mut self,
+        id: SessionId,
+        image: AttachedImage,
+        clock: Clock,
+        out: &mut Vec<Out>,
+    ) {
+        if let Some(view) = self.view_of(id) {
+            if view
+                .draft_images
+                .iter()
+                .any(|held| held.sha256 == image.sha256)
+            {
+                return;
+            }
+            if view.draft_images.len() + 1 > ATTACHMENTS_MAX {
+                out.push(images_full());
+                return;
+            }
+            let total: u64 = view.draft_images.iter().map(|held| held.size).sum();
+            if total + image.size > ATTACHMENTS_MAX_TOTAL_BYTES {
+                out.push(Out::Effect(PlatformEffect::Notice {
+                    text: format!(
+                        "images over {} in total",
+                        format::bytes(ATTACHMENTS_MAX_TOTAL_BYTES)
+                    ),
+                }));
+                return;
+            }
+        }
+        let action = Action::Attach {
+            session_id: id,
+            image,
+        };
+        self.dispatch_user(action, Purpose::Plain, clock, out);
     }
 
     /// Shows the next older (`older`) or newer earlier prompt; newer than
@@ -1669,6 +1836,24 @@ impl Head {
             fingerprint: uri.fingerprint,
             rev: self.revs,
         };
+    }
+}
+
+/// The notice for a draft at its image cap.
+fn images_full() -> Out {
+    Out::Effect(PlatformEffect::Notice {
+        text: format!("at most {ATTACHMENTS_MAX} images per message"),
+    })
+}
+
+/// The blobs of a logged user message's images; none for any other entry.
+fn message_image_blobs(entry: &Entry) -> Vec<&BlobView> {
+    match entry {
+        Entry::UserMessage { images, .. } => images
+            .iter()
+            .filter_map(|image| image.content.blob())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

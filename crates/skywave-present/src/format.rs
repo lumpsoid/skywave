@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use skywave_core::{
-    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextFill,
-    ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
+    AgentSetting, AgentView, AgentWork, AttachmentRefusal, BackgroundTask, BlobState, CallId,
+    ContextFill, ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
     ConversationsUnavailable, Decision, Delivery, DeviceRef, Effort, FailReason, ImportOutcome,
     Outgoing, Pause, PendingSession, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
     RunWhen, Schedule, SessionId, SessionRef, SessionUsage, SessionView, ShellEnd, ShellRun,
@@ -309,6 +309,18 @@ pub fn fail_reason(reason: FailReason) -> &'static str {
     match reason {
         FailReason::Rejected(reason) => reject_reason(reason),
         FailReason::Undeliverable => "the server could not take it",
+        FailReason::AttachmentRefused(AttachmentRefusal::TooLarge) => {
+            "an image is too large for the server"
+        }
+        FailReason::AttachmentRefused(AttachmentRefusal::NotAnImage) => {
+            "the server did not read an image as one"
+        }
+        FailReason::AttachmentRefused(AttachmentRefusal::HashMismatch) => {
+            "an image was damaged on the way"
+        }
+        FailReason::AttachmentRefused(AttachmentRefusal::Missing) => {
+            "an image is no longer on this device"
+        }
     }
 }
 
@@ -347,6 +359,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::BlobGone => "that content was already deleted or cropped",
         RejectReason::NotCroppable => "only tool and shell output can be cropped",
         RejectReason::BadCrop => "the kept lines do not fit that content",
+        RejectReason::UnknownAttachment => "an image expired on the server; send again",
+        RejectReason::TooManyAttachments => "too many images in one message",
+        RejectReason::AttachmentsTooLarge => "the message's images are too large together",
     }
 }
 
@@ -2031,6 +2046,7 @@ mod tests {
             task_stops: Vec::new(),
             mode: skywave_core::ComposerMode::Agent,
             draft: None,
+            draft_images: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),

@@ -18,13 +18,13 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, BlobRef, BlobStorage, BlobUse, ChangesResult, Command, CommandId, CommandKind,
-    CommandResult, ContextId, ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry,
-    DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse,
-    ImportOutcome, LimitSeverity, LimitWindow, LineSpan, ListResult, PROTOCOL_VERSION, PairRequest,
-    PairResponse, RUN_HEADER, RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin,
-    ShellEnd, ShellRunStorage, StorageReport, ToolResult, UsageLimit, UsageLimitsResult, limits,
-    path,
+    Attachment, BlobId, BlobRef, BlobStorage, BlobUse, ChangesResult, Command, CommandId,
+    CommandKind, CommandResult, ContentHash, ContextId, ConversationsResult, DeviceId, DeviceInfo,
+    DiffBody, DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange,
+    FileResult, HelloResponse, ImageType, ImportOutcome, LimitSeverity, LimitWindow, LineSpan,
+    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason, RunId,
+    RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage, StorageReport, ToolResult,
+    UploadResult, UsageLimit, UsageLimitsResult, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -746,6 +746,7 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
             session_id: SessionId::new(),
             context: ContextId::first_of(SessionId::new()),
             text: "hi".into(),
+            attachments: Vec::new(),
         },
     };
     let rejected = CommandResult::Rejected {
@@ -766,6 +767,7 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
             session_id: session,
             context: ContextId::first_of(session),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     };
     assert_eq!(
@@ -1061,6 +1063,473 @@ async fn blobs_download_whole_or_by_range() {
         device.get("/v1/blobs/not-a-uuid").await.status,
         StatusCode::BAD_REQUEST
     );
+}
+
+/// `size` bytes of an image: a PNG signature and filler.
+fn png(size: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(size, 0x42);
+    bytes
+}
+
+/// An image is staged under its hash: `HEAD` says whether it is, and a
+/// second `PUT` of it is answered as stored, not rewritten.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attachment_is_staged_once_and_reported_as_staged() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(1000);
+    let uri = path::attachment(ContentHash::of(&bytes));
+    let stored = UploadResult::Stored {
+        size: 1000,
+        media_type: ImageType::Png,
+    };
+
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NOT_FOUND);
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes.clone()))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<UploadResult>(), stored);
+    let staged = f
+        .storage
+        .dir
+        .attachments_dir()
+        .join(ContentHash::of(&bytes).to_hex());
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NO_CONTENT);
+    let again = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes))
+        .await;
+    assert_eq!(again.json::<UploadResult>(), stored);
+}
+
+/// A body is staged only under the hash its path names, and only if it is
+/// an image; a refusal leaves no file, temp files included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_upload_must_hash_to_its_path_and_be_an_image() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let image = png(1000);
+    let other = path::attachment(ContentHash::of(b"other"));
+    let reply = device
+        .send(Method::PUT, &other, &[], Bytes::from(image.clone()))
+        .await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::HashMismatch);
+
+    let pdf = b"%PDF-1.4 not an image".to_vec();
+    let uri = path::attachment(ContentHash::of(&pdf));
+    let reply = device.send(Method::PUT, &uri, &[], Bytes::from(pdf)).await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::NotAnImage);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+
+    let uri = path::attachment(ContentHash::of(&image));
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(image))
+        .await;
+    assert!(
+        matches!(reply.json::<UploadResult>(), UploadResult::Stored { .. }),
+        "control: the image under its own hash is stored"
+    );
+}
+
+/// An upload over `ATTACHMENT_MAX_BYTES` is `TooLarge` as JSON, not a 413,
+/// and stores nothing. A 3 MiB image, over axum's default 2 MB body limit,
+/// is stored: the limit is off for this route.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversize_upload_is_refused_as_json() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let big = png(limits::ATTACHMENT_MAX_BYTES as usize + 1);
+    let uri = path::attachment(ContentHash::of(&big));
+    let reply = device.send(Method::PUT, &uri, &[], Bytes::from(big)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::TooLarge);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+
+    let three_mib = png(3 << 20);
+    let uri = path::attachment(ContentHash::of(&three_mib));
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(three_mib))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored {
+            size: 3 << 20,
+            media_type: ImageType::Png,
+        }
+    );
+}
+
+/// On a low disk an upload is `DiskLow` and stores nothing; once the disk
+/// has room again the same upload is stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_on_a_low_disk_is_refused() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let f = Fixture::start_cropping(disk.clone(), None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(1000);
+    let uri = path::attachment(ContentHash::of(&bytes));
+
+    free.0.store(9, std::sync::atomic::Ordering::SeqCst);
+    assert!(disk.check());
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes.clone()))
+        .await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::DiskLow);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    assert!(!disk.check());
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored {
+            size: 1000,
+            media_type: ImageType::Png,
+        },
+        "control: with room again, the upload is stored"
+    );
+}
+
+/// A staging path that is not a hash is a bad request, for both methods.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_attachment_path_is_a_bad_request() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let uri = "/v1/attachments/xyz";
+    let put = device
+        .send(Method::PUT, uri, &[], Bytes::from(png(1000)))
+        .await;
+    assert_eq!(put.status, StatusCode::BAD_REQUEST);
+    let head = device.send(Method::HEAD, uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::BAD_REQUEST);
+}
+
+/// Stages `bytes` as an image with `PUT`, as a device does before it sends
+/// the message naming them; returns the hash.
+async fn stage_image(device: &mut Client, bytes: &[u8]) -> ContentHash {
+    let hash = ContentHash::of(bytes);
+    let reply = device
+        .send(
+            Method::PUT,
+            &path::attachment(hash),
+            &[],
+            Bytes::from(bytes.to_vec()),
+        )
+        .await;
+    assert!(matches!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { .. }
+    ));
+    hash
+}
+
+/// Whether an image with `hash` is staged, by `HEAD`.
+async fn is_staged(device: &mut Client, hash: ContentHash) -> bool {
+    let reply = device
+        .send(Method::HEAD, &path::attachment(hash), &[], Bytes::new())
+        .await;
+    reply.status == StatusCode::NO_CONTENT
+}
+
+/// A `SendMessage` to `context` of `session` naming `attachments`.
+fn message_command(
+    session: SessionId,
+    context: ContextId,
+    text: &str,
+    attachments: Vec<ContentHash>,
+) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::SendMessage {
+            session_id: session,
+            context,
+            text: text.into(),
+            attachments,
+        },
+    }
+}
+
+/// The attachments of the `UserMessage` logged at `seq`.
+async fn attachments_at(device: &mut Client, seq: Seq) -> Vec<Attachment> {
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let (_, event) = batch.iter().next().unwrap();
+    let EventKind::UserMessage { attachments, .. } = &event.kind else {
+        panic!("not a message: {:?}", event.kind);
+    };
+    attachments.clone()
+}
+
+/// How many blobs the `blobs` table records.
+fn blob_rows(f: &Fixture) -> i64 {
+    f.storage
+        .db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The file of blob `id` in the blob store.
+fn blob_file(f: &Fixture, id: BlobId) -> PathBuf {
+    f.storage.dir.blobs_dir().join(id.0.to_string())
+}
+
+/// A message naming a staged image takes it as a new blob of its own: the
+/// event carries the blob, the blob is an `attachment` in `event_blobs`,
+/// and the staged file goes. A resend is answered with the same result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_takes_its_staged_images_as_new_blobs() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let bytes = png(1000);
+    let hash = stage_image(&mut device, &bytes).await;
+    let send = message_command(session, context, "look", vec![hash]);
+
+    let seq = accepted_seq(&device.command(&send).await);
+    let attachments = attachments_at(&mut device, seq).await;
+    assert_eq!(attachments.len(), 1);
+    let blob = &attachments[0].blob;
+    assert_eq!(blob.sha256, hash);
+    assert_eq!(blob.size, 1000);
+    assert_eq!(attachments[0].media_type, ImageType::Png);
+    assert_eq!(std::fs::read(blob_file(&f, blob.id)).unwrap(), bytes);
+    let holds: String = f
+        .storage
+        .db
+        .conn()
+        .query_row(
+            "SELECT holds FROM event_blobs WHERE blob_id = ?1",
+            [blob.id.0.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(holds, "attachment");
+    assert!(
+        !is_staged(&mut device, hash).await,
+        "the staged file is gone"
+    );
+
+    assert_eq!(
+        device.command(&send).await,
+        CommandResult::Accepted { seq },
+        "a resend is answered from the log"
+    );
+    assert_eq!(blob_rows(&f), 1, "nothing was linked twice");
+}
+
+/// The same image named twice is two blobs, not one shared (D44). Once the
+/// message took it, staging it again makes a third blob for a later message.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_image_twice_is_two_blobs() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let bytes = png(1000);
+    let hash = stage_image(&mut device, &bytes).await;
+
+    let twice = message_command(session, context, "twice", vec![hash, hash]);
+    let seq = accepted_seq(&device.command(&twice).await);
+    let first = attachments_at(&mut device, seq).await;
+    assert_eq!(first.len(), 2);
+    assert_ne!(first[0].blob.id, first[1].blob.id, "two blobs, not one");
+    assert!(
+        !is_staged(&mut device, hash).await,
+        "consumed by the message"
+    );
+
+    assert_eq!(stage_image(&mut device, &bytes).await, hash);
+    let again = message_command(session, context, "again", vec![hash]);
+    let seq = accepted_seq(&device.command(&again).await);
+    let second = attachments_at(&mut device, seq).await;
+    assert_eq!(second.len(), 1);
+    assert_ne!(second[0].blob.id, first[0].blob.id);
+    assert_ne!(second[0].blob.id, first[1].blob.id);
+    assert_eq!(blob_rows(&f), 3);
+}
+
+/// A message naming an image that is not staged is `UnknownAttachment`, and
+/// logs and links nothing; a resend gets the same answer. Once the image is
+/// staged, a message with it goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_naming_an_unstaged_image_is_refused_and_logs_nothing() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let bytes = png(1000);
+    let hash = ContentHash::of(&bytes);
+    let head = f.log.head();
+    let before = blob_files(&f);
+
+    let send = message_command(session, context, "look", vec![hash]);
+    assert_eq!(
+        device.command(&send).await,
+        rejected(RejectReason::UnknownAttachment)
+    );
+    assert_eq!(
+        device.command(&send).await,
+        rejected(RejectReason::UnknownAttachment),
+        "stored"
+    );
+    assert_eq!(f.log.head(), head, "nothing logged");
+    assert_eq!(blob_files(&f), before, "nothing linked");
+
+    // Control: once staged, the same text with the image goes in.
+    stage_image(&mut device, &bytes).await;
+    let staged = message_command(session, context, "look", vec![hash]);
+    let seq = accepted_seq(&device.command(&staged).await);
+    assert_eq!(f.log.head(), seq);
+}
+
+/// A message refused for its context keeps its staged images: no blob is
+/// linked or recorded, and the image stays staged for the resend.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_message_keeps_its_staged_images() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let bytes = png(1000);
+    let hash = stage_image(&mut device, &bytes).await;
+    let head = f.log.head();
+    let before = blob_files(&f);
+    let rows = blob_rows(&f);
+
+    let stale = message_command(session, ContextId::new(), "look", vec![hash]);
+    assert_eq!(
+        device.command(&stale).await,
+        rejected(RejectReason::ContextChanged)
+    );
+    assert_eq!(f.log.head(), head, "nothing logged");
+    assert_eq!(blob_files(&f), before, "no blob file left");
+    assert_eq!(blob_rows(&f), rows, "no blob row added");
+    assert!(is_staged(&mut device, hash).await, "still staged");
+
+    // Control: the same image goes with the current context.
+    let current = message_command(session, context, "look", vec![hash]);
+    accepted_seq(&device.command(&current).await);
+}
+
+/// Too many names (more than `ATTACHMENTS_MAX`) and images over the total
+/// (`ATTACHMENTS_MAX_TOTAL_BYTES`) are refused. Nothing is linked, and the
+/// staged images stay staged.
+#[tokio::test(flavor = "multi_thread")]
+async fn too_many_or_too_large_images_are_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+
+    let nine: Vec<ContentHash> = (0..=limits::ATTACHMENTS_MAX as u8)
+        .map(|i| ContentHash::of(&[i]))
+        .collect();
+    let many = message_command(session, context, "many", nine);
+    assert_eq!(
+        device.command(&many).await,
+        rejected(RejectReason::TooManyAttachments)
+    );
+
+    // Three images of 3.6 MB each: 10.8 MB, over the 10 MB total.
+    let mut big = Vec::new();
+    for tag in 0..3u8 {
+        let mut bytes = png(3_600_000);
+        bytes[8] = tag;
+        big.push(stage_image(&mut device, &bytes).await);
+    }
+    let head = f.log.head();
+    let before = blob_files(&f);
+    let heavy = message_command(session, context, "heavy", big.clone());
+    assert_eq!(
+        device.command(&heavy).await,
+        rejected(RejectReason::AttachmentsTooLarge)
+    );
+    assert_eq!(f.log.head(), head, "nothing logged");
+    assert_eq!(blob_files(&f), before, "no blob added");
+    for hash in &big {
+        assert!(is_staged(&mut device, *hash).await, "still staged");
+    }
+
+    // Control: two of them, 7.2 MB, go in.
+    let two = message_command(session, context, "two", big[..2].to_vec());
+    accepted_seq(&device.command(&two).await);
+}
+
+/// On a low disk a message naming images is `DiskLow`, not
+/// `UnknownAttachment` for the image it does not have, and links nothing.
+/// With room again the message goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_message_on_a_low_disk_is_disk_low() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let f = Fixture::start_cropping(disk.clone(), None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let hash = stage_image(&mut device, &png(1000)).await;
+    let unstaged = ContentHash::of(b"never staged");
+    let before = blob_files(&f);
+
+    free.0.store(9, std::sync::atomic::Ordering::SeqCst);
+    assert!(disk.check());
+    let low = message_command(session, context, "look", vec![hash, unstaged]);
+    assert_eq!(device.command(&low).await, rejected(RejectReason::DiskLow));
+    assert_eq!(blob_files(&f), before, "no blob linked");
+    assert!(is_staged(&mut device, hash).await, "still staged");
+
+    // Control: with room again, the same message goes through.
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    assert!(!disk.check());
+    let fine = message_command(session, context, "look", vec![hash]);
+    accepted_seq(&device.command(&fine).await);
+}
+
+/// A message's image blob is an event blob that is not croppable, and it can
+/// be deleted like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_blob_can_be_deleted_not_cropped() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let hash = stage_image(&mut device, &png(1000)).await;
+    let send = message_command(session, context, "look", vec![hash]);
+    let seq = accepted_seq(&device.command(&send).await);
+    let blob = attachments_at(&mut device, seq).await[0].blob.id;
+
+    assert_eq!(
+        device.command(&crop_command(blob, &[span(0, 1)])).await,
+        rejected(RejectReason::NotCroppable)
+    );
+    let delete = Command {
+        id: CommandId::new(),
+        kind: CommandKind::DeleteBlob { blob },
+    };
+    accepted_seq(&device.command(&delete).await);
+    assert!(!blob_file(&f, blob).exists(), "the blob file went");
 }
 
 /// D45: a request that accepts zstd gets an event batch and a blob as one
@@ -2222,6 +2691,7 @@ async fn a_crop_is_taken_while_the_disk_is_low_or_the_server_stops() {
             session_id: session,
             context: ContextId::first_of(session),
             text: text.into(),
+            attachments: Vec::new(),
         },
     };
 

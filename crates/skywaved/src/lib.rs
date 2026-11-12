@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod attachments;
 pub mod blobs;
 pub mod commands;
 pub mod config;
@@ -84,13 +85,21 @@ impl Storage {
     /// `serve`'s startup pass over the blobs, once its address is bound and
     /// before anything that writes them starts: deletes the workdir blobs no
     /// answer names ([`workdir::collect_garbage`]), then sweeps the files no
-    /// row records ([`BlobStore::sweep`]). The caller must hold the data
-    /// dir's [`ServeLock`](data_dir::ServeLock), so no other daemon is
-    /// writing blobs here.
+    /// row records ([`BlobStore::sweep`]), then the staged uploads too old
+    /// or half-written ([`attachments::Staging::sweep`]). The caller must
+    /// hold the data dir's [`ServeLock`](data_dir::ServeLock), so no other
+    /// daemon is writing blobs or uploads here.
     pub fn collect_blobs(&mut self) -> Result<()> {
         let collected = workdir::collect_garbage(&mut self.db, &self.blobs)?;
         let swept = self.blobs.sweep(self.db.conn())?;
-        tracing::info!(collected, swept, "collected unused blobs");
+        let staged = attachments::Staging::new(self.dir.attachments_dir())
+            .sweep(attachments::STAGING_MAX_AGE)?;
+        tracing::info!(
+            collected,
+            swept,
+            staged,
+            "collected unused blobs and uploads"
+        );
         Ok(())
     }
 }

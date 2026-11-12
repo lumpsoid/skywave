@@ -27,6 +27,7 @@
 
 pub mod action;
 mod address;
+pub mod attachment;
 mod backoff;
 mod blobs;
 mod client;
@@ -74,11 +75,11 @@ pub use pairing::{
 pub use projection::{BlobFate, ContextFill, SessionSummary, SessionUsage, TurnRecord};
 pub use seam::{Request, Seam};
 pub use search::Query;
-pub use skywave_proto::Fingerprint;
 pub use skywave_proto::PROTOCOL_VERSION;
+pub use skywave_proto::{ContentHash, Fingerprint, ImageType};
 pub use store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, OutboxStatus, PendingCrop,
-    ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
+    Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
+    OutboxStatus, PendingCrop, ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
 };
 pub use transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
 pub use view::{
@@ -88,8 +89,8 @@ pub use view::{
     CompletionStatus, ComposerMode, ContextId, ContextView, ConversationItem, ConversationPicker,
     ConversationsStatus, ConversationsUnavailable, CropContent, CropView, Decision, Delivery,
     DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo, FailReason, FullView, ImportOutcome,
-    ImportedEntry, Link, LinkFailure, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo,
-    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession,
+    ImportedEntry, Link, LinkFailure, LinkRejection, ListKind, MessageImage, ModelChoice, Outgoing,
+    PairedInfo, PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession,
     PermissionMode, QUESTION_TOOL, Question, QuestionAnswer, QuestionOption, QuestionPrompt,
     Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule,
     ScheduleId, Screen, Seq, ServerAddressesView, SessionId, SessionListView, SessionRef,

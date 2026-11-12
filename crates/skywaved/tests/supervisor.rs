@@ -12,11 +12,11 @@ use std::time::Duration;
 use serde_json::json;
 use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
-    AgentWork, ApprovalId, CallId, Command, CommandId, CommandKind, CommandResult, ContextId,
-    Decision, DeviceId, Effort, Event, EventKind, Full, LoginFinishResult, LoginStartResult,
-    ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
-    ToolCall, ToolDisplay, ToolKind, ToolResult,
+    AgentWork, ApprovalId, Attachment, CallId, Command, CommandId, CommandKind, CommandResult,
+    ContentHash, ContextId, Decision, DeviceId, Effort, Event, EventKind, Full, ImageType,
+    LoginFinishResult, LoginStartResult, ModelChoice, PermissionMode, Question, QuestionAnswer,
+    QuestionOption, RejectReason, RuleScope, RuleSuggestion, Schedule, ScheduleId, Seq, SessionId,
+    SessionOrigin, SessionState, TaskId, ToolCall, ToolDisplay, ToolKind, ToolResult, UploadResult,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -26,9 +26,10 @@ use skywaved::agent::fake::{
 };
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
 use skywaved::agent::{
-    AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED, LoginSource,
+    AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED, Image, LoginSource,
     LoginState, LoginStatus,
 };
+use skywaved::attachments::{Staging, prepare};
 use skywaved::config::AgentConfig;
 use skywaved::control::{Confirm, Control, Reply, Stop, Work};
 use skywaved::disk::{Disk, FreeSpace};
@@ -212,8 +213,61 @@ impl Fixture {
                 session_id: self.session_id,
                 context,
                 text: text.into(),
+                attachments: Vec::new(),
             },
         ))
+    }
+
+    /// Sends `text` with `images` in the session's current context. Each
+    /// image is staged and linked as its own blob, as `PUT` and the server
+    /// would; its seq.
+    fn send_with_images(&mut self, text: &str, images: &[Vec<u8>]) -> Seq {
+        let staging = Staging::new(self.storage.dir.attachments_dir());
+        let hashes: Vec<ContentHash> = images
+            .iter()
+            .map(|bytes| {
+                let hash = ContentHash::of(bytes);
+                assert!(matches!(
+                    staging.stage(hash, bytes).unwrap(),
+                    UploadResult::Stored { .. }
+                ));
+                hash
+            })
+            .collect();
+        let prepared = prepare(&staging, &self.storage.blobs, false, &hashes).unwrap();
+        let command = Command {
+            id: CommandId::new(),
+            kind: CommandKind::SendMessage {
+                session_id: self.session_id,
+                context: self.current(),
+                text: text.into(),
+                attachments: hashes,
+            },
+        };
+        accepted(
+            self.log
+                .handle_with(
+                    &mut self.storage.db,
+                    DeviceId::new(),
+                    &command,
+                    Some(prepared.into()),
+                )
+                .unwrap(),
+        )
+    }
+
+    /// The attachments of the message logged at `seq`, in order.
+    fn attachments_at(&self, seq: Seq) -> Vec<Attachment> {
+        let event = self
+            .log
+            .read(&self.storage.db, Seq(seq.0 - 1), 1)
+            .unwrap()
+            .events
+            .remove(0);
+        match event.kind {
+            EventKind::UserMessage { attachments, .. } => attachments,
+            other => panic!("expected a message at seq {}, got {other:?}", seq.0),
+        }
     }
 
     /// The session's current context.
@@ -534,7 +588,14 @@ fn approval_script() -> FakeScript {
 }
 
 fn message(text: &str) -> FakeInput {
-    FakeInput::Message(text.into())
+    FakeInput::message(text)
+}
+
+/// A PNG: its signature and a `tag` byte, so each tag is different content.
+fn png(tag: u8) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.push(tag);
+    bytes
 }
 
 #[tokio::test]
@@ -1005,6 +1066,64 @@ async fn failed_turn_keeps_the_agent_running() {
     assert_eq!(
         agent.inputs(f.session_id),
         [f.started(false), message("first"), message("second"),]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_messages_images_reach_the_agent_in_order() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::text("Looking.")]));
+    let supervisor = f.start(&agent).await;
+
+    let (first, second) = (png(1), png(2));
+    f.send_with_images("look", &[first.clone(), second.clone()]);
+    f.wait_count("idle", 1, is_idle).await;
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            FakeInput::Message {
+                text: "look".into(),
+                images: vec![
+                    Image {
+                        media_type: ImageType::Png,
+                        bytes: first,
+                    },
+                    Image {
+                        media_type: ImageType::Png,
+                        bytes: second,
+                    },
+                ],
+            },
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_image_deleted_before_delivery_is_noted_and_the_rest_delivered() {
+    let mut f = Fixture::new();
+    let (gone, kept) = (png(1), png(2));
+    let seq = f.send_with_images("look", &[gone, kept.clone()]);
+    let deleted = f.attachments_at(seq)[0].blob.id;
+    accepted(f.handle(DeviceId::new(), CommandKind::DeleteBlob { blob: deleted }));
+
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::text("Looking.")]));
+    let supervisor = f.start(&agent).await;
+    f.wait_count("idle", 1, is_idle).await;
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            FakeInput::Message {
+                text: "look\n[image removed before delivery]".into(),
+                images: vec![Image {
+                    media_type: ImageType::Png,
+                    bytes: kept,
+                }],
+            },
+        ]
     );
     supervisor.shutdown().await.unwrap();
 }
@@ -4370,6 +4489,7 @@ fn send_in(f: &mut Fixture, session: SessionId, text: &str) -> Seq {
             session_id: session,
             context: ContextId::first_of(session),
             text: text.into(),
+            attachments: Vec::new(),
         },
     ))
 }
@@ -5206,6 +5326,7 @@ async fn a_low_disk_pauses_the_agent_refuses_new_work_and_still_interrupts_and_s
         session_id: f.session_id,
         context,
         text: "more".into(),
+        attachments: Vec::new(),
     };
     assert_eq!(
         rejected(f.handle(DeviceId::new(), message)),
@@ -5298,6 +5419,7 @@ async fn a_start_below_the_floor_comes_up_paused() {
         session_id: f.session_id,
         context,
         text: "two".into(),
+        attachments: Vec::new(),
     };
     assert_eq!(
         rejected(f.handle(DeviceId::new(), message)),
@@ -6073,6 +6195,7 @@ impl Fixture {
                 session_id: self.session_id,
                 context,
                 text: text.into(),
+                attachments: Vec::new(),
             },
         )
     }
