@@ -381,6 +381,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
         agent_label: match &session.state {
             SessionState::Idle => "agent idle".to_owned(),
             SessionState::AgentWorking => "agent working".to_owned(),
+            SessionState::BackgroundWork => "background work running".to_owned(),
             SessionState::AwaitingApproval(_) if session.pending_question.is_some() => {
                 "agent waiting for an answer".to_owned()
             }
@@ -1093,6 +1094,7 @@ fn agent_state(state: &SessionState) -> AgentState {
     match state {
         SessionState::Idle => AgentState::Idle,
         SessionState::AgentWorking => AgentState::Working,
+        SessionState::BackgroundWork => AgentState::Working,
         SessionState::AwaitingApproval(_) => AgentState::AwaitingApproval,
         SessionState::Errored(_) => AgentState::Errored,
         SessionState::Stopped => AgentState::Stopped,
@@ -1104,6 +1106,7 @@ fn badge(state: &SessionState) -> &'static str {
     match state {
         SessionState::Idle => "idle",
         SessionState::AgentWorking => "working",
+        SessionState::BackgroundWork => "working",
         SessionState::AwaitingApproval(_) => "approval",
         SessionState::Errored(_) => "error",
         SessionState::Stopped => "stopped",
@@ -1340,7 +1343,11 @@ mod tests {
     }
 
     fn session_screen(work: AgentWork, task_stops: Vec<(TaskId, Outgoing)>) -> SessionScreen {
-        let session = session_view(work, task_stops);
+        screen_of(session_view(work, task_stops))
+    }
+
+    /// The open session `session` as the screen the hub sends.
+    fn screen_of(session: SessionView) -> SessionScreen {
         let view = ViewState {
             link: Link::Connecting,
             queued: 0,
@@ -1645,6 +1652,24 @@ mod tests {
         assert_eq!(screen.stop_warning, None);
         assert!(screen.tasks.is_empty() && screen.schedules.is_empty());
         assert_eq!(screen.loops_note, None);
+    }
+
+    /// Background work on an idle turn shows as working, and offers no
+    /// interrupt; a working turn is the control.
+    #[test]
+    fn background_work_shows_working_without_interrupt() {
+        let mut session = session_view(AgentWork::default(), Vec::new());
+        session.state = SessionState::BackgroundWork;
+        let screen = screen_of(session.clone());
+        assert_eq!(screen.state, AgentState::Working);
+        assert_eq!(screen.badge_label, "working");
+        assert_eq!(screen.agent_label, "background work running");
+        assert!(!screen.can_interrupt);
+
+        session.state = SessionState::AgentWorking;
+        let screen = screen_of(session);
+        assert_eq!(screen.agent_label, "agent working");
+        assert!(screen.can_interrupt);
     }
 
     #[test]

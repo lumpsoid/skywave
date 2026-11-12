@@ -4516,6 +4516,9 @@ fn session_state(summary: &SessionSummary) -> SessionState {
     match &summary.state {
         // A turn still ending after the stop shows as working; an error wins.
         LogState::Idle if summary.stopped => SessionState::Stopped,
+        LogState::Idle if !summary.work.tasks.is_empty() || !summary.work.schedules.is_empty() => {
+            SessionState::BackgroundWork
+        }
         LogState::Idle => SessionState::Idle,
         LogState::AgentWorking => SessionState::AgentWorking,
         LogState::Errored { message } => SessionState::Errored(ErrorInfo {
@@ -5672,6 +5675,57 @@ mod tests {
             vec![EventKind::BackgroundTasksChanged { tasks: vec![] }],
         );
         assert_eq!(f.session_view().task_stops, vec![]);
+    }
+
+    /// An idle turn with a task or a schedule still running reads as working;
+    /// a working turn keeps its own state.
+    #[test]
+    fn background_work_reads_as_working_while_the_turn_is_idle() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        assert_eq!(f.session_view().state, SessionState::Idle);
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged {
+                tasks: vec![work_task("t1")],
+            }],
+        );
+        assert_eq!(f.session_view().state, SessionState::BackgroundWork);
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert_eq!(
+            f.list_view().sessions[0].state,
+            SessionState::BackgroundWork
+        );
+        f.open(sid);
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        assert_eq!(f.session_view().state, SessionState::AgentWorking);
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(f.session_view().state, SessionState::BackgroundWork);
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged { tasks: vec![] }],
+        );
+        assert_eq!(f.session_view().state, SessionState::Idle);
+        let schedule = skywave_proto::Schedule {
+            id: skywave_proto::ScheduleId("s1".into()),
+            when: "*/5 * * * *".into(),
+            recurring: true,
+            prompt: "check".into(),
+            outlives_agent: None,
+        };
+        f.log(
+            sid,
+            vec![EventKind::SchedulesChanged {
+                schedules: vec![schedule],
+            }],
+        );
+        assert_eq!(f.session_view().state, SessionState::BackgroundWork);
+        f.log(sid, vec![EventKind::SchedulesChanged { schedules: vec![] }]);
+        assert_eq!(f.session_view().state, SessionState::Idle);
     }
 
     #[test]

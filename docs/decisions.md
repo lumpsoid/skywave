@@ -454,8 +454,8 @@ loop: session-only jobs come back after `--resume`. So stopping the agent
 (Stop agent, new context, switch, move of the current context) asks for
 confirmation in both heads whenever non-ambient tasks run or a schedule
 exists, with the shared `skywave-present::format::stop_warning`, which says
-background tasks end and loops are paused, not ended. There is no always-on
-indicator (user decision); the work shows in a place the user opens.
+background tasks end and loops are paused, not ended. The work shows in a place
+the user opens, and the session reads as working while any exists (D51).
 **Subagents.** A subagent's own messages are dropped from the main timeline.
 A background subagent's approval stays open past the main turn, tied to its
 task, and is cancelled when the task leaves the set.
@@ -466,7 +466,7 @@ own, true because both heads render a per-task stop.
 **Deferred:**
 - cancelling a schedule from Skywave by any means (revisit only if a CLI adds
   a control request);
-- an always-on indicator;
+- ~~an always-on indicator~~ done as the working badge (D51);
 - ~~a subagent transcript view~~ done, read side only (D34); writing to a
   subagent is deferred there too;
 - task output (`output_file`, `summary`, `usage`);
@@ -1359,3 +1359,17 @@ it); content-addressed event blobs (D44); auto-resending under a new id on
 `UnknownAttachment` (implicit); `super_clipboard` and `super_drag_and_drop` for
 paste and drop (they do not build for Android with Gradle 9: irondash's
 cargokit calls `project.exec`).
+
+## D51. Background work reads as working
+A session whose turn is idle but whose agent still has background work (any
+task, ambient ones too, or any schedule) shows as working in every head.
+Core derives it: `session_state` maps an idle, not stopped log state with a
+non-empty `AgentWork` to `SessionState::BackgroundWork`. Heads draw the
+working badge with their own label ("background work running") and offer no
+interrupt, which would spare the tasks anyway; tasks stop from the
+background view. The wire and the server's state stay turn-only.
+**Why:** a loop or shell the agent started and forgot is otherwise hard to
+discover (user decision, 2026-11-13). Schedules count too, though they do
+not keep the agent alive (D31). **Rejected:** a server-side state event
+(it would change what the logged state means and tangle with turn
+recovery).

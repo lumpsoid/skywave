@@ -1438,8 +1438,10 @@ enum Outgoing {
 enum SessionState {
     Idle,
     AgentWorking,
+    BackgroundWork,                  // idle turn, live tasks or schedules (D51)
     AwaitingApproval(ApprovalId),
     Errored(ErrorInfo),
+    Stopped,
 }
 
 enum BlobState {
