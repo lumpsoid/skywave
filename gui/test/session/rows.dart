@@ -46,6 +46,7 @@ TimelineRow anyRow(
   commandId: commandId,
   tool: tool,
   sections: sections,
+  images: const [],
 );
 
 ToolFacts shellFacts(String title, {ToolState state = ToolState.done}) =>

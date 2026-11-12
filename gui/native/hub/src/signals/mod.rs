@@ -55,8 +55,8 @@ pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};
 pub use timeline::{
     BlobFacts, BlobStateKind, LineStyle, MarkdownAlign, MarkdownBlock, MarkdownCell, MarkdownKind,
-    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowKind, SectionFormat, SectionLine,
-    SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
+    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowImage, RowKind, SectionFormat,
+    SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
 };
 pub use workdir::{
     WorkdirChangeKind, WorkdirChangeRow, WorkdirContent, WorkdirEntryRow, WorkdirLine,

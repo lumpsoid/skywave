@@ -2741,6 +2741,70 @@ fn a_long_message_shows_its_head_and_expands_to_its_whole() {
     assert_eq!(copied(&outs), ["# Report\nhead line\nthe deep finding\n"]);
 }
 
+/// A message's image opens its own file, once the image is on this device;
+/// before, the open says it is not downloaded.
+#[test]
+fn opening_a_message_image_opens_its_file() {
+    use skywave_proto::{Attachment, BlobId, BlobRef, ImageType};
+    let mut rig = Rig::new();
+    let blob = BlobId::new();
+    // A user message is logged with its command id, as a device's own is.
+    let kind = EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "look".into(),
+        attachments: vec![Attachment {
+            blob: BlobRef {
+                id: blob,
+                size: 4,
+                sha256: ContentHash::of(b"png1"),
+            },
+            media_type: ImageType::Png,
+        }],
+    };
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![Event {
+                session_id: rig.session,
+                at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap(),
+                command_id: kind.logged_by_command().then(CommandId::new),
+                context: skywave_proto::ContextId::first_of(rig.session),
+                kind,
+            }],
+        })
+        .unwrap();
+    rig.view();
+    // Control: the message's row carries its image, not yet downloaded.
+    let images = &rig.rows().last().unwrap().images;
+    assert_eq!(images.len(), 1, "{images:?}");
+    assert_eq!(images[0].blob_id, Some(blob.0.to_string()));
+    let open = GuiIntent::OpenFull {
+        blob_id: blob.0.to_string(),
+    };
+    let outs = rig.intent(open.clone());
+    assert_eq!(notices(&outs), ["not downloaded yet"], "{outs:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image");
+    std::fs::write(&path, b"png1").unwrap();
+    rig.seam
+        .blob_status(
+            blob,
+            skywave_core::BlobStatus::Available { path: path.clone() },
+        )
+        .unwrap();
+    rig.view();
+    let outs = rig.intent(open);
+    let shown = path.display().to_string();
+    assert!(
+        outs.iter().any(|out| matches!(
+            out,
+            Out::Effect(PlatformEffect::OpenFile { path }) if *path == shown
+        )),
+        "{outs:?}"
+    );
+}
+
 #[test]
 fn an_inline_edit_output_expands_whole_without_a_download() {
     use skywave_proto::{EventKind, Full, ToolResult};
