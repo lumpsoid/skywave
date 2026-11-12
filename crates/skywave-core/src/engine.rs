@@ -34,8 +34,8 @@
 //!   [`WORKDIR_TIMEOUT`], and answers with [`Seam::workdir_answered`].
 //!
 //! **The link** runs while the device is paired, not rejected and not
-//! suspended. Each connection starts with `hello`, then runs two loops side
-//! by side until either fails:
+//! suspended. Each connection starts with `hello`, then runs three loops side
+//! by side until one fails:
 //! - the *pull loop* long-polls `GET /v1/events` from the store's cursor and
 //!   applies every batch in one transaction ([`Seam::apply_events`]);
 //! - the *outbox sender* sends the oldest pending command, marking it
@@ -52,6 +52,10 @@
 //!   request has a connection of its own, so the pull's tells whether the
 //!   link is down. Taking a command back (`OutboxChanged`) ends the wait to
 //!   resend it, and the next command goes.
+//! - the *draft stager* uploads the images of a draft as soon as they are
+//!   attached ([`Request::DraftImagesChanged`]), so a message finds them
+//!   staged; a transport error makes it wait a backoff instead of ending the
+//!   connection ([`stage_drafts`]).
 //!
 //! `Link` moves as follows: `Connecting` when the link (re)starts; after
 //! `hello`, `CatchingUp { have, server }` while the cursor is behind the
@@ -913,10 +917,11 @@ impl Wait {
     }
 }
 
-/// One connection: `hello`, then pull and send until either fails. A
-/// server error for one command, or a failure of its request alone, is not
+/// One connection: `hello`, then pull, send and stage drafts until one fails.
+/// A server error for one command, or a failure of its request alone, is not
 /// a failure of the sender ([`send_entry`]), so it never cuts the pull
-/// short; the pull is what finds the link down.
+/// short; the pull is what finds the link down. A transport error in the
+/// draft stager waits instead ([`stage_drafts`]).
 async fn connection(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -1407,16 +1412,18 @@ mod tests {
     use std::time::Duration;
 
     use skywave_proto::{
-        BlobId as ProtoBlobId, Command, CommandId, CommandKind, CommandResult, ContentHash,
-        EventBatch, HelloResponse, ImageType, PROTOCOL_VERSION, ServerId, SessionId, UploadResult,
+        Attachment, BlobId as ProtoBlobId, BlobRef, Command, CommandId, CommandKind, CommandResult,
+        ContentHash, EventBatch, EventKind, HelloResponse, ImageType, PROTOCOL_VERSION, ServerId,
+        SessionId, UploadResult,
     };
 
     use super::*;
     use crate::Core;
     use crate::attachment::{AttachedImage, attachment_dir};
     use crate::backoff::Jitter;
+    use crate::blobs::blob_dir;
     use crate::identity::PairedCredentials;
-    use crate::store::OutboxStatus;
+    use crate::store::{BlobStatus, OutboxStatus};
     use crate::transport::{BlobDownload, BoxFuture};
     use crate::view::{DeviceId, FailReason, Link, Outgoing, Screen};
 
@@ -3217,6 +3224,105 @@ mod tests {
             .store
             .attach_to_draft(session, &image, Utc::now())
             .unwrap();
+    }
+
+    /// A batch of a session's creation and one user message carrying an
+    /// image per `(blob, bytes)`, each blob the hash of its bytes.
+    fn message_with_images(session_id: SessionId, images: &[(ProtoBlobId, &[u8])]) -> EventBatch {
+        let attachments = images
+            .iter()
+            .map(|(id, bytes)| Attachment {
+                blob: BlobRef {
+                    id: *id,
+                    size: bytes.len() as u64,
+                    sha256: ContentHash::of(bytes),
+                },
+                media_type: ImageType::Png,
+            })
+            .collect();
+        let event = |kind| skywave_proto::Event {
+            session_id,
+            at: Utc::now(),
+            command_id: None,
+            context: skywave_proto::ContextId::first_of(session_id),
+            kind,
+        };
+        EventBatch {
+            from: Seq(1),
+            events: vec![
+                event(EventKind::SessionCreated {
+                    workdir: "/srv".into(),
+                    context_name: "start".into(),
+                    from: None,
+                }),
+                event(EventKind::UserMessage {
+                    device_id: DeviceId::new(),
+                    text: "look at these".into(),
+                    attachments,
+                }),
+            ],
+        }
+    }
+
+    /// A message's image this device attached is available from its local
+    /// file as soon as the batch lands, and no download of it is queued. The
+    /// message's other image, which this device never attached, still
+    /// downloads.
+    #[test]
+    fn an_own_image_is_available_without_a_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let session = SessionId::new();
+        let own = b"an image this device attached";
+        let other = b"an image another device attached";
+        put_file(dir.path(), own);
+        attach_draft_image(&seam, session, own);
+        let (own_blob, other_blob) = (ProtoBlobId::new(), ProtoBlobId::new());
+
+        let applied = seam
+            .apply_events(&message_with_images(
+                session,
+                &[(own_blob, own), (other_blob, other)],
+            ))
+            .unwrap();
+
+        let own_path = blob_dir(dir.path()).join(own_blob.0.to_string());
+        let own_record = seam.blob(own_blob).unwrap().unwrap();
+        assert_eq!(
+            own_record.status,
+            BlobStatus::Available {
+                path: own_path.clone()
+            }
+        );
+        assert_eq!(std::fs::read(&own_path).unwrap(), own);
+        let other_record = seam.blob(other_blob).unwrap().unwrap();
+        assert_eq!(other_record.status, BlobStatus::NotDownloaded);
+        assert_eq!(applied.blobs, [other_blob]);
+    }
+
+    /// An image this device attached whose local file is gone is no image
+    /// to use: its blob stays not downloaded and is queued as any other.
+    #[test]
+    fn an_own_image_without_its_file_still_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let session = SessionId::new();
+        let gone = b"an image whose file is gone";
+        put_file(dir.path(), gone);
+        attach_draft_image(&seam, session, gone);
+        std::fs::remove_file(attachment_path(dir.path(), ContentHash::of(gone))).unwrap();
+        let blob = ProtoBlobId::new();
+
+        let applied = seam
+            .apply_events(&message_with_images(session, &[(blob, gone)]))
+            .unwrap();
+
+        assert_eq!(
+            seam.blob(blob).unwrap().unwrap().status,
+            BlobStatus::NotDownloaded
+        );
+        assert!(!blob_dir(dir.path()).join(blob.0.to_string()).exists());
+        assert_eq!(applied.blobs, [blob]);
     }
 
     /// Runs the stager for a minute of paused time. It only ends on an
