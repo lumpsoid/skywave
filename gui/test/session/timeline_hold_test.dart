@@ -181,6 +181,38 @@ void expectInView(WidgetTester tester, String text) {
   expect(rect.bottom, lessThanOrEqualTo(view.bottom));
 }
 
+/// Pumps [count] rows in the scrollbar test's mix, then scrolls them from the
+/// newest end toward the oldest: 150 steps of 400 px, one frame each. Prints a
+/// summary of the frame times, which are never asserted: they depend on the
+/// machine.
+Future<void> measureScroll(WidgetTester tester, int count) async {
+  await pumpRows(tester, [
+    for (var i = 0; i < count; i++)
+      i % 3 == 0 ? detailed(i, count: 4 + i % 7) : row('s:$i', 'row $i'),
+  ]);
+  final position = tester.state<ScrollableState>(listScrollable()).position;
+  final start = scrolled(tester);
+  final micros = <int>[];
+  for (var step = 0; step < 150; step++) {
+    final watch = Stopwatch()..start();
+    position.jumpTo(position.pixels + 400);
+    await tester.pump();
+    watch.stop();
+    micros.add(watch.elapsedMicroseconds);
+  }
+  expect(scrolled(tester), greaterThan(start), reason: 'the scroll moved');
+
+  // The first 5 frames are warm-up, dropped before the percentiles.
+  final timed = micros.sublist(5)..sort();
+  int nearestRank(double p) => timed[(timed.length * p).ceil() - 1];
+  final mean = timed.reduce((a, b) => a + b) ~/ timed.length;
+  debugPrint(
+    'estimate cost: rows=$count frames=${timed.length} (5 warm-up dropped) '
+    'mean=$meanµs p50=${nearestRank(0.5)}µs p90=${nearestRank(0.9)}µs '
+    'max=${timed.last}µs',
+  );
+}
+
 void main() {
   group('scroll hold, scrolled back', () {
     testWidgets('the held row removed alone keeps the row above it still', (
@@ -980,5 +1012,16 @@ void main() {
       );
     }
     expect(tester.takeException(), isNull);
+  });
+
+  group('estimate cost', () {
+    testWidgets(
+      'scrolling 500 rows reports per-frame layout time',
+      (tester) => measureScroll(tester, 500),
+    );
+    testWidgets(
+      'scrolling 5000 rows reports per-frame layout time',
+      (tester) => measureScroll(tester, 5000),
+    );
   });
 }
