@@ -188,8 +188,11 @@ fn replay_records(
                         .unwrap_or_default(),
                     // Written by the protocol on the answer it follows.
                     ("control_request", Some("get_settings")) => Default::default(),
-                    ("user", _) => protocol
-                        .send_message(msg["message"]["content"].as_str().unwrap().to_owned()),
+                    ("user", _) => match &msg["message"]["content"] {
+                        Value::String(text) => protocol.send_message(text.to_owned()),
+                        Value::Array(blocks) => protocol.send_input(recorded_input(name, blocks)),
+                        other => panic!("{name}: unexpected user content {other:?}"),
+                    },
                     // Written by the protocol on the hook call it answers.
                     ("control_response", _)
                         if hook_calls
@@ -287,6 +290,44 @@ fn replay_records(
     assert!(written.is_empty(), "{name}: left over writes {written:?}");
     assert!(!protocol.turn_open(), "{name}: a turn is still open");
     (events, protocol.version().map(str::to_owned))
+}
+
+/// The input a recorded user message with array content was sent as: its
+/// images in order, and the text of its text block (blank when it has none).
+fn recorded_input(name: &str, blocks: &[Value]) -> ReadInput {
+    let mut input = ReadInput {
+        text: String::new(),
+        images: Vec::new(),
+    };
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                input.text = block["text"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: a text block without text"))
+                    .to_owned();
+            }
+            Some("image") => {
+                let source = &block["source"];
+                let media_type = match source["media_type"].as_str() {
+                    Some("image/png") => ImageType::Png,
+                    Some("image/jpeg") => ImageType::Jpeg,
+                    Some("image/gif") => ImageType::Gif,
+                    Some("image/webp") => ImageType::Webp,
+                    other => panic!("{name}: unknown image media type {other:?}"),
+                };
+                let data = source["data"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: an image block without data"));
+                let bytes = STANDARD
+                    .decode(data)
+                    .unwrap_or_else(|e| panic!("{name}: image data is not base64: {e}"));
+                input.images.push(Image { media_type, bytes });
+            }
+            other => panic!("{name}: unknown content block {other:?}"),
+        }
+    }
+    input
 }
 
 /// The answers a recorded allow of a question carries, read back from
@@ -648,6 +689,27 @@ fn replay_basic_two_turns() {
             "turn ended: Completed".to_owned(),
             "turn started".to_owned(),
             "text: PING".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
+        ]
+    );
+}
+
+/// The image fixture's two user messages carry array content: an image and
+/// its text, then the image alone.
+#[test]
+fn replay_an_image_message_and_an_image_alone() {
+    let events = replay_process("image", 0);
+    assert_eq!(
+        describe(&events),
+        [
+            format!("resume handle: {}", first_session("image")),
+            "turn started".to_owned(),
+            "text: Red".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
+            "turn started".to_owned(),
+            "text: Red".to_owned(),
             "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
         ]

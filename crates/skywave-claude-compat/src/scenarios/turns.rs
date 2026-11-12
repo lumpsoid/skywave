@@ -1,12 +1,12 @@
 //! Full scenarios about turns: messages, approvals, interrupts.
 
 use serde_json::json;
-use skywave_proto::{Decision, Question, QuestionAnswer};
+use skywave_proto::{Decision, ImageType, Question, QuestionAnswer};
 use skywaved::agent::claude_code::CliSession;
 use skywaved::agent::claude_code::protocol::INTERRUPT_REASON;
 use skywaved::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, PermissionMode, RuleScope, RuleSuggestion,
-    TurnOutcome,
+    AdapterEvent, AgentCallId, AgentRequestId, Image, PermissionMode, ReadInput, RuleScope,
+    RuleSuggestion, TurnOutcome,
 };
 
 use super::Ctx;
@@ -105,6 +105,50 @@ pub fn basic(ctx: &mut Ctx) -> Result<(), Stop> {
             || format!("init at {init:?}"),
         ),
     );
+    Ok(())
+}
+
+/// An 8 by 8 solid red PNG, the image both turns of [`image`] send.
+const RED_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4b, 0x6d, 0x29,
+    0xdc, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0x80,
+    0x15, 0x31, 0x0c, 0x2d, 0x09, 0x00, 0x28, 0xff, 0x3f, 0xc1, 0xce, 0x77, 0xc8, 0x4f, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// A message with an image and text, then one with the image alone. Its
+/// recording is the fixture `image.ndjson`.
+pub fn image(ctx: &mut Ctx) -> Result<(), Stop> {
+    let red_square = || Image {
+        media_type: ImageType::Png,
+        bytes: RED_PNG.to_vec(),
+    };
+    let mut s = ctx.session(Setup::default())?;
+    let from = s.mark();
+    s.send_input(ReadInput {
+        text: "What colour is this square? Answer with one word.".into(),
+        images: vec![red_square()],
+    });
+    let (_, outcome) = s.turn_end(from, TURN)?;
+    let text = s.find_event(from, |e| match e {
+        AdapterEvent::Text { parent: None, .. } => Some(()),
+        _ => None,
+    });
+    let checks = &mut ctx.checks;
+    checks.contract("the turn completes", completed(&outcome));
+    checks.contract(
+        "the model's text is read",
+        ensure(text.is_some(), || "no text".into()),
+    );
+    let from = s.mark();
+    s.send_input(ReadInput {
+        text: String::new(),
+        images: vec![red_square()],
+    });
+    let (_, outcome) = s.turn_end(from, TURN)?;
+    ctx.checks
+        .contract("an image alone takes a turn", completed(&outcome));
     Ok(())
 }
 
