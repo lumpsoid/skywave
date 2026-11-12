@@ -22,13 +22,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
-    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, HelloResponse, LogId, LogRun,
-    MIGRATED_SINCE, ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
+    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, HelloResponse, ImageType, LogId,
+    LogRun, MIGRATED_SINCE, ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
     UsageLimitsResult,
 };
 use uuid::Uuid;
 
 use crate::address::{ServerAddress, ServerAddresses};
+use crate::attachment::AttachedImage;
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
@@ -439,6 +440,30 @@ DELETE FROM settings WHERE key IN ('shell_enabled', 'bypass_allowed', 'login_exp
 "#),
     // The server addresses in their canonical form (`ServerAddress`).
     Code(canonicalize_server_addresses),
+    Sql(r#"
+-- The images a draft holds (`Store::attach_to_draft`). `attachments` keeps
+-- each image once, by its sha256, with what the composer and the model need
+-- of it; its bytes are its file under the data dir (`attachment_path`).
+-- `draft_attachments` keeps a session's agent draft's images in `position`
+-- order. A table of its own, not a column of `drafts`: a blank text deletes
+-- the `drafts` row, and the images stay. A replica from before this held no
+-- images: nothing to backfill. `IF NOT EXISTS` as above.
+CREATE TABLE IF NOT EXISTS attachments (
+    sha256 TEXT PRIMARY KEY,
+    media_type TEXT NOT NULL CHECK (media_type IN ('png', 'jpeg', 'gif', 'webp')),
+    size INTEGER NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS draft_attachments (
+    session_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode = 'agent'),
+    position INTEGER NOT NULL,
+    sha256 TEXT NOT NULL REFERENCES attachments (sha256),
+    PRIMARY KEY (session_id, mode, position)
+);
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -997,6 +1022,9 @@ pub struct Snapshot {
     pub pending_crops: Vec<PendingCrop>,
     pub settings: Settings,
     pub drafts: HashMap<(SessionId, ComposerMode), Draft>,
+    /// The images each session's agent draft holds, in order
+    /// ([`Store::draft_images`]).
+    pub draft_images: HashMap<SessionId, Vec<AttachedImage>>,
     /// Sessions whose composer does not write to the agent
     /// ([`Store::set_composer_mode`]).
     pub composer_modes: HashMap<SessionId, ComposerMode>,
@@ -1099,6 +1127,7 @@ impl Store {
             pending_crops: self.pending_crops()?,
             settings: self.settings()?,
             drafts: self.drafts()?,
+            draft_images: self.draft_images()?,
             composer_modes: self.composer_modes()?,
             read_marks: self.read_marks()?,
             deleted: read_deleted(&self.conn)?,
@@ -1409,7 +1438,8 @@ impl Store {
     }
 
     /// Deletes a session from this device only, in one transaction: its
-    /// events, summary, blob rows, draft, read mark and alerted approvals,
+    /// events, summary, blob rows, draft and the draft's images (the image
+    /// files stay), read mark and alerted approvals,
     /// its stored workdir answers, and the answered
     /// commands naming it. A tombstone keeps it out of the replica for good
     /// ([`apply_batch`](Store::apply_batch), [`put_workdir`](Store::put_workdir)).
@@ -1473,6 +1503,10 @@ impl Store {
         tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
         tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
         tx.execute(
+            "DELETE FROM draft_attachments WHERE session_id = ?1",
+            [&session],
+        )?;
+        tx.execute(
             "DELETE FROM composer_modes WHERE session_id = ?1",
             [&session],
         )?;
@@ -1500,11 +1534,11 @@ impl Store {
     /// stored workdir answers and blob rows the old server produced go, as
     /// do its device names, offered models and everything its `hello` said
     /// ([`ServerFacts`]), and so does what this device kept beside them —
-    /// drafts, composer modes, read marks, locally deleted sessions and
-    /// alerted approvals. The settings — the blob policy, a preference of
-    /// this device, and keys a newer build wrote — stay, as do snippets,
-    /// this device's too. Returns the blobs that were known, whose files
-    /// the caller removes.
+    /// drafts and their images, composer modes, read marks, locally deleted
+    /// sessions and alerted approvals. The settings — the blob policy, a
+    /// preference of this device, and keys a newer build wrote — stay, as do
+    /// snippets, this device's too. Returns the blobs that were known, whose
+    /// files the caller removes.
     pub fn reset_for_server(&mut self) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
         let blobs = {
@@ -1515,6 +1549,7 @@ impl Store {
         clear_replica(&tx)?;
         tx.execute_batch(
             "DELETE FROM drafts;
+             DELETE FROM draft_attachments;
              DELETE FROM composer_modes;
              DELETE FROM read_marks;
              DELETE FROM deleted_sessions;
@@ -1556,10 +1591,11 @@ impl Store {
     /// Persists a command as `Queued`. Enqueuing a [`CommandId`] that is
     /// already in the outbox changes nothing.
     ///
-    /// A message also deletes its session's agent draft, and a shell run its
-    /// shell draft, in the same transaction: a crash never leaves both the
-    /// queued command and the draft it was written in, which would invite
-    /// sending it twice.
+    /// A message also deletes its session's agent draft and the draft's
+    /// images (their files stay: the store does not collect them), and a
+    /// shell run its shell draft, in the same transaction: a crash never
+    /// leaves both the queued command and the draft it was written in, which
+    /// would invite sending it twice.
     pub fn enqueue(&self, command: &Command) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
@@ -1573,6 +1609,12 @@ impl Store {
                 "DELETE FROM drafts WHERE session_id = ?1 AND mode = ?2",
                 params![session_id.0.to_string(), mode_sql(mode)],
             )?;
+            if mode == ComposerMode::Agent {
+                tx.execute(
+                    "DELETE FROM draft_attachments WHERE session_id = ?1",
+                    [session_id.0.to_string()],
+                )?;
+            }
         }
         tx.execute(
             "INSERT INTO outbox (command_id, command) VALUES (?1, ?2)
@@ -1979,7 +2021,8 @@ impl Store {
     }
 
     /// Keeps `draft` as the session's unsent text in `mode`; `None` deletes
-    /// it.
+    /// it. The images of an agent draft stay either way
+    /// ([`Store::attach_to_draft`]).
     pub fn set_draft(
         &self,
         session_id: SessionId,
@@ -1996,6 +2039,87 @@ impl Store {
                 Ok(())
             }
         }
+    }
+
+    /// The images each session's agent draft holds, in the order they were
+    /// attached.
+    pub fn draft_images(&self) -> Result<HashMap<SessionId, Vec<AttachedImage>>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.session_id, a.sha256, a.media_type, a.size, a.width, a.height
+             FROM draft_attachments d JOIN attachments a ON a.sha256 = d.sha256
+             WHERE d.mode = 'agent' ORDER BY d.session_id, d.position",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((SessionId(uuid_col(row, 0)?), attached_image_cols(row, 1)?))
+        })?;
+        let mut images: HashMap<SessionId, Vec<AttachedImage>> = HashMap::new();
+        for row in rows {
+            let (session_id, image) = row?;
+            images.entry(session_id).or_default().push(image);
+        }
+        Ok(images)
+    }
+
+    /// Attaches `image` to the session's agent draft, after its images, in
+    /// one transaction. A draft holds an image at most once: one it already
+    /// holds changes nothing. The image's row is made on first sight, at
+    /// `now`; its file is the caller's to store (`attachment::store`).
+    pub fn attach_to_draft(
+        &self,
+        session_id: SessionId,
+        image: &AttachedImage,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        let sha256 = image.sha256.to_hex();
+        tx.execute(
+            "INSERT INTO attachments (sha256, media_type, size, width, height, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (sha256) DO NOTHING",
+            params![
+                sha256,
+                image_type_sql(image.media_type),
+                u64_sql(image.size)?,
+                i64::from(image.width),
+                i64::from(image.height),
+                now.to_rfc3339()
+            ],
+        )?;
+        let session = session_id.0.to_string();
+        let held: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM draft_attachments
+                WHERE session_id = ?1 AND mode = 'agent' AND sha256 = ?2)",
+            params![session, sha256],
+            |row| row.get(0),
+        )?;
+        if !held {
+            tx.execute(
+                "INSERT INTO draft_attachments (session_id, mode, position, sha256)
+                 VALUES (?1, 'agent',
+                    (SELECT COALESCE(MAX(position), -1) + 1 FROM draft_attachments
+                        WHERE session_id = ?1 AND mode = 'agent'),
+                    ?2)",
+                params![session, sha256],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Takes the image with `sha256` off the session's agent draft. The
+    /// other images keep their positions, and the image's row and file stay.
+    pub fn detach_from_draft(
+        &self,
+        session_id: SessionId,
+        sha256: ContentHash,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM draft_attachments
+             WHERE session_id = ?1 AND mode = 'agent' AND sha256 = ?2",
+            params![session_id.0.to_string(), sha256.to_hex()],
+        )?;
+        Ok(())
     }
 
     // ---- composer modes -------------------------------------------------------
@@ -2616,6 +2740,42 @@ fn mode_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<ComposerMode> {
     }
 }
 
+/// The serde name of `media_type`, as the `attachments` CHECK lists it.
+fn image_type_sql(media_type: ImageType) -> &'static str {
+    match media_type {
+        ImageType::Png => "png",
+        ImageType::Jpeg => "jpeg",
+        ImageType::Gif => "gif",
+        ImageType::Webp => "webp",
+    }
+}
+
+fn image_type_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<ImageType> {
+    let text: String = row.get(idx)?;
+    match text.as_str() {
+        "png" => Ok(ImageType::Png),
+        "jpeg" => Ok(ImageType::Jpeg),
+        "gif" => Ok(ImageType::Gif),
+        "webp" => Ok(ImageType::Webp),
+        _ => Err(bad_value(idx, Type::Text, format!("image type {text:?}"))),
+    }
+}
+
+/// An [`AttachedImage`] from the five columns of `attachments` from `first`
+/// on: sha256, media_type, size, width, height.
+fn attached_image_cols(row: &Row<'_>, first: usize) -> rusqlite::Result<AttachedImage> {
+    let sha256: String = row.get(first)?;
+    Ok(AttachedImage {
+        sha256: sha256
+            .parse()
+            .map_err(|e| bad_value(first, Type::Text, e))?,
+        media_type: image_type_col(row, first + 1)?,
+        size: u64_col(row, first + 2)?,
+        width: u32_col(row, first + 3)?,
+        height: u32_col(row, first + 4)?,
+    })
+}
+
 fn when_sql(when: RunWhen) -> &'static str {
     match when {
         RunWhen::Always => "always",
@@ -2895,6 +3055,11 @@ fn seq_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Seq> {
 fn u64_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(idx)?;
     u64::try_from(value).map_err(|e| bad_value(idx, Type::Integer, e))
+}
+
+fn u32_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<u32> {
+    let value: i64 = row.get(idx)?;
+    u32::try_from(value).map_err(|e| bad_value(idx, Type::Integer, e))
 }
 
 fn json_col<T: DeserializeOwned>(row: &Row<'_>, idx: usize) -> rusqlite::Result<T> {
