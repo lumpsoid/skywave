@@ -29,7 +29,7 @@ use skywave_proto::{
 use uuid::Uuid;
 
 use crate::address::{ServerAddress, ServerAddresses};
-use crate::attachment::AttachedImage;
+use crate::attachment::{self, AttachedImage};
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
@@ -1094,8 +1094,14 @@ impl Store {
     /// A replica stamped with an older `PROTOCOL_VERSION` since
     /// `MIGRATED_SINCE` is migrated to this build's; any other is refused
     /// with [`StoreError::ProtocolMismatch`] before anything reads it.
+    ///
+    /// Then collects the images nothing needs any more, and the files without
+    /// a row ([`Store::collect_attachments`]). A failure there is logged and
+    /// the open goes on.
     pub fn open(data_dir: &Path) -> Result<Store, StoreError> {
-        Store::init(connect(data_dir)?)
+        let store = Store::init(connect(data_dir)?)?;
+        store.collect_image_files(data_dir);
+        Ok(store)
     }
 
     /// A replica that lives only in memory, for tests of components above
@@ -1616,7 +1622,8 @@ impl Store {
     /// already in the outbox changes nothing.
     ///
     /// A message also deletes its session's agent draft and the draft's
-    /// images (their files stay: the store does not collect them), and a
+    /// images (their rows and files stay until nothing needs them, see
+    /// [`Store::collect_attachments`]), and a
     /// shell run its shell draft, in the same transaction: a crash never
     /// leaves both the queued command and the draft it was written in, which
     /// would invite sending it twice.
@@ -2218,6 +2225,74 @@ impl Store {
             params![session_id.0.to_string(), sha256.to_hex()],
         )?;
         Ok(())
+    }
+
+    /// Deletes, in one transaction, the rows of the images nothing needs any
+    /// more, and returns their hashes; their files are the caller's to remove.
+    /// An image is still needed while one of these holds:
+    /// - a draft holds it: it is one of the draft's images;
+    /// - a message naming it is unsettled (`result` NULL): it may still be
+    ///   posted;
+    /// - a message naming it was rejected, undeliverable or refused its
+    ///   attachment: Edit puts its images back into the draft;
+    /// - a message naming it was accepted at a `seq` past the cursor: the
+    ///   reply can settle it before the pull applies its event, and the
+    ///   event's own-copy step needs the file.
+    ///
+    /// Nothing else keeps an image, so an image no longer needed is collected
+    /// by the next call, not by the detach or settle that freed it.
+    pub fn collect_attachments(&self) -> Result<Vec<ContentHash>, StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        let hashes = {
+            let mut stmt = tx.prepare(
+                "SELECT a.sha256 FROM attachments a
+                 WHERE NOT EXISTS (SELECT 1 FROM draft_attachments d WHERE d.sha256 = a.sha256)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM outbox o, json_each(o.command, '$.kind.attachments') j
+                     WHERE j.value = a.sha256
+                       AND (o.result IS NULL
+                         OR json_extract(o.result, '$.result')
+                             IN ('rejected', 'undeliverable', 'attachment_refused')
+                         OR (json_extract(o.result, '$.result') = 'accepted'
+                             AND json_extract(o.result, '$.seq')
+                                 > (SELECT seq FROM cursor WHERE id = 0))))",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let sha256: String = row.get(0)?;
+                sha256.parse().map_err(|e| bad_value(0, Type::Text, e))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<ContentHash>>>()?
+        };
+        for hash in &hashes {
+            tx.execute("DELETE FROM attachments WHERE sha256 = ?1", [hash.to_hex()])?;
+        }
+        tx.commit()?;
+        Ok(hashes)
+    }
+
+    /// At open, with the data dir's lock held: removes the files of the
+    /// images [`Store::collect_attachments`] frees, then every file without
+    /// a row left, the `.tmp-*` files included. Only at open: a row-less
+    /// file may be a write whose row is still to come. A failure is logged;
+    /// the sweep runs only when the rows could be read, as they are its keep
+    /// set.
+    fn collect_image_files(&self, data_dir: &Path) {
+        match self.collect_attachments() {
+            Ok(collected) => {
+                for hash in collected {
+                    attachment::remove(data_dir, hash);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "cannot collect the replica's images"),
+        }
+        match self.attachments() {
+            Ok(rows) => {
+                let keep = rows.into_keys().collect::<HashSet<_>>();
+                attachment::sweep(data_dir, &keep);
+            }
+            Err(error) => tracing::warn!(%error, "cannot read the replica's images"),
+        }
     }
 
     // ---- composer modes -------------------------------------------------------
