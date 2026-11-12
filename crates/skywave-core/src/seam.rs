@@ -19,7 +19,7 @@ use skywave_proto::{
 };
 
 use crate::address::ServerAddress;
-use crate::attachment::attachment_path;
+use crate::attachment::{self, attachment_path};
 use crate::blobs::{blob_dir, remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
@@ -344,6 +344,11 @@ impl Seam {
             mark_alerted(state, &alerted);
             // After the model took the batch: it registers the blobs there.
             own_images_available(state, &data_dir, &mut applied)?;
+            // After the own copies: they are hard links, so a removed
+            // attachment file leaves the blob intact.
+            for sha256 in state.store.collect_attachments()? {
+                attachment::remove(&data_dir, sha256);
+            }
             for blob in &applied.purged {
                 remove_blob_files(&data_dir, *blob);
             }

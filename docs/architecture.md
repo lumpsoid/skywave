@@ -862,7 +862,11 @@ logs) an event that no longer decodes rather than failing.
   sha256 (its bytes are the file under `<data>/attachments/`); a blank
   text leaves them, sending the message or deleting the session drops
   them, and editing a queued message puts its images back before the
-  draft's (the files are not collected yet). `workdir_snapshots` keeps the latest
+  draft's. An image's row and file go once no draft holds it, no queued or
+  failed (still editable) message names it, and no accepted message the
+  replica has not applied names it; this runs when the store opens (which
+  also clears files without a row) and after each applied batch, once the
+  device's own copies are linked. `workdir_snapshots` keeps the latest
   stored answer per workdir read (session, kind, requested path), so a
   workdir already browsed reads offline; `workdir_blob_refs` names the
   blobs each answer holds. A refresh replaces the answer, and a blob row

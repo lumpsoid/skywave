@@ -23,6 +23,7 @@
 //! It lives in core so the TUI's future `/attach <path>` follows the same
 //! rules.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Cursor};
@@ -188,6 +189,54 @@ pub fn store(data_dir: &Path, prepared: &Prepared) -> io::Result<PathBuf> {
     }
     sync_dir(&dir)?;
     Ok(path)
+}
+
+/// Removes the file of the attachment `sha256` under `data_dir`. A file
+/// already gone is no error; a failure is logged, since the caller has
+/// already dropped the image's row.
+pub fn remove(data_dir: &Path, sha256: ContentHash) {
+    remove_file(&attachment_path(data_dir, sha256));
+}
+
+/// Removes every file in the attachment directory under `data_dir` whose
+/// name is not a hash in `keep`: files without a row, and the `.tmp-*` files
+/// a store left when it was cut off. A directory not there yet is no error;
+/// a failure is logged.
+pub fn sweep(data_dir: &Path, keep: &HashSet<ContentHash>) {
+    let dir = attachment_dir(data_dir);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, "cannot list the attachment files");
+            return;
+        }
+    };
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let kept = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<ContentHash>().ok())
+                    .is_some_and(|hash| keep.contains(&hash));
+                if !kept {
+                    remove_file(&entry.path());
+                }
+            }
+            Err(error) => tracing::warn!(%error, "cannot list the attachment files"),
+        }
+    }
+}
+
+fn remove_file(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot remove an attachment file");
+        }
+    }
 }
 
 fn ensure_within_cap(len: usize) -> Result<(), AttachRefusal> {

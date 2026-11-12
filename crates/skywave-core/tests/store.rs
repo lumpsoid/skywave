@@ -1,11 +1,12 @@
 //! Local replica behaviour: idempotent apply, gap rejection, and state that
 //! survives a reopen (cold start == normal start).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use skywave_core::attachment::AttachedImage;
+use skywave_core::attachment::{AttachedImage, attachment_dir};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, AttachmentRefusal, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError,
@@ -2665,10 +2666,16 @@ fn load_returns_every_attachment_even_after_it_is_detached() {
     let (_tmp, dir) = data_dir();
     let session = SessionId::new();
     let (a, b) = (image("a"), image("b"));
+    let other = SessionId::new();
     let store = Store::open(&dir).unwrap();
     store.attach_to_draft(session, &a, at(0)).unwrap();
     store.attach_to_draft(session, &b, at(1)).unwrap();
     store.detach_from_draft(session, a.sha256).unwrap();
+    // A queued message still names `a`, so its row outlives the detach; an
+    // image nothing names is collected when the store opens.
+    store
+        .enqueue(&send_with_images(other, vec![a.sha256]))
+        .unwrap();
     drop(store);
 
     let store = Store::open(&dir).unwrap();
@@ -5054,4 +5061,142 @@ fn the_failures_migration_keeps_a_populated_replica() {
         .query_row("SELECT count(*) FROM blob_failures", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0, "the trigger is back");
+}
+
+/// A message that names `attachments`, as the composer sends it.
+fn send_with_images(session_id: SessionId, attachments: Vec<ContentHash>) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::SendMessage {
+            session_id,
+            context: ContextId::first_of(session_id),
+            text: "pictures".into(),
+            attachments,
+        },
+    }
+}
+
+/// Queues a message with `image` attached, as the composer does: the image
+/// goes into the session's draft, and queuing the message takes it out again.
+/// The image's row stays.
+fn queue_with_image(store: &Store, session_id: SessionId, image: &AttachedImage) -> CommandId {
+    store.attach_to_draft(session_id, image, at(0)).unwrap();
+    let command = send_with_images(session_id, vec![image.sha256]);
+    store.enqueue(&command).unwrap();
+    command.id
+}
+
+#[test]
+fn attachments_are_collected_once_nothing_needs_them() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let (session, drafting) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    let (d, x, q, r, u, a1, a2) = (
+        image("d"),
+        image("x"),
+        image("q"),
+        image("r"),
+        image("u"),
+        image("a1"),
+        image("a2"),
+    );
+
+    // Still in a draft: kept.
+    store.attach_to_draft(drafting, &d, at(0)).unwrap();
+    // Attached, then detached: its row stays, and nothing needs it.
+    store.attach_to_draft(drafting, &x, at(1)).unwrap();
+    store.detach_from_draft(drafting, x.sha256).unwrap();
+
+    // Unsettled: kept.
+    queue_with_image(&store, session, &q);
+    // Rejected, undeliverable: kept, as Edit puts their images back.
+    let rejected = queue_with_image(&store, session, &r);
+    let undeliverable = queue_with_image(&store, session, &u);
+    // Accepted at seq 2 (applied below) and at seq 6 (not applied yet).
+    let accepted_early = queue_with_image(&store, session, &a1);
+    let accepted_late = queue_with_image(&store, session, &a2);
+    store
+        .record_result(
+            rejected,
+            &CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            at(2),
+        )
+        .unwrap();
+    assert!(store.record_undeliverable(undeliverable, at(3)).unwrap());
+    store
+        .record_result(
+            accepted_early,
+            &CommandResult::Accepted { seq: Seq(2) },
+            at(4),
+        )
+        .unwrap();
+    store
+        .record_result(
+            accepted_late,
+            &CommandResult::Accepted { seq: Seq(6) },
+            at(5),
+        )
+        .unwrap();
+    store.apply_batch(&log.batch(1, 3), Utc::now()).unwrap();
+
+    let collected = store.collect_attachments().unwrap();
+    assert_eq!(collected.len(), 2, "{collected:?}");
+    assert_eq!(
+        collected.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([x.sha256, a1.sha256])
+    );
+    assert!(store.collect_attachments().unwrap().is_empty());
+    let kept: HashSet<ContentHash> = store.attachments().unwrap().into_keys().collect();
+    assert_eq!(
+        kept,
+        HashSet::from([d.sha256, q.sha256, r.sha256, u.sha256, a2.sha256])
+    );
+
+    // Once the replica has applied the late accept, its image goes too.
+    store.apply_batch(&log.batch(4, 6), Utc::now()).unwrap();
+    assert_eq!(store.collect_attachments().unwrap(), [a2.sha256]);
+}
+
+#[test]
+fn opening_the_store_removes_unneeded_image_files() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (kept, gone) = (image("kept"), image("gone"));
+    let orphan = ContentHash::of(b"no row");
+    {
+        let store = Store::open(&dir).unwrap();
+        store.attach_to_draft(session, &kept, at(0)).unwrap();
+        store.attach_to_draft(session, &gone, at(1)).unwrap();
+        store.detach_from_draft(session, gone.sha256).unwrap();
+    }
+
+    let files = attachment_dir(&dir);
+    std::fs::create_dir_all(&files).unwrap();
+    for name in [
+        kept.sha256.to_hex(),
+        gone.sha256.to_hex(),
+        orphan.to_hex(),
+        ".tmp-abc".to_owned(),
+    ] {
+        std::fs::write(files.join(name), b"bytes").unwrap();
+    }
+    let present = |name: &str| files.join(name).exists();
+    assert!(present(&gone.sha256.to_hex()), "written, before the open");
+
+    let store = Store::open(&dir).unwrap();
+    assert!(
+        present(&kept.sha256.to_hex()),
+        "a file still in a draft stays"
+    );
+    assert!(
+        !present(&gone.sha256.to_hex()),
+        "a detached image's file goes"
+    );
+    assert!(!present(&orphan.to_hex()), "a file without a row goes");
+    assert!(!present(".tmp-abc"), "a temporary file goes");
+    let rows: HashSet<ContentHash> = store.attachments().unwrap().into_keys().collect();
+    assert_eq!(rows, HashSet::from([kept.sha256]));
 }
