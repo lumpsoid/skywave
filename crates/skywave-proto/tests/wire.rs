@@ -1116,6 +1116,44 @@ fn all_changes_results() -> Vec<ChangesResult> {
     ]
 }
 
+fn all_log_results() -> Vec<LogResult> {
+    vec![
+        LogResult::Log(CommitLog {
+            at: at(),
+            branch: Some("main".into()),
+            commits: vec![
+                Commit {
+                    sha: "e3c8849a1f0b2c7d6e5f4a3b2c1d0e9f8a7b6c5d".into(),
+                    short: "e3c8849".into(),
+                    author: "Ada Lovelace".into(),
+                    time: "2026-10-29T11:58:00Z".parse().unwrap(),
+                    subject: "fix(skywaved): keep the log's order".into(),
+                },
+                Commit {
+                    sha: "1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c".into(),
+                    short: "1d2c3b4".into(),
+                    author: "Zoë Ångström".into(),
+                    time: "2026-10-28T09:30:00Z".parse().unwrap(),
+                    subject: "docs: explain the café fixture".into(),
+                },
+            ],
+            more: true,
+        }),
+        LogResult::Log(CommitLog {
+            at: at(),
+            branch: None,
+            commits: vec![],
+            more: false,
+        }),
+        LogResult::NotGit,
+        LogResult::Failed {
+            reason: "git: command not found".into(),
+        },
+        LogResult::UnknownSession,
+        LogResult::WorkdirGone,
+    ]
+}
+
 fn all_list_results() -> Vec<ListResult> {
     let entry = |name: &str, kind: EntryKind| DirEntry {
         name: name.into(),
@@ -1530,6 +1568,9 @@ fn every_workdir_body_round_trips() {
     for result in all_changes_results() {
         round_trip(&result);
     }
+    for result in all_log_results() {
+        round_trip(&result);
+    }
     for result in all_list_results() {
         round_trip(&result);
     }
@@ -1602,6 +1643,16 @@ fn workdir_fixtures_cover_every_variant() {
             ChangesResult::WorkdirGone => "workdir_gone",
         });
     }
+    let mut logs = BTreeSet::new();
+    for result in all_log_results() {
+        logs.insert(match &result {
+            LogResult::Log(_) => "log",
+            LogResult::NotGit => "not_git",
+            LogResult::Failed { .. } => "failed",
+            LogResult::UnknownSession => "unknown_session",
+            LogResult::WorkdirGone => "workdir_gone",
+        });
+    }
     let mut lists = BTreeSet::new();
     let mut kinds = BTreeSet::new();
     for result in all_list_results() {
@@ -1638,6 +1689,7 @@ fn workdir_fixtures_cover_every_variant() {
         });
     }
     assert_eq!(changes.len(), 5, "{changes:?}");
+    assert_eq!(logs.len(), 5, "{logs:?}");
     assert_eq!(diffs.len(), 4, "{diffs:?}");
     assert_eq!(file_changes.len(), 7, "{file_changes:?}");
     assert_eq!(lists.len(), 6, "{lists:?}");
@@ -1649,6 +1701,7 @@ fn workdir_fixtures_cover_every_variant() {
 #[test]
 fn workdir_caps() {
     assert_eq!(limits::WORKDIR_CHANGES_MAX, 500);
+    assert_eq!(limits::WORKDIR_LOG_MAX, 50);
     assert_eq!(limits::WORKDIR_DIFF_MAX_BYTES, 1024 * 1024);
     assert_eq!(limits::WORKDIR_DIFFS_MAX_BYTES, 8 * 1024 * 1024);
     assert_eq!(limits::WORKDIR_FILE_MAX_BYTES, 4 * 1024 * 1024);
@@ -1742,8 +1795,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v30() {
-    assert_eq!(PROTOCOL_VERSION, 30);
+fn protocol_is_v31() {
+    assert_eq!(PROTOCOL_VERSION, 31);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1984,6 +2037,7 @@ fn api_paths() {
     assert_eq!(path::AGENT_LOGIN_START, "/v1/agent-login/start");
     assert_eq!(path::AGENT_LOGIN_FINISH, "/v1/agent-login/finish");
     assert_eq!(path::WORKDIR_CHANGES, "/v1/workdir/changes");
+    assert_eq!(path::WORKDIR_LOG, "/v1/workdir/log");
     assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
     assert_eq!(path::BLOB_ROUTE, "/v1/blobs/{id}");
@@ -2033,6 +2087,7 @@ fn wire_format_snapshot() {
         command_results: Vec<CommandResult>,
         workdir_query: WorkdirQuery,
         workdir_changes: Vec<ChangesResult>,
+        workdir_log: Vec<LogResult>,
         workdir_list: Vec<ListResult>,
         workdir_file: Vec<FileResult>,
         conversations: Vec<ConversationsResult>,
@@ -2070,6 +2125,7 @@ fn wire_format_snapshot() {
         command_results: all_command_results(),
         workdir_query: workdir_query(),
         workdir_changes: all_changes_results(),
+        workdir_log: all_log_results(),
         workdir_list: all_list_results(),
         workdir_file: all_file_results(),
         conversations: all_conversations_results(),
