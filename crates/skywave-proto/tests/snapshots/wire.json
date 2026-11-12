@@ -1963,7 +1963,7 @@
           "sha": "1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c",
           "short": "1d2c3b4",
           "author": "Zoë Ångström",
-          "time": "2026-10-28T09:30:00Z",
+          "time": null,
           "subject": "docs: explain the café fixture"
         }
       ],

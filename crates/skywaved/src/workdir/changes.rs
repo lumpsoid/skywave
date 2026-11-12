@@ -255,17 +255,8 @@ impl<'a> Snapshot<'a> {
         let git = self.git;
         let mut repo = Repo::new(git, workdir, self.deadline);
 
-        let inside = repo.output(&["rev-parse", "--is-inside-work-tree"])?;
-        if inside.status.success() {
-            match inside.out.trim_ascii() {
-                b"true" => {}
-                b"false" => return Ok(ChangesResult::NotGit),
-                _ => return Err(GitError::Failed(inside.reason())),
-            }
-        } else if inside.stderr.starts_with(b"fatal: not a git repository") {
+        if !work_tree(&repo)? {
             return Ok(ChangesResult::NotGit);
-        } else {
-            return Err(GitError::Failed(inside.reason()));
         }
 
         // Exit 1: no filter is configured at all.
@@ -277,12 +268,7 @@ impl<'a> Snapshot<'a> {
             _ => return Err(GitError::Failed(config.reason())),
         }
 
-        let branch = repo.output(&["symbolic-ref", "--short", "-q", "HEAD"])?;
-        let branch = match branch.status.code() {
-            Some(0) => Some(String::from_utf8_lossy(branch.out.trim_ascii()).into_owned()),
-            Some(1) => None,
-            _ => return Err(GitError::Failed(branch.reason())),
-        };
+        let branch = branch(&repo)?;
         let head = repo.output(&["rev-parse", "--short", "-q", "--verify", "HEAD"])?;
         let head = match head.status.code() {
             Some(0) => Some(String::from_utf8_lossy(head.out.trim_ascii()).into_owned()),
@@ -572,6 +558,36 @@ enum Synthesised {
     TooLarge(u64),
     /// Gone, or no longer what `lstat` said, since it was listed.
     Gone,
+}
+
+/// Whether the workdir is inside a git work tree (`rev-parse
+/// --is-inside-work-tree`); `false` for a git dir, a bare repo, or no repo.
+pub(super) fn work_tree(repo: &Repo<'_>) -> Result<bool, GitError> {
+    let inside = repo.output(&["rev-parse", "--is-inside-work-tree"])?;
+    if inside.status.success() {
+        match inside.out.trim_ascii() {
+            b"true" => Ok(true),
+            b"false" => Ok(false),
+            _ => Err(GitError::Failed(inside.reason())),
+        }
+    } else if inside.stderr.starts_with(b"fatal: not a git repository") {
+        Ok(false)
+    } else {
+        Err(GitError::Failed(inside.reason()))
+    }
+}
+
+/// The checked-out branch's name (`symbolic-ref --short`), `None` when
+/// `HEAD` is detached.
+pub(super) fn branch(repo: &Repo<'_>) -> Result<Option<String>, GitError> {
+    let branch = repo.output(&["symbolic-ref", "--short", "-q", "HEAD"])?;
+    match branch.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(branch.out.trim_ascii()).into_owned(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(GitError::Failed(branch.reason())),
+    }
 }
 
 /// Splits patch `out` at section headers into `sink`, holding at most one
@@ -1106,7 +1122,7 @@ fn new_file_patch(path: &str, mode: &str, content: &[u8]) -> (Vec<u8>, u32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::process::Command;
@@ -1121,7 +1137,7 @@ mod tests {
     use crate::error::Error;
 
     /// Runs the real git for test setup, immune to the user's config.
-    fn run_git(dir: &Path, args: &[&str]) -> std::process::Output {
+    pub(in crate::workdir) fn run_git(dir: &Path, args: &[&str]) -> std::process::Output {
         Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -1144,7 +1160,7 @@ mod tests {
     }
 
     /// [`run_git`], which must succeed; its stdout.
-    fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
+    pub(in crate::workdir) fn git(dir: &Path, args: &[&str]) -> Vec<u8> {
         let output = run_git(dir, args);
         assert!(
             output.status.success(),
@@ -1154,7 +1170,7 @@ mod tests {
         output.stdout
     }
 
-    fn init(dir: &Path) {
+    pub(in crate::workdir) fn init(dir: &Path) {
         git(dir, &["init", "-q"]);
     }
 
@@ -1163,7 +1179,7 @@ mod tests {
         git(dir, &["commit", "-q", "-m", "c"]);
     }
 
-    fn write(path: PathBuf, content: impl AsRef<[u8]>) {
+    pub(in crate::workdir) fn write(path: PathBuf, content: impl AsRef<[u8]>) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -1172,14 +1188,14 @@ mod tests {
 
     /// The reader's git, immune to the user's config and to any repository
     /// above the tree.
-    fn isolated(t: &Tree) -> Git {
+    pub(in crate::workdir) fn isolated(t: &Tree) -> Git {
         Git::default()
             .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
             .with_env("GIT_CONFIG_NOSYSTEM", "1")
             .with_env("GIT_CEILING_DIRECTORIES", t.root.parent().unwrap())
     }
 
-    fn reader(t: &Tree, git: Git) -> WorkdirReader {
+    pub(in crate::workdir) fn reader(t: &Tree, git: Git) -> WorkdirReader {
         WorkdirReader::new(
             Db::open(&t.storage.dir.db_path()).unwrap(),
             t.storage.blobs.clone(),

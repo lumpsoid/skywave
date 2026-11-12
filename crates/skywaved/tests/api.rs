@@ -22,9 +22,9 @@ use skywave_proto::{
     CommandKind, CommandResult, ContentHash, ContextId, ConversationsResult, DeviceId, DeviceInfo,
     DiffBody, DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange,
     FileResult, HelloResponse, ImageType, ImportOutcome, LimitSeverity, LimitWindow, LineSpan,
-    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason, RunId,
-    RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage, StorageReport, ToolResult,
-    UploadResult, UsageLimit, UsageLimitsResult, limits, path,
+    ListResult, LogResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason,
+    RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage, StorageReport,
+    ToolResult, UploadResult, UsageLimit, UsageLimitsResult, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -584,6 +584,7 @@ async fn a_request_for_another_run_is_refused_untouched() {
         path::DIRS.to_owned(),
         path::CONVERSATIONS.to_owned(),
         path::WORKDIR_CHANGES.to_owned(),
+        path::WORKDIR_LOG.to_owned(),
         path::WORKDIR_LIST.to_owned(),
         path::WORKDIR_FILE.to_owned(),
     ] {
@@ -3059,6 +3060,40 @@ async fn workdir_changes_answer_with_200_and_a_diff_blob() {
     let mut anon = f.anonymous().await;
     assert_eq!(
         anon.get(&changes(session)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_log_answers_with_200_and_the_commits() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    setup_git(&workdir, &["init", "-q"]);
+    std::fs::write(workdir.join("a.txt"), "one\n").unwrap();
+    setup_git(&workdir, &["add", "a.txt"]);
+    setup_git(&workdir, &["commit", "-q", "-m", "first"]);
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let log = |session: SessionId| format!("{}?session={}", path::WORKDIR_LOG, session.0);
+
+    let reply = device.get(&log(session)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let LogResult::Log(answer) = reply.json::<LogResult>() else {
+        panic!("expected a log: {:?}", reply.body);
+    };
+    assert_eq!(answer.branch.as_deref(), Some("main"));
+    assert_eq!(answer.commits.len(), 1);
+    assert_eq!(answer.commits[0].subject, "first");
+    assert!(!answer.more);
+
+    let reply = device.get(&log(SessionId::new())).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<LogResult>(), LogResult::UnknownSession);
+    let mut anon = f.anonymous().await;
+    assert_eq!(
+        anon.get(&log(session)).await.status,
         StatusCode::UNAUTHORIZED
     );
 }
