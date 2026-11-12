@@ -15,10 +15,10 @@ use uuid::Uuid;
 pub use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, ChangeSet, ChangedFile,
     ChangesResult, CommandId, ContextId, Decision, DeviceId, DiffBody, DirEntry, Effort, EntryKind,
-    FileBody, FileChange, FileResult, ImportOutcome, LinkTarget, ListResult, ModelChoice,
-    PermissionMode, Question, QuestionAnswer, QuestionOption, Refusal, RejectReason, RuleScope,
-    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, ShellEnd, SubagentUsage, TaskId,
-    TaskKind, ToolKind, TurnUsage,
+    FileBody, FileChange, FileResult, ImportOutcome, LinkTarget, ListResult, LogResult,
+    ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, Refusal, RejectReason,
+    RuleScope, RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, ShellEnd,
+    SubagentUsage, TaskId, TaskKind, ToolKind, TurnUsage,
 };
 pub use skywave_proto::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport,
@@ -598,6 +598,8 @@ pub enum CropContent {
 pub enum WorkdirPane {
     /// What changed against `HEAD`.
     Changes,
+    /// The newest commits on `HEAD`.
+    Commits,
     /// One changed file's diff, from the stored changes. `untracked` tells
     /// apart the two entries one path can have
     /// ([`ChangeSet::files`](skywave_proto::ChangeSet::files)).
@@ -644,6 +646,8 @@ pub enum WorkdirBody {
     /// Never read: offline, or before the answer.
     Nothing,
     Changes(ChangesResult),
+    /// The commit log the commits pane shows.
+    Log(LogResult),
     /// `file` from the stored changes, `None` once they no longer list it
     /// (or are no change set); `blob` its diff, if it has one.
     Diff {

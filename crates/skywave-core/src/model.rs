@@ -1258,7 +1258,9 @@ impl Model {
                     WorkdirPane::File { path } => up(path),
                     WorkdirPane::Dir { path } if !path.is_empty() => up(path),
                     WorkdirPane::Diff { .. } => Action::ShowWorkdir(WorkdirPane::Changes),
-                    WorkdirPane::Changes | WorkdirPane::Dir { .. } => Action::OpenSession(*id),
+                    WorkdirPane::Changes | WorkdirPane::Commits | WorkdirPane::Dir { .. } => {
+                        Action::OpenSession(*id)
+                    }
                 });
             }
             Place::Crop(page) => {
@@ -2533,6 +2535,9 @@ impl Model {
         let body = match (&pane, self.workdirs.stored.get(&ask)) {
             (WorkdirPane::Changes, Some(WorkdirAnswer::Changes(result))) => {
                 WorkdirBody::Changes(result.clone())
+            }
+            (WorkdirPane::Commits, Some(WorkdirAnswer::Log(result))) => {
+                WorkdirBody::Log(result.clone())
             }
             (WorkdirPane::Diff { path, untracked }, Some(WorkdirAnswer::Changes(result))) => {
                 let file = changed_file(result, path, *untracked).cloned();
@@ -4163,6 +4168,7 @@ fn blob_command(entry: &OutboxEntry) -> Option<(BlobId, BlobPending)> {
 fn pane_ask(session: SessionId, pane: &WorkdirPane) -> WorkdirAsk {
     match pane {
         WorkdirPane::Changes | WorkdirPane::Diff { .. } => WorkdirAsk::Changes { session },
+        WorkdirPane::Commits => WorkdirAsk::Log { session },
         WorkdirPane::Dir { path } => WorkdirAsk::List {
             session,
             path: path.clone(),
@@ -12238,8 +12244,8 @@ mod tests {
         use std::sync::mpsc::Receiver;
 
         use skywave_proto::{
-            BlobId as ProtoBlobId, BlobUse, ChangeSet, DirEntry, EntryKind, LineSpan, ListResult,
-            ToolResult,
+            BlobId as ProtoBlobId, BlobUse, ChangeSet, Commit, CommitLog, DirEntry, EntryKind,
+            LineSpan, ListResult, LogResult, ToolResult,
         };
 
         use super::*;
@@ -12299,6 +12305,21 @@ mod tests {
                     .collect(),
                 truncated: false,
             })
+        }
+
+        fn logged(subject: &str) -> WorkdirAnswer {
+            WorkdirAnswer::Log(LogResult::Log(CommitLog {
+                at: Utc::now(),
+                branch: Some("main".into()),
+                commits: vec![Commit {
+                    sha: "f".repeat(40),
+                    short: "fffffff".into(),
+                    author: "Ada".into(),
+                    time: Some(Utc::now()),
+                    subject: subject.into(),
+                }],
+                more: false,
+            }))
         }
 
         fn requests(effects: Vec<Effect>) -> Vec<Request> {
@@ -12420,6 +12441,80 @@ mod tests {
             };
             assert_eq!(view(&f).body, WorkdirBody::Dir(result));
             assert_eq!(view(&f).last_dir, "src");
+        }
+
+        #[test]
+        fn workdir_the_commits_pane_asks_the_log_once_and_refreshes_it() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+
+            let (req, ask) = asked(f.dispatch(Action::ShowWorkdir(WorkdirPane::Commits)));
+            assert_eq!(ask, WorkdirAsk::Log { session: id });
+            let shown = view(&f);
+            assert_eq!(shown.pane, WorkdirPane::Commits);
+            assert_eq!(shown.fetch, WorkdirFetch::Loading);
+            assert_eq!(shown.body, WorkdirBody::Nothing);
+            // Showing it again while the read is on its way asks nothing.
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Commits))
+                    .is_empty()
+            );
+
+            let log = logged("Add the log");
+            assert!(answer(&mut f, req, ask.clone(), log.clone()).is_empty());
+            let shown = view(&f);
+            assert_eq!(shown.fetch, WorkdirFetch::Idle);
+            let WorkdirAnswer::Log(result) = log else {
+                unreachable!()
+            };
+            assert_eq!(shown.body, WorkdirBody::Log(result));
+
+            // Stored: showing it again asks nothing, and refreshing asks again.
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Commits))
+                    .is_empty()
+            );
+            let (again, asked_again) = asked(f.dispatch(Action::RefreshWorkdir));
+            assert_eq!(asked_again, WorkdirAsk::Log { session: id });
+            assert!(again > req, "a fresh request id");
+            assert_eq!(view(&f).fetch, WorkdirFetch::Loading);
+
+            // The changes pane is stored too: switching back asks nothing.
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes))
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn workdir_a_failed_log_keeps_the_stored_log() {
+            let live = Live::new();
+            live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            let (req, ask) = live.asked(Action::ShowWorkdir(WorkdirPane::Commits));
+            let good = logged("Add the log");
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(good.clone()))
+                .unwrap();
+            let WorkdirAnswer::Log(result) = good.clone() else {
+                unreachable!()
+            };
+            assert_eq!(live.view().body, WorkdirBody::Log(result.clone()));
+
+            let (req, _) = live.asked(Action::RefreshWorkdir);
+            let failed = WorkdirAnswer::Log(LogResult::Failed {
+                reason: "git timed out".into(),
+            });
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(failed))
+                .unwrap();
+            let shown = live.view();
+            assert_eq!(shown.fetch, WorkdirFetch::Failed("git timed out".into()));
+            assert_eq!(shown.body, WorkdirBody::Log(result));
+            assert_eq!(live.stored()[&ask], good, "the store kept the good one");
         }
 
         #[test]

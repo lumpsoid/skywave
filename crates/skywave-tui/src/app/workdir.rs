@@ -308,9 +308,11 @@ impl App {
 fn workdir_common(view: &WorkdirView, key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Tab | KeyCode::BackTab => Some(Action::ShowWorkdir(match view.pane {
-            WorkdirPane::Changes | WorkdirPane::Diff { .. } => WorkdirPane::Dir {
-                path: view.last_dir.clone(),
-            },
+            WorkdirPane::Changes | WorkdirPane::Commits | WorkdirPane::Diff { .. } => {
+                WorkdirPane::Dir {
+                    path: view.last_dir.clone(),
+                }
+            }
             WorkdirPane::Dir { .. } | WorkdirPane::File { .. } => WorkdirPane::Changes,
         })),
         KeyCode::Char('r') => Some(Action::RefreshWorkdir),

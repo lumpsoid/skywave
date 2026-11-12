@@ -1195,8 +1195,9 @@ logs) an event that no longer decodes rather than failing.
   Nothing is stored: the listing goes stale at once.
 - **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
   changes; `ShowWorkdir` switches between the changes, one file's diff (a
-  path and whether it is the untracked entry), a directory and a file;
-  `RefreshWorkdir` reads the pane again (a diff: the changes). The fetch
+  path and whether it is the untracked entry), a directory and a file; a
+  commits pane shows the stored commit log, asked and refreshed like the
+  changes. `RefreshWorkdir` reads the pane again (a diff: the changes). The fetch
   rule is plain: showing a pane whose read has no stored answer asks once,
   a stored one shows with its time until a refresh, and showing a diff or
   file whose content is not downloaded asks for that blob. Offline nothing
@@ -1211,8 +1212,8 @@ logs) an event that no longer decodes rather than failing.
   `ChangesResult::Failed` or `LogResult::Failed` stays in memory and never
   replaces a stored answer; any other answer is stored, and the model learns the blobs it
   registered and purged in the same update. Back walks file → its
-  directory, diff → changes, directory → its parent, and the changes or
-  the workdir root → the session; a session deleted here falls back to the
+  directory, diff → changes, directory → its parent, and the changes, the
+  commits or the workdir root → the session; a session deleted here falls back to the
   archived list.
 - **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
   the sessions they ran in; heads total them with `skywave_present::usage`
