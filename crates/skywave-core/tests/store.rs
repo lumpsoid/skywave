@@ -102,6 +102,7 @@ impl Log {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "hi".into(),
+                    attachments: Vec::new(),
                 },
             ),
             event(
@@ -417,6 +418,7 @@ fn send(session_id: SessionId, text: &str) -> Command {
             session_id,
             context: ContextId::first_of(session_id),
             text: text.into(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -992,6 +994,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "back".into(),
+                    attachments: Vec::new(),
                 },
             ),
         ],
@@ -1048,6 +1051,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: text.into(),
+                attachments: Vec::new(),
             },
         )
     };
@@ -1149,6 +1153,7 @@ fn notable_count_is_projected_and_backfilled() {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "hi".into(),
+                    attachments: Vec::new(),
                 },
             ),
             event(
@@ -1282,6 +1287,7 @@ fn events_settle_the_commands_they_name() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "x".into(),
+                attachments: Vec::new(),
             },
         )
     };
@@ -1741,6 +1747,7 @@ fn v30_opens_a_v29_replica_with_its_user_messages() {
     let message = EventKind::UserMessage {
         device_id: DeviceId::new(),
         text: "look".into(),
+        attachments: Vec::new(),
     };
     let batch = EventBatch {
         from: Seq(1),
@@ -1855,6 +1862,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             },
         )
     };
@@ -1927,6 +1935,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             },
         )
     };

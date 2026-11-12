@@ -1389,7 +1389,7 @@ mod tests {
         assert_eq!(kind, v29);
         assert!(matches!(
             serde_json::from_str(&kind).unwrap(),
-            EventKind::UserMessage { .. }
+            EventKind::UserMessage { attachments, .. } if attachments.is_empty()
         ));
     }
 

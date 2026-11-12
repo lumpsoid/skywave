@@ -342,7 +342,8 @@ fn offline_send_is_persisted_first_and_appears_once() {
         CommandKind::SendMessage {
             session_id: sid,
             context: ContextId::first_of(sid),
-            text: "fix the build".into()
+            text: "fix the build".into(),
+            attachments: Vec::new(),
         }
     );
     let view = views.last();
@@ -386,6 +387,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
                 EventKind::UserMessage {
                     device_id: device,
                     text: "fix the build".into(),
+                    attachments: Vec::new(),
                 },
             )
         }],
@@ -1136,6 +1138,7 @@ fn a_message_after_an_acked_switch_not_yet_pulled_goes_to_the_switch_context() {
                     EventKind::UserMessage {
                         device_id: elsewhere,
                         text: "x".into(),
+                        attachments: Vec::new(),
                     },
                 )
             },
@@ -1181,6 +1184,7 @@ fn a_moved_context_opens_its_new_session_once_the_move_is_pulled() {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "fix it".into(),
+                    attachments: Vec::new(),
                 },
             ),
             event(

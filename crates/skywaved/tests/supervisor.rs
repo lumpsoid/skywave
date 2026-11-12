@@ -212,6 +212,7 @@ impl Fixture {
                 session_id: self.session_id,
                 context,
                 text: text.into(),
+                attachments: Vec::new(),
             },
         ))
     }
@@ -4370,6 +4371,7 @@ fn send_in(f: &mut Fixture, session: SessionId, text: &str) -> Seq {
             session_id: session,
             context: ContextId::first_of(session),
             text: text.into(),
+            attachments: Vec::new(),
         },
     ))
 }
@@ -5206,6 +5208,7 @@ async fn a_low_disk_pauses_the_agent_refuses_new_work_and_still_interrupts_and_s
         session_id: f.session_id,
         context,
         text: "more".into(),
+        attachments: Vec::new(),
     };
     assert_eq!(
         rejected(f.handle(DeviceId::new(), message)),
@@ -5298,6 +5301,7 @@ async fn a_start_below_the_floor_comes_up_paused() {
         session_id: f.session_id,
         context,
         text: "two".into(),
+        attachments: Vec::new(),
     };
     assert_eq!(
         rejected(f.handle(DeviceId::new(), message)),
@@ -6073,6 +6077,7 @@ impl Fixture {
                 session_id: self.session_id,
                 context,
                 text: text.into(),
+                attachments: Vec::new(),
             },
         )
     }

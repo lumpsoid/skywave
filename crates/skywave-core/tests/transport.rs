@@ -246,6 +246,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
             session_id,
             context: ContextId::first_of(session_id),
             text: "hi".into(),
+            attachments: Vec::new(),
         },
     };
     let sent = tokio::time::timeout(SOON, transport.send_command(&send))
@@ -561,6 +562,7 @@ async fn log_of(transport: &HttpsTransport, fx: &Fixture, texts: Vec<String>) ->
                 session_id,
                 context: ContextId::first_of(session_id),
                 text,
+                attachments: Vec::new(),
             },
         };
         let CommandResult::Accepted { seq: sent } = transport.send_command(&send).await.unwrap()

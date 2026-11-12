@@ -743,10 +743,12 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                         session_id,
                         context,
                         text,
+                        ..
                     },
                     EventKind::UserMessage {
                         device_id,
                         text: logged,
+                        ..
                     },
                 ) => {
                     assert_eq!(*device_id, device);

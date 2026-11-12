@@ -87,6 +87,25 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::UserMessage {
             device_id: device(),
             text: "run the tests".into(),
+            attachments: Vec::new(),
+        },
+        EventKind::UserMessage {
+            device_id: device(),
+            text: "look at these".into(),
+            attachments: vec![
+                Attachment {
+                    blob: blob(),
+                    media_type: ImageType::Png,
+                },
+                Attachment {
+                    blob: BlobRef {
+                        id: Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0010).into(),
+                        size: 120_000,
+                        sha256: ContentHash::of(b"jpeg image"),
+                    },
+                    media_type: ImageType::Jpeg,
+                },
+            ],
         },
         EventKind::AgentMessage {
             parent: None,
@@ -837,6 +856,16 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             context: context(),
             text: "hello".into(),
+            attachments: Vec::new(),
+        },
+        CommandKind::SendMessage {
+            session_id: session(),
+            context: context(),
+            text: "look at these".into(),
+            attachments: vec![
+                ContentHash::of(b"png image"),
+                ContentHash::of(b"jpeg image"),
+            ],
         },
         CommandKind::ResolveApproval {
             id: approval(),
@@ -1282,6 +1311,46 @@ fn turn_usage_decodes_with_figures_left_out() {
         })
     );
     assert!(TurnUsage::default().is_empty());
+}
+
+#[test]
+fn v29_messages_read_as_without_attachments() {
+    let kind = decode(
+        r#"{"type":"user_message","device_id":"01920000-0000-7000-8000-000000000003","text":"hi"}"#,
+    );
+    assert!(
+        matches!(&kind, EventKind::UserMessage { attachments, .. } if attachments.is_empty()),
+        "{kind:?}"
+    );
+    let command: CommandKind = serde_json::from_str(
+        r#"{"type":"send_message","session_id":"01920000-0000-7000-8000-000000000001","context":"01920000-0000-7000-8000-000000000008","text":"hi"}"#,
+    )
+    .unwrap();
+    assert!(
+        matches!(&command, CommandKind::SendMessage { attachments, .. } if attachments.is_empty()),
+        "{command:?}"
+    );
+    // A text-only message writes exactly its v29 JSON, with no attachments key.
+    let text_only = EventKind::UserMessage {
+        device_id: device(),
+        text: "hi".into(),
+        attachments: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_string(&text_only).unwrap(),
+        r#"{"type":"user_message","device_id":"01920000-0000-7000-8000-000000000003","text":"hi"}"#
+    );
+    // Positive control: with an image, the key is there.
+    let with_image = EventKind::UserMessage {
+        device_id: device(),
+        text: "hi".into(),
+        attachments: vec![Attachment {
+            blob: blob(),
+            media_type: ImageType::Png,
+        }],
+    };
+    let json = serde_json::to_string(&with_image).unwrap();
+    assert!(json.contains(r#""attachments":[{"#), "{json}");
 }
 
 #[test]

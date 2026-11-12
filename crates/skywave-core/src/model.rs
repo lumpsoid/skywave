@@ -732,6 +732,7 @@ impl Model {
                     session_id,
                     context,
                     text,
+                    attachments: Vec::new(),
                 });
                 // The store drops the draft with the enqueue.
                 if !effects.is_empty() {
@@ -3227,6 +3228,7 @@ impl Model {
                     session_id,
                     context,
                     text,
+                    ..
                 } if *session_id == id && !logged.contains(&e.command.id) => {
                     if let Some(context) = contexts.iter_mut().find(|c| c.id == *context) {
                         context.messages += 1;
@@ -3328,7 +3330,9 @@ impl Model {
             let entry = match &event.kind {
                 // The server logs every message with its command id, the
                 // entry's key; one without would have none to show under.
-                EventKind::UserMessage { device_id, text } => event.command_id.map(|command_id| {
+                EventKind::UserMessage {
+                    device_id, text, ..
+                } => event.command_id.map(|command_id| {
                     logged.insert(command_id);
                     let sent = outbox.get(&command_id);
                     Entry::UserMessage {
@@ -3695,6 +3699,7 @@ impl Model {
                 session_id,
                 context,
                 text,
+                ..
             } if *session_id == id && !logged.contains(&e.command.id) => {
                 Some(TimelineItem::Pending {
                     command_id: e.command.id,
@@ -4676,6 +4681,7 @@ mod tests {
             session_id: sid,
             context,
             text: "hello".into(),
+            attachments: Vec::new(),
         };
         assert_eq!(
             send(&mut f),
@@ -4725,7 +4731,8 @@ mod tests {
             CommandKind::SendMessage {
                 session_id: sid,
                 context: skywave_proto::ContextId::first_of(sid),
-                text: "hello".into()
+                text: "hello".into(),
+                attachments: Vec::new(),
             }
         );
         // Queued: the time comes from the command's UUIDv7 id.
@@ -4808,6 +4815,7 @@ mod tests {
                     EventKind::UserMessage {
                         device_id: me,
                         text: "hello".into(),
+                        attachments: Vec::new(),
                     },
                 ),
                 (None, EventKind::SessionStateChanged(LogState::AgentWorking)),
@@ -4883,6 +4891,7 @@ mod tests {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "from the phone".into(),
+                    attachments: Vec::new(),
                 },
             )],
         );
@@ -5882,6 +5891,7 @@ mod tests {
                 EventKind::UserMessage {
                     device_id: phone,
                     text: "from the phone".into(),
+                    attachments: Vec::new(),
                 },
                 EventKind::ApprovalRequested {
                     id: approval,
@@ -5940,6 +5950,7 @@ mod tests {
                 kind: EventKind::UserMessage {
                     device_id: phone,
                     text: "again".into(),
+                    attachments: Vec::new(),
                 },
             }],
         };
@@ -6076,6 +6087,7 @@ mod tests {
         EventKind::UserMessage {
             device_id: DeviceId::new(),
             text: text.into(),
+            attachments: Vec::new(),
         }
     }
 
@@ -8666,6 +8678,7 @@ mod tests {
         let message = |device_id| EventKind::UserMessage {
             device_id,
             text: "hi".into(),
+            attachments: Vec::new(),
         };
         f.log(
             sid,
@@ -8709,6 +8722,7 @@ mod tests {
                 EventKind::UserMessage {
                     device_id: DeviceId::new(),
                     text: "go on".into(),
+                    attachments: Vec::new(),
                 },
                 agent("done"),
             ],
@@ -8740,6 +8754,7 @@ mod tests {
         let message = |device_id| EventKind::UserMessage {
             device_id,
             text: "hi".into(),
+            attachments: Vec::new(),
         };
         // Created here: the first message, then the agent's answer.
         let sid = f.session("/srv/a");
@@ -10964,6 +10979,7 @@ mod tests {
                 EventKind::UserMessage {
                     device_id: f.me,
                     text: "hello".into(),
+                    attachments: Vec::new(),
                 },
             )],
         );

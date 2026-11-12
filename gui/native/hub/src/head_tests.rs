@@ -2215,6 +2215,7 @@ fn context_intents_map_to_actions_and_the_screen_lists_the_contexts() {
     rig.log(vec![EventKind::UserMessage {
         device_id: DeviceId::new(),
         text: "fix the flaky test\nplease".into(),
+        attachments: Vec::new(),
     }]);
     let session = rig.open_session();
     assert!(session.can_clear, "positive control");
@@ -2288,6 +2289,7 @@ fn a_context_moves_once_the_core_offers_it_and_a_queued_move_can_be_discarded() 
     rig.log(vec![EventKind::UserMessage {
         device_id: DeviceId::new(),
         text: "fix it".into(),
+        attachments: Vec::new(),
     }]);
     let row = rig.open_session().contexts[0].clone();
     assert!(!row.can_move, "negative control: no turn answered yet");
