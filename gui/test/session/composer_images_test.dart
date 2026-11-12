@@ -1,3 +1,4 @@
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -10,6 +11,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'rows.dart';
 
 final _originalPicker = pickImages;
+final _originalClipboard = readClipboardImage;
 
 TimelineHolder _holding() =>
     TimelineHolder()..apply(TimelineUpdateSnapshot(sessionId: 's1', items: []));
@@ -59,8 +61,31 @@ IconButton _sendButton(WidgetTester tester) => tester.widget<IconButton>(
   ),
 );
 
+/// Ctrl+V, as a key down and up with Ctrl held around it.
+Future<void> _pressCtrlV(WidgetTester tester) async {
+  await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+  await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+  await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+}
+
+/// Runs [body] as a Linux desktop. The override is reset inside the test:
+/// the binding checks foundation variables before any tearDown runs.
+Future<void> _asLinux(Future<void> Function() body) async {
+  debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+  try {
+    await body();
+  } finally {
+    debugDefaultTargetPlatformOverride = null;
+  }
+}
+
 void main() {
-  tearDown(() => pickImages = _originalPicker);
+  tearDown(() {
+    pickImages = _originalPicker;
+    readClipboardImage = _originalClipboard;
+    TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, null);
+  });
 
   testWidgets('chips show the draft\'s images and ✕ detaches', (tester) async {
     final sent = <GuiIntent>[];
@@ -174,5 +199,125 @@ void main() {
       sent: sent,
     );
     expect(find.byKey(const Key('attach-image')), findsOneWidget);
+  });
+
+  testWidgets(
+    'Ctrl+V with an image in the clipboard attaches it',
+    (tester) => _asLinux(() async {
+      readClipboardImage = () async => Uint8List.fromList([1, 2, 3]);
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(composer: _draft(text: 'look')),
+        timeline: _holding(),
+        sent: sent,
+      );
+      await tester.tap(_composer());
+      await tester.pump();
+      await _pressCtrlV(tester);
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAttachImageBytes>(), [
+        GuiIntentAttachImageBytes(
+          sessionId: 's1',
+          bytes: Uint8List.fromList([1, 2, 3]),
+          mime: 'image/png',
+        ),
+      ]);
+      expect(tester.widget<TextField>(_composer()).controller!.text, 'look');
+    }),
+  );
+
+  testWidgets(
+    'Ctrl+V with text only pastes the text',
+    (tester) => _asLinux(() async {
+      readClipboardImage = () async => null;
+      TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'Clipboard.getData') {
+              return <String, Object?>{'text': 'hello'};
+            }
+            return null;
+          });
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: _holding(),
+        sent: sent,
+      );
+      await tester.tap(_composer());
+      await tester.pump();
+      await _pressCtrlV(tester);
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(_composer()).controller!.text, 'hello');
+      expect(sent.whereType<GuiIntentAttachImageBytes>(), isEmpty);
+    }),
+  );
+
+  testWidgets(
+    'a dropped file is attached, in drop order',
+    (tester) => _asLinux(() async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: _holding(),
+        sent: sent,
+      );
+      tester.widget<DropTarget>(find.byType(DropTarget)).onDragDone!(
+        DropDoneDetails(
+          files: [DropItemFile('/a.png'), DropItemFile('/b.txt')],
+          localPosition: Offset.zero,
+          globalPosition: Offset.zero,
+        ),
+      );
+      await tester.pump();
+      expect(sent.whereType<GuiIntentAttachImageFile>(), [
+        const GuiIntentAttachImageFile(sessionId: 's1', path: '/a.png'),
+        const GuiIntentAttachImageFile(sessionId: 's1', path: '/b.txt'),
+      ]);
+
+      // Control: in shell mode the drop target is off.
+      sent.clear();
+      await pumpSession(
+        tester,
+        screen: screenWith(composer: _draft(mode: ComposerModeView.shell)),
+        timeline: _holding(),
+        sent: sent,
+      );
+      expect(
+        tester.widget<DropTarget>(find.byType(DropTarget)).enable,
+        isFalse,
+      );
+    }),
+  );
+
+  testWidgets('keyboard image insertion attaches it', (tester) async {
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: _holding(),
+      sent: sent,
+    );
+    final insertion = tester
+        .widget<TextField>(_composer())
+        .contentInsertionConfiguration!;
+    expect(insertion.allowedMimeTypes, contains('image/png'));
+    insertion.onContentInserted(
+      KeyboardInsertedContent(
+        mimeType: 'image/png',
+        uri: 'content://x',
+        data: Uint8List.fromList([9]),
+      ),
+    );
+    await tester.pump();
+    expect(sent.whereType<GuiIntentAttachImageBytes>(), [
+      GuiIntentAttachImageBytes(
+        sessionId: 's1',
+        bytes: Uint8List.fromList([9]),
+        mime: 'image/png',
+      ),
+    ]);
   });
 }

@@ -2,6 +2,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:pasteboard/pasteboard.dart';
 
 /// Asks the user for images and returns their local paths; empty when
 /// they cancel.
@@ -9,6 +10,12 @@ typedef PickImages = Future<List<String>> Function(BuildContext context);
 
 /// The picker the composer uses. Tests replace it.
 PickImages pickImages = _pickPlatform;
+
+/// The image on the system clipboard as PNG bytes, or null when it holds
+/// none. The composer uses it on desktop paste. Tests replace it.
+Future<Uint8List?> Function() readClipboardImage = _pasteboardImage;
+
+Future<Uint8List?> _pasteboardImage() => Pasteboard.image;
 
 Future<List<String>> _pickPlatform(BuildContext context) =>
     switch (defaultTargetPlatform) {

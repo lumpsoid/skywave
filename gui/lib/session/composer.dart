@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart' hide listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,15 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// Whether Enter sends (a hardware keyboard is the norm) or makes a new
 /// line (a soft keyboard, with the send button).
 bool get enterSends => switch (defaultTargetPlatform) {
+  TargetPlatform.linux ||
+  TargetPlatform.macOS ||
+  TargetPlatform.windows => true,
+  _ => false,
+};
+
+/// Whether images can be pasted (Ctrl+V, Cmd+V on macOS) and dropped onto
+/// the composer: the desktops, where the clipboard and drop plugins apply.
+bool get _desktop => switch (defaultTargetPlatform) {
   TargetPlatform.linux ||
   TargetPlatform.macOS ||
   TargetPlatform.windows => true,
@@ -158,11 +168,55 @@ class ComposerState extends State<Composer> {
   Future<void> _attach() async {
     final paths = await pickImages(context);
     if (!mounted) return;
+    _attachFiles(paths);
+  }
+
+  /// Attaches each file to the draft, in order. The hub refuses what is not
+  /// an image, with a notice.
+  void _attachFiles(List<String> paths) {
     for (final path in paths) {
       widget.send(
         GuiIntentAttachImageFile(sessionId: widget.sessionId, path: path),
       );
     }
+  }
+
+  /// Ctrl+V (Cmd+V on macOS): an image on the clipboard is attached, and
+  /// anything else is pasted as text, as the field would paste it.
+  Future<void> _paste() async {
+    final image = await readClipboardImage();
+    if (!mounted) return;
+    if (image != null) {
+      widget.send(
+        GuiIntentAttachImageBytes(
+          sessionId: widget.sessionId,
+          bytes: image,
+          mime: 'image/png',
+        ),
+      );
+      return;
+    }
+    final text = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
+    if (!mounted || text == null) return;
+    final selection = _field.selection.isValid
+        ? _field.selection
+        : TextSelection.collapsed(offset: _field.text.length);
+    _field.value = _field.value.replaced(selection, text);
+  }
+
+  /// Content the phone keyboard inserts (a GIF from the keyboard's
+  /// picker, say): attached when it came with its bytes. The mime types
+  /// are limited to images by the configuration.
+  void _contentInserted(KeyboardInsertedContent content) {
+    final data = content.data;
+    if (data == null) return;
+    widget.send(
+      GuiIntentAttachImageBytes(
+        sessionId: widget.sessionId,
+        bytes: data,
+        mime: content.mimeType,
+      ),
+    );
   }
 
   /// Opens the snippets (in shell mode the saved commands); one put in
@@ -192,6 +246,16 @@ class ComposerState extends State<Composer> {
     final composing =
         _field.value.composing.isValid && !_field.value.composing.isCollapsed;
     if (composing) return KeyEventResult.ignored;
+
+    final paste = defaultTargetPlatform == TargetPlatform.macOS
+        ? keyboard.isMetaPressed
+        : keyboard.isControlPressed;
+    if (paste && key == LogicalKeyboardKey.keyV && _desktop && !_shell) {
+      // Handled here so the field's own paste does not run as well. Only
+      // the key down pastes: a held key repeats without pasting again.
+      if (event is KeyDownEvent) _paste();
+      return KeyEventResult.handled;
+    }
 
     if (key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter) {
@@ -230,7 +294,7 @@ class ComposerState extends State<Composer> {
     final composer = widget.composer;
     final shell = _shell;
     final notes = [?composer.toLabel, ?composer.historyLabel];
-    return Material(
+    final body = Material(
       color: theme.colorScheme.surfaceContainer,
       child: SafeArea(
         top: false,
@@ -313,6 +377,18 @@ class ComposerState extends State<Composer> {
                           : TextCapitalization.sentences,
                       autocorrect: !shell,
                       enableSuggestions: !shell,
+                      // The phone keyboard's images (agent mode only).
+                      contentInsertionConfiguration: shell
+                          ? null
+                          : ContentInsertionConfiguration(
+                              allowedMimeTypes: const [
+                                'image/png',
+                                'image/jpeg',
+                                'image/gif',
+                                'image/webp',
+                              ],
+                              onContentInserted: _contentInserted,
+                            ),
                       style: shell
                           ? const TextStyle(
                               fontFamily: monoFamily,
@@ -372,6 +448,14 @@ class ComposerState extends State<Composer> {
           ),
         ),
       ),
+    );
+    // Files dropped on a desktop window; off in shell mode.
+    if (!_desktop) return body;
+    return DropTarget(
+      enable: !shell,
+      onDragDone: (details) =>
+          _attachFiles([for (final file in details.files) file.path]),
+      child: body,
     );
   }
 }
