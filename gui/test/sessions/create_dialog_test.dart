@@ -73,6 +73,7 @@ void main() {
             CandidateView(path: '/srv/two', recent: false),
           ],
           selected: 0,
+          stale: false,
           statusLabel: 'more not shown · keep typing',
         ),
       ),
@@ -120,6 +121,7 @@ void main() {
         popup: CompletionPopup(
           candidates: [],
           selected: 0,
+          stale: false,
           emptyLabel: 'no matching directories',
         ),
       ),

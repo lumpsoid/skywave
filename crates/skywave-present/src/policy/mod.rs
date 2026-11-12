@@ -15,7 +15,6 @@
 //!   device's finished.
 //! - [`PromptHistory`]: recalling earlier prompts, or shell commands, with
 //!   a stash.
-//! - [`CompletionSettle`]: workdir completion.
 //! - [`WorkdirPicker`]: the workdir candidate list, always shown, with its
 //!   highlight and descent into a directory.
 //! - [`TimelineSearch`]: the timeline search's query, matches and current
@@ -29,7 +28,6 @@
 //! [`looks_like_pair_uri`], [`shell_stop`], [`message_refusal`].
 
 mod alert;
-mod completion;
 mod conversation;
 mod draft;
 mod expand;
@@ -42,7 +40,6 @@ mod workdir_picker;
 pub use alert::{
     Alert, AlertUpdate, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise,
 };
-pub use completion::CompletionSettle;
 pub use conversation::{ConversationOnly, in_conversation};
 pub use draft::{DRAFT_SAVE_AFTER, DraftSaver, message_refusal};
 pub use expand::ExpandFetch;

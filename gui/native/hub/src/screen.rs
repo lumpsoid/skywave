@@ -24,7 +24,7 @@ use skywave_present::format::{
 };
 use skywave_present::limits;
 use skywave_present::login;
-use skywave_present::policy::{CompletionSettle, dismissable, question_unanswered, unanswered};
+use skywave_present::policy::{WorkdirPicker, dismissable, question_unanswered, unanswered};
 use skywave_present::question::reply_text;
 use skywave_present::sections::{
     ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
@@ -76,14 +76,14 @@ pub struct Ui<'a> {
     pub conversation_only: bool,
 }
 
-/// The new-session prompt: its input as the hub knows it and the
-/// completion settling it.
+/// The new-session prompt: its input as the hub knows it and the highlight
+/// in its candidate list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateUi {
     pub input: String,
     /// Bumped whenever the hub rewrites `input`.
     pub rev: u32,
-    pub settle: CompletionSettle,
+    pub picker: WorkdirPicker,
     /// The optional outside agent conversation id the user typed. The
     /// user's alone: the hub never rewrites it, so it needs no rev.
     pub conversation: String,
@@ -312,35 +312,32 @@ fn creating_view(pending: &PendingSession) -> CreatingView {
 }
 
 fn create_prompt(create: &CreateUi, completion: Option<&Completion>, link: &Link) -> CreatePrompt {
-    let popup = completion
-        .filter(|_| create.settle.open())
-        .map(|completion| {
-            let offline = matches!(link, Link::Reconnecting { .. } | Link::Rejected(_));
-            CompletionPopup {
-                candidates: completion
-                    .candidates
-                    .iter()
-                    .map(|c| CandidateView {
-                        path: clean_line(&c.path),
-                        recent: c.source == CandidateSource::Recent,
-                    })
-                    .collect(),
-                selected: count(create.settle.selected()),
-                status_label: match completion.status {
-                    CompletionStatus::Loading => Some("listing…"),
-                    CompletionStatus::Unavailable if offline => Some("offline · recent only"),
-                    CompletionStatus::Unavailable => Some("unavailable · recent only"),
-                    CompletionStatus::Ready { truncated: true } => {
-                        Some("more not shown · keep typing")
-                    }
-                    CompletionStatus::Ready { truncated: false } => None,
-                }
-                .map(str::to_owned),
-                empty_label: (completion.candidates.is_empty()
-                    && completion.status != CompletionStatus::Loading)
-                    .then(|| "no matching directories".to_owned()),
+    let popup = completion.map(|completion| {
+        let offline = matches!(link, Link::Reconnecting { .. } | Link::Rejected(_));
+        CompletionPopup {
+            candidates: completion
+                .candidates
+                .iter()
+                .map(|c| CandidateView {
+                    path: clean_line(&c.path),
+                    recent: c.source == CandidateSource::Recent,
+                })
+                .collect(),
+            selected: create.picker.highlighted().map(count),
+            stale: completion.input != create.input,
+            status_label: match completion.status {
+                CompletionStatus::Loading => Some("listing…"),
+                CompletionStatus::Unavailable if offline => Some("offline · recent only"),
+                CompletionStatus::Unavailable => Some("unavailable · recent only"),
+                CompletionStatus::Ready { truncated: true } => Some("more not shown · keep typing"),
+                CompletionStatus::Ready { truncated: false } => None,
             }
-        });
+            .map(str::to_owned),
+            empty_label: (completion.candidates.is_empty()
+                && completion.status != CompletionStatus::Loading)
+                .then(|| "no matching directories".to_owned()),
+        }
+    });
     CreatePrompt {
         input: create.input.clone(),
         input_rev: create.rev,

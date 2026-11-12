@@ -289,6 +289,7 @@ void main() {
           popup: CompletionPopup(
             candidates: [CandidateView(path: '/srv/one', recent: true)],
             selected: 0,
+            stale: false,
             statusLabel: 'offline · recent only',
           ),
         ),
