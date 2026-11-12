@@ -28,6 +28,7 @@ pub use skywave_proto::{LimitSeverity, LimitWindow, UsageLimit, UsageLimitsResul
 pub use crate::projection::{SessionUsage, TurnRecord};
 
 use crate::address::ServerAddress;
+use crate::attachment::AttachedImage;
 use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
 
 /// One full snapshot of everything a head shows. Pushed whole after every
@@ -1178,6 +1179,10 @@ pub struct SessionView {
     pub mode: ComposerMode,
     /// This device's unsent message, as last saved.
     pub draft: Option<Draft>,
+    /// This device's images for the next message, in order
+    /// ([`Action::Attach`](crate::Action::Attach)). The files are at
+    /// [`attachment::attachment_path`](crate::attachment::attachment_path).
+    pub draft_images: Vec<AttachedImage>,
     /// This device's unsent shell command, as last saved, with the
     /// condition picked for it ([`Draft::when`]). Kept even with blank
     /// text when a condition other than [`RunWhen::Always`] was picked.
@@ -2050,6 +2055,7 @@ mod tests {
             task_stops: Vec::new(),
             mode: ComposerMode::Agent,
             draft: None,
+            draft_images: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: ShellView::default(),

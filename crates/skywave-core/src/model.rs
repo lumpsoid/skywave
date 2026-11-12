@@ -10,15 +10,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use skywave_proto::limits::{ATTACHMENTS_MAX, ATTACHMENTS_MAX_TOTAL_BYTES};
 use skywave_proto::{
-    BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ConversationsResult, DeviceInfo,
-    DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem, LoginFinishResult,
-    LoginStartResult, QuestionAnswer, RejectReason, RuleSuggestion, SessionOrigin,
-    SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, answers_fit,
+    BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ContentHash, ConversationsResult,
+    DeviceInfo, DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem,
+    LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RuleSuggestion,
+    SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, answers_fit,
 };
 
 use crate::action::{Action, Route};
 use crate::address::{ServerAddress, ServerAddresses};
+use crate::attachment::AttachedImage;
 use crate::completion::Completer;
 use crate::conversations::Conversations;
 use crate::identity::{Identity, Pairing};
@@ -65,6 +67,10 @@ pub(crate) enum Effect {
     SaveServerAddresses(ServerAddresses),
     /// Keep the session's draft in that mode; `None` deletes it.
     SaveDraft((SessionId, ComposerMode), Option<Draft>),
+    /// Add the image to the session's agent draft, after the images it holds.
+    AttachToDraft(SessionId, AttachedImage),
+    /// Take the image with this hash off the session's agent draft.
+    DetachFromDraft(SessionId, ContentHash),
     SaveComposerMode(SessionId, ComposerMode),
     SaveReadMark(SessionId, ReadMark),
     SaveSnippet(Snippet),
@@ -74,6 +80,9 @@ pub(crate) enum Effect {
     Withdraw {
         id: CommandId,
         draft: Option<((SessionId, ComposerMode), Draft)>,
+        /// The session's agent draft images after the withdrawal, in order,
+        /// written with the rest; `None` leaves them as they are.
+        images: Option<(SessionId, Vec<ContentHash>)>,
     },
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
@@ -289,6 +298,11 @@ pub(crate) struct Model {
     blobs_disk_full: bool,
     /// This device's unsent messages and shell commands, as stored.
     drafts: HashMap<(SessionId, ComposerMode), Draft>,
+    /// The images of each session's agent draft, in order, as stored.
+    draft_images: HashMap<SessionId, Vec<AttachedImage>>,
+    /// Every known image's metadata, as stored: a queued message's
+    /// attachments are looked up here when it is taken back into a draft.
+    attachments: HashMap<ContentHash, AttachedImage>,
     /// What each session's composer writes where it is not the agent, as
     /// stored.
     composer_modes: HashMap<SessionId, ComposerMode>,
@@ -390,6 +404,8 @@ impl Model {
             wanted: HashSet::new(),
             blobs_disk_full: false,
             drafts: HashMap::new(),
+            draft_images: HashMap::new(),
+            attachments: HashMap::new(),
             composer_modes: HashMap::new(),
             draft_rev: 0,
             read_marks: HashMap::new(),
@@ -429,6 +445,8 @@ impl Model {
         self.blobs = snapshot.blobs.into_iter().map(|b| (b.id, b)).collect();
         self.fates = snapshot.fates;
         self.drafts = snapshot.drafts;
+        self.draft_images = snapshot.draft_images;
+        self.attachments = snapshot.attachments;
         self.composer_modes = snapshot.composer_modes;
         self.read_marks = snapshot.read_marks;
         self.snippets = Snippets::new(snapshot.snippets);
@@ -722,9 +740,16 @@ impl Model {
                 let Some(summary) = self.summary(session_id) else {
                     return Vec::new();
                 };
-                if text.trim().is_empty() {
+                // The draft's images are the message's attachments: core
+                // owns them, so the head sends only the text.
+                let images = self.draft_images_of(session_id);
+                if text.trim().is_empty() && images.is_empty() {
                     return Vec::new();
                 }
+                if !within_attachment_caps(images) {
+                    return Vec::new();
+                }
+                let attachments = images.iter().map(|image| image.sha256).collect();
                 // The message goes where this device's own clear or switch
                 // on its way leads, so it is not refused for that.
                 let context = self.target_context(summary);
@@ -732,11 +757,12 @@ impl Model {
                     session_id,
                     context,
                     text,
-                    attachments: Vec::new(),
+                    attachments,
                 });
-                // The store drops the draft with the enqueue.
+                // The store drops the draft and its images with the enqueue.
                 if !effects.is_empty() {
                     self.drafts.remove(&(session_id, ComposerMode::Agent));
+                    self.draft_images.remove(&session_id);
                 }
                 effects
             }
@@ -784,6 +810,32 @@ impl Model {
                 cursor,
                 when,
             } => self.save_draft((session_id, mode), text, cursor, when),
+            Action::Attach { session_id, image } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                let mut images = self.draft_images_of(session_id).to_vec();
+                if images.iter().any(|held| held.sha256 == image.sha256) {
+                    return Vec::new();
+                }
+                images.push(image.clone());
+                if !within_attachment_caps(&images) {
+                    return Vec::new();
+                }
+                self.attachments.insert(image.sha256, image.clone());
+                self.set_draft_images(session_id, images);
+                vec![Effect::AttachToDraft(session_id, image)]
+            }
+            Action::Detach { session_id, sha256 } => {
+                let mut images = self.draft_images_of(session_id).to_vec();
+                let held = images.len();
+                images.retain(|image| image.sha256 != sha256);
+                if images.len() == held {
+                    return Vec::new();
+                }
+                self.set_draft_images(session_id, images);
+                vec![Effect::DetachFromDraft(session_id, sha256)]
+            }
             Action::SaveSnippet { name, text, kind } => self
                 .snippets
                 .save(&name, text, kind)
@@ -1506,48 +1558,109 @@ impl Model {
         };
         // A message is set off from the draft by a blank line, a shell
         // command by a line break: the next line is the next command.
-        let (key, text, when, separator) = match &self.outbox[index].command.kind {
+        let (key, text, when, separator, attachments) = match &self.outbox[index].command.kind {
             CommandKind::SendMessage {
-                session_id, text, ..
+                session_id,
+                text,
+                attachments,
+                ..
             } if edit => (
                 (*session_id, ComposerMode::Agent),
                 text,
                 RunWhen::Always,
                 "\n\n",
+                attachments.as_slice(),
             ),
             CommandKind::RunShell {
                 session_id,
                 command,
                 when,
-            } if edit => ((*session_id, ComposerMode::Shell), command, *when, "\n"),
+            } if edit => (
+                (*session_id, ComposerMode::Shell),
+                command,
+                *when,
+                "\n",
+                &[][..],
+            ),
             _ if edit => return Vec::new(),
             _ => {
                 self.outbox.remove(index);
                 return vec![
-                    Effect::Withdraw { id, draft: None },
+                    Effect::Withdraw {
+                        id,
+                        draft: None,
+                        images: None,
+                    },
                     Effect::Request(Request::OutboxChanged),
                 ];
             }
         };
-        let joined = match self.drafts.get(&key) {
-            Some(old) if !old.text.trim().is_empty() => format!("{text}{separator}{}", old.text),
-            _ => text.clone(),
+        // A blank message adds no lines in front of the draft's text.
+        let old = self.drafts.get(&key).map_or("", |old| old.text.as_str());
+        let joined = match (text.trim().is_empty(), old.trim().is_empty()) {
+            (true, _) => old.to_owned(),
+            (false, true) => text.clone(),
+            (false, false) => format!("{text}{separator}{old}"),
         };
         let draft = Draft {
             cursor: text.chars().count(),
             text: joined,
             when,
         };
+        let restored = (!attachments.is_empty()).then(|| self.restored_images(key.0, attachments));
         self.outbox.remove(index);
         self.drafts.insert(key, draft.clone());
         self.draft_rev += 1;
+        let images = restored.map(|images| {
+            let hashes: Vec<ContentHash> = images.iter().map(|image| image.sha256).collect();
+            self.set_draft_images(key.0, images);
+            (key.0, hashes)
+        });
         vec![
             Effect::Withdraw {
                 id,
                 draft: Some((key, draft)),
+                images,
             },
             Effect::Request(Request::OutboxChanged),
         ]
+    }
+
+    /// The images an edited message puts back into `session_id`'s agent
+    /// draft: its own, in order, then the draft's that it does not hold. A
+    /// message's image with no metadata known here is skipped.
+    fn restored_images(
+        &self,
+        session_id: SessionId,
+        attachments: &[ContentHash],
+    ) -> Vec<AttachedImage> {
+        let own: Vec<AttachedImage> = attachments
+            .iter()
+            .filter_map(|sha256| self.attachments.get(sha256).cloned())
+            .collect();
+        let kept: Vec<AttachedImage> = self
+            .draft_images_of(session_id)
+            .iter()
+            .filter(|held| !own.iter().any(|image| image.sha256 == held.sha256))
+            .cloned()
+            .collect();
+        own.into_iter().chain(kept).collect()
+    }
+
+    /// The images the session's agent draft holds, in order.
+    fn draft_images_of(&self, session_id: SessionId) -> &[AttachedImage] {
+        self.draft_images
+            .get(&session_id)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Sets the session's agent draft images; none removes the entry.
+    fn set_draft_images(&mut self, session_id: SessionId, images: Vec<AttachedImage>) {
+        if images.is_empty() {
+            self.draft_images.remove(&session_id);
+        } else {
+            self.draft_images.insert(session_id, images);
+        }
     }
 
     /// Pending in the replica and not already answered from this device
@@ -1883,6 +1996,7 @@ impl Model {
         self.sessions.retain(|s| s.id != id);
         self.turns.retain(|t| t.session_id != id);
         self.drafts.retain(|(session, _), _| *session != id);
+        self.draft_images.remove(&id);
         self.composer_modes.remove(&id);
         self.read_marks.remove(&id);
         self.outbox
@@ -2746,6 +2860,7 @@ impl Model {
             task_stops: self.task_stops(summary, events),
             mode: self.composer_mode(id),
             draft: self.drafts.get(&(id, ComposerMode::Agent)).cloned(),
+            draft_images: self.draft_images_of(id).to_vec(),
             shell_draft: self.drafts.get(&(id, ComposerMode::Shell)).cloned(),
             draft_rev: self.draft_rev,
             shell: self.shell_view(id, events),
@@ -4300,6 +4415,15 @@ fn fresh_context_name(used: &HashSet<String>, mut roll: impl FnMut() -> String) 
     fresh
 }
 
+/// Whether `images` fit one message: at most [`ATTACHMENTS_MAX`] of them,
+/// and at most [`ATTACHMENTS_MAX_TOTAL_BYTES`] bytes together.
+fn within_attachment_caps(images: &[AttachedImage]) -> bool {
+    let bytes = images
+        .iter()
+        .fold(0u64, |sum, image| sum.saturating_add(image.size));
+    images.len() <= ATTACHMENTS_MAX && bytes <= ATTACHMENTS_MAX_TOTAL_BYTES
+}
+
 /// The session a command names, if it names one. An answer names its
 /// approval only; its session is pending that approval meanwhile.
 fn command_session(kind: &CommandKind) -> Option<SessionId> {
@@ -4363,8 +4487,8 @@ mod tests {
 
     use chrono::{TimeDelta, TimeZone, Utc};
     use skywave_proto::{
-        BlobRef, Decision, Effort, ImportOutcome, RejectReason, RuleScope, ToolDisplay, ToolKind,
-        ToolResult,
+        BlobRef, Decision, Effort, ImageType, ImportOutcome, RejectReason, RuleScope, ToolDisplay,
+        ToolKind, ToolResult,
     };
 
     use super::*;
@@ -7213,6 +7337,7 @@ mod tests {
                 Effect::Withdraw {
                     id: first.id,
                     draft: Some(((sid, ComposerMode::Agent), draft.clone())),
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -7243,6 +7368,7 @@ mod tests {
                             when: RunWhen::Always,
                         }
                     )),
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -7258,6 +7384,7 @@ mod tests {
                 Effect::Withdraw {
                     id: third.id,
                     draft: None,
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -7269,6 +7396,280 @@ mod tests {
         let interrupt = queued(&f.dispatch(Action::Interrupt { session_id: sid }));
         assert!(f.dispatch(Action::EditQueued(interrupt.id)).is_empty());
         assert!(f.dispatch(Action::Discard(interrupt.id)).is_empty());
+    }
+
+    /// A small PNG image tagged `tag` (its hash is the tag's), `size` bytes.
+    fn image(tag: u8, size: u64) -> AttachedImage {
+        AttachedImage {
+            sha256: ContentHash::of(&[tag]),
+            media_type: ImageType::Png,
+            size,
+            width: 16,
+            height: 16,
+        }
+    }
+
+    /// The images the open session's agent draft shows.
+    fn draft_images(f: &Fixture) -> Vec<AttachedImage> {
+        f.session_view().draft_images
+    }
+
+    #[test]
+    fn attach_and_detach_change_the_draft_images() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let a = image(1, 100);
+
+        assert_eq!(
+            f.dispatch(Action::Attach {
+                session_id: sid,
+                image: a.clone(),
+            }),
+            vec![Effect::AttachToDraft(sid, a.clone())]
+        );
+        assert_eq!(draft_images(&f), vec![a.clone()]);
+        assert!(
+            f.dispatch(Action::Attach {
+                session_id: sid,
+                image: a.clone(),
+            })
+            .is_empty(),
+            "a draft holds an image once"
+        );
+        assert_eq!(
+            f.dispatch(Action::Detach {
+                session_id: sid,
+                sha256: a.sha256,
+            }),
+            vec![Effect::DetachFromDraft(sid, a.sha256)]
+        );
+        assert!(draft_images(&f).is_empty());
+        assert!(
+            f.dispatch(Action::Detach {
+                session_id: sid,
+                sha256: a.sha256,
+            })
+            .is_empty(),
+            "already off the draft"
+        );
+        let unknown = SessionId::new();
+        assert!(
+            f.dispatch(Action::Attach {
+                session_id: unknown,
+                image: a,
+            })
+            .is_empty(),
+            "an unknown session has no draft"
+        );
+    }
+
+    #[test]
+    fn the_draft_refuses_an_image_past_either_cap() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        for tag in 0..8 {
+            let effects = f.dispatch(Action::Attach {
+                session_id: sid,
+                image: image(tag, 1_000),
+            });
+            assert_eq!(effects.len(), 1, "image {tag} fits");
+        }
+        assert!(
+            f.dispatch(Action::Attach {
+                session_id: sid,
+                image: image(8, 1_000),
+            })
+            .is_empty(),
+            "a ninth image is past the count cap"
+        );
+        assert_eq!(draft_images(&f).len(), 8);
+
+        // Bytes count together: two of 4 MB fit in 10 MB, a third of 2.5 MB
+        // does not.
+        let other = f.session("/srv/b");
+        f.open(other);
+        for tag in [20, 21] {
+            let effects = f.dispatch(Action::Attach {
+                session_id: other,
+                image: image(tag, 4_000_000),
+            });
+            assert_eq!(effects.len(), 1, "image {tag} fits");
+        }
+        assert!(
+            f.dispatch(Action::Attach {
+                session_id: other,
+                image: image(22, 2_500_000),
+            })
+            .is_empty(),
+            "the bytes are past the total cap"
+        );
+        assert_eq!(draft_images(&f).len(), 2);
+    }
+
+    #[test]
+    fn a_message_takes_its_draft_images_even_with_blank_text() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let (a, b) = (image(1, 100), image(2, 200));
+        f.dispatch(Action::Attach {
+            session_id: sid,
+            image: a.clone(),
+        });
+        f.dispatch(Action::Attach {
+            session_id: sid,
+            image: b.clone(),
+        });
+
+        let command = queued(&f.dispatch(Action::SendMessage {
+            session_id: sid,
+            text: "  ".into(),
+        }));
+        let CommandKind::SendMessage { attachments, .. } = command.kind else {
+            panic!("expected a message");
+        };
+        assert_eq!(attachments, vec![a.sha256, b.sha256]);
+        assert!(draft_images(&f).is_empty(), "sending takes the images");
+
+        assert!(
+            f.dispatch(Action::SendMessage {
+                session_id: sid,
+                text: " ".into(),
+            })
+            .is_empty(),
+            "blank with no images is not sent"
+        );
+    }
+
+    #[test]
+    fn a_draft_past_a_cap_is_not_sent() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        for tag in 0..5 {
+            f.dispatch(Action::Attach {
+                session_id: sid,
+                image: image(tag, 100),
+            });
+        }
+        let first = send(&mut f, sid, "five images");
+        for tag in 5..9 {
+            f.dispatch(Action::Attach {
+                session_id: sid,
+                image: image(tag, 100),
+            });
+        }
+        assert_eq!(draft_images(&f).len(), 4);
+
+        // Taken back, the message's five go ahead of the four: nine, past
+        // the count cap. Edits are not refused, sending is.
+        f.dispatch(Action::EditQueued(first.id));
+        assert_eq!(draft_images(&f).len(), 9);
+        assert!(
+            f.dispatch(Action::SendMessage {
+                session_id: sid,
+                text: "go".into(),
+            })
+            .is_empty(),
+            "the draft is past the count cap"
+        );
+        assert_eq!(draft_images(&f).len(), 9);
+    }
+
+    #[test]
+    fn editing_a_queued_message_puts_its_images_before_the_drafts() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let (a, b, c) = (image(1, 100), image(2, 200), image(3, 300));
+        f.dispatch(Action::Attach {
+            session_id: sid,
+            image: a.clone(),
+        });
+        let first = send(&mut f, sid, "look");
+        f.dispatch(Action::Attach {
+            session_id: sid,
+            image: b.clone(),
+        });
+        f.dispatch(Action::Attach {
+            session_id: sid,
+            image: c.clone(),
+        });
+        let rev = f.session_view().draft_rev;
+
+        assert_eq!(
+            f.dispatch(Action::EditQueued(first.id)),
+            vec![
+                Effect::Withdraw {
+                    id: first.id,
+                    draft: Some((
+                        (sid, ComposerMode::Agent),
+                        Draft {
+                            text: "look".into(),
+                            cursor: 4,
+                            when: RunWhen::Always,
+                        }
+                    )),
+                    images: Some((sid, vec![a.sha256, b.sha256, c.sha256])),
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        let view = f.session_view();
+        assert_eq!(view.draft_images, vec![a.clone(), b.clone(), c.clone()]);
+        assert!(view.draft_rev > rev, "heads refill their composer");
+
+        // A draft that already holds A keeps one A, at the message's place.
+        let other = f.session("/srv/b");
+        f.open(other);
+        f.dispatch(Action::Attach {
+            session_id: other,
+            image: a.clone(),
+        });
+        let again = send(&mut f, other, "again");
+        f.dispatch(Action::Attach {
+            session_id: other,
+            image: a.clone(),
+        });
+        f.dispatch(Action::Attach {
+            session_id: other,
+            image: b.clone(),
+        });
+        let effects = f.dispatch(Action::EditQueued(again.id));
+        assert_eq!(
+            effects[0],
+            Effect::Withdraw {
+                id: again.id,
+                draft: Some((
+                    (other, ComposerMode::Agent),
+                    Draft {
+                        text: "again".into(),
+                        cursor: 5,
+                        when: RunWhen::Always,
+                    }
+                )),
+                images: Some((other, vec![a.sha256, b.sha256])),
+            }
+        );
+        assert_eq!(draft_images(&f), vec![a.clone(), b.clone()]);
+
+        // Discarding a message takes its images with it: nothing goes back.
+        let third = send(&mut f, other, "never");
+        assert!(draft_images(&f).is_empty(), "sending takes the images");
+        assert_eq!(
+            f.dispatch(Action::Discard(third.id)),
+            vec![
+                Effect::Withdraw {
+                    id: third.id,
+                    draft: None,
+                    images: None,
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        assert!(draft_images(&f).is_empty());
     }
 
     #[test]
@@ -7297,6 +7698,7 @@ mod tests {
                             when: RunWhen::Always,
                         }
                     )),
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -7379,6 +7781,7 @@ mod tests {
                 Effect::Withdraw {
                     id: command.id,
                     draft: None,
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -7920,6 +8323,7 @@ mod tests {
                 Effect::Withdraw {
                     id: refused.id,
                     draft: None,
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -8830,8 +9234,8 @@ mod tests {
             pending_crops: Vec::new(),
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
-            draft_images: HashMap::new(),
-            attachments: HashMap::new(),
+            draft_images: model.draft_images.clone(),
+            attachments: model.attachments.clone(),
             composer_modes: model.composer_modes.clone(),
             read_marks: model.read_marks.clone(),
             deleted: model.deleted.clone(),
@@ -9843,7 +10247,8 @@ mod tests {
             vec![
                 Effect::Withdraw {
                     id: delete.id,
-                    draft: None
+                    draft: None,
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -9960,7 +10365,8 @@ mod tests {
             vec![
                 Effect::Withdraw {
                     id: cropped.id,
-                    draft: None
+                    draft: None,
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -10697,7 +11103,7 @@ mod tests {
         )));
         let effects = f.dispatch(Action::EditQueued(stale.id));
         assert!(
-            matches!(&effects[..], [Effect::Withdraw { id, draft: Some(_) }, _] if *id == stale.id)
+            matches!(&effects[..], [Effect::Withdraw { id, draft: Some(_), .. }, _] if *id == stale.id)
         );
         let view = f.session_view();
         assert_eq!(
@@ -11083,7 +11489,8 @@ mod tests {
             [
                 Effect::Withdraw {
                     id: moved.id,
-                    draft: None
+                    draft: None,
+                    images: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]

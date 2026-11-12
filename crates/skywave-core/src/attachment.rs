@@ -103,8 +103,9 @@ impl fmt::Display for AttachRefusal {
             Self::NotAnImage => f.write_str("not an image"),
             Self::TooLarge { bytes } => write!(
                 f,
-                "image too large ({:.1} MB after shrinking)",
-                *bytes as f64 / 1_000_000.0
+                "image too large ({:.1} MB; at most {:.2} MB)",
+                *bytes as f64 / 1_000_000.0,
+                ATTACHMENT_MAX_BYTES as f64 / 1_000_000.0
             ),
             Self::Unreadable => f.write_str("the image could not be read"),
         }
