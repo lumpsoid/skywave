@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
+import 'package:skywave_gui/session/row_tile.dart';
 import 'package:skywave_gui/session/search_holder.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
 import 'package:skywave_gui/session/timeline_view.dart';
@@ -28,6 +29,17 @@ String heldKey(WidgetTester tester) => tester
 /// The on-screen top of the row numbered [n], which shows `row <n>`.
 double topOf(WidgetTester tester, int n) =>
     tester.getRect(find.text('row $n')).top;
+
+/// The on-screen top of the whole row showing `row <n>`, its RowTile box. The
+/// text sits lower in a short row than in a tall one, so when a row's size
+/// changes the text can move inside a box whose top stays put.
+double rowTopOf(WidgetTester tester, int n) => tester
+    .getRect(
+      find
+          .ancestor(of: find.text('row $n'), matching: find.byType(RowTile))
+          .first,
+    )
+    .top;
 
 /// The number `n` of the newest row whose `row <n>` text lies entirely inside
 /// the list's rect.
@@ -375,38 +387,40 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    // Fails: Expected <524.0>, actual <508.0> (line 389)
+    // Measures the row's box, not its text: a tall row lays its text out 12 px
+    // below its top and a short one 28 px below (measured). The text moved
+    // 16 px inside a box whose top stayed put.
     testWidgets('the held row growing keeps its top still', (tester) async {
       final timeline = await scrolledBack(tester);
       final held = heldKey(tester);
       final n = int.parse(held.substring(2));
-      final before = topOf(tester, n);
-      final above = topOf(tester, n - 1);
+      final before = rowTopOf(tester, n);
+      final above = rowTopOf(tester, n - 1);
 
       timeline.apply(upsert(detailed(n), n));
       await tester.pumpAndSettle();
 
       expect(find.text('line 39'), findsOneWidget, reason: 'the row grew');
-      expect(topOf(tester, n), closeTo(before, 0.5));
-      expect(topOf(tester, n - 1), closeTo(above, 0.5));
+      expect(rowTopOf(tester, n), closeTo(before, 0.5));
+      expect(rowTopOf(tester, n - 1), closeTo(above, 0.5));
       expect(tester.takeException(), isNull);
-    }, skip: true);
+    });
 
-    // Fails: Expected <168.0>, actual <292.0> (line 405)
+    // At pixel 500 the view would clamp at the newest end, the fallback.
     testWidgets('the held row shrinking keeps its top still', (tester) async {
       final timeline = await pumpRows(tester, sixty(tallAt: 57));
-      await scrollTo(tester, 500);
+      await scrollTo(tester, 700);
       expect(heldKey(tester), 's:57');
-      final before = topOf(tester, 57);
+      final before = rowTopOf(tester, 57);
       expect(find.text('line 39'), findsOneWidget, reason: 'tall to start');
 
       timeline.apply(upsert(detailed(57, count: 1), 57));
       await tester.pumpAndSettle();
 
       expect(find.text('line 39'), findsNothing, reason: 'the row shrank');
-      expect(topOf(tester, 57), closeTo(before, 0.5));
+      expect(rowTopOf(tester, 57), closeTo(before, 0.5));
       expect(tester.takeException(), isNull);
-    }, skip: true);
+    });
 
     testWidgets('a held row taller than the viewport stays put when a row '
         'is added below', (tester) async {
@@ -584,14 +598,14 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    // Fails: Expected <456.0>, actual <428.0>, after toggle 2
     testWidgets('conversation only toggled five times keeps the message in '
         'view still', (tester) async {
       final timeline = await pumpMixedAtTool(tester);
-      final watched = newestMessage(tester);
-      final before = topOf(tester, watched);
 
       for (var i = 0; i < 5; i++) {
+        // Re-picked before each toggle, as the off test picks its message.
+        final watched = newestMessage(tester);
+        final before = topOf(tester, watched);
         if (i.isEven) {
           hideTools(timeline);
         } else {
@@ -605,7 +619,7 @@ void main() {
         );
       }
       expect(tester.takeException(), isNull);
-    }, skip: true);
+    });
 
     testWidgets('conversation only toggled across frames keeps the message in '
         'view still', (tester) async {
