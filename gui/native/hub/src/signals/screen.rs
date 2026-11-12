@@ -450,16 +450,21 @@ pub struct CreatePrompt {
     /// The input as the hub last set it; Dart overwrites its field only
     /// when `input_rev` changes (a completion filled it in).
     pub input: String,
+    /// Changes when a user action (Tab, Enter, a tap) rewrote the input;
+    /// never on a reply.
     pub input_rev: u32,
-    /// The candidate list, while open.
+    /// The candidate list; shown whenever the core has a completion.
     pub popup: Option<CompletionPopup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct CompletionPopup {
     pub candidates: Vec<CandidateView>,
-    /// The highlighted candidate.
-    pub selected: u32,
+    /// The highlighted candidate; none until ↓ (Enter then creates).
+    pub selected: Option<u32>,
+    /// The candidates are for an earlier input while a new directory loads:
+    /// shown dimmed, and they cannot be highlighted or chosen.
+    pub stale: bool,
     /// `listing…`, `offline · recent only`, `more not shown · keep typing`.
     pub status_label: Option<String>,
     /// `no matching directories`, when there are no candidates.
