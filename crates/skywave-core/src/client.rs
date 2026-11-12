@@ -787,9 +787,10 @@ impl State {
                 Effect::DeleteSnippet(id) => self.store.delete_snippet(id),
                 // Refused when the store disagrees with the model; the
                 // resync below then shows what the store holds.
-                Effect::Withdraw { id, draft } => self
-                    .store
-                    .withdraw(id, draft.as_ref().map(|(key, d)| (*key, d))),
+                Effect::Withdraw { id, draft } => {
+                    self.store
+                        .withdraw(id, draft.as_ref().map(|(key, d)| (*key, d)), None)
+                }
                 Effect::LoadSession(id) => self
                     .store
                     .session_events(id)

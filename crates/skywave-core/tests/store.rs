@@ -2403,15 +2403,15 @@ fn withdraw_anything_not_accepted() {
 
     // Only what was accepted stays.
     assert!(matches!(
-        store.withdraw(accepted.id, None),
+        store.withdraw(accepted.id, None, None),
         Err(StoreError::NotWithdrawable(id)) if id == accepted.id
     ));
     assert!(matches!(
-        store.withdraw(CommandId::new(), None),
+        store.withdraw(CommandId::new(), None, None),
         Err(StoreError::NotWithdrawable(_))
     ));
     for command in [&fresh, &claimed, &requeued, &refused, &undeliverable] {
-        store.withdraw(command.id, None).unwrap();
+        store.withdraw(command.id, None, None).unwrap();
     }
     let left: Vec<CommandId> = store
         .outbox()
@@ -2449,7 +2449,7 @@ fn withdraw_anything_not_accepted() {
     let outbox = store.outbox().unwrap();
     assert!(outbox[1].discardable());
     assert!(!outbox[2].discardable());
-    store.withdraw(create.id, None).unwrap();
+    store.withdraw(create.id, None, None).unwrap();
 }
 
 #[test]
@@ -2480,7 +2480,7 @@ fn withdraw_into_draft_is_one_transaction() {
     .unwrap();
     assert!(
         store
-            .withdraw(command.id, Some(((session, AGENT), &draft)))
+            .withdraw(command.id, Some(((session, AGENT), &draft)), None)
             .is_err()
     );
     assert_eq!(store.pending_outbox().unwrap().len(), 1);
@@ -2489,7 +2489,7 @@ fn withdraw_into_draft_is_one_transaction() {
     // Once it succeeds the text is in the draft only, never in both.
     conn.execute_batch("DROP TRIGGER full").unwrap();
     store
-        .withdraw(command.id, Some(((session, AGENT), &draft)))
+        .withdraw(command.id, Some(((session, AGENT), &draft)), None)
         .unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
@@ -2500,10 +2500,137 @@ fn withdraw_into_draft_is_one_transaction() {
     let other = SessionId::new();
     assert!(
         store
-            .withdraw(command.id, Some(((other, AGENT), &draft)))
+            .withdraw(command.id, Some(((other, AGENT), &draft)), None)
             .is_err()
     );
     assert!(!store.drafts().unwrap().contains_key(&(other, AGENT)));
+}
+
+#[test]
+fn withdrawing_a_message_puts_its_images_back_in_one_transaction() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b, c) = (image("a"), image("b"), image("c"));
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SendMessage {
+            session_id: session,
+            context: ContextId::first_of(session),
+            text: "with pictures".into(),
+            attachments: vec![a.sha256, b.sha256],
+        },
+    };
+    let draft = Draft {
+        text: "with pictures".into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    };
+    let hashes = [a.sha256, b.sha256, c.sha256];
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(session, &a, at(0)).unwrap();
+    store.attach_to_draft(session, &b, at(1)).unwrap();
+    store.enqueue(&command).unwrap();
+    assert!(!store.draft_images().unwrap().contains_key(&session));
+    store.attach_to_draft(session, &c, at(2)).unwrap();
+
+    // A write that fails after the delete keeps the message queued and the
+    // draft's images as they were.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER full BEFORE INSERT ON draft_attachments BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    assert!(
+        store
+            .withdraw(
+                command.id,
+                Some(((session, AGENT), &draft)),
+                Some((session, &hashes))
+            )
+            .is_err()
+    );
+    assert_eq!(store.pending_outbox().unwrap().len(), 1);
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        std::slice::from_ref(&c)
+    );
+    assert!(!store.drafts().unwrap().contains_key(&(session, AGENT)));
+
+    // Once it succeeds the images are back in the draft, in order.
+    conn.execute_batch("DROP TRIGGER full").unwrap();
+    store
+        .withdraw(
+            command.id,
+            Some(((session, AGENT), &draft)),
+            Some((session, &hashes)),
+        )
+        .unwrap();
+    assert!(store.outbox().unwrap().is_empty());
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        [a.clone(), b.clone(), c.clone()]
+    );
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert!(store.outbox().unwrap().is_empty());
+    assert_eq!(store.drafts().unwrap()[&(session, AGENT)], draft);
+    assert_eq!(store.draft_images().unwrap()[&session], [a, b, c]);
+}
+
+#[test]
+fn a_refused_withdraw_writes_no_images() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b, c) = (image("a"), image("b"), image("c"));
+    let fresh = send(session, "not sent yet");
+    let accepted = send(session, "sent");
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(session, &a, at(0)).unwrap();
+    store.attach_to_draft(session, &b, at(1)).unwrap();
+    store.enqueue(&fresh).unwrap();
+
+    // Positive control: the same call writes the images of a command it may
+    // take back.
+    store
+        .withdraw(fresh.id, None, Some((session, &[a.sha256, b.sha256])))
+        .unwrap();
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        [a.clone(), b.clone()]
+    );
+
+    store.enqueue(&accepted).unwrap();
+    assert!(store.claim_send(accepted.id, at(1)).unwrap());
+    store
+        .record_result(accepted.id, &CommandResult::Accepted { seq: Seq(1) }, at(2))
+        .unwrap();
+    store.attach_to_draft(session, &c, at(3)).unwrap();
+
+    assert!(matches!(
+        store.withdraw(accepted.id, None, Some((session, &[a.sha256]))),
+        Err(StoreError::NotWithdrawable(id)) if id == accepted.id
+    ));
+    assert_eq!(store.draft_images().unwrap()[&session], [c]);
+    assert!(!store.drafts().unwrap().contains_key(&(session, AGENT)));
+}
+
+#[test]
+fn load_returns_every_attachment_even_after_it_is_detached() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b) = (image("a"), image("b"));
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(session, &a, at(0)).unwrap();
+    store.attach_to_draft(session, &b, at(1)).unwrap();
+    store.detach_from_draft(session, a.sha256).unwrap();
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.attachments.len(), 2);
+    assert_eq!(snapshot.attachments[&a.sha256], a);
+    assert_eq!(snapshot.attachments[&b.sha256], b);
+    assert_eq!(store.attachments().unwrap(), snapshot.attachments);
 }
 
 // ---- local delete ---------------------------------------------------------------
@@ -3486,7 +3613,7 @@ fn withdrawing_a_run_keeps_it_as_the_shell_draft() {
     store.set_draft(session, AGENT, Some(&agent)).unwrap();
     store.enqueue(&run).unwrap();
     store
-        .withdraw(run.id, Some(((session, SHELL), &draft)))
+        .withdraw(run.id, Some(((session, SHELL), &draft)), None)
         .unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
