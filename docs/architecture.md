@@ -360,6 +360,24 @@ the daemon's appends, which would otherwise stop `serve` (below).
   run finds its output by its `ShellFinished` seq) and a later crop or
   delete is stamped like the first. Taken while the disk is low and while
   `serve` stops, like a delete.
+- **Images on a message** (v30): `SendMessage { attachments }` names staged
+  images (`PUT /v1/attachments/{sha256}`) by hash, and is prepared like a
+  crop, before its transaction. Each staged image is hard-linked into a
+  fresh blob (`BlobStore::link`, a copy across file systems), not adopted,
+  so a refused message keeps its staged files for a resend and the same
+  image named twice is two blobs (D44). The transaction records those
+  blobs' rows, each `event_blobs` row holding `attachment`, and appends the
+  `UserMessage` with its attachments; the staged files go after the commit.
+  Refusals, in order: `ServerStopping`, `DiskLow` (nothing is linked),
+  `UnknownSession`, `ContextChanged`, `MessageTooLong`, then
+  `TooManyAttachments` (more than `ATTACHMENTS_MAX` names), then
+  `AttachmentsTooLarge` (the images total over `ATTACHMENTS_MAX_TOTAL_BYTES`),
+  then `UnknownAttachment` (a name not staged, or no longer an image or the
+  hash it names). A refused command's linked files go as a crop's do. A
+  crash between a link and the commit leaves blob files without rows, which
+  the startup sweep removes; one between the commit and the staged file's
+  removal leaves that file, which eviction removes. `DeleteBlob` takes an
+  attachment's blob; `CropBlob` answers `NotCroppable`.
 - **Restart cost**: nothing prunes the log yet, so what a daemon start
   reads must not grow with it. Each lookup it makes, per session or over
   the log, reads a projection (`open_calls`: a `ToolCall` adds its call,

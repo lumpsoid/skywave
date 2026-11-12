@@ -206,6 +206,18 @@ impl BlobStore {
         self.adopt_with(path, |from, to| std::fs::rename(from, to))
     }
 
+    /// Makes `path` a new blob without consuming it: a hard link (a copy
+    /// across file systems), so the source stays. The content is hashed as
+    /// it is read. Follow with [`record`](BlobStore::record).
+    ///
+    /// On a failed directory sync `adopt_file` renames the new file back
+    /// onto `path`. For a hard link of the same inode that rename is a
+    /// no-op, so the new file stays without a row: the startup sweep removes
+    /// it.
+    pub fn link(&self, path: &Path) -> Result<BlobMeta> {
+        self.adopt_with(path, |from, to| std::fs::hard_link(from, to))
+    }
+
     /// [`adopt`](BlobStore::adopt) with the rename injected, for tests.
     fn adopt_with(
         &self,
@@ -520,6 +532,35 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, [meta.id.0.to_string()], "no temp file is left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_keeps_the_source_and_makes_a_new_blob_each_time() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let path = storage.dir.attachments_dir().join("staged");
+        let content = b"a staged image";
+        std::fs::write(&path, content).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let first = storage.blobs.link(&path).unwrap();
+        let second = storage.blobs.link(&path).unwrap();
+        assert!(path.exists(), "the source stays");
+        assert_ne!(first.id, second.id, "a new blob each time");
+        assert_eq!(first.size, content.len() as u64);
+        assert_eq!(first.sha256, ContentHash::of(content));
+        for meta in [&first, &second] {
+            storage.blobs.record(storage.db.conn(), meta).unwrap();
+            let blob = storage.dir.blobs_dir().join(meta.id.0.to_string());
+            assert_eq!(std::fs::read(&blob).unwrap(), content);
+            assert_eq!(
+                std::fs::metadata(&blob).unwrap().ino(),
+                inode,
+                "a hard link"
+            );
+        }
     }
 
     #[test]

@@ -157,7 +157,7 @@ use crate::agent::{
     self, AgentLogin, LimitsError, LoginState, LoginStatus, OutsideConversations, SourceError,
     UsageLimitsSource,
 };
-use crate::attachments::Staging;
+use crate::attachments::{self, Staging};
 use crate::blobs::BlobStore;
 use crate::commands::Preparation;
 use crate::crop::{self, CropHook};
@@ -508,6 +508,9 @@ async fn commands(
             conversation: Some(_),
             ..
         } | CommandKind::CropBlob { .. }
+    ) || matches!(
+        &command.kind,
+        CommandKind::SendMessage { attachments, .. } if !attachments.is_empty()
     );
     let reply = if prepares {
         prepared(&api, device, command).await
@@ -524,10 +527,11 @@ async fn commands(
 
 /// Handles a command prepared before its transaction, outside the API's
 /// connection: an adopting `CreateSession`, whose history is read and
-/// bounded, or a `CropBlob`, whose new blob is written. Slow file work
-/// must not hold up every other device's commands. A resend that arrives
-/// while the command is being prepared waits for that one's reply, so a
-/// command is never prepared twice.
+/// bounded, a `CropBlob`, whose new blob is written, or a `SendMessage`
+/// naming images, whose staged images are linked. Slow file work must not
+/// hold up every other device's commands. A resend that arrives while the
+/// command is being prepared waits for that one's reply, so a command is
+/// never prepared twice.
 async fn prepared(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
     loop {
         let role = {
@@ -590,6 +594,9 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
     }
     let prepared = match &command.kind {
         CommandKind::CropBlob { blob, keep } => prepare_crop(api, id, *blob, keep.clone()).await?,
+        CommandKind::SendMessage { attachments, .. } => {
+            Some(prepare_attachments(api, attachments.clone()).await?)
+        }
         _ => prepare_import(api, &command).await?.map(Preparation::from),
     };
     api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
@@ -652,6 +659,34 @@ async fn prepare_crop(
         Err(_) => {
             tracing::warn!(command = %id.0, "cropping a blob timed out");
             Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
+/// The staged images a `SendMessage` names, linked as new blobs on a blocking
+/// thread ([`attachments::prepare`]), off the API's connection. The disk is
+/// read here, as `prepare_import` reads it: while it is low nothing is
+/// linked, and the command is refused `DiskLow`. A file-system failure is a
+/// 500.
+async fn prepare_attachments(
+    api: &Arc<Api>,
+    hashes: Vec<ContentHash>,
+) -> std::result::Result<Preparation, StatusCode> {
+    let disk_low = api.log.disk().refresh();
+    let (staging, blobs) = (api.staging.clone(), api.blobs.clone());
+    let linked = tokio::task::spawn_blocking(move || {
+        attachments::prepare(&staging, &blobs, disk_low, &hashes)
+    })
+    .await;
+    match linked {
+        Ok(Ok(prepared)) => Ok(prepared.into()),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "linking a message's images failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "a message's image thread failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

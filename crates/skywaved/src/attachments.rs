@@ -11,15 +11,23 @@
 //! than [`STAGING_MAX_AGE`] at startup. Eviction is garbage collection, not an
 //! outcome: a message naming an image that is no longer staged is refused as
 //! `UnknownAttachment` when its command arrives.
+//!
+//! A `SendMessage` naming staged images takes each as a new blob: [`prepare`]
+//! hard-links every one into the blob store before the command's transaction
+//! ([`Prepared`]), and the transaction records those blobs. The staged files
+//! are removed once it commits; a refused message keeps them, so a resend
+//! needs no upload.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use skywave_proto::{ContentHash, ImageType, UploadResult, limits};
+use rusqlite::Connection;
+use skywave_proto::{Attachment, ContentHash, ImageType, RejectReason, UploadResult, limits};
 
-use crate::error::{IoContext, Result};
+use crate::blobs::{BlobMeta, BlobStore};
+use crate::error::{Error, IoContext, Result};
 
 /// Most bytes the staged files may total; past it the oldest are evicted.
 pub const STAGING_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -180,6 +188,152 @@ impl Staging {
     }
 }
 
+/// A `SendMessage`'s images, linked into the blob store before its
+/// transaction ([`prepare`]). It owns the blob files it linked: dropped
+/// before [`Prepared::kept`], they are removed.
+#[derive(Debug)]
+pub struct Prepared {
+    /// Per hash, in order: its new blob and sniffed type, or `None` if it is
+    /// not a staged image. Empty when nothing was linked.
+    links: Vec<Option<(BlobMeta, ImageType)>>,
+    /// The hashes the message names, in order.
+    staged: Vec<ContentHash>,
+    disk_low: bool,
+    blobs: BlobStore,
+    staging: Staging,
+    /// Set once the blobs are recorded, in the transaction that commits them.
+    logged: bool,
+}
+
+/// Links each staged image `hashes` names into `blobs` as a new blob, not
+/// recorded. Links nothing while `disk_low`, or when `hashes` names more than
+/// [`limits::ATTACHMENTS_MAX`]: [`Prepared::decide`] refuses either before a
+/// link is needed. Blocking: call it off the async runtime.
+pub fn prepare(
+    staging: &Staging,
+    blobs: &BlobStore,
+    disk_low: bool,
+    hashes: &[ContentHash],
+) -> Result<Prepared> {
+    let mut prepared = Prepared {
+        links: Vec::new(),
+        staged: hashes.to_vec(),
+        disk_low,
+        blobs: blobs.clone(),
+        staging: staging.clone(),
+        logged: false,
+    };
+    if disk_low || hashes.len() > limits::ATTACHMENTS_MAX {
+        return Ok(prepared);
+    }
+    for &hash in hashes {
+        let link = prepared.link(hash)?;
+        prepared.links.push(link);
+    }
+    Ok(prepared)
+}
+
+impl Prepared {
+    /// Links the staged image `hash` as a new blob. `None` when it is not
+    /// staged, is no longer an image, or no longer hashes to its name: the
+    /// message then names an image it does not have.
+    fn link(&self, hash: ContentHash) -> Result<Option<(BlobMeta, ImageType)>> {
+        let path = self.staging.path(hash);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context(|| format!("opening {}", path.display())),
+        };
+        let mut head = Vec::new();
+        Read::take(&mut file, SNIFF_LEN)
+            .read_to_end(&mut head)
+            .context(|| format!("reading {}", path.display()))?;
+        let Some(media_type) = ImageType::sniff(&head) else {
+            return Ok(None);
+        };
+        let meta = match self.blobs.link(&path) {
+            Ok(meta) => meta,
+            // Evicted since it was opened.
+            Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        if meta.sha256 != hash {
+            self.blobs.discard(meta.id);
+            return Ok(None);
+        }
+        Ok(Some((meta, media_type)))
+    }
+
+    /// Whether the message may be logged, or why not, checked in the order
+    /// `apply` refuses: `DiskLow`, `TooManyAttachments` (more hashes than
+    /// [`limits::ATTACHMENTS_MAX`]), `AttachmentsTooLarge` (the images found
+    /// total over [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`]), then
+    /// `UnknownAttachment` for any hash not staged.
+    pub(crate) fn decide(&self) -> std::result::Result<(), RejectReason> {
+        if self.disk_low {
+            return Err(RejectReason::DiskLow);
+        }
+        if self.staged.len() > limits::ATTACHMENTS_MAX {
+            return Err(RejectReason::TooManyAttachments);
+        }
+        let total: u64 = self.links.iter().flatten().map(|(meta, _)| meta.size).sum();
+        if total > limits::ATTACHMENTS_MAX_TOTAL_BYTES {
+            return Err(RejectReason::AttachmentsTooLarge);
+        }
+        if self.links.iter().any(Option::is_none) {
+            return Err(RejectReason::UnknownAttachment);
+        }
+        Ok(())
+    }
+
+    /// Records the linked blobs in the caller's transaction and returns the
+    /// attachments they make, in order. Only after [`Prepared::decide`]
+    /// passed. Their files stay this one's until [`Prepared::kept`].
+    pub(crate) fn log(&mut self, tx: &Connection) -> Result<Vec<Attachment>> {
+        let mut attachments = Vec::with_capacity(self.links.len());
+        for (meta, media_type) in self.links.iter().flatten() {
+            self.blobs.record(tx, meta)?;
+            attachments.push(Attachment {
+                blob: meta.blob_ref(),
+                media_type: *media_type,
+            });
+        }
+        self.logged = true;
+        Ok(attachments)
+    }
+
+    /// Called once the transaction [`Prepared::log`] wrote to is committed:
+    /// the staged files go, and the blobs are the log's. A crash before this
+    /// leaves the staged files, which eviction removes. One never logged
+    /// keeps nothing: its blob files go when it is dropped.
+    pub(crate) fn kept(mut self) {
+        if !self.logged {
+            return;
+        }
+        for hash in &self.staged {
+            let path = self.staging.path(*hash);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "removing a staged image");
+                }
+            }
+        }
+        self.links.clear();
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        for (meta, _) in self.links.iter().flatten() {
+            self.blobs.discard(meta.id);
+        }
+    }
+}
+
 /// A file in the staging directory, as [`Staging::files`] lists it.
 struct Entry {
     path: PathBuf,
@@ -217,6 +371,8 @@ fn remove(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Storage;
+    use skywave_proto::BlobId;
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -367,6 +523,151 @@ mod tests {
                 .unwrap(),
             0,
             "a missing directory has nothing to sweep"
+        );
+    }
+
+    /// An image: its PNG signature and `size` bytes of `tag`, so each tag is
+    /// different content.
+    fn image(size: usize, tag: u8) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(size, tag);
+        bytes
+    }
+
+    /// A data dir's store and the staging directory beside its blobs.
+    fn stores() -> (tempfile::TempDir, Storage, Staging) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let staging = Staging::new(storage.dir.attachments_dir());
+        (tmp, storage, staging)
+    }
+
+    /// Stages `bytes`, returning their hash.
+    fn stage(staging: &Staging, bytes: &[u8]) -> ContentHash {
+        let hash = ContentHash::of(bytes);
+        assert!(matches!(
+            staging.stage(hash, bytes).unwrap(),
+            UploadResult::Stored { .. }
+        ));
+        hash
+    }
+
+    /// How many files the blob store holds.
+    fn blob_files(storage: &Storage) -> usize {
+        std::fs::read_dir(storage.dir.blobs_dir()).unwrap().count()
+    }
+
+    #[test]
+    fn linked_images_are_new_blobs_and_the_staged_files_stay() {
+        let (_tmp, storage, staging) = stores();
+        let (a, b) = (
+            stage(&staging, &image(100, 1)),
+            stage(&staging, &image(100, 2)),
+        );
+
+        let prepared = prepare(&staging, &storage.blobs, false, &[a, b, a]).unwrap();
+        assert_eq!(prepared.decide(), Ok(()));
+        let ids: Vec<BlobId> = prepared
+            .links
+            .iter()
+            .map(|link| link.as_ref().unwrap().0.id)
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(ids[0], ids[2], "the same image twice is two blobs");
+        assert_ne!(ids[1], ids[2]);
+        assert_eq!(blob_files(&storage), 3);
+        assert!(
+            staging.contains(a) && staging.contains(b),
+            "staged files stay"
+        );
+        assert_eq!(prepared.links[2].as_ref().unwrap().0.sha256, a);
+        assert_eq!(prepared.links[1].as_ref().unwrap().1, ImageType::Png);
+    }
+
+    #[test]
+    fn decide_gives_each_refusal_in_its_order() {
+        let (_tmp, storage, staging) = stores();
+        let a = stage(&staging, &image(100, 1));
+        let missing = ContentHash::of(b"never staged");
+        let blobs = &storage.blobs;
+
+        // Control: a staged image alone is accepted.
+        assert_eq!(
+            prepare(&staging, blobs, false, &[a]).unwrap().decide(),
+            Ok(())
+        );
+        assert_eq!(blob_files(&storage), 0, "dropped unlogged: no file left");
+
+        assert_eq!(
+            prepare(&staging, blobs, true, &[a]).unwrap().decide(),
+            Err(RejectReason::DiskLow)
+        );
+        assert_eq!(
+            prepare(&staging, blobs, false, &[a, missing])
+                .unwrap()
+                .decide(),
+            Err(RejectReason::UnknownAttachment)
+        );
+        let nine = vec![missing; limits::ATTACHMENTS_MAX + 1];
+        assert_eq!(
+            prepare(&staging, blobs, false, &nine).unwrap().decide(),
+            Err(RejectReason::TooManyAttachments),
+            "counted before the unstaged hashes are looked at"
+        );
+        assert_eq!(
+            prepare(&staging, blobs, true, &nine).unwrap().decide(),
+            Err(RejectReason::DiskLow),
+            "the disk is checked first"
+        );
+        assert_eq!(blob_files(&storage), 0, "nothing refused was linked");
+
+        let big: Vec<ContentHash> = (1..=3)
+            .map(|tag| stage(&staging, &image(3_600_000, tag)))
+            .collect();
+        assert_eq!(
+            prepare(&staging, blobs, false, &big[..2]).unwrap().decide(),
+            Ok(()),
+            "control: two images of 7.2 MB fit"
+        );
+        assert_eq!(
+            prepare(&staging, blobs, false, &big).unwrap().decide(),
+            Err(RejectReason::AttachmentsTooLarge)
+        );
+    }
+
+    #[test]
+    fn dropping_an_unlogged_preparation_removes_its_blobs_and_keeps_the_staged_files() {
+        let (_tmp, storage, staging) = stores();
+        let a = stage(&staging, &image(100, 1));
+        let prepared = prepare(&staging, &storage.blobs, false, &[a, a]).unwrap();
+        assert_eq!(blob_files(&storage), 2);
+        drop(prepared);
+        assert_eq!(blob_files(&storage), 0);
+        assert!(staging.contains(a));
+    }
+
+    #[test]
+    fn a_logged_then_kept_preparation_keeps_its_blobs_and_removes_the_staged_files() {
+        let (_tmp, storage, staging) = stores();
+        let (a, b) = (
+            stage(&staging, &image(100, 1)),
+            stage(&staging, &image(100, 2)),
+        );
+        let mut prepared = prepare(&staging, &storage.blobs, false, &[a, b]).unwrap();
+        prepared.decide().unwrap();
+        let logged = prepared.log(storage.db.conn()).unwrap();
+        assert_eq!(logged.len(), 2);
+        assert_eq!(logged[1].blob.sha256, b);
+        prepared.kept();
+
+        assert_eq!(blob_files(&storage), 2, "the blobs are the log's");
+        for attachment in &logged {
+            let meta = storage.blobs.meta(storage.db.conn(), attachment.blob.id);
+            assert!(meta.unwrap().is_some(), "each has its row");
+        }
+        assert!(
+            !staging.contains(a) && !staging.contains(b),
+            "staged files went"
         );
     }
 }

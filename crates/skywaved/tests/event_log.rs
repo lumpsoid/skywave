@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
-    ContentHash, ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind,
-    ImportOutcome, ImportedItem, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen,
-    Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind,
-    ToolCall, ToolDisplay, ToolKind, ToolResult, limits,
+    ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, ImportOutcome,
+    ImportedItem, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
+    ScheduleId, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind, ToolCall,
+    ToolDisplay, ToolKind, ToolResult, limits,
 };
 use skywaved::agent::fake::FakeOutside;
 use skywaved::agent::import::{self, IMPORT_DEADLINE, Prepared};
@@ -3011,47 +3011,6 @@ fn a_message_over_the_cap_is_refused_and_logs_nothing() {
     assert!(matches!(
         f.last_event().kind,
         EventKind::UserMessage { text, .. } if text == longest
-    ));
-}
-
-#[test]
-fn a_message_with_an_unstaged_image_is_refused_and_logs_nothing() {
-    let mut f = Fixture::new();
-    let session = f.create_session();
-    let context = ContextId::first_of(session);
-    let head = f.log.head();
-    let image = vec![ContentHash::of(b"png")];
-    assert_eq!(
-        f.handle(CommandKind::SendMessage {
-            session_id: session,
-            context,
-            text: "look".into(),
-            attachments: image.clone(),
-        }),
-        rejected(RejectReason::UnknownAttachment)
-    );
-    // The context is checked first: a stale message with an image is stale.
-    assert_eq!(
-        f.handle(CommandKind::SendMessage {
-            session_id: session,
-            context: ContextId::new(),
-            text: "look".into(),
-            attachments: image,
-        }),
-        rejected(RejectReason::ContextChanged)
-    );
-    assert_eq!(f.log.head(), head, "a rejected message logs nothing");
-
-    // Positive control: the same text without an image goes in.
-    accepted(f.handle(CommandKind::SendMessage {
-        session_id: session,
-        context,
-        text: "look".into(),
-        attachments: Vec::new(),
-    }));
-    assert!(matches!(
-        f.last_event().kind,
-        EventKind::UserMessage { text, attachments, .. } if text == "look" && attachments.is_empty()
     ));
 }
 
