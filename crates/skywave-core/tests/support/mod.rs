@@ -921,6 +921,7 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                     } => Entry::UserMessage {
                         command_id,
                         text,
+                        images: Vec::new(),
                         from: shared_device(from),
                         outgoing: None,
                         delivery: None,

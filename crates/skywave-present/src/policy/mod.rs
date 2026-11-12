@@ -195,6 +195,7 @@ pub(crate) mod tests {
             Entry::UserMessage {
                 command_id: CommandId::new(),
                 text: text.to_owned(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: DeviceId::new(),
                     name: None,
