@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart' hide listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/session/image_picking.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -133,17 +136,34 @@ class ComposerState extends State<Composer> {
     );
   }
 
-  /// Nothing to send: the hub refuses blank text, so the button is off
-  /// and Enter does nothing.
   bool get _blank => _field.text.trim().isEmpty;
 
-  /// Sends the field's text, unless it is blank.
+  bool get _shell => widget.composer.mode == ComposerModeView.shell;
+
+  /// Nothing to send: no text and no image. The hub refuses it, so the
+  /// button is off and Enter does nothing.
+  bool get _nothingToSend => _blank && widget.composer.images.isEmpty;
+
+  /// An image is still being prepared (agent mode): the hub refuses Send
+  /// until it is ready.
+  bool get _preparing => !_shell && widget.composer.preparing > 0;
+
+  /// Sends the draft, unless there is nothing to send or it must wait.
   void submit() {
-    if (_blank) return;
+    if (_nothingToSend || _preparing) return;
     widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
   }
 
-  bool get _shell => widget.composer.mode == ComposerModeView.shell;
+  /// Picks images and attaches each one to the draft, in the order picked.
+  Future<void> _attach() async {
+    final paths = await pickImages(context);
+    if (!mounted) return;
+    for (final path in paths) {
+      widget.send(
+        GuiIntentAttachImageFile(sessionId: widget.sessionId, path: path),
+      );
+    }
+  }
 
   /// Opens the snippets (in shell mode the saved commands); one put in
   /// brings the focus back to the field.
@@ -254,6 +274,14 @@ class ComposerState extends State<Composer> {
                     GuiIntentStopShell(sessionId: widget.sessionId),
                   ),
                 ),
+              if (!shell &&
+                  (composer.images.isNotEmpty || composer.preparing > 0))
+                _ImageChips(
+                  sessionId: widget.sessionId,
+                  images: composer.images,
+                  preparing: composer.preparing,
+                  send: widget.send,
+                ),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
@@ -263,6 +291,15 @@ class ComposerState extends State<Composer> {
                     icon: const Icon(Icons.bookmark_outline),
                   ),
                   const SizedBox(width: 2),
+                  if (!shell) ...[
+                    IconButton(
+                      key: const Key('attach-image'),
+                      tooltip: 'Attach image',
+                      onPressed: _attach,
+                      icon: const Icon(Icons.image_outlined),
+                    ),
+                    const SizedBox(width: 2),
+                  ],
                   Expanded(
                     child: TextField(
                       controller: _field,
@@ -325,7 +362,7 @@ class ComposerState extends State<Composer> {
                     valueListenable: _field,
                     builder: (context, _, _) => IconButton.filled(
                       tooltip: shell ? 'Run' : 'Send',
-                      onPressed: _blank ? null : submit,
+                      onPressed: _nothingToSend || _preparing ? null : submit,
                       icon: const Icon(Icons.arrow_upward),
                     ),
                   ),
@@ -335,6 +372,128 @@ class ComposerState extends State<Composer> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Above the field: the draft's images, each with a ✕, and a spinner for
+/// each one still being prepared.
+class _ImageChips extends StatelessWidget {
+  const _ImageChips({
+    required this.sessionId,
+    required this.images,
+    required this.preparing,
+    required this.send,
+  });
+
+  final String sessionId;
+  final List<ComposerImage> images;
+  final int preparing;
+  final SendIntent send;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 64,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        // Room above and below the thumbnails for the ✕ that overhangs.
+        padding: const EdgeInsets.fromLTRB(4, 6, 4, 2),
+        children: [
+          for (final image in images)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: _ImageChip(
+                image: image,
+                onDetach: () => send(
+                  GuiIntentDetachImage(
+                    sessionId: sessionId,
+                    sha256: image.sha256,
+                  ),
+                ),
+              ),
+            ),
+          for (var i = 0; i < preparing; i++)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: SizedBox(
+                key: ValueKey('image-preparing-$i'),
+                width: 56,
+                height: 56,
+                child: const Center(
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// One image of the draft: its thumbnail, or its size where the file
+/// cannot be shown, and a ✕ that takes it off the draft.
+class _ImageChip extends StatelessWidget {
+  const _ImageChip({required this.image, required this.onDetach});
+
+  final ComposerImage image;
+  final VoidCallback onDetach;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = SkyColors.of(context);
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Image.file(
+            File(image.path),
+            width: 56,
+            height: 56,
+            fit: BoxFit.cover,
+            cacheWidth: 112,
+            errorBuilder: (context, error, stackTrace) => Container(
+              width: 56,
+              height: 56,
+              color: theme.colorScheme.surfaceContainerHighest,
+              padding: const EdgeInsets.all(2),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.image_outlined, size: 18),
+                  Text(
+                    image.sizeLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: colors.muted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        Positioned(
+          top: -6,
+          right: -6,
+          child: Material(
+            color: theme.colorScheme.surfaceContainerHighest,
+            shape: const CircleBorder(),
+            child: IconButton(
+              key: Key('detach-${image.sha256}'),
+              tooltip: 'Remove image',
+              onPressed: onDetach,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 24, height: 24),
+              iconSize: 14,
+              icon: const Icon(Icons.close),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
