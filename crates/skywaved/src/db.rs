@@ -443,6 +443,23 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE approvals ADD COLUMN
         questions TEXT CHECK (questions IS NULL OR json_valid(questions));
     "#,
+    // v23: an image on a user message (protocol v30, `BlobUse::Attachment`).
+    // Made again as in v21: SQLite cannot change a CHECK in place.
+    r#"
+    CREATE TABLE event_blobs_v23 (
+        blob_id    TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        holds      TEXT NOT NULL CHECK (holds IN
+            ('tool_input', 'tool_body', 'tool_output', 'approval_input', 'shell_output',
+             'message', 'attachment'))
+    ) STRICT;
+    INSERT INTO event_blobs_v23 (blob_id, session_id, seq, holds)
+        SELECT blob_id, session_id, seq, holds FROM event_blobs;
+    DROP TABLE event_blobs;
+    ALTER TABLE event_blobs_v23 RENAME TO event_blobs;
+    CREATE INDEX event_blobs_seq ON event_blobs (seq);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -1112,6 +1129,71 @@ mod tests {
             .execute(
                 "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
                  VALUES ('b2', 's', 1, 'message')",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// v23 lets an image on a user message have a blob row: the table made
+    /// again keeps v22's rows and its `event_blobs_seq` index.
+    #[test]
+    fn v23_schema_lets_an_attachment_blob_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..22] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 22).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, ?1)",
+                [PROTOCOL_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('m1', 's', 1, 'message')",
+                [],
+            )
+            .unwrap();
+            // v22 refuses an image's blob.
+            assert!(
+                conn.execute(
+                    "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                     VALUES ('a1', 's', 1, 'attachment')",
+                    [],
+                )
+                .is_err()
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows: Vec<(String, String, i64, String)> = db
+            .conn()
+            .prepare("SELECT blob_id, session_id, seq, holds FROM event_blobs ORDER BY blob_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [("m1".to_owned(), "s".to_owned(), 1, "message".to_owned())]
+        );
+        let index: String = db
+            .conn()
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'event_blobs_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, "event_blobs_seq");
+        db.conn()
+            .execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('a1', 's', 1, 'attachment')",
                 [],
             )
             .unwrap();
