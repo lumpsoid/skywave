@@ -65,8 +65,8 @@ class TimelineViewState extends State<TimelineView> {
 
   /// The height each row was last laid out at, by key: the scroll extent of
   /// the rows not built is estimated from them. Heights depend on the width
-  /// the text wraps at, so the map is cleared when that width changes.
-  final _heights = <String, double>{};
+  /// the text wraps at, so the cache is cleared when that width changes.
+  final _heights = _Heights();
   double? _heightsWidth;
 
   bool _following = true;
@@ -548,6 +548,30 @@ class _HoldPhysics extends ScrollPhysics {
   }
 }
 
+/// The measured height of each row seen, by row key, with their running total
+/// so the mean costs nothing per layout.
+class _Heights {
+  final _byKey = <String, double>{};
+  double _sum = 0;
+
+  double? operator [](String key) => _byKey[key];
+
+  bool get isEmpty => _byKey.isEmpty;
+
+  double get mean => _sum / _byKey.length;
+
+  void record(String key, double height) {
+    final old = _byKey[key];
+    _byKey[key] = height;
+    _sum += height - (old ?? 0);
+  }
+
+  void clear() {
+    _byKey.clear();
+    _sum = 0;
+  }
+}
+
 /// The timeline's rows as the list's children. The default estimate of the
 /// extent of the rows not built extrapolates from the rows built right now,
 /// so the scrollbar's size changes with every scroll. This one sums the
@@ -570,7 +594,7 @@ class _RowsDelegate extends SliverChildBuilderDelegate {
   final List<TimelineRow> rows;
 
   /// The heights of the rows laid out so far, by key.
-  final Map<String, double> heights;
+  final _Heights heights;
 
   @override
   double? estimateMaxScrollOffset(
@@ -592,7 +616,7 @@ class _RowsDelegate extends SliverChildBuilderDelegate {
     final mean = heights.isEmpty
         ? (trailingScrollOffset - leadingScrollOffset) /
               (lastIndex - firstIndex + 1)
-        : heights.values.reduce((a, b) => a + b) / heights.length;
+        : heights.mean;
     var extent = trailingScrollOffset;
     for (var i = lastIndex + 1; i < count; i++) {
       extent += heights[rows[rows.length - 1 - i].key] ?? mean;
@@ -616,7 +640,7 @@ class _Slot extends StatefulWidget {
 
   final String rowKey;
   final Map<String, BuildContext> slots;
-  final Map<String, double> heights;
+  final _Heights heights;
   final Widget child;
 
   @override
@@ -658,7 +682,7 @@ class _SlotBox extends SingleChildRenderObjectWidget {
   const _SlotBox({required this.rowKey, required this.heights, super.child});
 
   final String rowKey;
-  final Map<String, double> heights;
+  final _Heights heights;
 
   @override
   RenderObject createRenderObject(BuildContext context) =>
@@ -678,13 +702,13 @@ class _RenderSlotBox extends RenderProxyBox {
   _RenderSlotBox({required this.rowKey, required this.heights});
 
   String rowKey;
-  Map<String, double> heights;
+  _Heights heights;
   double? height;
 
   @override
   void performLayout() {
     super.performLayout();
     height = size.height;
-    heights[rowKey] = size.height;
+    heights.record(rowKey, size.height);
   }
 }
