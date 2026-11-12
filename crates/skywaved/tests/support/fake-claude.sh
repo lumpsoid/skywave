@@ -268,6 +268,8 @@ while IFS= read -r line; do
       ;;
     *'"type":"user"'*)
       command=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+      # Keywords match without the uuid: its random hex can spell one (deaf).
+      body=$(printf '%s' "$line" | sed 's/"uuid":"[^"]*"//')
       if [ -n "$command" ]; then
         lifecycle "$command" queued
         lifecycle "$command" started
@@ -283,7 +285,7 @@ while IFS= read -r line; do
         printf '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","terminal_reason":"api_error","session_id":"%s"}\n' "$sid"
         continue
       fi
-      case "$line" in
+      case "$body" in
         *stubborn*)
           (trap '' TERM; exec sleep 300) </dev/null >/dev/null 2>&1 &
           echo $! > child.txt
@@ -293,10 +295,10 @@ while IFS= read -r line; do
           echo $! > child.txt
           ;;
       esac
-      case "$line" in
+      case "$body" in
         *litter*) printf 'not json\n' ;;
       esac
-      case "$line" in
+      case "$body" in
         *quit*)
           exit 0
           ;;
