@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
-    EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
-    LoginStartResult, RunId, StorageReport, UploadResult, UsageLimitsResult, WorkdirQuery,
+    EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
+    LoginFinishResult, LoginStartResult, RunId, StorageReport, UploadResult, UsageLimitsResult,
+    WorkdirQuery,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -128,6 +129,17 @@ pub trait Transport: Send + Sync {
         &'a self,
         query: &'a WorkdirQuery,
     ) -> BoxFuture<'a, Result<ChangesResult, TransportError>> {
+        let _ = query;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/workdir/log?session=`: the newest commits of the session's
+    /// workdir `HEAD`. Defaults to [`TransportError::NotFound`] like
+    /// [`workdir_changes`](Transport::workdir_changes).
+    fn workdir_log<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<LogResult, TransportError>> {
         let _ = query;
         Box::pin(async { Err(TransportError::NotFound) })
     }

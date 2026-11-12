@@ -287,8 +287,8 @@ INSERT INTO turns (seq, session_id, at, usage)
 "#),
     Sql(r#"
 -- The latest answer to each workdir read (`Store::put_workdir`): `path` as
--- requested, '' for changes; `result` the `ChangesResult`, `ListResult` or
--- `FileResult` as JSON.
+-- requested, '' for changes; `result` the `ChangesResult`, `ListResult`,
+-- `FileResult` or, since the migration that allows 'log', `LogResult` as JSON.
 CREATE TABLE workdir_snapshots (
     session_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('changes', 'list', 'file')),
@@ -463,6 +463,23 @@ CREATE TABLE IF NOT EXISTS draft_attachments (
     sha256 TEXT NOT NULL REFERENCES attachments (sha256),
     PRIMARY KEY (session_id, mode, position)
 );
+"#),
+    // The workdir commit log (`WorkdirAsk::Log`) is a fourth read kind. SQLite
+    // keeps a column's CHECK as created, so `workdir_snapshots` is rebuilt
+    // (create, copy, drop, rename) to allow 'log'. Its rows keep their kind
+    // and path; no index, trigger or foreign key names the table.
+    Sql(r#"
+CREATE TABLE workdir_snapshots_with_log (
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('changes', 'list', 'file', 'log')),
+    path TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (json_valid(result)),
+    PRIMARY KEY (session_id, kind, path)
+);
+INSERT INTO workdir_snapshots_with_log (session_id, kind, path, result)
+    SELECT session_id, kind, path, result FROM workdir_snapshots;
+DROP TABLE workdir_snapshots;
+ALTER TABLE workdir_snapshots_with_log RENAME TO workdir_snapshots;
 "#),
 ];
 
@@ -2010,6 +2027,7 @@ impl Store {
             WorkdirAnswer::Changes(result) => to_json(result)?,
             WorkdirAnswer::List(result) => to_json(result)?,
             WorkdirAnswer::File(result) => to_json(result)?,
+            WorkdirAnswer::Log(result) => to_json(result)?,
         };
         tx.execute(
             "INSERT INTO workdir_snapshots (session_id, kind, path, result)
@@ -2091,6 +2109,7 @@ impl Store {
                 WorkdirAsk::Changes { .. } => WorkdirAnswer::Changes(json_col(row, 3)?),
                 WorkdirAsk::List { .. } => WorkdirAnswer::List(json_col(row, 3)?),
                 WorkdirAsk::File { .. } => WorkdirAnswer::File(json_col(row, 3)?),
+                WorkdirAsk::Log { .. } => WorkdirAnswer::Log(json_col(row, 3)?),
             };
             Ok((ask, answer))
         })?;

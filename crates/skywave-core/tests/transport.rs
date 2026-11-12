@@ -15,8 +15,8 @@ use skywave_core::{
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     ConversationsResult, DirEntry, DirsResult, EntryKind, EventKind, EventsQuery, FileBody,
-    FileResult, HelloResponse, ImageType, ListResult, OutsideConversation, PROTOCOL_VERSION, Seq,
-    SessionId, UploadResult, WorkdirQuery,
+    FileResult, HelloResponse, ImageType, ListResult, LogResult, OutsideConversation,
+    PROTOCOL_VERSION, Seq, SessionId, UploadResult, WorkdirQuery,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, Rng, seed};
 use skywaved::agent::fake::FakeOutside;
@@ -772,6 +772,7 @@ async fn workdir_reads_default_to_not_found() {
         Old.workdir_changes(&query).await,
         Err(TransportError::NotFound)
     );
+    assert_eq!(Old.workdir_log(&query).await, Err(TransportError::NotFound));
     assert_eq!(
         Old.workdir_list(&query).await,
         Err(TransportError::NotFound)
@@ -826,6 +827,10 @@ async fn workdir_reads_reach_a_real_server() {
         transport.workdir_changes(&query("")).await.unwrap(),
         ChangesResult::NotGit
     );
+    assert_eq!(
+        transport.workdir_log(&query("")).await.unwrap(),
+        LogResult::NotGit
+    );
     let ListResult::Listed {
         path,
         entries,
@@ -869,6 +874,10 @@ async fn workdir_reads_reach_a_real_server() {
     assert_eq!(
         transport.workdir_changes(&unknown).await.unwrap(),
         ChangesResult::UnknownSession
+    );
+    assert_eq!(
+        transport.workdir_log(&unknown).await.unwrap(),
+        LogResult::UnknownSession
     );
     assert_eq!(
         transport.workdir_list(&unknown).await.unwrap(),
