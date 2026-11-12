@@ -19,12 +19,12 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
     BlobId, BlobRef, BlobStorage, BlobUse, ChangesResult, Command, CommandId, CommandKind,
-    CommandResult, ContextId, ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry,
-    DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse,
-    ImportOutcome, LimitSeverity, LimitWindow, LineSpan, ListResult, PROTOCOL_VERSION, PairRequest,
-    PairResponse, RUN_HEADER, RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin,
-    ShellEnd, ShellRunStorage, StorageReport, ToolResult, UsageLimit, UsageLimitsResult, limits,
-    path,
+    CommandResult, ContentHash, ContextId, ConversationsResult, DeviceId, DeviceInfo, DiffBody,
+    DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange, FileResult,
+    HelloResponse, ImageType, ImportOutcome, LimitSeverity, LimitWindow, LineSpan, ListResult,
+    PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason, RunId, RunsSince, Seq,
+    SessionId, SessionOrigin, ShellEnd, ShellRunStorage, StorageReport, ToolResult, UploadResult,
+    UsageLimit, UsageLimitsResult, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -1063,6 +1063,159 @@ async fn blobs_download_whole_or_by_range() {
         device.get("/v1/blobs/not-a-uuid").await.status,
         StatusCode::BAD_REQUEST
     );
+}
+
+/// `size` bytes of an image: a PNG signature and filler.
+fn png(size: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(size, 0x42);
+    bytes
+}
+
+/// An image is staged under its hash: `HEAD` says whether it is, and a
+/// second `PUT` of it is answered as stored, not rewritten.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attachment_is_staged_once_and_reported_as_staged() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(1000);
+    let uri = path::attachment(ContentHash::of(&bytes));
+    let stored = UploadResult::Stored {
+        size: 1000,
+        media_type: ImageType::Png,
+    };
+
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NOT_FOUND);
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes.clone()))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<UploadResult>(), stored);
+    let staged = f
+        .storage
+        .dir
+        .attachments_dir()
+        .join(ContentHash::of(&bytes).to_hex());
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NO_CONTENT);
+    let again = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes))
+        .await;
+    assert_eq!(again.json::<UploadResult>(), stored);
+}
+
+/// A body is staged only under the hash its path names, and only if it is
+/// an image; a refusal leaves no file, temp files included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_upload_must_hash_to_its_path_and_be_an_image() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let image = png(1000);
+    let other = path::attachment(ContentHash::of(b"other"));
+    let reply = device
+        .send(Method::PUT, &other, &[], Bytes::from(image.clone()))
+        .await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::HashMismatch);
+
+    let pdf = b"%PDF-1.4 not an image".to_vec();
+    let uri = path::attachment(ContentHash::of(&pdf));
+    let reply = device.send(Method::PUT, &uri, &[], Bytes::from(pdf)).await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::NotAnImage);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+
+    let uri = path::attachment(ContentHash::of(&image));
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(image))
+        .await;
+    assert!(
+        matches!(reply.json::<UploadResult>(), UploadResult::Stored { .. }),
+        "control: the image under its own hash is stored"
+    );
+}
+
+/// An upload over `ATTACHMENT_MAX_BYTES` is `TooLarge` as JSON, not a 413,
+/// and stores nothing. A 3 MiB image, over axum's default 2 MB body limit,
+/// is stored: the limit is off for this route.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversize_upload_is_refused_as_json() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let big = png(limits::ATTACHMENT_MAX_BYTES as usize + 1);
+    let uri = path::attachment(ContentHash::of(&big));
+    let reply = device.send(Method::PUT, &uri, &[], Bytes::from(big)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::TooLarge);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+
+    let three_mib = png(3 << 20);
+    let uri = path::attachment(ContentHash::of(&three_mib));
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(three_mib))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored {
+            size: 3 << 20,
+            media_type: ImageType::Png,
+        }
+    );
+}
+
+/// On a low disk an upload is `DiskLow` and stores nothing; once the disk
+/// has room again the same upload is stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_on_a_low_disk_is_refused() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let f = Fixture::start_cropping(disk.clone(), None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(1000);
+    let uri = path::attachment(ContentHash::of(&bytes));
+
+    free.0.store(9, std::sync::atomic::Ordering::SeqCst);
+    assert!(disk.check());
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes.clone()))
+        .await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::DiskLow);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    assert!(!disk.check());
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored {
+            size: 1000,
+            media_type: ImageType::Png,
+        },
+        "control: with room again, the upload is stored"
+    );
+}
+
+/// A staging path that is not a hash is a bad request, for both methods.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_attachment_path_is_a_bad_request() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let uri = "/v1/attachments/xyz";
+    let put = device
+        .send(Method::PUT, uri, &[], Bytes::from(png(1000)))
+        .await;
+    assert_eq!(put.status, StatusCode::BAD_REQUEST);
+    let head = device.send(Method::HEAD, uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::BAD_REQUEST);
 }
 
 /// D45: a request that accepts zstd gets an event batch and a blob as one
