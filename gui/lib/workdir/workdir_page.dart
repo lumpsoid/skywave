@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
@@ -330,29 +331,33 @@ class _TextPane extends StatelessWidget {
             ),
           ),
         Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-            itemCount: lines.length,
-            itemBuilder: (context, i) {
-              final line = lines[i];
-              final text = Text(
-                line.text,
-                style: _style(line.kind, base, colors),
-              );
-              if (!numbered) {
-                return text;
-              }
-              return Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '${'${i + 1}'.padLeft(width)}  ',
-                    style: base.copyWith(color: colors.muted),
-                  ),
-                  Expanded(child: text),
-                ],
-              );
-            },
+          child: SelectionArea(
+            child: ListView.builder(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+              itemCount: lines.length,
+              itemBuilder: (context, i) {
+                final line = lines[i];
+                final text = _SelectableLine(
+                  text: line.text,
+                  style: _style(line.kind, base, colors),
+                );
+                if (!numbered) {
+                  return text;
+                }
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SelectionContainer.disabled(
+                      child: Text(
+                        '${'${i + 1}'.padLeft(width)}  ',
+                        style: base.copyWith(color: colors.muted),
+                      ),
+                    ),
+                    Expanded(child: text),
+                  ],
+                );
+              },
+            ),
           ),
         ),
       ],
@@ -372,4 +377,68 @@ class _TextPane extends StatelessWidget {
     WorkdirLineKind.meta => base.copyWith(color: colors.muted),
     WorkdirLineKind.context || WorkdirLineKind.plain => base,
   };
+}
+
+/// One line of a file or diff as its own selection container, so a copy ends
+/// the line with a newline. A scrollable joins its children's selected text
+/// with nothing, which would run the copied lines together.
+class _SelectableLine extends StatefulWidget {
+  const _SelectableLine({required this.text, required this.style});
+
+  final String text;
+  final TextStyle style;
+
+  /// What a blank line shows: an empty `Text` has nothing to select, so a
+  /// copy would skip the line. A zero-width space is selectable and takes
+  /// the same height; the delegate drops it from the copy.
+  static const blank = '\u{200B}';
+
+  @override
+  State<_SelectableLine> createState() => _SelectableLineState();
+}
+
+class _SelectableLineState extends State<_SelectableLine> {
+  final _delegate = _LineSelectionDelegate();
+
+  @override
+  void dispose() {
+    _delegate.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _delegate.isBlank = widget.text.isEmpty;
+    return SelectionContainer(
+      delegate: _delegate,
+      child: Text(
+        widget.text.isEmpty ? _SelectableLine.blank : widget.text,
+        style: widget.style,
+      ),
+    );
+  }
+}
+
+/// Selects its one line and ends the copied text with `\n` when the
+/// selection reaches the end of the line, not when it stops inside it.
+class _LineSelectionDelegate extends MultiSelectableSelectionContainerDelegate {
+  bool isBlank = false;
+
+  @override
+  SelectedContent? getSelectedContent() {
+    final range = getSelection();
+    if (range == null) {
+      return null;
+    }
+    final copied = super.getSelectedContent()?.plainText ?? '';
+    final text = isBlank
+        ? copied.replaceAll(_SelectableLine.blank, '')
+        : copied;
+    final reachesEnd =
+        range.startOffset >= contentLength || range.endOffset >= contentLength;
+    return SelectedContent(plainText: reachesEnd ? '$text\n' : text);
+  }
+
+  @override
+  void ensureChildUpdated(Selectable selectable) {}
 }
