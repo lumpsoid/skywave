@@ -34,8 +34,8 @@ use crate::snippets::Snippets;
 use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
-    BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, ServerFacts, Settings,
-    Snapshot,
+    AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark,
+    ServerFacts, Settings, Snapshot,
 };
 use crate::tls;
 use crate::transport::TransportError;
@@ -2054,6 +2054,19 @@ impl Model {
     pub(crate) fn command_undeliverable(&mut self, id: CommandId, now: DateTime<Utc>) {
         if let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) {
             entry.status = OutboxStatus::Undeliverable;
+            entry.answered_at = Some(now);
+        }
+    }
+
+    /// Mirrors [`Store::record_attachment_refused`](crate::Store::record_attachment_refused).
+    pub(crate) fn command_attachment_refused(
+        &mut self,
+        id: CommandId,
+        reason: AttachmentRefusal,
+        now: DateTime<Utc>,
+    ) {
+        if let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) {
+            entry.status = OutboxStatus::AttachmentRefused(reason);
             entry.answered_at = Some(now);
         }
     }

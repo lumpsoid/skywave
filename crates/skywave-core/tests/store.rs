@@ -8,9 +8,9 @@ use chrono::{TimeZone, Utc};
 use skywave_core::attachment::AttachedImage;
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
-    Action, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
-    OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen, ServerAddress,
-    ServerFacts, Settings, Snippet, SnippetId, Store, StoreError,
+    Action, AttachmentRefusal, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError,
+    Draft, LockError, OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen,
+    ServerAddress, ServerFacts, Settings, Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
@@ -2450,6 +2450,52 @@ fn withdraw_anything_not_accepted() {
     assert!(outbox[1].discardable());
     assert!(!outbox[2].discardable());
     store.withdraw(create.id, None, None).unwrap();
+}
+
+#[test]
+fn attachment_refused_settles_and_withdraws() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    let command = send(SessionId::new(), "with an image");
+    store.enqueue(&command).unwrap();
+
+    assert!(
+        store
+            .record_attachment_refused(command.id, AttachmentRefusal::NotAnImage, at(1))
+            .unwrap()
+    );
+    // The first refusal is kept.
+    assert!(
+        !store
+            .record_attachment_refused(command.id, AttachmentRefusal::Missing, at(2))
+            .unwrap()
+    );
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(
+        entry.status,
+        OutboxStatus::AttachmentRefused(AttachmentRefusal::NotAnImage)
+    );
+    assert!(entry.status.is_settled());
+    assert!(entry.discardable());
+    // Settled, so it is never claimed for sending.
+    assert!(!store.claim_send(command.id, at(3)).unwrap());
+
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let result: String = conn
+        .query_row(
+            "SELECT result FROM outbox WHERE command_id = ?1",
+            [command.id.0.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"{"result":"attachment_refused","reason":"not_an_image"}"#
+    );
+    drop(conn);
+
+    store.withdraw(command.id, None, None).unwrap();
+    assert!(store.outbox().unwrap().is_empty());
 }
 
 #[test]
