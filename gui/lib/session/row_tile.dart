@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/highlight.dart';
+import 'package:skywave_gui/session/images.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/markdown_body.dart';
 import 'package:skywave_gui/session/section_block.dart';
@@ -414,6 +417,22 @@ class _Message extends StatelessWidget {
   /// The row's tap, for a tap on the text.
   final VoidCallback? onTap;
 
+  /// A logged image opens its blob (the hub answers with the file); a
+  /// queued one opens its local file; one not downloaded is fetched.
+  void _tapImage(RowImage image) {
+    final blob = image.blobId;
+    final path = image.path;
+    if (path == null) {
+      if (blob != null && image.canDownload) {
+        send.act(ActionIntentDownloadBlob(blobId: blob));
+      }
+    } else if (blob != null) {
+      send(GuiIntentOpenFull(blobId: blob));
+    } else {
+      openLocalImage(path);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -473,6 +492,22 @@ class _Message extends StatelessWidget {
               style: theme.textTheme.labelMedium?.copyWith(
                 color: authorColor,
                 fontWeight: FontWeight.bold,
+              ),
+            ),
+          if (row.images.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 4),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final (index, image) in row.images.indexed)
+                    _ImageThumb(
+                      key: Key('row-image-$index'),
+                      image: image,
+                      onTap: () => _tapImage(image),
+                    ),
+                ],
               ),
             ),
           if (row.text.isNotEmpty)
@@ -550,6 +585,75 @@ class _Message extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// One image on a message's row: its picture where there is a file to
+/// show, else its placeholder. A tap does what [onTap] says.
+class _ImageThumb extends StatelessWidget {
+  const _ImageThumb({required this.image, required this.onTap, super.key});
+
+  final RowImage image;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final path = image.path;
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onTap,
+      child: path == null
+          ? _ImagePlaceholder(image: image)
+          : ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Image.file(
+                File(path),
+                height: 160,
+                fit: BoxFit.contain,
+                cacheHeight: 320,
+                errorBuilder: (context, error, stackTrace) =>
+                    _ImagePlaceholder(image: image),
+              ),
+            ),
+    );
+  }
+}
+
+/// Stands in for an image with no file to show: its label, and a download
+/// icon where a tap would fetch it.
+class _ImagePlaceholder extends StatelessWidget {
+  const _ImagePlaceholder({required this.image});
+
+  final RowImage image;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = SkyColors.of(context);
+    final fetchable = image.blobId != null && image.canDownload;
+    return Container(
+      width: 120,
+      height: 90,
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.image_outlined, size: 18, color: colors.muted),
+          Text(
+            image.label,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: theme.textTheme.labelSmall?.copyWith(color: colors.muted),
+          ),
+          if (fetchable) Icon(Icons.download, size: 16, color: colors.muted),
+        ],
       ),
     );
   }
