@@ -194,9 +194,12 @@ only your server.
 
 ### 3. Work
 
-Press `n` to create a session in a directory under one of your `roots`
-(`Tab` completes the path from the server, or from recent workdirs while
-offline), then start talking to the agent. Each session is titled by the
+Press `n` to create a session in a directory under one of your `roots`. The
+directory list is always shown: recent workdirs first, then the roots, and it
+narrows as you type (recent workdirs stand in while offline). `↓` highlights a
+row; Enter or `Tab` on it opens that directory and lists its subdirectories.
+With nothing highlighted, `Tab` completes the path, and Enter creates the
+session. Then start talking to the agent. Each session is titled by the
 first line of its first message until you name it: `r` on the session list
 (or `R` on the timeline) renames it on every device, and an empty name brings
 the default title back.
