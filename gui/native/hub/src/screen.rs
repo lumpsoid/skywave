@@ -491,6 +491,8 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             shell_enabled: false,
             prompt: None,
             can_stop: false,
+            images: Vec::new(),
+            preparing: 0,
         }),
         // The composer's kind only: saved prompts in agent mode, saved
         // commands in shell mode.

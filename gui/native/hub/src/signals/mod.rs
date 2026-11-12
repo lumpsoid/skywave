@@ -42,14 +42,14 @@ pub use intents::{
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView,
-    CompletionPopup, ComposerModeView, ComposerView, ContextRow, ConversationRowView,
-    ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView,
-    InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState, ModeOption,
-    ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
-    QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
-    SessionRowView, SessionScreen, ShellPromptView, SnippetView, StopHeadings, StorageGroupingView,
-    StorageRowView, StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow,
-    UsageGroupingView, UsageRowView, UsageSpanView,
+    CompletionPopup, ComposerImage, ComposerModeView, ComposerView, ContextRow,
+    ConversationRowView, ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView,
+    InfoFieldView, InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState,
+    ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView,
+    QuestionPanel, QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate,
+    ScreenView, SessionRowView, SessionScreen, ShellPromptView, SnippetView, StopHeadings,
+    StorageGroupingView, StorageRowView, StorageTotalView, SubagentHeaderView, SubagentRowView,
+    TaskRow, UsageGroupingView, UsageRowView, UsageSpanView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};

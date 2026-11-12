@@ -20,9 +20,13 @@ use std::pin::pin;
 use std::task::Poll;
 
 use rinf::{DartSignal, DartSignalPack, RustSignal, SignalReceiver};
+use skywave_core::SessionId;
+use skywave_core::attachment::AttachedImage;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
+use crate::attach::prepare_image;
 use crate::boot::{self, Running};
 use crate::dispatcher::Report;
 use crate::head::{Clock, Head, Out};
@@ -326,8 +330,11 @@ async fn run(
     stop: &mut Stop,
 ) -> Result<(), String> {
     let mut head = Head::holding(hub.prefs, recovery.holders);
+    head.set_data_dir(hub.data_dir.clone());
     recovery.stepped(*head.awake());
     let mut shown = None;
+    // Images prepared off this task answer here, in the order they finish.
+    let (prepared_tx, mut prepared) = unbounded_channel();
     loop {
         // Read afresh each turn: what is due changes with every step.
         let wake = head.next_wake(Clock::read()).map(TokioInstant::from_std);
@@ -365,18 +372,21 @@ async fn run(
             // snapshots may have stopped for good. Closed only with the
             // core, so this branch then just goes quiet.
             Ok(message) = &mut hub.failed => return Err(message),
+            Some((session_id, result)) = prepared.recv() => {
+                head.on_prepared(session_id, result, Clock::read())
+            }
             () = sleep_until(wake.unwrap_or_else(TokioInstant::now)), if wake.is_some() => {
                 head.on_wake(Clock::read())
             }
         };
         #[cfg(test)]
         tests::panic_if_asked();
-        perform(outs, hub, &mut shown);
+        perform(outs, hub, &mut shown, &prepared_tx);
         recovery.stepped(*head.awake());
     }
     // The one way out of the loop: the unsaved draft and read mark are
     // queued now, and closing applies everything queued before shutdown.
-    perform(head.on_stop(Clock::read()), hub, &mut shown);
+    perform(head.on_stop(Clock::read()), hub, &mut shown, &prepared_tx);
     Ok(())
 }
 
@@ -398,8 +408,14 @@ async fn catching<T>(work: impl Future<Output = T>) -> Result<T, String> {
 /// Carries out a step's outputs in order: signals to Dart, actions to the
 /// dispatcher, suspend and resume to the core (neither blocks: each only
 /// flips the engine's flag), preferences to their file (a failed write is
-/// logged: the head keeps the choice until the hub stops).
-fn perform(outs: Vec<Out>, hub: &Running, shown: &mut Option<&'static str>) {
+/// logged: the head keeps the choice until the hub stops), images to prepare
+/// (on a blocking thread, the result sent to `prepared`).
+fn perform(
+    outs: Vec<Out>,
+    hub: &Running,
+    shown: &mut Option<&'static str>,
+    prepared: &UnboundedSender<(SessionId, Result<AttachedImage, String>)>,
+) {
     for out in outs {
         match out {
             Out::Link(update) => update.send_signal_to_dart(),
@@ -419,6 +435,19 @@ fn perform(outs: Vec<Out>, hub: &Running, shown: &mut Option<&'static str>) {
             Out::Dispatch(tag, action) => {
                 tracing::debug!(tag, ?action, "dispatch");
                 hub.dispatcher.send(tag, action);
+            }
+            Out::Prepare { session_id, source } => {
+                let (data_dir, done) = (hub.data_dir.clone(), prepared.clone());
+                tokio::spawn(async move {
+                    let result =
+                        tokio::task::spawn_blocking(move || prepare_image(&data_dir, source))
+                            .await
+                            .unwrap_or_else(|err| {
+                                Err(format!("the image could not be prepared: {err}"))
+                            });
+                    // Nothing waits for the answer once the loop has ended.
+                    let _ = done.send((session_id, result));
+                });
             }
             Out::Suspend => {
                 tracing::info!("app backgrounded: suspending the engine");
@@ -770,7 +799,8 @@ mod tests {
         let on = prefs::Prefs {
             stay_connected: true,
         };
-        perform(vec![Out::SavePrefs(on)], &hub, &mut None);
+        let (prepared, _) = unbounded_channel();
+        perform(vec![Out::SavePrefs(on)], &hub, &mut None, &prepared);
         let file = dir.path().join("skywave-gui.json");
         assert!(file.is_file());
         assert!(
@@ -786,7 +816,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
         std::fs::write(file.join("x"), b"").unwrap();
-        perform(vec![Out::SavePrefs(on)], &hub, &mut None);
+        perform(vec![Out::SavePrefs(on)], &hub, &mut None, &prepared);
         hub.close();
     }
 

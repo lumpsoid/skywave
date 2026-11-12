@@ -748,6 +748,7 @@ name = "hub"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "image",
  "rinf",
  "serde",
  "serde_json",

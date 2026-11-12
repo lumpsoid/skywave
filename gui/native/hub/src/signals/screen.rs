@@ -872,6 +872,23 @@ pub struct ComposerView {
     pub prompt: Option<ShellPromptView>,
     /// In shell mode, the stop button does something (`StopShell`).
     pub can_stop: bool,
+    /// The images of the agent draft, in the order they were attached; none
+    /// in shell mode.
+    pub images: Vec<ComposerImage>,
+    /// Images picked or pasted and still being prepared: a message waits
+    /// for them.
+    pub preparing: u32,
+}
+
+/// An image of the composer's draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ComposerImage {
+    /// The image's sha256, 64 hex digits; it names the image to detach.
+    pub sha256: String,
+    /// The prepared image's file on this device, for a thumbnail.
+    pub path: String,
+    /// `812 B`, `1.2 MiB`.
+    pub size_label: String,
 }
 
 /// The shell prompt in its parts, shown in order: `work [if ok ✓] $`.
