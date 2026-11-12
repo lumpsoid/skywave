@@ -689,11 +689,15 @@ impl Head {
                 let cursor = utf16_to_chars(&text, cursor_utf16.into());
                 let composer = &mut session.composer;
                 // Setting the field from `rev` may echo back: no edit.
-                if composer.text != text || composer.cursor != cursor {
+                if composer.text != text {
                     composer.text = text;
                     composer.cursor = cursor;
                     session.saver.edited(clock.now);
                     session.end_history();
+                } else if composer.cursor != cursor {
+                    // A caret move is not an edit: it keeps history browsing.
+                    composer.cursor = cursor;
+                    session.saver.edited(clock.now);
                 }
             }
             GuiIntent::ComposerSubmit { session_id } => {

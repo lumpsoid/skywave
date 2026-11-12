@@ -1459,6 +1459,56 @@ fn history_recalls_and_restores_the_stash() {
 }
 
 #[test]
+fn a_caret_move_keeps_browsing_history() {
+    let mut rig = Rig::new();
+    for prompt in ["oldest", "123\n123", "newest"] {
+        rig.edit(prompt);
+        rig.submit();
+        rig.results();
+        rig.view();
+    }
+    rig.edit("123\n123\n1");
+    rig.intent(GuiIntent::HistoryOlder);
+    assert_eq!(rig.composer().text, "newest");
+    assert_eq!(rig.composer().history_label.as_deref(), Some("1 of 3"));
+    rig.intent(GuiIntent::HistoryOlder);
+    assert_eq!(rig.composer().text, "123\n123");
+    assert_eq!(rig.composer().history_label.as_deref(), Some("2 of 3"));
+    // Up inside the recalled multi-line prompt moves the caret, not the text.
+    rig.intent(GuiIntent::DraftEdited {
+        session_id: rig.session.0.to_string(),
+        text: "123\n123".into(),
+        cursor_utf16: 3,
+    });
+    assert_eq!(rig.composer().history_label.as_deref(), Some("2 of 3"));
+    rig.intent(GuiIntent::HistoryOlder);
+    assert_eq!(rig.composer().text, "oldest");
+    assert_eq!(rig.composer().history_label.as_deref(), Some("3 of 3"));
+    for _ in 0..3 {
+        rig.intent(GuiIntent::HistoryNewer);
+    }
+    assert_eq!(rig.composer().text, "123\n123\n1");
+    assert_eq!(rig.composer().history_label, None);
+}
+
+#[test]
+fn a_text_edit_still_ends_browsing() {
+    let mut rig = Rig::new();
+    rig.edit("first");
+    rig.submit();
+    rig.results();
+    rig.view();
+    rig.edit("half");
+    rig.intent(GuiIntent::HistoryOlder);
+    assert_eq!(rig.composer().history_label.as_deref(), Some("1 of 1"));
+    rig.edit("first!");
+    assert_eq!(rig.composer().history_label, None);
+    rig.intent(GuiIntent::HistoryNewer);
+    // Dart's field keeps what Dart typed, so the head's own draft is checked.
+    assert_eq!(rig.head.session.as_ref().unwrap().composer.text, "first!");
+}
+
+#[test]
 fn snippets_are_saved_from_rows_and_the_composer_and_inserted_at_the_cursor() {
     let mut rig = Rig::new();
     rig.edit("run the tests");
