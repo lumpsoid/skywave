@@ -535,7 +535,7 @@ fn approval_script() -> FakeScript {
 }
 
 fn message(text: &str) -> FakeInput {
-    FakeInput::Message(text.into())
+    FakeInput::message(text)
 }
 
 #[tokio::test]

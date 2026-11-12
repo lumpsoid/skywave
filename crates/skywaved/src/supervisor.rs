@@ -340,8 +340,8 @@ use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation, EventMapper,
-    LoginSeen, LoginSource, LoginState, StartSpec, bounded_models, load_grants, load_origin,
-    load_resume_handle, unsent_notice,
+    LoginSeen, LoginSource, LoginState, StartSpec, UserInput, bounded_models, load_grants,
+    load_origin, load_resume_handle, unsent_notice,
 };
 use crate::db::Db;
 use crate::disk::Disk;
@@ -1464,7 +1464,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         // Read before the agent gets it: a login that succeeds from here
         // on may come after the agent read its own for this message.
         let logins = self.config.login.successes();
-        let error = match running.session.send_message(text).await {
+        let error = match running.session.send_message(UserInput::from(text)).await {
             Ok(()) => {
                 running.login_seen.handed(logins);
                 running.owed_turns += 1;

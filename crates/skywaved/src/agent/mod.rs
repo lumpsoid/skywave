@@ -111,6 +111,7 @@ pub(crate) mod mapper;
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -119,7 +120,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use skywave_proto::{ContextId, Decision, SessionId, SessionOrigin};
+use skywave_proto::{ContextId, Decision, ImageType, SessionId, SessionOrigin};
 pub use skywave_proto::{
     Effort, LimitSeverity, LimitWindow, ModelChoice, PermissionMode, Question, QuestionAnswer,
     QuestionOption, RuleScope, RuleSuggestion, TaskKind, TurnUsage, UsageLimit,
@@ -662,15 +663,104 @@ pub const INTERRUPT_UNANSWERED: &str = "agent did not answer the interrupt; stop
 pub const CONVERSATION_GONE: &str = "This context's conversation history is gone from the \
     server, so the agent cannot go on with it. Start a new context to continue.";
 
+/// A user message as the supervisor hands it over: the text and its image
+/// attachments, each as an open file. The supervisor only opens the files;
+/// it runs every session on one runtime, where reading them would stall the
+/// others. The adapter reads them ([`UserInput::read`]), and an open file
+/// keeps its bytes even if the blob is deleted meanwhile.
+#[derive(Debug)]
+pub struct UserInput {
+    pub text: String,
+    pub images: Vec<ImageInput>,
+}
+
+/// An image attachment of a [`UserInput`], opened and not read yet.
+#[derive(Debug)]
+pub struct ImageInput {
+    pub media_type: ImageType,
+    pub file: std::fs::File,
+}
+
+/// What is appended to a message's text for each image that could not be
+/// read, so the agent is not told about a picture it cannot see.
+pub const IMAGE_REMOVED: &str = "[image removed before delivery]";
+
+/// A user message with its images read: what an adapter writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadInput {
+    pub text: String,
+    pub images: Vec<Image>,
+}
+
+/// An image attachment's bytes, read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub media_type: ImageType,
+    pub bytes: Vec<u8>,
+}
+
+impl UserInput {
+    /// Appends [`IMAGE_REMOVED`] to the text, on a line of its own.
+    pub fn note_missing(&mut self) {
+        if !self.text.is_empty() {
+            self.text.push('\n');
+        }
+        self.text.push_str(IMAGE_REMOVED);
+    }
+
+    /// Reads every image to its end. An image that cannot be read is left
+    /// out and noted with [`UserInput::note_missing`]; the rest is
+    /// delivered. This blocks on file I/O, so it runs off the async runtime.
+    pub fn read(mut self) -> ReadInput {
+        let mut images = Vec::with_capacity(self.images.len());
+        for ImageInput {
+            media_type,
+            mut file,
+        } in std::mem::take(&mut self.images)
+        {
+            let mut bytes = Vec::new();
+            match file.read_to_end(&mut bytes) {
+                Ok(_) => images.push(Image { media_type, bytes }),
+                Err(_) => self.note_missing(),
+            }
+        }
+        ReadInput {
+            text: self.text,
+            images,
+        }
+    }
+}
+
+/// A text-only message, with no images.
+impl From<String> for UserInput {
+    fn from(text: String) -> Self {
+        UserInput {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+/// A text-only message, with no images.
+impl From<&str> for UserInput {
+    fn from(text: &str) -> Self {
+        UserInput::from(text.to_owned())
+    }
+}
+
 /// One running agent session.
 ///
 /// Requests return once the agent has been told; results arrive as
 /// [`AdapterEvent`]s. After the agent exits every request fails with
 /// [`AgentError::Closed`].
 pub trait AgentSession: Send + 'static {
-    /// Sends a user message; it starts a turn, or the next one if a turn runs.
-    fn send_message(&mut self, text: String)
-    -> impl Future<Output = Result<(), AgentError>> + Send;
+    /// Sends a user message with its images; it starts a turn, or the next
+    /// one if a turn runs. The adapter reads the images itself
+    /// ([`UserInput::read`]), before the message is written.
+    fn send_message(
+        &mut self,
+        input: UserInput,
+    ) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Answers approval `request`; with an approval, `rule` grants the
     /// request's suggestion with that index too (the log only holds a rule
@@ -1039,5 +1129,87 @@ pub fn load_grants(db: &Db, session: SessionId) -> Result<Option<Grants>> {
     match row {
         None => Err(Error::UnknownSession(session)),
         Some(json) => Ok(json.as_deref().map(serde_json::from_str).transpose()?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use super::*;
+
+    #[test]
+    fn read_returns_each_image_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        let jpeg = dir.path().join("b.jpeg");
+        std::fs::write(&png, b"png-bytes").unwrap();
+        std::fs::write(&jpeg, b"jpeg-bytes").unwrap();
+        let input = UserInput {
+            text: "look".into(),
+            images: vec![
+                ImageInput {
+                    media_type: ImageType::Png,
+                    file: File::open(&png).unwrap(),
+                },
+                ImageInput {
+                    media_type: ImageType::Jpeg,
+                    file: File::open(&jpeg).unwrap(),
+                },
+            ],
+        };
+        assert_eq!(
+            input.read(),
+            ReadInput {
+                text: "look".into(),
+                images: vec![
+                    Image {
+                        media_type: ImageType::Png,
+                        bytes: b"png-bytes".to_vec(),
+                    },
+                    Image {
+                        media_type: ImageType::Jpeg,
+                        bytes: b"jpeg-bytes".to_vec(),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_read_is_left_out_and_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"png-bytes").unwrap();
+        // A directory opens, but reading it fails with EISDIR on Linux.
+        let input = UserInput {
+            text: "look".into(),
+            images: vec![
+                ImageInput {
+                    media_type: ImageType::Jpeg,
+                    file: File::open(dir.path()).unwrap(),
+                },
+                ImageInput {
+                    media_type: ImageType::Png,
+                    file: File::open(&png).unwrap(),
+                },
+            ],
+        };
+        let read = input.read();
+        assert_eq!(read.text, "look\n[image removed before delivery]");
+        assert_eq!(
+            read.images,
+            [Image {
+                media_type: ImageType::Png,
+                bytes: b"png-bytes".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_note_on_an_empty_text_is_the_note_alone() {
+        let mut input = UserInput::from("");
+        input.note_missing();
+        assert_eq!(input.text, IMAGE_REMOVED);
     }
 }
