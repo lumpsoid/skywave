@@ -176,7 +176,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `TooManyAttachments` and `AttachmentsTooLarge`, the
 /// `limits::ATTACHMENT*` consts, and `HEAD` and `PUT`
 /// [`path::ATTACHMENT_ROUTE`] answering [`UploadResult`].
-pub const PROTOCOL_VERSION: u32 = 30;
+///
+/// v31: the workdir commit log: `GET` [`path::WORKDIR_LOG`] answering
+/// [`LogResult`] ([`CommitLog`], [`Commit`]) and [`limits::WORKDIR_LOG_MAX`].
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -1279,6 +1282,9 @@ pub mod limits {
     /// [`ChangeSet`](crate::ChangeSet); the rest are only counted in
     /// [`ChangeSet::total`](crate::ChangeSet::total).
     pub const WORKDIR_CHANGES_MAX: usize = 500;
+    /// Most [`Commit`](crate::Commit)s in one [`CommitLog`](crate::CommitLog);
+    /// [`CommitLog::more`](crate::CommitLog::more) says older ones exist.
+    pub const WORKDIR_LOG_MAX: usize = 50;
     /// Largest diff of one changed file, in bytes; past it the file's diff
     /// is [`DiffBody::TooLarge`](crate::DiffBody::TooLarge).
     pub const WORKDIR_DIFF_MAX_BYTES: u64 = 1024 * 1024;
@@ -2768,7 +2774,7 @@ pub enum LimitSeverity {
     Warning,
 }
 
-/// Query string of `GET /v1/workdir/{changes,list,file}`. Names a session,
+/// Query string of `GET /v1/workdir/{changes,log,list,file}`. Names a session,
 /// not a raw path: the server resolves the root from the session's workdir,
 /// so a device reads only workdirs that sessions run in.
 ///
@@ -2782,7 +2788,7 @@ pub enum LimitSeverity {
 pub struct WorkdirQuery {
     pub session: SessionId,
     /// Relative to the session's workdir, `/` separated, empty for the
-    /// workdir itself; ignored by `changes`.
+    /// workdir itself; ignored by `changes` and `log`.
     #[serde(default)]
     pub path: String,
 }
@@ -2863,6 +2869,52 @@ pub enum DiffBody {
     TooLarge { bytes: u64 },
     /// Left out: the snapshot reached [`limits::WORKDIR_DIFFS_MAX_BYTES`].
     Omitted,
+}
+
+/// Response to `GET /v1/workdir/log`, always 200: every outcome is a
+/// domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum LogResult {
+    /// The newest commits on `HEAD`.
+    Log(CommitLog),
+    /// The workdir is in no git work tree.
+    NotGit,
+    /// git is missing or exited unexpectedly; `reason` is bounded text.
+    Failed {
+        reason: String,
+    },
+    UnknownSession,
+    WorkdirGone,
+}
+
+/// The commits a workdir's `HEAD` points into, newest first.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CommitLog {
+    /// Server clock when the log was read.
+    pub at: DateTime<Utc>,
+    /// The checked-out branch; `None` when `HEAD` is detached.
+    pub branch: Option<String>,
+    /// At most [`limits::WORKDIR_LOG_MAX`], newest first; empty on an
+    /// unborn branch.
+    pub commits: Vec<Commit>,
+    /// Older commits exist past `commits`.
+    pub more: bool,
+}
+
+/// One commit in a [`CommitLog`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    /// Full object name.
+    pub sha: String,
+    /// Abbreviated as git abbreviates it in this repo.
+    pub short: String,
+    /// Author name.
+    pub author: String,
+    /// Author date.
+    pub time: DateTime<Utc>,
+    /// First line of the message.
+    pub subject: String,
 }
 
 /// Response to `GET /v1/workdir/list`, always 200: every outcome is a domain
@@ -2977,6 +3029,8 @@ pub mod path {
     pub const AGENT_LOGIN_FINISH: &str = "/v1/agent-login/finish";
     /// What changed in a session's workdir: [`crate::ChangesResult`].
     pub const WORKDIR_CHANGES: &str = "/v1/workdir/changes";
+    /// The newest commits on a session's workdir `HEAD`: [`crate::LogResult`].
+    pub const WORKDIR_LOG: &str = "/v1/workdir/log";
     /// One directory of a session's workdir: [`crate::ListResult`].
     pub const WORKDIR_LIST: &str = "/v1/workdir/list";
     /// One file of a session's workdir: [`crate::FileResult`].

@@ -535,7 +535,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
-    v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30,
+    v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -607,6 +607,13 @@ fn v28_to_v29(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// events read as no attachments, as their JSON lacks the field. Nothing
 /// stored changes.
 fn v29_to_v30(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v30 to v31, as the server's step of the same name. v31 added the
+/// workdir commit log, a new read; no stored workdir answer or event
+/// changes shape. Nothing stored changes.
+fn v30_to_v31(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 

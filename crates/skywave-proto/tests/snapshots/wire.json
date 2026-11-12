@@ -1,7 +1,7 @@
 {
-  "protocol_version": 30,
+  "protocol_version": 31,
   "hello": {
-    "protocol_version": 30,
+    "protocol_version": 31,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -1931,6 +1931,50 @@
       "head": null,
       "files": [],
       "total": 0
+    },
+    {
+      "result": "not_git"
+    },
+    {
+      "result": "failed",
+      "reason": "git: command not found"
+    },
+    {
+      "result": "unknown_session"
+    },
+    {
+      "result": "workdir_gone"
+    }
+  ],
+  "workdir_log": [
+    {
+      "result": "log",
+      "at": "2026-10-29T12:00:00Z",
+      "branch": "main",
+      "commits": [
+        {
+          "sha": "e3c8849a1f0b2c7d6e5f4a3b2c1d0e9f8a7b6c5d",
+          "short": "e3c8849",
+          "author": "Ada Lovelace",
+          "time": "2026-10-29T11:58:00Z",
+          "subject": "fix(skywaved): keep the log's order"
+        },
+        {
+          "sha": "1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c",
+          "short": "1d2c3b4",
+          "author": "Zoë Ångström",
+          "time": "2026-10-28T09:30:00Z",
+          "subject": "docs: explain the café fixture"
+        }
+      ],
+      "more": true
+    },
+    {
+      "result": "log",
+      "at": "2026-10-29T12:00:00Z",
+      "branch": null,
+      "commits": [],
+      "more": false
     },
     {
       "result": "not_git"
