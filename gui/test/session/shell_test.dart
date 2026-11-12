@@ -374,7 +374,9 @@ void main() {
       timeline: timelineOf('hello'),
       sent: sent,
     );
-    await tester.tap(find.byTooltip('Saved commands'));
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('composer-snippets')));
     await tester.pumpAndSettle();
     expect(find.text('Saved commands'), findsOneWidget);
     await tester.longPress(find.text('build'));
@@ -382,7 +384,9 @@ void main() {
     expect(sent.whereType<GuiIntentRunSnippet>().single.snippetId, 'n1');
     expect(sent.whereType<GuiIntentInsertSnippet>(), isEmpty);
 
-    await tester.tap(find.byTooltip('Saved commands'));
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('composer-snippets')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('build'));
     await tester.pumpAndSettle();

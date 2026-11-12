@@ -579,7 +579,9 @@ void main() {
       sent: sent,
     );
     await show([tests, commit]);
-    await tester.tap(find.byTooltip('Snippets'));
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('composer-snippets')));
     await tester.pumpAndSettle();
     expect(find.text('run the tests'), findsOneWidget);
     expect(find.text('Save the message as a snippet'), findsNothing);
@@ -637,7 +639,9 @@ void main() {
     );
 
     await tester.enterText(find.byType(TextField), 'ship it');
-    await tester.tap(find.byTooltip('Snippets'));
+    await tester.tap(find.byKey(const Key('composer-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('composer-snippets')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Save the message as a snippet'));
     await tester.pumpAndSettle();
@@ -1234,6 +1238,54 @@ void main() {
         debugDefaultTargetPlatformOverride = null;
       }
     });
+
+    testWidgets(
+      'the input menu offers snippets, an image and the previous prompt',
+      (tester) async {
+        tall(tester);
+        final sent = <GuiIntent>[];
+        await pumpSession(
+          tester,
+          screen: screenWith(),
+          timeline: holding([]),
+          sent: sent,
+        );
+        await tester.tap(find.byKey(const Key('composer-menu')));
+        await tester.pumpAndSettle();
+        expect(find.byKey(const Key('composer-snippets')), findsOneWidget);
+        expect(find.byKey(const Key('attach-image')), findsOneWidget);
+        expect(find.byKey(const Key('history-older')), findsOneWidget);
+        expect(find.byType(BottomSheet), findsNothing);
+
+        await tester.tap(find.byKey(const Key('history-older')));
+        await tester.pumpAndSettle();
+        expect(sent.last, const GuiIntentHistoryOlder());
+      },
+    );
+
+    testWidgets(
+      'on a phone the input menu is a sheet and recalls the previous prompt',
+      (tester) async {
+        tester.view.physicalSize = const Size(360, 780);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.reset);
+        final sent = <GuiIntent>[];
+        await pumpSession(
+          tester,
+          screen: screenWith(),
+          timeline: holding([]),
+          sent: sent,
+        );
+        await tester.tap(find.byKey(const Key('composer-menu')));
+        await tester.pumpAndSettle();
+        expect(find.byType(BottomSheet), findsOneWidget);
+
+        await tester.tap(find.byKey(const Key('history-older')));
+        await tester.pumpAndSettle();
+        expect(sent.last, const GuiIntentHistoryOlder());
+        expect(find.byType(BottomSheet), findsNothing);
+      },
+    );
 
     testWidgets('the send button sends, only once there is text', (
       tester,

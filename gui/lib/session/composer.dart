@@ -349,21 +349,30 @@ class ComposerState extends State<Composer> {
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  IconButton(
-                    tooltip: shell ? 'Saved commands' : 'Snippets',
-                    onPressed: _pickSnippet,
-                    icon: const Icon(Icons.bookmark_outline),
+                  _InputMenu(
+                    actions: [
+                      _InputAction(
+                        key: const Key('composer-snippets'),
+                        icon: Icons.bookmark_outline,
+                        title: shell ? 'Saved commands' : 'Snippets',
+                        onTap: () => _pickSnippet(),
+                      ),
+                      if (!shell)
+                        _InputAction(
+                          key: const Key('attach-image'),
+                          icon: Icons.image_outlined,
+                          title: 'Attach image',
+                          onTap: () => _attach(),
+                        ),
+                      _InputAction(
+                        key: const Key('history-older'),
+                        icon: Icons.history,
+                        title: 'Previous prompt',
+                        onTap: () => widget.send(const GuiIntentHistoryOlder()),
+                      ),
+                    ],
                   ),
                   const SizedBox(width: 2),
-                  if (!shell) ...[
-                    IconButton(
-                      key: const Key('attach-image'),
-                      tooltip: 'Attach image',
-                      onPressed: _attach,
-                      icon: const Icon(Icons.image_outlined),
-                    ),
-                    const SizedBox(width: 2),
-                  ],
                   Expanded(
                     child: TextField(
                       controller: _field,
@@ -646,6 +655,85 @@ class _ShellBar extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// One entry of the input menu: its key (for tests), icon, title and what
+/// it does.
+class _InputAction {
+  const _InputAction({
+    required this.key,
+    required this.icon,
+    required this.title,
+    required this.onTap,
+  });
+
+  final Key key;
+  final IconData icon;
+  final String title;
+  final VoidCallback onTap;
+}
+
+/// The composer's input actions behind one button: a sheet on a phone (no
+/// hardware keyboard, so no key for the history), a popup on a wide window.
+class _InputMenu extends StatelessWidget {
+  const _InputMenu({required this.actions});
+
+  final List<_InputAction> actions;
+
+  @override
+  Widget build(BuildContext context) {
+    if (isCompact(context)) {
+      return IconButton(
+        key: const Key('composer-menu'),
+        tooltip: 'Input actions',
+        icon: const Icon(Icons.add_circle_outline),
+        onPressed: () => _showSheet(context),
+      );
+    }
+    return PopupMenuButton<VoidCallback>(
+      key: const Key('composer-menu'),
+      tooltip: 'Input actions',
+      icon: const Icon(Icons.add_circle_outline),
+      onSelected: (action) => action(),
+      itemBuilder: (context) => [
+        for (final a in actions)
+          PopupMenuItem(
+            key: a.key,
+            value: a.onTap,
+            child: ListTile(
+              leading: Icon(a.icon),
+              title: Text(a.title),
+              contentPadding: EdgeInsets.zero,
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// The actions as a sheet; one tapped closes the sheet, then runs.
+  void _showSheet(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheet) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final a in actions)
+              ListTile(
+                key: a.key,
+                leading: Icon(a.icon),
+                title: Text(a.title),
+                onTap: () {
+                  Navigator.of(sheet).pop();
+                  a.onTap();
+                },
+              ),
+          ],
+        ),
       ),
     );
   }
