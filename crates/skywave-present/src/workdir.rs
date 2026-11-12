@@ -8,7 +8,7 @@ use skywave_core::{
     ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry, EntryKind, FileBody, FileChange,
     FileResult, LinkTarget, ListResult, WorkdirFetch,
 };
-use skywave_proto::limits;
+use skywave_proto::{Commit, CommitLog, LogResult, limits};
 
 use crate::format;
 
@@ -232,6 +232,7 @@ pub fn taken_label(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// What a pane shows before its first answer.
 pub const NOT_FETCHED: &str = "Not fetched yet; refresh when online.";
 
+const NOT_GIT: &str = "Not a git repository. Browse the files under Files.";
 const UNKNOWN_SESSION: &str = "The server no longer knows this session.";
 const WORKDIR_GONE: &str = "The session's working directory no longer exists.";
 const NOT_ALLOWED: &str = "Outside the session's working directory: not shown.";
@@ -266,7 +267,7 @@ pub fn changes_wording(result: &ChangesResult) -> Option<String> {
             None => "No commits and no files yet.".to_owned(),
         },
         ChangesResult::Changes(_) => return None,
-        ChangesResult::NotGit => "Not a git repository. Browse the files under Files.".to_owned(),
+        ChangesResult::NotGit => NOT_GIT.to_owned(),
         ChangesResult::Failed { reason } => format!("git failed: {reason}"),
         ChangesResult::UnknownSession => UNKNOWN_SESSION.to_owned(),
         ChangesResult::WorkdirGone => WORKDIR_GONE.to_owned(),
@@ -286,6 +287,42 @@ pub fn changes_capped(set: &ChangeSet) -> Option<String> {
             thousands(u64::from(set.total))
         )
     })
+}
+
+/// The commits pane's header: the branch, or `detached` when `HEAD` is.
+pub fn log_label(log: &CommitLog) -> String {
+    log.branch.as_deref().unwrap_or("detached").to_owned()
+}
+
+/// What the commits pane shows instead of rows: why there are none, or that
+/// the branch has no commits yet. `None` when there are rows to list.
+pub fn log_wording(result: &LogResult) -> Option<String> {
+    let text = match result {
+        LogResult::Log(log) if log.commits.is_empty() => "No commits yet.".to_owned(),
+        LogResult::Log(_) => return None,
+        LogResult::NotGit => NOT_GIT.to_owned(),
+        LogResult::Failed { reason } => format!("git failed: {reason}"),
+        LogResult::UnknownSession => UNKNOWN_SESSION.to_owned(),
+        LogResult::WorkdirGone => WORKDIR_GONE.to_owned(),
+    };
+    Some(text)
+}
+
+/// That a log stops short of the older commits: "Showing the newest 50
+/// commits." `None` when `more` is off, so the log is the whole history.
+pub fn log_capped(log: &CommitLog) -> Option<String> {
+    log.more.then(|| {
+        format!(
+            "Showing the newest {} commits.",
+            thousands(log.commits.len() as u64)
+        )
+    })
+}
+
+/// A commit's author date as an age: "3 h ago". `None` when git gave no
+/// usable date.
+pub fn commit_time_label(commit: &Commit, now: DateTime<Utc>) -> Option<String> {
+    commit.time.map(|t| format::ago(t, now))
 }
 
 /// What the diff pane shows instead of a diff, for `file` as the stored
@@ -711,6 +748,81 @@ mod tests {
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(1000), "1,000");
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    fn commit(i: usize, time: Option<DateTime<Utc>>) -> Commit {
+        Commit {
+            sha: format!("{i:040x}"),
+            short: format!("{i:07x}"),
+            author: "Ada".to_owned(),
+            time,
+            subject: format!("commit {i}"),
+        }
+    }
+
+    fn log(branch: Option<&str>, commits: usize, more: bool) -> CommitLog {
+        CommitLog {
+            at: at(3, 14, 2, 11),
+            branch: branch.map(str::to_owned),
+            commits: (0..commits)
+                .map(|i| commit(i, Some(at(3, 14, 2, 11))))
+                .collect(),
+            more,
+        }
+    }
+
+    #[test]
+    fn log_labels() {
+        assert_eq!(log_label(&log(Some("main"), 0, false)), "main");
+        assert_eq!(log_label(&log(None, 0, false)), "detached");
+    }
+
+    #[test]
+    fn log_wordings() {
+        let wording = |r: LogResult| log_wording(&r);
+        assert_eq!(
+            wording(LogResult::Log(log(Some("main"), 0, false))).as_deref(),
+            Some("No commits yet.")
+        );
+        assert_eq!(wording(LogResult::Log(log(Some("main"), 1, false))), None);
+        assert_eq!(
+            wording(LogResult::NotGit).as_deref(),
+            Some("Not a git repository. Browse the files under Files.")
+        );
+        assert_eq!(
+            wording(LogResult::Failed {
+                reason: "boom".into()
+            })
+            .as_deref(),
+            Some("git failed: boom")
+        );
+        assert_eq!(
+            wording(LogResult::UnknownSession).as_deref(),
+            Some("The server no longer knows this session.")
+        );
+        assert_eq!(
+            wording(LogResult::WorkdirGone).as_deref(),
+            Some("The session's working directory no longer exists.")
+        );
+    }
+
+    #[test]
+    fn a_log_with_more_says_how_many_it_shows() {
+        assert_eq!(
+            log_capped(&log(Some("main"), 50, true)).as_deref(),
+            Some("Showing the newest 50 commits.")
+        );
+        assert_eq!(log_capped(&log(Some("main"), 50, false)), None);
+    }
+
+    #[test]
+    fn commit_times_read_as_an_age() {
+        let now = at(3, 17, 2, 11);
+        assert_eq!(
+            commit_time_label(&commit(0, Some(at(3, 14, 2, 11))), now).as_deref(),
+            Some("3 h ago")
+        );
+        assert_eq!(commit_time_label(&commit(0, None), now), None);
     }
 
     fn blob() -> skywave_proto::BlobRef {
