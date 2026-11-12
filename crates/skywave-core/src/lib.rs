@@ -27,6 +27,7 @@
 
 pub mod action;
 mod address;
+pub mod attachment;
 mod backoff;
 mod blobs;
 mod client;
@@ -74,8 +75,8 @@ pub use pairing::{
 pub use projection::{BlobFate, ContextFill, SessionSummary, SessionUsage, TurnRecord};
 pub use seam::{Request, Seam};
 pub use search::Query;
-pub use skywave_proto::Fingerprint;
 pub use skywave_proto::PROTOCOL_VERSION;
+pub use skywave_proto::{ContentHash, Fingerprint, ImageType};
 pub use store::{
     Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, OutboxStatus, PendingCrop,
     ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
