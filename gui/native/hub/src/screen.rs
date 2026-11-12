@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Local, Utc};
 use skywave_core::{
-    AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
+    AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, Candidate, CandidateSource, Completion,
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
     LoginFlowView, LoginOutcome, LoginView, Outgoing, PairingStatus, PairingView, PendingSession,
     PermissionMode, QuestionPrompt, RuleSuggestion, Screen, SessionId, SessionInfoView,
@@ -311,6 +311,24 @@ fn creating_view(pending: &PendingSession) -> CreatingView {
     }
 }
 
+/// The text a candidate row shows. A server listing under the input's
+/// directory (everything up to its last `/`, for an absolute input) shows
+/// the name past that directory; anything else shows its full path.
+fn candidate_label(input: &str, candidate: &Candidate) -> String {
+    let dir = input
+        .rfind('/')
+        .filter(|_| input.starts_with('/'))
+        .map(|end| &input[..=end]);
+    match dir {
+        Some(dir)
+            if candidate.source == CandidateSource::Server && candidate.path.starts_with(dir) =>
+        {
+            clean_line(&candidate.path[dir.len()..])
+        }
+        _ => clean_line(&candidate.path),
+    }
+}
+
 fn create_prompt(create: &CreateUi, completion: Option<&Completion>, link: &Link) -> CreatePrompt {
     let popup = completion.map(|completion| {
         let offline = matches!(link, Link::Reconnecting { .. } | Link::Rejected(_));
@@ -320,13 +338,15 @@ fn create_prompt(create: &CreateUi, completion: Option<&Completion>, link: &Link
                 .iter()
                 .map(|c| CandidateView {
                     path: clean_line(&c.path),
+                    label: candidate_label(&completion.input, c),
                     recent: c.source == CandidateSource::Recent,
                 })
                 .collect(),
             selected: create.picker.highlighted().map(count),
             stale: completion.input != create.input,
+            loading: completion.status == CompletionStatus::Loading,
             status_label: match completion.status {
-                CompletionStatus::Loading => Some("listing…"),
+                CompletionStatus::Loading => None,
                 CompletionStatus::Unavailable if offline => Some("offline · recent only"),
                 CompletionStatus::Unavailable => Some("unavailable · recent only"),
                 CompletionStatus::Ready { truncated: true } => Some("more not shown · keep typing"),

@@ -13,6 +13,10 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// closes the candidate list or else the prompt. Every one is an intent;
 /// what it does is Rust's. A tap on a candidate takes it.
 ///
+/// The candidate list sits in a box of fixed height, with a loading bar
+/// slot above it and a status line below, so the dialog never changes size
+/// as the list does.
+///
 /// The workdir field is the user's; it takes Rust's input only when
 /// `input_rev` changes (a completion filled it in). A second, optional
 /// field takes the id of a Claude Code conversation started outside
@@ -80,16 +84,12 @@ class _CreateDialogState extends State<CreateDialog> {
 
   KeyEventResult _key(FocusNode _, KeyEvent event) {
     if (event is KeyUpEvent) return KeyEventResult.ignored;
-    final listed = widget.prompt.popup?.candidates.isNotEmpty ?? false;
     final intent = switch (event.logicalKey) {
       LogicalKeyboardKey.tab when event is KeyDownEvent =>
         const GuiIntentCompletionComplete(),
-      LogicalKeyboardKey.arrowUp when listed => const GuiIntentCompletionMove(
-        up: true,
-      ),
-      LogicalKeyboardKey.arrowDown when listed => const GuiIntentCompletionMove(
-        up: false,
-      ),
+      // Rust ignores a move when nothing is listed.
+      LogicalKeyboardKey.arrowUp => const GuiIntentCompletionMove(up: true),
+      LogicalKeyboardKey.arrowDown => const GuiIntentCompletionMove(up: false),
       LogicalKeyboardKey.enter || LogicalKeyboardKey.numpadEnter
           when event is KeyDownEvent =>
         const GuiIntentCompletionAccept(),
@@ -121,6 +121,73 @@ class _CreateDialogState extends State<CreateDialog> {
     _input.dispose();
     _list.dispose();
     super.dispose();
+  }
+
+  /// The candidate box: up to `_visibleRows` rows, as much as the window
+  /// allows (the dialog's Flexible bounds it), and never a height that
+  /// follows the candidates. Stale rows are dimmed and take no taps; with
+  /// no rows, the empty label sits in the middle of the box.
+  Widget _candidateBox(CompletionPopup? popup, ThemeData theme) {
+    final candidates = popup?.candidates ?? const <CandidateView>[];
+    final stale = popup?.stale ?? false;
+    return SizedBox(
+      key: const Key('completion-popup'),
+      height: _rowHeight * _visibleRows,
+      child: Card.outlined(
+        margin: EdgeInsets.zero,
+        child: Opacity(
+          opacity: stale ? 0.5 : 1.0,
+          child: IgnorePointer(
+            ignoring: stale,
+            child: Stack(
+              children: [
+                ListView.builder(
+                  controller: _list,
+                  itemExtent: _rowHeight,
+                  itemCount: candidates.length,
+                  itemBuilder: (context, i) => _CandidateTile(
+                    candidate: candidates[i],
+                    selected: i == popup?.selected,
+                    onTap: () => _send(GuiIntentCompletionPick(index: i)),
+                  ),
+                ),
+                if (candidates.isEmpty)
+                  Positioned.fill(
+                    child: Center(
+                      child: Text(
+                        popup?.emptyLabel ?? '',
+                        style: _mutedText(theme),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// The line under the box: the popup's status when it has one, else the
+  /// keys that apply to the highlight. Always one line tall.
+  Widget _statusLine(CompletionPopup? popup, ThemeData theme) {
+    final text =
+        popup?.statusLabel ??
+        (popup?.selected == null
+            ? '↓ choose · Tab complete · Enter create'
+            : 'Enter open · Esc unselect');
+    return SizedBox(
+      height: 20,
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          text,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: _mutedText(theme),
+        ),
+      ),
+    );
   }
 
   @override
@@ -161,44 +228,17 @@ class _CreateDialogState extends State<CreateDialog> {
                   onSubmitted: (_) => _send(const GuiIntentCompletionAccept()),
                 ),
               ),
-              if (popup != null) ...[
-                const SizedBox(height: 8),
-                Card.outlined(
-                  key: const Key('completion-popup'),
-                  margin: EdgeInsets.zero,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      if (popup.candidates.isNotEmpty)
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(
-                            maxHeight: _rowHeight * _visibleRows,
-                          ),
-                          child: ListView.builder(
-                            controller: _list,
-                            shrinkWrap: true,
-                            itemExtent: _rowHeight,
-                            itemCount: popup.candidates.length,
-                            itemBuilder: (context, i) => _CandidateTile(
-                              candidate: popup.candidates[i],
-                              selected: i == popup.selected,
-                              onTap: () =>
-                                  _send(GuiIntentCompletionPick(index: i)),
-                            ),
-                          ),
-                        ),
-                      if (popup.emptyLabel case final empty?)
-                        _Note(empty, color: theme.colorScheme.onSurfaceVariant),
-                      if (popup.statusLabel case final status?)
-                        _Note(
-                          status,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                    ],
-                  ),
-                ),
-              ],
+              // Reserved whether or not Rust is listing: no movement.
+              SizedBox(
+                height: 2,
+                child: (popup?.loading ?? false)
+                    ? const LinearProgressIndicator(minHeight: 2)
+                    : null,
+              ),
+              // Loose: the dialog's content is bounded by the window, so the
+              // box gets what is left, at most its own height.
+              Flexible(child: _candidateBox(popup, theme)),
+              _statusLine(popup, theme),
               const SizedBox(height: 16),
               Focus(
                 onKeyEvent: _idKey,
@@ -262,8 +302,10 @@ class _CandidateTile extends StatelessWidget {
       dense: true,
       selected: selected,
       selectedTileColor: theme.colorScheme.secondaryContainer,
+      leading: const Icon(Icons.folder_outlined),
       title: Text(
-        candidate.path,
+        candidate.label,
+        maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: monoText,
       ),
@@ -280,20 +322,8 @@ class _CandidateTile extends StatelessWidget {
   }
 }
 
-class _Note extends StatelessWidget {
-  const _Note(this.text, {required this.color});
-
-  final String text;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: Text(
-        text,
-        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: color),
-      ),
-    );
-  }
+TextStyle? _mutedText(ThemeData theme) {
+  return theme.textTheme.bodySmall?.copyWith(
+    color: theme.colorScheme.onSurfaceVariant,
+  );
 }
