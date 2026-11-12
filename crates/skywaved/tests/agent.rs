@@ -5,6 +5,7 @@
 //! fed to the mapper.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -16,9 +17,9 @@ use skywave_proto::limits::{
 };
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BackgroundTask, BodyFormat, CallId, Command, CommandId,
-    CommandKind, CommandResult, ContextId, Decision, DeviceId, EventKind, Full, RejectReason,
-    Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, ToolCall, ToolDisplay, ToolKind,
-    ToolResult,
+    CommandKind, CommandResult, ContextId, Decision, DeviceId, EventKind, Full, ImageType,
+    RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, ToolCall,
+    ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::fake::{
     FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step,
@@ -26,8 +27,8 @@ use skywaved::agent::fake::{
 };
 use skywaved::agent::{
     self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSchedule, AgentSession,
-    AgentTask, Conversation, DisplayBody, EventMapper, ResultDisplay, StartSpec, TaskKind,
-    TurnOutcome, load_resume_handle,
+    AgentTask, Conversation, DisplayBody, EventMapper, Image, ImageInput, ResultDisplay, StartSpec,
+    TaskKind, TurnOutcome, UserInput, load_resume_handle,
 };
 use skywaved::{EventLog, Storage};
 use tempfile::TempDir;
@@ -204,6 +205,57 @@ fn big_output() -> String {
     (0..400)
         .map(|i| format!("line {i:04} of the listing\n"))
         .collect()
+}
+
+#[tokio::test]
+async fn the_fake_agent_receives_a_messages_images_in_order() {
+    let f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::text("Looking.")]));
+    let (mut session, _events) = agent.start(f.spec()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let png = dir.path().join("a.png");
+    let jpeg = dir.path().join("b.jpeg");
+    std::fs::write(&png, b"png-bytes").unwrap();
+    std::fs::write(&jpeg, b"jpeg-bytes").unwrap();
+    let input = UserInput {
+        text: "look".into(),
+        images: vec![
+            ImageInput {
+                media_type: ImageType::Png,
+                file: File::open(&png).unwrap(),
+            },
+            ImageInput {
+                media_type: ImageType::Jpeg,
+                file: File::open(&jpeg).unwrap(),
+            },
+        ],
+    };
+    // The open file pins its bytes: the blob is deleted before the send.
+    std::fs::remove_file(&png).unwrap();
+    session.send_message(input).await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            FakeInput::Started {
+                conversation: FakeConversation::Fresh,
+                context: ContextId::first_of(f.session_id),
+                grants: None,
+            },
+            FakeInput::Message {
+                text: "look".into(),
+                images: vec![
+                    Image {
+                        media_type: ImageType::Png,
+                        bytes: b"png-bytes".to_vec(),
+                    },
+                    Image {
+                        media_type: ImageType::Jpeg,
+                        bytes: b"jpeg-bytes".to_vec(),
+                    },
+                ],
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -386,7 +438,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
                 context: ContextId::first_of(f.session_id),
                 grants: None,
             },
-            FakeInput::Message("look around".into()),
+            FakeInput::message("look around"),
             FakeInput::Answer("req-1".into(), Decision::Approve, None),
         ]
     );

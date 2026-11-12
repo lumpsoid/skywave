@@ -119,9 +119,10 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSchedule, AgentSession, AgentTask, Conversation, Effort, Grants, HistoryRead, Listed,
-    ModelChoice, OutsideConversations, PermissionMode, Question, QuestionAnswer, ResultDisplay,
-    ResumeHandle, RuleScope, RuleSuggestion, SourceError, StartSpec, TurnOutcome,
+    AgentSchedule, AgentSession, AgentTask, Conversation, Effort, Grants, HistoryRead, Image,
+    Listed, ModelChoice, OutsideConversations, PermissionMode, Question, QuestionAnswer,
+    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, SourceError, StartSpec, TurnOutcome,
+    UserInput,
 };
 
 /// Capacity of a fake session's event channel.
@@ -571,7 +572,11 @@ pub enum FakeInput {
         /// The session's grants the start was given.
         grants: Option<Grants>,
     },
-    Message(String),
+    /// A user message: its text and its images as read.
+    Message {
+        text: String,
+        images: Vec<Image>,
+    },
     /// An answer and the rule it grants, if any.
     Answer(AgentRequestId, Decision, Option<u8>),
     /// A question's answers.
@@ -585,6 +590,16 @@ pub enum FakeInput {
     SetEffort(Effort),
     StopTask(String),
     Shutdown,
+}
+
+impl FakeInput {
+    /// A user message with no images.
+    pub fn message(text: impl Into<String>) -> FakeInput {
+        FakeInput::Message {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
 }
 
 /// The scripted agent adapter. Clones share the script and session progress.
@@ -830,8 +845,14 @@ impl FakeSession {
 }
 
 impl AgentSession for FakeSession {
-    async fn send_message(&mut self, text: String) -> Result<(), AgentError> {
-        self.request(FakeInput::Message(text))
+    async fn send_message(&mut self, input: UserInput) -> Result<(), AgentError> {
+        // The fake reads the images on the runtime: its files are
+        // test-sized, so that costs nothing a test would notice.
+        let read = input.read();
+        self.request(FakeInput::Message {
+            text: read.text,
+            images: read.images,
+        })
     }
 
     async fn answer_approval(
@@ -1012,7 +1033,7 @@ impl Runner {
                         () = sleep_until(next_wakeup) => continue,
                     };
                     match input {
-                        Some(FakeInput::Message(text)) => text,
+                        Some(FakeInput::Message { text, .. }) => text,
                         Some(FakeInput::StopTask(task)) => {
                             self.stopped(task);
                             continue;
@@ -1294,7 +1315,7 @@ impl Runner {
         match input {
             Some(FakeInput::Interrupt) => Err(Stop::Interrupt),
             Some(FakeInput::Shutdown) | None => Err(Stop::Shutdown),
-            Some(FakeInput::Message(text)) => {
+            Some(FakeInput::Message { text, .. }) => {
                 self.queued.push_back(text);
                 Ok(())
             }
