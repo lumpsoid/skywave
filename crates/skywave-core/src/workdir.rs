@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use skywave_proto::{
-    BlobRef, ChangesResult, DiffBody, FileBody, FileResult, ListResult, SessionId, WorkdirQuery,
+    BlobRef, ChangesResult, DiffBody, FileBody, FileResult, ListResult, LogResult, SessionId,
+    WorkdirQuery,
 };
 
 use crate::seam::Request;
@@ -36,32 +37,36 @@ pub enum WorkdirAsk {
     List { session: SessionId, path: String },
     /// One file; `path` as requested, relative to the workdir.
     File { session: SessionId, path: String },
+    /// The newest commits on `HEAD`.
+    Log { session: SessionId },
 }
 
 impl WorkdirAsk {
     pub fn session(&self) -> SessionId {
         match self {
             WorkdirAsk::Changes { session }
+            | WorkdirAsk::Log { session }
             | WorkdirAsk::List { session, .. }
             | WorkdirAsk::File { session, .. } => *session,
         }
     }
 
-    /// The requested path; empty for [`WorkdirAsk::Changes`]. Not the
-    /// canonical path the answer names.
+    /// The requested path; empty for [`WorkdirAsk::Changes`] and
+    /// [`WorkdirAsk::Log`]. Not the canonical path the answer names.
     pub fn path(&self) -> &str {
         match self {
-            WorkdirAsk::Changes { .. } => "",
+            WorkdirAsk::Changes { .. } | WorkdirAsk::Log { .. } => "",
             WorkdirAsk::List { path, .. } | WorkdirAsk::File { path, .. } => path,
         }
     }
 
-    /// `changes`, `list` or `file`: the replica's `kind` column.
+    /// `changes`, `list`, `file` or `log`: the replica's `kind` column.
     pub fn kind(&self) -> &'static str {
         match self {
             WorkdirAsk::Changes { .. } => "changes",
             WorkdirAsk::List { .. } => "list",
             WorkdirAsk::File { .. } => "file",
+            WorkdirAsk::Log { .. } => "log",
         }
     }
 
@@ -72,6 +77,7 @@ impl WorkdirAsk {
             "changes" => Some(WorkdirAsk::Changes { session }),
             "list" => Some(WorkdirAsk::List { session, path }),
             "file" => Some(WorkdirAsk::File { session, path }),
+            "log" => Some(WorkdirAsk::Log { session }),
             _ => None,
         }
     }
@@ -91,6 +97,7 @@ pub enum WorkdirAnswer {
     Changes(ChangesResult),
     List(ListResult),
     File(FileResult),
+    Log(LogResult),
 }
 
 impl WorkdirAnswer {
@@ -109,9 +116,10 @@ impl WorkdirAnswer {
                 content: FileBody::Blob(blob),
                 ..
             }) => vec![blob.clone()],
-            WorkdirAnswer::Changes(_) | WorkdirAnswer::List(_) | WorkdirAnswer::File(_) => {
-                Vec::new()
-            }
+            WorkdirAnswer::Changes(_)
+            | WorkdirAnswer::List(_)
+            | WorkdirAnswer::File(_)
+            | WorkdirAnswer::Log(_) => Vec::new(),
         }
     }
 
@@ -122,6 +130,7 @@ impl WorkdirAnswer {
             (WorkdirAnswer::Changes(_), WorkdirAsk::Changes { .. })
                 | (WorkdirAnswer::List(_), WorkdirAsk::List { .. })
                 | (WorkdirAnswer::File(_), WorkdirAsk::File { .. })
+                | (WorkdirAnswer::Log(_), WorkdirAsk::Log { .. })
         )
     }
 }

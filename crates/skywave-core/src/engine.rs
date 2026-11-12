@@ -638,6 +638,7 @@ async fn read_workdir(
             .workdir_changes(&query)
             .await
             .map(WorkdirAnswer::Changes),
+        WorkdirAsk::Log { .. } => transport.workdir_log(&query).await.map(WorkdirAnswer::Log),
         WorkdirAsk::List { .. } => transport
             .workdir_list(&query)
             .await
@@ -2144,7 +2145,7 @@ mod tests {
             [],
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 2)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 3)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(

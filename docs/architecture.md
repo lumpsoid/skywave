@@ -1207,9 +1207,9 @@ logs) an event that no longer decodes rather than failing.
   answer per read (as stored), the request id each read waits on, and the
   last failure, in memory. `Seam::workdir_answered` lets the model decide
   first: an answer to an older request than the read's latest touches
-  neither the replica nor the model. A transport error or
-  `ChangesResult::Failed` stays in memory and never replaces a stored
-  answer; any other answer is stored, and the model learns the blobs it
+  neither the replica nor the model. A transport error,
+  `ChangesResult::Failed` or `LogResult::Failed` stays in memory and never
+  replaces a stored answer; any other answer is stored, and the model learns the blobs it
   registered and purged in the same update. Back walks file → its
   directory, diff → changes, directory → its parent, and the changes or
   the workdir root → the session; a session deleted here falls back to the

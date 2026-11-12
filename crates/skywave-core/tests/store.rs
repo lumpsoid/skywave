@@ -15,11 +15,12 @@ use skywave_core::{
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
-    ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
-    Decision, DeviceId, DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange,
-    FileResult, Full, ImageType, ImportOutcome, ImportedItem, LimitSeverity, LimitWindow, LineSpan,
-    RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
-    TaskKind, ToolResult, TurnUsage, UsageLimit, UsageLimitsResult,
+    ChangesResult, Command, CommandId, CommandKind, CommandResult, Commit, CommitLog, ContentHash,
+    ContextId, Decision, DeviceId, DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody,
+    FileChange, FileResult, Full, ImageType, ImportOutcome, ImportedItem, LimitSeverity,
+    LimitWindow, LineSpan, LogResult, RejectReason, Schedule, ScheduleId, Seq, SessionId,
+    SessionOrigin, SessionState, TaskId, TaskKind, ToolResult, TurnUsage, UsageLimit,
+    UsageLimitsResult,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -829,7 +830,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -959,7 +960,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1637,7 +1638,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -1886,7 +1887,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2029,7 +2030,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
     drop(store);
 
     // A replica from before the column: the migration derives it from the log.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
     let store = Store::open(&dir).unwrap();
     assert_eq!(order(&store), vec![c, b, a]);
     assert_eq!(store.session(c).unwrap().unwrap().last_message_seq, Seq(5));
@@ -2039,12 +2040,13 @@ const AGENT: ComposerMode = ComposerMode::Agent;
 const SHELL: ComposerMode = ComposerMode::Shell;
 
 /// Rewinds the schema to `version`. A rewind past the list-order column's
-/// migration reruns it, so this undoes it here; the last three, moving the
-/// server facts, canonicalizing the server addresses and creating the
-/// attachment tables, rerun over a current schema as is.
+/// migration reruns it, so this undoes it here; the last four, moving the
+/// server facts, canonicalizing the server addresses, creating the
+/// attachment tables and rebuilding the workdir snapshots, rerun over a
+/// current schema as is.
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
-    if version < skywave_core::store::SCHEMA_VERSION - 3 {
+    if version < skywave_core::store::SCHEMA_VERSION - 4 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN last_message_seq;")
             .unwrap();
     }
@@ -2066,7 +2068,7 @@ fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
         ))
         .unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 3);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 4);
     };
     let settings_keys = |dir: &Path| -> Vec<String> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2128,7 +2130,7 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
         conn.execute_batch(rows).unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 2);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 3);
     };
     let stored = |dir: &Path| -> Vec<(String, String)> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2371,7 +2373,7 @@ fn the_attachment_tables_come_with_the_migration() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());
     drop_attachments(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
 
     let store = Store::open(&dir).unwrap();
     store
@@ -3327,7 +3329,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 18);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -4097,7 +4099,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -4283,6 +4285,53 @@ fn a_workdir_answer_without_blobs_purges_the_ones_it_replaced() {
     ));
 }
 
+/// A commit log of two commits, the second with no time.
+fn commit_log() -> WorkdirAnswer {
+    WorkdirAnswer::Log(LogResult::Log(CommitLog {
+        at: Utc.with_ymd_and_hms(2026, 11, 3, 9, 0, 0).unwrap(),
+        branch: Some("main".into()),
+        commits: vec![
+            Commit {
+                sha: "abc1234def5678".into(),
+                short: "abc1234".into(),
+                author: "Ada".into(),
+                time: Some(Utc.with_ymd_and_hms(2026, 11, 2, 18, 30, 0).unwrap()),
+                subject: "feat: the commit log".into(),
+            },
+            Commit {
+                sha: "9f8e7d6c5b4a".into(),
+                short: "9f8e7d6".into(),
+                author: "Grace".into(),
+                time: None,
+                subject: "fix: an old commit".into(),
+            },
+        ],
+        more: true,
+    }))
+}
+
+#[test]
+fn a_workdir_log_answer_is_stored_and_read_back() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let ask = WorkdirAsk::Log { session: log.a };
+    let answer = commit_log();
+    put(&mut store, &ask, &answer);
+    assert!(
+        matches!(
+            store.put_workdir(&changes_ask(log.a), &answer),
+            Err(StoreError::WorkdirMismatch)
+        ),
+        "a log answer is not a changes answer"
+    );
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.load().unwrap().workdirs[&ask], answer);
+}
+
 #[test]
 fn two_sessions_on_one_workdir_share_a_blob_and_deleting_one_keeps_it() {
     let (_tmp, dir) = data_dir();
@@ -4379,7 +4428,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -4389,6 +4438,63 @@ fn the_workdir_migration_keeps_a_populated_replica() {
     let d1 = diff_blob(1);
     let (registered, _) = put(&mut store, &changes_ask(log.a), &changes(&[&d1]));
     assert_eq!(registered, [d1.id]);
+}
+
+#[test]
+fn the_workdir_log_migration_keeps_the_stored_answers() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let d1 = diff_blob(1);
+    let (changes_answer, file_answer) = (changes(&[&d1]), file("x", &d1));
+    put(&mut store, &changes_ask(log.a), &changes_answer);
+    put(&mut store, &file_ask(log.a, "x"), &file_answer);
+    drop(store);
+
+    // Undo the migration: the table as it was, its CHECK without 'log'.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE workdir_snapshots_before_log (
+             session_id TEXT NOT NULL,
+             kind TEXT NOT NULL CHECK (kind IN ('changes', 'list', 'file')),
+             path TEXT NOT NULL,
+             result TEXT NOT NULL CHECK (json_valid(result)),
+             PRIMARY KEY (session_id, kind, path)
+         );
+         INSERT INTO workdir_snapshots_before_log (session_id, kind, path, result)
+             SELECT session_id, kind, path, result FROM workdir_snapshots;
+         DROP TABLE workdir_snapshots;
+         ALTER TABLE workdir_snapshots_before_log RENAME TO workdir_snapshots;",
+    )
+    .unwrap();
+    // Inside a transaction, dropped unfinished so nothing is written: a file
+    // row is accepted (the positive control), a log row is refused.
+    let session = log.a.0.to_string();
+    let tx = conn.unchecked_transaction().unwrap();
+    let insert = |kind: &str| {
+        tx.execute(
+            "INSERT INTO workdir_snapshots (session_id, kind, path, result)
+             VALUES (?1, ?2, 'y', '{}')",
+            rusqlite::params![session, kind],
+        )
+    };
+    assert!(insert("file").is_ok(), "the undone table takes a file");
+    assert!(insert("log").is_err(), "and refuses a log");
+    drop(tx);
+    drop(conn);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let mut store = Store::open(&dir).unwrap();
+    let loaded = store.load().unwrap().workdirs;
+    assert_eq!(loaded.len(), 2, "both answers survive the reopen");
+    assert_eq!(loaded[&changes_ask(log.a)], changes_answer);
+    assert_eq!(loaded[&file_ask(log.a, "x")], file_answer);
+    let ask = WorkdirAsk::Log { session: log.a };
+    put(&mut store, &ask, &commit_log());
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.load().unwrap().workdirs[&ask], commit_log());
 }
 
 /// An adopted session, its imported history (a call's output a blob) and
@@ -4506,7 +4612,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -4545,7 +4651,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -4958,7 +5064,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -5086,7 +5192,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);

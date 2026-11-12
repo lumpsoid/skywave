@@ -523,7 +523,7 @@ mod tests {
         let creds = credentials("a");
         older_build(dir.path(), &[("server_address", " MyHost ")]);
         let conn = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 2)
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 3)
             .unwrap();
         drop(conn);
         legacy::write(dir.path(), legacy::DIR, &creds);

@@ -41,9 +41,9 @@ use serde::de::DeserializeOwned;
 use skywave_proto::encoding::{DECODED_LENGTH_HEADER, ZSTD};
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
-    EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
-    LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport, UploadResult,
-    UsageLimitsResult, WorkdirQuery, path,
+    EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
+    LoginFinishResult, LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport,
+    UploadResult, UsageLimitsResult, WorkdirQuery, path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -1050,6 +1050,13 @@ impl Transport for HttpsTransport {
         query: &'a WorkdirQuery,
     ) -> BoxFuture<'a, Result<ChangesResult, TransportError>> {
         Box::pin(self.workdir(path::WORKDIR_CHANGES, query))
+    }
+
+    fn workdir_log<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<LogResult, TransportError>> {
+        Box::pin(self.workdir(path::WORKDIR_LOG, query))
     }
 
     fn workdir_list<'a>(

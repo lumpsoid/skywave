@@ -15,7 +15,7 @@ use std::sync::mpsc::Receiver;
 use chrono::Utc;
 use skywave_proto::{
     ChangesResult, CommandResult, ContentHash, ConversationsResult, DirsResult, EventBatch,
-    HelloResponse, LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
+    HelloResponse, LogResult, LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
 };
 
 use crate::address::ServerAddress;
@@ -496,12 +496,12 @@ impl Seam {
     /// The answer to [`Request::Workdir`] `req`, for `ask`. In one update:
     /// the model first decides whether `req` is still the latest for `ask`
     /// (a stale answer touches neither the replica nor the model); a domain
-    /// answer other than `ChangesResult::Failed` is then stored
-    /// ([`Store::put_workdir`](crate::Store::put_workdir)) and the model
-    /// takes it with the blobs it registered and purged, whose files go.
-    /// A transport error or a `Failed` stays in memory as the read's
-    /// failure, and the stored answer stays. An answer for a session no
-    /// longer in the replica is dropped.
+    /// answer other than `ChangesResult::Failed` or `LogResult::Failed` is
+    /// then stored ([`Store::put_workdir`](crate::Store::put_workdir)) and
+    /// the model takes it with the blobs it registered and purged, whose
+    /// files go. A transport error or a `Failed` stays in memory as the
+    /// read's failure, and the stored answer stays. An answer for a session
+    /// no longer in the replica is dropped.
     pub fn workdir_answered(
         &self,
         req: u64,
@@ -518,7 +518,8 @@ impl Seam {
                     state.model.workdir_failed(&ask, error.to_string());
                     return Ok(());
                 }
-                Ok(WorkdirAnswer::Changes(ChangesResult::Failed { reason })) => {
+                Ok(WorkdirAnswer::Changes(ChangesResult::Failed { reason }))
+                | Ok(WorkdirAnswer::Log(LogResult::Failed { reason })) => {
                     state.model.workdir_failed(&ask, reason);
                     return Ok(());
                 }
