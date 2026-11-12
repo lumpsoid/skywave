@@ -1,4 +1,7 @@
+import 'dart:ui' show PointerDeviceKind;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'package:skywave_gui/workdir/workdir_page.dart';
@@ -234,6 +237,121 @@ void main() {
     expect(find.text('fn main() {}'), findsOneWidget);
     expect(find.text('1  '), findsOneWidget);
     expect(find.text('2  '), findsOneWidget);
+  });
+
+  // A file of two lines with a blank one between, and the clipboard writes.
+  Future<List<String>> pumpThreeLines(WidgetTester tester) async {
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await pump(
+      tester,
+      screen(
+        pane: WorkdirPaneKind.file,
+        path: 'src/main.rs',
+        header: 'src/main.rs  25 B',
+        content: const WorkdirContent(
+          blob: BlobFacts(
+            blobId: 'b-3',
+            state: BlobStateKind.available,
+            label: 'downloaded',
+            canDownload: false,
+          ),
+          lines: [
+            WorkdirLine(kind: WorkdirLineKind.plain, text: 'fn main() {}'),
+            WorkdirLine(kind: WorkdirLineKind.plain, text: ''),
+            WorkdirLine(kind: WorkdirLineKind.plain, text: '-not a diff'),
+          ],
+        ),
+      ),
+    );
+    return copied;
+  }
+
+  Future<void> copyShortcut(WidgetTester tester, {bool all = false}) async {
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    if (all) {
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+    }
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets(
+    'a file\'s lines are copied one per line, without their numbers',
+    (tester) async {
+      final copied = await pumpThreeLines(tester);
+      await tester.tap(find.text('fn main() {}'));
+      await tester.pump();
+      await copyShortcut(tester, all: true);
+      expect(copied, ['fn main() {}\n\n-not a diff\n']);
+      expect(copied.single, isNot(contains('1  ')));
+      expect(copied.single, isNot(contains('2  ')));
+      expect(copied.single, isNot(contains('3  ')));
+      // The lines sit as far apart as plain Text lines do: three lines of the
+      // same style, the blank one included, and no extra line per line.
+      final first = find.text('fn main() {}');
+      final style = tester.widget<Text>(first).style;
+      final line = tester.getSize(first).height;
+      expect(
+        tester.getTopLeft(find.text('-not a diff')).dy -
+            tester.getTopLeft(first).dy,
+        2 * line,
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Column(
+            children: [
+              Text('a', style: style),
+              Text('b', style: style),
+            ],
+          ),
+        ),
+      );
+      expect(tester.getSize(find.text('a')).height, line);
+      expect(
+        tester.getTopLeft(find.text('b')).dy -
+            tester.getTopLeft(find.text('a')).dy,
+        line,
+      );
+    },
+  );
+
+  testWidgets('part of one line copies only that part', (tester) async {
+    final copied = await pumpThreeLines(tester);
+    final line = find.text('fn main() {}');
+    final from = tester.getTopLeft(line) + const Offset(1, 4);
+    // The Text spans the page, so aim a few characters in, not at its centre.
+    final to = from + const Offset(30, 0);
+    final gesture = await tester.startGesture(
+      from,
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pump();
+    await gesture.moveTo(to);
+    await tester.pump();
+    await gesture.up();
+    await tester.pumpAndSettle();
+    await copyShortcut(tester);
+    expect(copied, hasLength(1));
+    expect(copied.single, isNotEmpty);
+    expect(copied.single, isNot(contains('\n')));
+    expect('fn main() {}'.startsWith(copied.single), isTrue);
+    expect(copied.single.length, lessThan('fn main() {}'.length));
   });
 
   testWidgets('a file listing opens entries and goes up', (tester) async {
