@@ -1,7 +1,7 @@
 {
-  "protocol_version": 29,
+  "protocol_version": 30,
   "hello": {
-    "protocol_version": 29,
+    "protocol_version": 30,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -1771,6 +1771,18 @@
     {
       "result": "rejected",
       "reason": "bad_crop"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_attachment"
+    },
+    {
+      "result": "rejected",
+      "reason": "too_many_attachments"
+    },
+    {
+      "result": "rejected",
+      "reason": "attachments_too_large"
     }
   ],
   "workdir_query": {
@@ -2113,6 +2125,13 @@
         "session": "01920000-0000-7000-8000-000000000001",
         "seq": 17,
         "holds": "message"
+      },
+      {
+        "id": "01920000-0000-7000-8000-000000000005",
+        "size": 2000000,
+        "session": "01920000-0000-7000-8000-000000000001",
+        "seq": 17,
+        "holds": "attachment"
       }
     ],
     "shell_runs": [
@@ -2211,6 +2230,25 @@
     {
       "result": "failed",
       "reason": "invalid code"
+    }
+  ],
+  "upload_results": [
+    {
+      "result": "stored",
+      "size": 340000,
+      "media_type": "png"
+    },
+    {
+      "result": "too_large"
+    },
+    {
+      "result": "not_an_image"
+    },
+    {
+      "result": "hash_mismatch"
+    },
+    {
+      "result": "disk_low"
     }
   ]
 }

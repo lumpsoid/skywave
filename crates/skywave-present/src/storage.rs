@@ -268,6 +268,7 @@ pub fn holds_label(holds: BlobUse) -> &'static str {
         BlobUse::ApprovalInput => "approval input",
         BlobUse::ShellOutput => "shell output",
         BlobUse::Message => "message",
+        BlobUse::Attachment => "image",
     }
 }
 

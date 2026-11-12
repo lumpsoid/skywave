@@ -347,6 +347,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::BlobGone => "that content was already deleted or cropped",
         RejectReason::NotCroppable => "only tool and shell output can be cropped",
         RejectReason::BadCrop => "the kept lines do not fit that content",
+        RejectReason::UnknownAttachment => "an image expired on the server; send again",
+        RejectReason::TooManyAttachments => "too many images in one message",
+        RejectReason::AttachmentsTooLarge => "the message's images are too large together",
     }
 }
 
