@@ -91,8 +91,15 @@
 //! session's current one: the message was written for a conversation the
 //! agent has left. Then `MessageTooLong` when its text is over
 //! [`limits::MESSAGE_MAX_BYTES`]: logged verbatim or not at all, never cut.
-//! Then `UnknownAttachment` when it names any image: staging uploads is not
-//! built yet, so the server has none to name.
+//! Then, for a message naming images (staged by hash with `PUT
+//! /v1/attachments`): `TooManyAttachments` for more than
+//! [`limits::ATTACHMENTS_MAX`] names, `AttachmentsTooLarge` when the images
+//! they name total more than [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`], then
+//! `UnknownAttachment` for a name that is not a staged image. The images are
+//! prepared like a crop ([`crate::attachments`]): the transaction records each
+//! one's new blob, as an `attachment`, and appends the `UserMessage` naming
+//! them; the staged files go after the commit, and a refused message keeps
+//! them. `DiskLow` comes before all of these, as for any new work.
 //!
 //! **ClearContext.** The new context's id is the client's, so an offline
 //! device can address it before the server answers; one that is already a
@@ -225,6 +232,7 @@ use skywave_proto::{
 };
 
 use crate::agent::import;
+use crate::attachments;
 use crate::crop;
 use crate::db::Db;
 use crate::dirs;
@@ -240,6 +248,9 @@ pub enum Preparation {
     Import(import::Prepared),
     /// A `CropBlob`'s new blob ([`crop::prepare`]).
     Crop(crop::Prepared),
+    /// A `SendMessage`'s staged images, linked as blobs
+    /// ([`attachments::prepare`]).
+    Attachments(attachments::Prepared),
 }
 
 impl Preparation {
@@ -247,6 +258,7 @@ impl Preparation {
         match self {
             Preparation::Import(prepared) => prepared.kept(),
             Preparation::Crop(prepared) => prepared.kept(),
+            Preparation::Attachments(prepared) => prepared.kept(),
         }
     }
 }
@@ -263,6 +275,12 @@ impl From<crop::Prepared> for Preparation {
     }
 }
 
+impl From<attachments::Prepared> for Preparation {
+    fn from(prepared: attachments::Prepared) -> Preparation {
+        Preparation::Attachments(prepared)
+    }
+}
+
 impl EventLog {
     /// Handles `command` from `device` and returns its result.
     ///
@@ -274,8 +292,8 @@ impl EventLog {
     /// Blocking: it runs SQLite and, for `CreateSession`, file system calls.
     /// An adopting `CreateSession` imports nothing here: its
     /// `ImportFinished` says `Unavailable` (see [`EventLog::handle_with`]).
-    /// A `CropBlob` that passes its checks needs its crop prepared: here it
-    /// is an error, and nothing is recorded.
+    /// A `CropBlob` that passes its checks, or a `SendMessage` naming images,
+    /// needs its preparation: here it is an error, and nothing is recorded.
     pub fn handle(
         &self,
         db: &mut Db,
@@ -287,8 +305,9 @@ impl EventLog {
 
     /// [`EventLog::handle`], with what the command needs prepared
     /// beforehand off the database: the history an adopting
-    /// `CreateSession` imports ([`import::prepare`]) or the new blob of a
-    /// `CropBlob` ([`crop::prepare`]).
+    /// `CreateSession` imports ([`import::prepare`]), the new blob of a
+    /// `CropBlob` ([`crop::prepare`]) or the staged images of a
+    /// `SendMessage` ([`attachments::prepare`]).
     ///
     /// An import's blob rows and `Imported` events are logged in the
     /// command's transaction. It is logged only for an accepted adopting
@@ -296,9 +315,11 @@ impl EventLog {
     /// that canonicalises elsewhere now logs `Failed("workdir changed")`,
     /// and with none the outcome is `Unavailable`. A crop's new blob is
     /// recorded, and its old one's row deleted, only if the old blob is
-    /// still stored; its old file goes after the commit. Whatever is not
-    /// logged and committed, a stored or refused command or a failed
-    /// transaction included, has its blob files removed.
+    /// still stored; its old file goes after the commit. A message's images
+    /// are recorded as its attachments' blobs, and their staged files go
+    /// after the commit. Whatever is not logged and committed, a stored or
+    /// refused command or a failed transaction included, has its blob files
+    /// removed.
     pub fn handle_with(
         &self,
         db: &mut Db,
@@ -413,7 +434,9 @@ impl EventLog {
                         Some(Preparation::Import(_)) => ImportOutcome::Failed {
                             reason: import::WORKDIR_CHANGED.to_owned(),
                         },
-                        None | Some(Preparation::Crop(_)) => ImportOutcome::Unavailable,
+                        None | Some(Preparation::Crop(_) | Preparation::Attachments(_)) => {
+                            ImportOutcome::Unavailable
+                        }
                     };
                     (session, context, EventKind::ImportFinished { outcome })
                 }
@@ -433,14 +456,21 @@ impl EventLog {
                 if text.len() > limits::MESSAGE_MAX_BYTES {
                     return Ok(Err(RejectReason::MessageTooLong));
                 }
-                // No upload can be staged yet, so no image can be named.
-                if !attachments.is_empty() {
-                    return Ok(Err(RejectReason::UnknownAttachment));
-                }
+                let attachments = if attachments.is_empty() {
+                    Vec::new()
+                } else {
+                    let Some(Preparation::Attachments(prepared)) = prepared else {
+                        return Err(Error::Unprepared("SendMessage"));
+                    };
+                    if let Err(reason) = prepared.decide() {
+                        return Ok(Err(reason));
+                    }
+                    prepared.log(tx)?
+                };
                 let kind = EventKind::UserMessage {
                     device_id: device,
                     text: text.clone(),
-                    attachments: Vec::new(),
+                    attachments,
                 };
                 (*session_id, session.context, kind)
             }
