@@ -698,9 +698,10 @@ collects one. `serve`,
   fails at once naming the dir. `pair` and `devices` do not take it and
   run beside the daemon.
   Changes run the `git` CLI in the workdir (no git library): `rev-parse`
-  decides `NotGit` from its output, then one `git diff <HEAD or the empty
-  tree> --relative -M -z --raw --numstat` gives the entries (so a workdir
-  below a repo's top shows its own subtree, in its own terms),
+  decides `NotGit` from its output, then one `git diff <the branch's full
+  ref, bare HEAD when detached, or the empty tree> --relative -M -z --raw
+  --numstat` gives the entries (so a workdir below a repo's top shows its
+  own subtree, in its own terms),
   `ls-files --unmerged` marks `Conflicted`, and `ls-files --others
   --exclude-standard` the untracked ones. One streamed `git diff` gives the
   patches, split at `diff --git ` lines and paired with entries by their

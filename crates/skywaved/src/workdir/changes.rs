@@ -269,14 +269,16 @@ impl<'a> Snapshot<'a> {
         }
 
         let branch = branch(&repo)?;
-        let head = repo.output(&["rev-parse", "--short", "-q", "--verify", "HEAD"])?;
+        let target = head_ref(&repo)?;
+        let commit = format!("{target}^{{commit}}");
+        let head = repo.output(&["rev-parse", "--short", "-q", "--verify", commit.as_str()])?;
         let head = match head.status.code() {
             Some(0) => Some(String::from_utf8_lossy(head.out.trim_ascii()).into_owned()),
             Some(1) => None,
             _ => return Err(GitError::Failed(head.reason())),
         };
         let base = match head {
-            Some(_) => "HEAD".to_owned(),
+            Some(_) => target,
             // Unborn: against the empty tree, in the repo's own hash.
             None => {
                 let empty = repo
@@ -587,6 +589,19 @@ pub(super) fn branch(repo: &Repo<'_>) -> Result<Option<String>, GitError> {
         )),
         Some(1) => Ok(None),
         _ => Err(GitError::Failed(branch.reason())),
+    }
+}
+
+/// The name `HEAD` stands for: the branch's full ref, never the bare
+/// `HEAD`. On an unborn branch a ref called `HEAD` elsewhere
+/// (`refs/tags/HEAD`) would answer the bare name. A detached `HEAD` is a
+/// file of its own and answers it.
+pub(super) fn head_ref(repo: &Repo<'_>) -> Result<String, GitError> {
+    let target = repo.output(&["symbolic-ref", "-q", "HEAD"])?;
+    match target.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(target.out.trim_ascii()).into_owned()),
+        Some(1) => Ok("HEAD".to_owned()),
+        _ => Err(GitError::Failed(target.reason())),
     }
 }
 
@@ -1444,6 +1459,30 @@ pub(super) mod tests {
         assert_eq!(
             diff_text(&t, empty),
             "diff --git a/empty b/empty\nnew file mode 100644\n"
+        );
+    }
+
+    #[test]
+    fn an_unborn_branch_ignores_a_ref_named_head() {
+        let t = Tree::new();
+        init(&t.workdir);
+        write(t.workdir.join("kept"), "one\n");
+        git(&t.workdir, &["add", "kept"]);
+        git(&t.workdir, &["commit", "-q", "-m", "one"]);
+        git(&t.workdir, &["update-ref", "refs/tags/HEAD", "HEAD"]);
+        // `--orphan` keeps `kept` in the index: on the unborn branch it is a
+        // staged addition.
+        git(&t.workdir, &["checkout", "-q", "--orphan", "fresh"]);
+
+        let set = change_set(&t);
+        assert_eq!(
+            (set.branch.as_deref(), set.head.as_deref()),
+            (Some("fresh"), None)
+        );
+        let kept = entry(&set, "kept", false);
+        assert_eq!(
+            (kept.change, kept.added, kept.removed),
+            (FileChange::Added, Some(1), Some(0))
         );
     }
 
