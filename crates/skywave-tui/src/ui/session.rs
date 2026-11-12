@@ -158,6 +158,7 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
         // Ctrl-X stops a shell run in shell mode.
         SessionState::AgentWorking if ui.shell() => Span::raw("agent working").cyan(),
         SessionState::AgentWorking => Span::raw("agent working · Ctrl-X interrupts").cyan(),
+        SessionState::BackgroundWork => Span::raw("background work running").cyan(),
         SessionState::AwaitingApproval(_) if session.pending_question.is_some() => {
             Span::raw("agent waiting for an answer").yellow()
         }

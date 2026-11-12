@@ -1520,12 +1520,14 @@ fn fit(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Short text and colour for a session state; the text alone tells them
-/// apart.
+/// Short text and colour for a session state. Background work reads as
+/// working too; the session's status line tells it apart.
 pub(crate) fn state_badge(state: &SessionState) -> (&'static str, Style) {
     match state {
         SessionState::Idle => ("idle", Style::new().green()),
-        SessionState::AgentWorking => ("working", Style::new().cyan().bold()),
+        SessionState::AgentWorking | SessionState::BackgroundWork => {
+            ("working", Style::new().cyan().bold())
+        }
         SessionState::AwaitingApproval(_) => ("approval", Style::new().yellow().bold()),
         SessionState::Errored(_) => ("error", Style::new().red().bold()),
         SessionState::Stopped => ("stopped", Style::new().dark_gray()),

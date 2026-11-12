@@ -398,6 +398,9 @@ impl Delivery {
 pub enum SessionState {
     Idle,
     AgentWorking,
+    /// The turn is idle but the agent still has background work: a task
+    /// (ambient ones too) or a schedule.
+    BackgroundWork,
     /// Blocked until some device answers this approval (D8).
     AwaitingApproval(ApprovalId),
     Errored(ErrorInfo),
