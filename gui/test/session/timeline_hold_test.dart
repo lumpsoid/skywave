@@ -443,6 +443,25 @@ void main() {
       expect(tester.getRect(find.text('line 90')).top, closeTo(before, 0.5));
       expect(tester.takeException(), isNull);
     });
+
+    // The held row at 100 px would need the view at about -650 once it
+    // collapses: past the newest end.
+    testWidgets('a collapse the hold cannot follow stops at the newest end', (
+      tester,
+    ) async {
+      final timeline = await pumpRows(tester, sixty());
+      timeline.apply(upsert(detailed(59), 59));
+      await tester.pumpAndSettle();
+      await scrollTo(tester, 100);
+      expect(heldKey(tester), 's:59');
+
+      timeline.apply(upsert(detailed(59, count: 1), 59));
+      await tester.pump();
+
+      expect(scrolled(tester), greaterThanOrEqualTo(0));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    });
   });
 
   group('scroll hold, mixed heights', () {
@@ -719,6 +738,45 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
+    testWidgets('a search step right after rows change still lands on the '
+        'match', (tester) async {
+      tester.view
+        ..physicalSize = const Size(400, 600)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      final search = SearchHolder();
+      final timeline = holding(sixty());
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: timeline,
+        search: search,
+        sent: <GuiIntent>[],
+      );
+      await tester.drag(listScrollable(), const Offset(0, 400));
+      await tester.pumpAndSettle();
+      expect(scrolled(tester), greaterThan(32));
+      final match = heldNumber(tester) - 4;
+      final before = rowTopOf(tester, match);
+
+      timeline.apply(upsert(row('s:60', 'row 60'), 60));
+      search.apply(
+        SearchUpdate(
+          open: true,
+          query: 'row $match',
+          countLabel: '1 of 1',
+          wrapped: false,
+          currentKey: 's:$match',
+          hits: [],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(rowTopOf(tester, match), isNot(closeTo(before, 0.5)));
+      expectInView(tester, 'row $match');
+      expect(tester.takeException(), isNull);
+    });
+
     testWidgets('rows changing during a drag keep the held row under the '
         'finger', (tester) async {
       final timeline = await scrolledBack(tester);
@@ -748,6 +806,26 @@ void main() {
       await g.up();
       await tester.pumpAndSettle();
 
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('a drag move right after rows change is not undone', (
+      tester,
+    ) async {
+      final timeline = await scrolledBack(tester);
+      final g = await tester.startGesture(tester.getCenter(listScrollable()));
+      await g.moveBy(const Offset(0, 40));
+      await tester.pump();
+      final n = wholeRowInView(tester);
+      final before = rowTopOf(tester, n);
+
+      timeline.apply(upsert(row('s:60', 'row 60'), 60));
+      await g.moveBy(const Offset(0, 30));
+      await tester.pump();
+
+      expect(rowTopOf(tester, n), closeTo(before + 30, 0.5));
+      await g.up();
+      await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
     });
 
