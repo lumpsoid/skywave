@@ -194,6 +194,27 @@ class TimelineViewState extends State<TimelineView> {
     return 0;
   }
 
+  /// Re-records where each held row sits on screen at [pixels], the position
+  /// the view has just moved to. A scroll made before the list lays out (a
+  /// search step, a reveal, a drag or fling tick) moves the view, and the hold
+  /// would otherwise return the place it measured at the record and undo that
+  /// move. Before the layout, [_topOf] still gives the last laid-out tops,
+  /// which is where the rows are on screen now. A correction the physics makes
+  /// during layout is a `correctPixels` and sends no notification, so the hold
+  /// does not re-record its own correction. A row with no laid-out top keeps
+  /// its entry.
+  void _rebaseHeld(double pixels) {
+    final held = _held;
+    if (held == null) return;
+    _held = [
+      for (final row in held)
+        if (_topOf(row.key) case final top?)
+          (key: row.key, screen: top - pixels)
+        else
+          row,
+    ];
+  }
+
   (String?, int?) _targetOf(SearchUpdate? search) =>
       (search?.currentKey, search?.currentLine);
 
@@ -215,6 +236,7 @@ class TimelineViewState extends State<TimelineView> {
   bool _onScroll(ScrollNotification note) {
     if (note.depth != 0) return false;
     if (note is UserScrollNotification) _reveal = null;
+    if (note is ScrollUpdateNotification) _rebaseHeld(note.metrics.pixels);
     if (note is ScrollUpdateNotification || note is ScrollEndNotification) {
       _setFollowing(note.metrics.extentBefore <= _endSlack);
     }
@@ -494,7 +516,15 @@ class _HoldPhysics extends ScrollPhysics {
       isScrolling: isScrolling,
       velocity: velocity,
     );
-    return position + shift(position);
+    final held = position + shift(position);
+    if (held == position) return position;
+    // The hold never scrolls past the ends: when the held place cannot be
+    // reached, the view stops at the end. A position already past an end (an
+    // overscroll in progress) is left to the physics.
+    final min = newPosition.minScrollExtent;
+    final max = newPosition.maxScrollExtent;
+    if (position < min || position > max) return position;
+    return math.min(math.max(held, min), max);
   }
 }
 
