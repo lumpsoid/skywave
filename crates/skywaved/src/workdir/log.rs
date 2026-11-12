@@ -6,7 +6,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use skywave_proto::{Commit, CommitLog, LogResult, WorkdirQuery, limits};
 
-use super::changes::{branch, work_tree};
+use super::changes::{branch, head_ref, work_tree};
 use super::git::{GitError, Repo};
 use super::{Git, Located, Snapshot};
 use crate::error::Result;
@@ -78,17 +78,9 @@ fn read(git: &Git, workdir: &Path, deadline: Instant) -> Result<LogResult, GitEr
 }
 
 /// The commit the branch names, `None` while it names none yet (an unborn
-/// branch). The branch is named by its full ref, never the bare `HEAD`: on
-/// an unborn branch a ref called `HEAD` elsewhere (`refs/tags/HEAD`) would
-/// answer the bare name. A detached `HEAD` is a file of its own and answers
-/// it.
+/// branch). Resolved through [`head_ref`].
 fn tip(repo: &Repo<'_>) -> Result<Option<String>, GitError> {
-    let target = repo.output(&["symbolic-ref", "-q", "HEAD"])?;
-    let target = match target.status.code() {
-        Some(0) => lossy(target.out.trim_ascii()),
-        Some(1) => "HEAD".to_owned(),
-        _ => return Err(GitError::Failed(target.reason())),
-    };
+    let target = head_ref(repo)?;
     let commit = format!("{target}^{{commit}}");
     let sha = repo.output(&["rev-parse", "-q", "--verify", commit.as_str()])?;
     match sha.status.code() {
