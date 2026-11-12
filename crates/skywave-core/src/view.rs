@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use skywave_proto::Fingerprint;
+use skywave_proto::{Fingerprint, ImageType};
 use uuid::Uuid;
 
 pub use skywave_proto::{
@@ -462,6 +462,14 @@ pub struct BlobView {
     pub pending: Option<BlobPending>,
 }
 
+/// An image on a user message: its type and its blob, which downloads like
+/// any other (or is this device's own file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageImage {
+    pub media_type: ImageType,
+    pub blob: BlobView,
+}
+
 /// This device's own delete or crop of a blob
 /// ([`Action::DeleteBlob`](crate::Action::DeleteBlob),
 /// [`Action::CropBlob`](crate::Action::CropBlob)) on its way, or refused.
@@ -857,7 +865,8 @@ pub struct SessionRow {
     pub pending_approvals: usize,
     pub last_activity: DateTime<Utc>,
     /// This device keeps an unsent message or shell command for the
-    /// session (a shell draft holding only a condition does not count).
+    /// session (a shell draft holding only a condition does not count), or
+    /// images for its next message.
     pub has_draft: bool,
     /// Agent output (messages, approval requests, errors) this device has
     /// not seen yet. Messages from any device never count.
@@ -1550,6 +1559,9 @@ pub enum TimelineItem {
         /// when it reaches the server.
         context: ContextId,
         text: String,
+        /// The images it carries, in order; each file is at
+        /// [`attachment_path`](crate::attachment::attachment_path).
+        images: Vec<AttachedImage>,
         outgoing: Outgoing,
         /// [`Action::Discard`](crate::Action::Discard) and
         /// [`Action::EditQueued`](crate::Action::EditQueued) take it back:
@@ -1600,6 +1612,8 @@ pub enum Entry {
         /// this id became this message.
         command_id: CommandId,
         text: String,
+        /// The message's images, in the order attached.
+        images: Vec<MessageImage>,
         /// Who sent it; [`DeviceRef::me`] when this device did.
         from: DeviceRef,
         /// Delivery state when this device sent it.
@@ -1995,6 +2009,7 @@ mod tests {
             Entry::UserMessage {
                 command_id: CommandId::new(),
                 text: text.into(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: DeviceId::new(),
                     name: None,
@@ -2011,6 +2026,7 @@ mod tests {
             command_id: CommandId::new(),
             context: ContextId::new(),
             text: text.into(),
+            images: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: None,

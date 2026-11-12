@@ -358,6 +358,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             command_id: command.id,
             context: ContextId::first_of(sid),
             text: "fix the build".into(),
+            images: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: Some(queued),
@@ -414,6 +415,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             entry: Entry::UserMessage {
                 command_id: command.id,
                 text: "fix the build".into(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: device,
                     name: None,

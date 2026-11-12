@@ -45,14 +45,15 @@ use crate::view::{
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
-    LinkRejection, ListKind, LoginView, ModelChoice, Outgoing, PairedInfo, PairedLink,
-    PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession, QUESTION_TOOL, Question,
-    QuestionPrompt, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, ServerAddressesView, SessionId,
-    SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
-    SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
-    SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable,
-    UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane, WorkdirView,
+    LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
+    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession,
+    QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER, Screen, Seq,
+    ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow,
+    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
+    ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
+    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
+    WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -2601,13 +2602,14 @@ impl Model {
                     state: session_state(s),
                     pending_approvals: s.pending_approvals.len(),
                     last_activity: s.last_activity,
-                    has_draft: [ComposerMode::Agent, ComposerMode::Shell]
-                        .iter()
-                        .any(|mode| {
-                            self.drafts
-                                .get(&(s.id, *mode))
-                                .is_some_and(|d| !d.text.trim().is_empty())
-                        }),
+                    has_draft: !self.draft_images_of(s.id).is_empty()
+                        || [ComposerMode::Agent, ComposerMode::Shell]
+                            .iter()
+                            .any(|mode| {
+                                self.drafts
+                                    .get(&(s.id, *mode))
+                                    .is_some_and(|d| !d.text.trim().is_empty())
+                            }),
                     unread: match self.read_marks.get(&s.id) {
                         Some(mark) => s.notable.saturating_sub(mark.notable),
                         None => s.notable,
@@ -3467,13 +3469,22 @@ impl Model {
                 // The server logs every message with its command id, the
                 // entry's key; one without would have none to show under.
                 EventKind::UserMessage {
-                    device_id, text, ..
+                    device_id,
+                    text,
+                    attachments,
                 } => event.command_id.map(|command_id| {
                     logged.insert(command_id);
                     let sent = outbox.get(&command_id);
                     Entry::UserMessage {
                         command_id,
                         text: text.clone(),
+                        images: attachments
+                            .iter()
+                            .map(|attachment| MessageImage {
+                                media_type: attachment.media_type,
+                                blob: self.blob_view(&attachment.blob),
+                            })
+                            .collect(),
                         from: DeviceRef {
                             me: self.is_own_message(sent.is_some(), *device_id),
                             ..self.device_ref(*device_id)
@@ -3830,23 +3841,29 @@ impl Model {
             *answer = self.local_answer(approval, offered, pending);
         }
 
-        items.extend(self.outbox.iter().filter_map(|e| match &e.command.kind {
-            CommandKind::SendMessage {
-                session_id,
-                context,
-                text,
-                ..
-            } if *session_id == id && !logged.contains(&e.command.id) => {
-                Some(TimelineItem::Pending {
-                    command_id: e.command.id,
-                    context: *context,
-                    text: text.clone(),
-                    outgoing: Outgoing::from(&e.status),
-                    discardable: e.discardable(),
-                    delivery: Delivery::of(e),
-                })
+        items.extend(self.outbox.iter().filter_map(|e| {
+            match &e.command.kind {
+                CommandKind::SendMessage {
+                    session_id,
+                    context,
+                    text,
+                    attachments,
+                } if *session_id == id && !logged.contains(&e.command.id) => {
+                    Some(TimelineItem::Pending {
+                        command_id: e.command.id,
+                        context: *context,
+                        text: text.clone(),
+                        images: attachments
+                            .iter()
+                            .filter_map(|sha256| self.attachments.get(sha256).cloned())
+                            .collect(),
+                        outgoing: Outgoing::from(&e.status),
+                        discardable: e.discardable(),
+                        delivery: Delivery::of(e),
+                    })
+                }
+                _ => None,
             }
-            _ => None,
         }));
         (items, tools.granted)
     }
@@ -4508,8 +4525,8 @@ mod tests {
 
     use chrono::{TimeDelta, TimeZone, Utc};
     use skywave_proto::{
-        BlobRef, Decision, Effort, ImageType, ImportOutcome, RejectReason, RuleScope, ToolDisplay,
-        ToolKind, ToolResult,
+        Attachment, BlobRef, Decision, Effort, ImageType, ImportOutcome, RejectReason, RuleScope,
+        ToolDisplay, ToolKind, ToolResult,
     };
 
     use super::*;
@@ -4899,6 +4916,7 @@ mod tests {
                 command_id: command.id,
                 context: skywave_proto::ContextId::first_of(sid),
                 text: "hello".into(),
+                images: Vec::new(),
                 outgoing,
                 discardable: matches!(outgoing, Outgoing::Queued | Outgoing::Sending),
                 delivery: Some(delivery),
@@ -4992,6 +5010,7 @@ mod tests {
                 &Entry::UserMessage {
                     command_id: command.id,
                     text: "hello".into(),
+                    images: Vec::new(),
                     from: DeviceRef {
                         id: me,
                         name: None,
@@ -5070,6 +5089,7 @@ mod tests {
                     tries: 0,
                     ..
                 }),
+                ..
             } if *command_id == command.id && text == "x"
         ));
     }
@@ -7486,6 +7506,126 @@ mod tests {
             .is_empty(),
             "an unknown session has no draft"
         );
+    }
+
+    #[test]
+    fn a_sent_message_shows_its_images_until_and_after_it_is_logged() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let (a, b) = (image(1, 100), image(2, 200));
+        for picked in [&a, &b] {
+            f.dispatch(Action::Attach {
+                session_id: sid,
+                image: picked.clone(),
+            });
+        }
+        let command = send(&mut f, sid, "look");
+        let pending_images = |f: &Fixture| match &f.session_view().timeline[..] {
+            [TimelineItem::Pending { images, .. }] => images.clone(),
+            other => panic!("expected one pending message, got {other:?}"),
+        };
+        assert_eq!(pending_images(&f), vec![a.clone(), b.clone()]);
+
+        let blob_of = |image: &AttachedImage| BlobRef {
+            id: BlobId::new(),
+            size: image.size,
+            sha256: image.sha256,
+        };
+        let (blob_a, blob_b) = (blob_of(&a), blob_of(&b));
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::UserMessage {
+                    device_id: me,
+                    text: "look".into(),
+                    attachments: vec![
+                        Attachment {
+                            blob: blob_a.clone(),
+                            media_type: ImageType::Png,
+                        },
+                        Attachment {
+                            blob: blob_b.clone(),
+                            media_type: ImageType::Png,
+                        },
+                    ],
+                },
+            )],
+        );
+        let logged_images = |f: &Fixture| {
+            f.session_view()
+                .timeline
+                .into_iter()
+                .find_map(|item| match item {
+                    TimelineItem::Logged {
+                        entry: Entry::UserMessage { images, .. },
+                        ..
+                    } => Some(images),
+                    _ => None,
+                })
+                .expect("the message is logged")
+        };
+        let not_downloaded = |blob: &BlobRef| BlobView {
+            id: blob.id,
+            state: BlobState::NotDownloaded { size: blob.size },
+            change: None,
+            pending: None,
+        };
+        assert_eq!(
+            logged_images(&f),
+            vec![
+                MessageImage {
+                    media_type: ImageType::Png,
+                    blob: not_downloaded(&blob_a),
+                },
+                MessageImage {
+                    media_type: ImageType::Png,
+                    blob: not_downloaded(&blob_b),
+                },
+            ]
+        );
+        assert!(
+            !f.session_view()
+                .timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::Pending { .. })),
+            "the logged message replaces the pending one"
+        );
+
+        let path = PathBuf::from("/blobs/a.png");
+        f.model
+            .blob_status(blob_a.id, BlobStatus::Available { path: path.clone() });
+        let shown = logged_images(&f);
+        assert_eq!(shown[0].blob.state, BlobState::Available { path });
+        assert_eq!(shown[1].blob.state, BlobState::NotDownloaded { size: 200 });
+    }
+
+    #[test]
+    fn an_image_only_draft_marks_the_session() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let a = image(1, 100);
+        let has_draft = |f: &Fixture| {
+            f.list_view()
+                .sessions
+                .iter()
+                .find(|r| r.id == sid)
+                .unwrap()
+                .has_draft
+        };
+        assert!(!has_draft(&f));
+        f.dispatch(Action::Attach {
+            session_id: sid,
+            image: a.clone(),
+        });
+        assert!(has_draft(&f), "an image with no text is a draft");
+        f.dispatch(Action::Detach {
+            session_id: sid,
+            sha256: a.sha256,
+        });
+        assert!(!has_draft(&f));
     }
 
     #[test]

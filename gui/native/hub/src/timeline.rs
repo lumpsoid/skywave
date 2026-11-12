@@ -1014,6 +1014,7 @@ mod tests {
             command_id: id,
             context: ContextId::new(),
             text: text.into(),
+            images: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: None,
@@ -1029,6 +1030,7 @@ mod tests {
             entry: Entry::UserMessage {
                 command_id: id,
                 text: text.into(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: DeviceId::new(),
                     name: None,
