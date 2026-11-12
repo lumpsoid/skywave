@@ -941,6 +941,61 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('the scrollbar keeps its size when conversation only hides and '
+      'shows tool rows it has seen', (tester) async {
+    double extent() => tester
+        .state<ScrollableState>(listScrollable())
+        .position
+        .maxScrollExtent;
+
+    // Scrolls 150 px at a time to the oldest end and back to the newest, so
+    // every row has been laid out. Returns the extent at the newest end.
+    Future<double> layOutAll() async {
+      final position = tester.state<ScrollableState>(listScrollable()).position;
+      for (final older in [true, false]) {
+        var steps = 0;
+        while (older
+            ? position.pixels < position.maxScrollExtent
+            : position.pixels > 0) {
+          if (++steps == 200) fail('the sweep did not end in 200 steps');
+          final next = position.pixels + (older ? 150 : -150);
+          await scrollTo(
+            tester,
+            math.min(math.max(next, 0.0), position.maxScrollExtent),
+          );
+        }
+      }
+      return extent();
+    }
+
+    // The conversation alone, laid out in full, is the extent to expect with
+    // the tool rows hidden. Unmounting first gives the list fresh heights.
+    await pumpRows(tester, [
+      for (var i = 0; i < 60; i += 2) row('s:$i', 'row $i'),
+    ]);
+    final conversation = await layOutAll();
+    await tester.pumpWidget(const SizedBox());
+
+    final timeline = await pumpRows(tester, mixed());
+    final before = await layOutAll();
+    expect(timeline.rows, hasLength(60));
+
+    hideTools(timeline);
+    await tester.pump();
+    expect(timeline.rows, hasLength(30), reason: 'the tool rows are hidden');
+    expect(
+      extent(),
+      closeTo(conversation, 0.01),
+      reason: 'the extent with the tool rows hidden',
+    );
+
+    showTools(timeline);
+    await tester.pump();
+    expect(timeline.rows, hasLength(60), reason: 'the tool rows are back');
+    expect(extent(), closeTo(before, 0.01));
+    expect(tester.takeException(), isNull);
+  });
+
   group('estimate cost', () {
     testWidgets(
       'scrolling 500 rows reports per-frame layout time',
