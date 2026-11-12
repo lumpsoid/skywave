@@ -61,6 +61,30 @@ pub struct Prepared {
     pub height: u32,
 }
 
+impl Prepared {
+    /// The image this prepared one is, as a draft keeps it.
+    pub fn attached(&self) -> AttachedImage {
+        AttachedImage {
+            sha256: self.sha256,
+            media_type: self.media_type,
+            size: self.size,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+/// An image in a draft: what the store and the model keep of a prepared
+/// image; its bytes are the file at [`attachment_path`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedImage {
+    pub sha256: ContentHash,
+    pub media_type: ImageType,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Why an image cannot be attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachRefusal {

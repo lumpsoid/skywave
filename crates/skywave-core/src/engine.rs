@@ -1908,7 +1908,7 @@ mod tests {
             [],
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 1)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 2)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(

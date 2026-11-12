@@ -857,7 +857,11 @@ logs) an event that no longer decodes rather than failing.
   `blobs`, `settings`, and what is this device's alone (D5: drafts per
   session and composer mode, composer modes, snippets, read marks, local
   deletes, alerted approvals). A schema migration backfills a new
-  projection from the stored events. `workdir_snapshots` keeps the latest
+  projection from the stored events. `draft_attachments` keeps a session's
+  agent draft's images in order, and `attachments` each image once by
+  sha256 (its bytes are the file under `<data>/attachments/`); a blank
+  text leaves them, and sending the message or deleting the session drops
+  them (the files are not collected yet). `workdir_snapshots` keeps the latest
   stored answer per workdir read (session, kind, requested path), so a
   workdir already browsed reads offline; `workdir_blob_refs` names the
   blobs each answer holds. A refresh replaces the answer, and a blob row

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
+use skywave_core::attachment::AttachedImage;
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
@@ -15,7 +16,7 @@ use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
     ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     Decision, DeviceId, DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange,
-    FileResult, Full, ImportOutcome, ImportedItem, LimitSeverity, LimitWindow, LineSpan,
+    FileResult, Full, ImageType, ImportOutcome, ImportedItem, LimitSeverity, LimitWindow, LineSpan,
     RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
     TaskKind, ToolResult, TurnUsage, UsageLimit, UsageLimitsResult,
 };
@@ -641,6 +642,15 @@ fn drop_drafts(dir: &Path) {
     conn.execute_batch("DROP TABLE drafts").unwrap();
 }
 
+fn drop_attachments(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "DROP TABLE draft_attachments;
+         DROP TABLE attachments;",
+    )
+    .unwrap();
+}
+
 fn drop_unread(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch(
@@ -818,7 +828,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -948,7 +958,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1626,7 +1636,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -1835,7 +1845,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -1978,7 +1988,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
     drop(store);
 
     // A replica from before the column: the migration derives it from the log.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!(order(&store), vec![c, b, a]);
     assert_eq!(store.session(c).unwrap().unwrap().last_message_seq, Seq(5));
@@ -1988,12 +1998,12 @@ const AGENT: ComposerMode = ComposerMode::Agent;
 const SHELL: ComposerMode = ComposerMode::Shell;
 
 /// Rewinds the schema to `version`. A rewind past the list-order column's
-/// migration reruns it, so this undoes it here; the last two, moving the
-/// server facts and canonicalizing the server addresses, rerun over a
-/// current schema as is.
+/// migration reruns it, so this undoes it here; the last three, moving the
+/// server facts, canonicalizing the server addresses and creating the
+/// attachment tables, rerun over a current schema as is.
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
-    if version < skywave_core::store::SCHEMA_VERSION - 2 {
+    if version < skywave_core::store::SCHEMA_VERSION - 3 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN last_message_seq;")
             .unwrap();
     }
@@ -2015,7 +2025,7 @@ fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
         ))
         .unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 2);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 3);
     };
     let settings_keys = |dir: &Path| -> Vec<String> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2077,7 +2087,7 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
         conn.execute_batch(rows).unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 1);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 2);
     };
     let stored = |dir: &Path| -> Vec<(String, String)> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2213,6 +2223,120 @@ fn enqueue_message_clears_its_draft_atomically() {
         [&(b, AGENT)]
     );
     assert_eq!(store.pending_outbox().unwrap().len(), 2);
+}
+
+/// An image for a draft; each `seed` is an image of its own.
+fn image(seed: &str) -> AttachedImage {
+    AttachedImage {
+        sha256: ContentHash::of(seed.as_bytes()),
+        media_type: ImageType::Png,
+        size: seed.len() as u64,
+        width: 4,
+        height: 3,
+    }
+}
+
+#[test]
+fn draft_images_keep_their_order_over_a_reopen() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b) = (image("a"), image("b"));
+    {
+        let store = Store::open(&dir).unwrap();
+        store.attach_to_draft(session, &a, at(0)).unwrap();
+        store.attach_to_draft(session, &b, at(1)).unwrap();
+        // Already held: a no-op.
+        store.attach_to_draft(session, &a, at(2)).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.load().unwrap().draft_images[&session],
+        [a.clone(), b.clone()]
+    );
+
+    store.detach_from_draft(session, a.sha256).unwrap();
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        std::slice::from_ref(&b)
+    );
+
+    // Blank text no longer hides the images: the draft row goes, they stay.
+    let draft = Draft {
+        text: "half typed".into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    };
+    store.set_draft(session, AGENT, Some(&draft)).unwrap();
+    store.set_draft(session, AGENT, None).unwrap();
+    assert!(store.drafts().unwrap().is_empty());
+    assert_eq!(
+        store.draft_images().unwrap()[&session],
+        std::slice::from_ref(&b)
+    );
+
+    // A detached image comes back after the others, not in its old place.
+    store.attach_to_draft(session, &a, at(3)).unwrap();
+    assert_eq!(store.draft_images().unwrap()[&session], [b, a]);
+}
+
+#[test]
+fn sending_a_message_drops_its_draft_images() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let store = Store::open(&dir).unwrap();
+    store.attach_to_draft(a, &image("to a"), at(0)).unwrap();
+    store.attach_to_draft(b, &image("to b"), at(1)).unwrap();
+    assert_eq!(store.draft_images().unwrap()[&a], [image("to a")]);
+
+    store.enqueue(&send(a, "with a picture")).unwrap();
+    let images = store.draft_images().unwrap();
+    assert!(!images.contains_key(&a));
+    assert_eq!(images[&b], [image("to b")]);
+}
+
+#[test]
+fn deleting_a_session_drops_its_draft_images() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store.attach_to_draft(a, &image("to a"), at(0)).unwrap();
+    store.attach_to_draft(b, &image("to b"), at(1)).unwrap();
+    assert!(store.draft_images().unwrap().contains_key(&a));
+
+    store.delete_session_locally(a, at(2)).unwrap();
+    let images = store.draft_images().unwrap();
+    assert!(!images.contains_key(&a));
+    assert_eq!(images[&b], [image("to b")]);
+}
+
+#[test]
+fn resetting_for_another_server_drops_every_draft_image() {
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .attach_to_draft(SessionId::new(), &image("a"), at(0))
+        .unwrap();
+    store
+        .attach_to_draft(SessionId::new(), &image("b"), at(1))
+        .unwrap();
+    assert_eq!(store.draft_images().unwrap().len(), 2);
+
+    store.reset_for_server().unwrap();
+    assert!(store.draft_images().unwrap().is_empty());
+}
+
+#[test]
+fn the_attachment_tables_come_with_the_migration() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    drop_attachments(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let store = Store::open(&dir).unwrap();
+    store
+        .attach_to_draft(SessionId::new(), &image("a"), at(0))
+        .unwrap();
+    assert_eq!(store.draft_images().unwrap().len(), 1);
 }
 
 #[test]
@@ -2983,7 +3107,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -3753,7 +3877,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -4035,7 +4159,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -4162,7 +4286,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -4201,7 +4325,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -4614,7 +4738,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -4742,7 +4866,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);
