@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, BlobDownload, Core, ExpectedRun, HttpsTransport, Identity, PairError,
@@ -12,10 +13,10 @@ use skywave_core::{
     TransportConfig, TransportError, pair, pair_and_report,
 };
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
+    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     ConversationsResult, DirEntry, DirsResult, EntryKind, EventKind, EventsQuery, FileBody,
-    FileResult, HelloResponse, ListResult, OutsideConversation, PROTOCOL_VERSION, Seq, SessionId,
-    WorkdirQuery,
+    FileResult, HelloResponse, ImageType, ListResult, OutsideConversation, PROTOCOL_VERSION, Seq,
+    SessionId, UploadResult, WorkdirQuery,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, Rng, seed};
 use skywaved::agent::fake::FakeOutside;
@@ -382,6 +383,21 @@ async fn list_conversations_defaults_to_not_found() {
     );
 }
 
+/// A transport that cannot stage attachments answers `NotFound`, as a
+/// server without `/v1/attachments` would.
+#[tokio::test]
+async fn attachment_calls_default_to_not_found() {
+    let sha = ContentHash::of(b"image");
+    assert_eq!(
+        Old.attachment_staged(sha).await,
+        Err(TransportError::NotFound)
+    );
+    assert_eq!(
+        Old.upload_attachment(sha, Bytes::new()).await,
+        Err(TransportError::NotFound)
+    );
+}
+
 /// `GET /v1/conversations` against a real server with a paired device: the
 /// listing decodes field for field, and a server whose agent cannot list
 /// answers `Unavailable`, not an error.
@@ -425,6 +441,56 @@ async fn conversations_are_listed_by_a_real_server() {
     assert_eq!(
         transport.list_conversations().await.unwrap(),
         ConversationsResult::Unavailable
+    );
+}
+
+/// `HEAD` and `PUT /v1/attachments/{sha256}` against a real server: an
+/// image is staged under its hash, a hash that does not match its bytes is
+/// refused and stages nothing, and a non-image is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn attachments_stage_on_a_real_server() {
+    let fx = Fixture::start().await;
+    let transport = paired_transport(&fx).await;
+    // The server sniffs only the magic bytes, so a PNG header and padding
+    // are an image to it.
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&[0u8; 64]);
+    let sha = ContentHash::of(&png);
+
+    assert!(!transport.attachment_staged(sha).await.unwrap());
+    assert_eq!(
+        transport
+            .upload_attachment(sha, Bytes::from(png.clone()))
+            .await
+            .unwrap(),
+        UploadResult::Stored {
+            size: png.len() as u64,
+            media_type: ImageType::Png,
+        }
+    );
+    assert!(transport.attachment_staged(sha).await.unwrap());
+
+    // The PNG's bytes, one byte changed, under a hash they do not match.
+    let mut altered = png.clone();
+    let last = altered.len() - 1;
+    altered[last] ^= 0xff;
+    let fresh = ContentHash::of(b"other");
+    assert_eq!(
+        transport
+            .upload_attachment(fresh, Bytes::from(altered))
+            .await
+            .unwrap(),
+        UploadResult::HashMismatch
+    );
+    assert!(!transport.attachment_staged(fresh).await.unwrap());
+
+    let text = b"just text";
+    assert_eq!(
+        transport
+            .upload_attachment(ContentHash::of(text), Bytes::from_static(text))
+            .await
+            .unwrap(),
+        UploadResult::NotAnImage
     );
 }
 
