@@ -462,12 +462,12 @@ pub struct BlobView {
     pub pending: Option<BlobPending>,
 }
 
-/// An image on a user message: its type and its blob, which downloads like
-/// any other (or is this device's own file).
+/// An image on a user message: its type, and the image's blob as it stands:
+/// downloadable (or this device's own file), deleted, or cropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageImage {
     pub media_type: ImageType,
-    pub blob: BlobView,
+    pub content: FullView,
 }
 
 /// This device's own delete or crop of a blob

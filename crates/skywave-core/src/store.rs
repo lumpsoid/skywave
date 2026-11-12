@@ -2240,7 +2240,7 @@ impl Store {
     ///   event's own-copy step needs the file.
     ///
     /// Nothing else keeps an image, so an image no longer needed is collected
-    /// by the next call, not by the detach or settle that freed it.
+    /// when the store opens, not by the detach or settle that freed it.
     pub fn collect_attachments(&self) -> Result<Vec<ContentHash>, StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;

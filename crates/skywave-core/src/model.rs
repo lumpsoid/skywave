@@ -3482,7 +3482,7 @@ impl Model {
                             .iter()
                             .map(|attachment| MessageImage {
                                 media_type: attachment.media_type,
-                                blob: self.blob_view(&attachment.blob),
+                                content: self.fated_view(&attachment.blob),
                             })
                             .collect(),
                         from: DeviceRef {
@@ -7455,6 +7455,21 @@ mod tests {
         f.session_view().draft_images
     }
 
+    /// The images of the open session's first logged user message.
+    fn logged_images(f: &Fixture) -> Vec<MessageImage> {
+        f.session_view()
+            .timeline
+            .into_iter()
+            .find_map(|item| match item {
+                TimelineItem::Logged {
+                    entry: Entry::UserMessage { images, .. },
+                    ..
+                } => Some(images),
+                _ => None,
+            })
+            .expect("the message is logged")
+    }
+
     #[test]
     fn attach_and_detach_change_the_draft_images() {
         let mut f = Fixture::paired();
@@ -7554,19 +7569,6 @@ mod tests {
                 },
             )],
         );
-        let logged_images = |f: &Fixture| {
-            f.session_view()
-                .timeline
-                .into_iter()
-                .find_map(|item| match item {
-                    TimelineItem::Logged {
-                        entry: Entry::UserMessage { images, .. },
-                        ..
-                    } => Some(images),
-                    _ => None,
-                })
-                .expect("the message is logged")
-        };
         let not_downloaded = |blob: &BlobRef| BlobView {
             id: blob.id,
             state: BlobState::NotDownloaded { size: blob.size },
@@ -7578,11 +7580,11 @@ mod tests {
             vec![
                 MessageImage {
                     media_type: ImageType::Png,
-                    blob: not_downloaded(&blob_a),
+                    content: FullView::Blob(not_downloaded(&blob_a)),
                 },
                 MessageImage {
                     media_type: ImageType::Png,
-                    blob: not_downloaded(&blob_b),
+                    content: FullView::Blob(not_downloaded(&blob_b)),
                 },
             ]
         );
@@ -7598,8 +7600,73 @@ mod tests {
         f.model
             .blob_status(blob_a.id, BlobStatus::Available { path: path.clone() });
         let shown = logged_images(&f);
-        assert_eq!(shown[0].blob.state, BlobState::Available { path });
-        assert_eq!(shown[1].blob.state, BlobState::NotDownloaded { size: 200 });
+        assert_eq!(
+            shown[0].content.blob().unwrap().state,
+            BlobState::Available { path }
+        );
+        assert_eq!(
+            shown[1].content.blob().unwrap().state,
+            BlobState::NotDownloaded { size: 200 }
+        );
+    }
+
+    #[test]
+    fn a_deleted_message_image_shows_as_deleted() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let (a, b) = (image(1, 100), image(2, 200));
+        let command = send(&mut f, sid, "look");
+        let blob_of = |image: &AttachedImage| BlobRef {
+            id: BlobId::new(),
+            size: image.size,
+            sha256: image.sha256,
+        };
+        let (blob_a, blob_b) = (blob_of(&a), blob_of(&b));
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::UserMessage {
+                    device_id: me,
+                    text: "look".into(),
+                    attachments: vec![
+                        Attachment {
+                            blob: blob_a.clone(),
+                            media_type: ImageType::Png,
+                        },
+                        Attachment {
+                            blob: blob_b.clone(),
+                            media_type: ImageType::Png,
+                        },
+                    ],
+                },
+            )],
+        );
+        // Another device deletes the first image only: the second, which
+        // nothing deleted, must still show as a blob (the control).
+        let other = DeviceId::new();
+        f.log(
+            sid,
+            vec![EventKind::BlobDeleted {
+                blob: blob_a.id,
+                holds: BlobUse::Message,
+                by: other,
+            }],
+        );
+
+        let shown = logged_images(&f);
+        assert!(
+            matches!(&shown[0].content, FullView::Deleted { by } if by.id == other),
+            "{:?}",
+            shown[0]
+        );
+        assert!(
+            matches!(&shown[1].content, FullView::Blob(_)),
+            "{:?}",
+            shown[1]
+        );
     }
 
     #[test]
