@@ -1287,6 +1287,65 @@ void main() {
       },
     );
 
+    testWidgets('while browsing history the note row steps older and newer', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      final timeline = holding([]);
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          composer: const ComposerView(
+            text: 'recalled',
+            cursorUtf16: 8,
+            rev: 1,
+            mode: ComposerModeView.agent,
+            shellEnabled: false,
+            canStop: false,
+            images: [],
+            preparing: 0,
+            historyLabel: '2 of 5',
+          ),
+        ),
+        timeline: timeline,
+        sent: sent,
+      );
+      expect(find.textContaining('2 of 5'), findsOneWidget);
+
+      sent.clear();
+      await tester.tap(find.byKey(const Key('history-older-step')));
+      await tester.pumpAndSettle();
+      expect(sent.last, const GuiIntentHistoryOlder());
+
+      sent.clear();
+      await tester.tap(find.byKey(const Key('history-newer-step')));
+      await tester.pumpAndSettle();
+      expect(sent.last, const GuiIntentHistoryNewer());
+
+      // Not browsing, but the note row shows (a to-label): no step buttons.
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          composer: const ComposerView(
+            text: 'recalled',
+            cursorUtf16: 8,
+            rev: 2,
+            mode: ComposerModeView.agent,
+            shellEnabled: false,
+            canStop: false,
+            images: [],
+            preparing: 0,
+            toLabel: 'to the main agent',
+          ),
+        ),
+        timeline: timeline,
+        sent: sent,
+      );
+      expect(find.textContaining('to the main agent'), findsOneWidget);
+      expect(find.byKey(const Key('history-older-step')), findsNothing);
+      expect(find.byKey(const Key('history-newer-step')), findsNothing);
+    });
+
     testWidgets('the send button sends, only once there is text', (
       tester,
     ) async {

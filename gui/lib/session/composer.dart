@@ -325,6 +325,26 @@ class ComposerState extends State<Composer> {
                           ),
                         ),
                       ),
+                      if (composer.historyLabel != null) ...[
+                        IconButton(
+                          key: const Key('history-older-step'),
+                          tooltip: 'Older prompt',
+                          visualDensity: VisualDensity.compact,
+                          iconSize: 18,
+                          onPressed: () =>
+                              widget.send(const GuiIntentHistoryOlder()),
+                          icon: const Icon(Icons.keyboard_arrow_up),
+                        ),
+                        IconButton(
+                          key: const Key('history-newer-step'),
+                          tooltip: 'Newer prompt',
+                          visualDensity: VisualDensity.compact,
+                          iconSize: 18,
+                          onPressed: () =>
+                              widget.send(const GuiIntentHistoryNewer()),
+                          icon: const Icon(Icons.keyboard_arrow_down),
+                        ),
+                      ],
                     ],
                   ),
                 ),
