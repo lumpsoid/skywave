@@ -4632,7 +4632,7 @@ mod workdir {
         WorkdirFetch, WorkdirPane, WorkdirView,
     };
     use skywave_present::workdir::NOT_FETCHED;
-    use skywave_proto::BlobRef;
+    use skywave_proto::{BlobRef, Commit, CommitLog, LogResult};
 
     use super::*;
     use crate::signals::{
@@ -4761,6 +4761,99 @@ mod workdir {
         );
         assert!(screen.entries.is_empty());
         assert_eq!(screen.content, None);
+    }
+
+    #[test]
+    fn the_workdir_commits_pane_lists_commits_newest_first() {
+        let mut rig = Rig::new();
+        let commits = vec![
+            Commit {
+                sha: "a1b2c3d4e5f6".into(),
+                short: "a1b2c3d".into(),
+                author: "Ada".into(),
+                time: Some(taken() - chrono::Duration::hours(3)),
+                subject: "Add the log".into(),
+            },
+            Commit {
+                sha: "e4f5a6b7c8d9".into(),
+                short: "e4f5a6b".into(),
+                author: "Zoë".into(),
+                time: None,
+                subject: "First".into(),
+            },
+        ];
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Commits,
+            WorkdirFetch::Idle,
+            WorkdirBody::Log(LogResult::Log(CommitLog {
+                at: taken(),
+                branch: Some("main".into()),
+                commits,
+                more: true,
+            })),
+        );
+        assert_eq!(screen.pane, WorkdirPaneKind::Commits);
+        assert_eq!(screen.header, "main · taken 12:00:00");
+        assert_eq!(screen.wording, None);
+        assert_eq!(screen.notes, ["Showing the newest 2 commits."]);
+        let rows: Vec<_> = screen
+            .commits
+            .iter()
+            .map(|r| {
+                (
+                    r.short.as_str(),
+                    r.subject.as_str(),
+                    r.author.as_str(),
+                    r.time_label.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("a1b2c3d", "Add the log", "Ada", Some("4 h ago")),
+                ("e4f5a6b", "First", "Zoë", None),
+            ]
+        );
+        assert!(screen.changes.is_empty());
+        assert!(screen.entries.is_empty());
+        assert_eq!(screen.content, None);
+    }
+
+    #[test]
+    fn the_workdir_commits_pane_words_an_empty_and_a_failed_log() {
+        let mut rig = Rig::new();
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Commits,
+            WorkdirFetch::Idle,
+            WorkdirBody::Log(LogResult::Log(CommitLog {
+                at: taken(),
+                branch: Some("main".into()),
+                commits: Vec::new(),
+                more: false,
+            })),
+        );
+        assert_eq!(screen.wording.as_deref(), Some("No commits yet."));
+        assert!(screen.commits.is_empty());
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Commits,
+            WorkdirFetch::Failed("offline".into()),
+            WorkdirBody::Log(LogResult::Failed {
+                reason: "boom".into(),
+            }),
+        );
+        assert_eq!(screen.wording.as_deref(), Some("git failed: boom"));
+        assert!(screen.commits.is_empty());
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Commits,
+            WorkdirFetch::Loading,
+            WorkdirBody::Nothing,
+        );
+        assert_eq!(screen.header, "Commits");
     }
 
     #[test]
@@ -5038,6 +5131,13 @@ mod workdir {
         });
         rig.intent(GuiIntent::Act {
             action: ActionIntent::ShowWorkdir {
+                pane: WorkdirPaneKind::Commits,
+                path: String::new(),
+                untracked: false,
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::ShowWorkdir {
                 pane: WorkdirPaneKind::Diff,
                 path: "a.txt".into(),
                 untracked: true,
@@ -5070,6 +5170,7 @@ mod workdir {
                 Action::OpenWorkdir {
                     session_id: rig.session
                 },
+                Action::ShowWorkdir(WorkdirPane::Commits),
                 Action::ShowWorkdir(WorkdirPane::Diff {
                     path: "a.txt".into(),
                     untracked: true

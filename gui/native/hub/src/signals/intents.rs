@@ -407,8 +407,8 @@ pub enum ActionIntent {
         session_id: String,
     },
     /// A pane of the workdir screen: `path` names the diff's file, the
-    /// directory or the file (ignored for `Changes`); `untracked` tells a
-    /// diff's two entries for one path apart.
+    /// directory or the file (ignored for `Changes` and `Commits`);
+    /// `untracked` tells a diff's two entries for one path apart.
     ShowWorkdir {
         pane: WorkdirPaneKind,
         path: String,

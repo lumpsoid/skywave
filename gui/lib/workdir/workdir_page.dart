@@ -7,10 +7,11 @@ import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// A session's workdir, read-only: its git changes and a changed file's
-/// diff (Changes), or its files and one file's content (Files). Rust
-/// reads each pane on request and keeps the answer, so what was read
-/// shows offline; this lays out what it worded. The diff or file shown is
-/// capped by the hub; "Open" opens the whole downloaded file.
+/// diff (Changes), its newest commits (Commits), or its files and one
+/// file's content (Files). Rust reads each pane on request and keeps the
+/// answer, so what was read shows offline; this lays out what it worded.
+/// The diff or file shown is capped by the hub; "Open" opens the whole
+/// downloaded file.
 class WorkdirPage extends StatelessWidget {
   const WorkdirPage({
     required this.screen,
@@ -26,6 +27,8 @@ class WorkdirPage extends StatelessWidget {
   bool get _onChanges =>
       screen.pane == WorkdirPaneKind.changes ||
       screen.pane == WorkdirPaneKind.diff;
+
+  bool get _onCommits => screen.pane == WorkdirPaneKind.commits;
 
   void _show(WorkdirPaneKind pane, String path, {bool untracked = false}) =>
       send.act(
@@ -92,9 +95,19 @@ class WorkdirPage extends StatelessWidget {
                     },
                   ),
                   ChoiceChip(
+                    key: const Key('workdir-tab-commits'),
+                    label: const Text('Commits'),
+                    selected: _onCommits,
+                    onSelected: (_) {
+                      if (screen.pane != WorkdirPaneKind.commits) {
+                        _show(WorkdirPaneKind.commits, '');
+                      }
+                    },
+                  ),
+                  ChoiceChip(
                     key: const Key('workdir-tab-files'),
                     label: const Text('Files'),
-                    selected: !_onChanges,
+                    selected: !_onChanges && !_onCommits,
                     onSelected: (_) {
                       if (screen.pane != WorkdirPaneKind.dir ||
                           screen.path != screen.lastDir) {
@@ -132,6 +145,7 @@ class WorkdirPage extends StatelessWidget {
             Expanded(
               child: switch (screen.pane) {
                 WorkdirPaneKind.changes ||
+                WorkdirPaneKind.commits ||
                 WorkdirPaneKind.dir => _ListPane(screen: screen, send: send),
                 WorkdirPaneKind.diff ||
                 WorkdirPaneKind.file => _TextPane(screen: screen, send: send),
@@ -144,8 +158,8 @@ class WorkdirPage extends StatelessWidget {
   }
 }
 
-/// The changed files, or a directory's entries; the pane's wording and
-/// notes beneath them.
+/// The changed files, the commits, or a directory's entries; the pane's
+/// wording and notes beneath them.
 class _ListPane extends StatelessWidget {
   const _ListPane({required this.screen, required this.send});
 
@@ -161,6 +175,7 @@ class _ListPane extends StatelessWidget {
     return ListView(
       children: [
         for (final row in screen.changes) _ChangeTile(row: row, send: send),
+        for (final row in screen.commits) _CommitTile(row: row),
         if (screen.canGoUp)
           ListTile(
             dense: true,
@@ -251,6 +266,32 @@ class _ChangeTile extends StatelessWidget {
           untracked: row.untracked,
         ),
       ),
+    );
+  }
+}
+
+/// One commit: its short sha, subject, author and age.
+class _CommitTile extends StatelessWidget {
+  const _CommitTile({required this.row});
+
+  final WorkdirCommitRow row;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = SkyColors.of(context);
+    final time = row.timeLabel;
+    return ListTile(
+      dense: true,
+      leading: Text(
+        row.short,
+        style: TextStyle(
+          fontFamily: monoFamily,
+          fontFamilyFallback: monoFallback,
+          color: colors.muted,
+        ),
+      ),
+      title: Text(row.subject),
+      subtitle: Text(time == null ? row.author : '${row.author} · $time'),
     );
   }
 }

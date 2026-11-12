@@ -8,6 +8,8 @@ use super::timeline::BlobFacts;
 pub enum WorkdirPaneKind {
     /// What changed against `HEAD`.
     Changes,
+    /// The newest commits on `HEAD`.
+    Commits,
     /// One changed file's diff.
     Diff,
     /// One directory.
@@ -45,6 +47,8 @@ pub struct WorkdirScreen {
     pub notes: Vec<String>,
     /// The changes pane's files, as the server sorted them.
     pub changes: Vec<WorkdirChangeRow>,
+    /// The commits pane's commits, newest first.
+    pub commits: Vec<WorkdirCommitRow>,
     /// A directory below the workdir: a `..` row, which sends `Back`.
     pub can_go_up: bool,
     /// The directory pane's entries, directories first.
@@ -82,6 +86,18 @@ pub struct WorkdirChangeRow {
     /// `+12 −3`, `binary`.
     pub counts_label: Option<String>,
     pub untracked: bool,
+}
+
+/// One commit of the commits pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct WorkdirCommitRow {
+    /// The abbreviated sha.
+    pub short: String,
+    /// The first line of its message.
+    pub subject: String,
+    pub author: String,
+    /// `3 h ago`; `None` when the commit has no usable date.
+    pub time_label: Option<String>,
 }
 
 /// One directory entry. It opens with `ShowWorkdir(opens, path)`.

@@ -154,6 +154,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             untracked,
         } => Action::ShowWorkdir(match pane {
             WorkdirPaneKind::Changes => WorkdirPane::Changes,
+            WorkdirPaneKind::Commits => WorkdirPane::Commits,
             WorkdirPaneKind::Diff => WorkdirPane::Diff { path, untracked },
             WorkdirPaneKind::Dir => WorkdirPane::Dir { path },
             WorkdirPaneKind::File => WorkdirPane::File { path },
