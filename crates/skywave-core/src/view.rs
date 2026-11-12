@@ -785,12 +785,13 @@ pub enum ListKind {
 /// Directories that complete what the user typed as a workdir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
-    /// The input the candidates are for.
+    /// The input the candidates are for. While a new directory loads it is
+    /// the earlier input the kept candidates were for (status `Loading`).
     pub input: String,
     /// Paths that extend `input`, without a trailing `/`: the server's
     /// listing once it is known, else recent workdirs from the replica. A
     /// relative input matches the roots and recent workdirs by any path
-    /// component.
+    /// component, recent workdirs first.
     pub candidates: Vec<Candidate>,
     pub status: CompletionStatus,
 }

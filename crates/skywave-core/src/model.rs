@@ -9897,9 +9897,10 @@ mod tests {
         assert_eq!(
             candidates(&f),
             vec![
-                ("/srv/code".to_owned(), CandidateSource::Server),
                 ("/srv/code/web".to_owned(), CandidateSource::Recent),
-            ]
+                ("/srv/code".to_owned(), CandidateSource::Server),
+            ],
+            "recent workdirs first, then the roots not among them"
         );
 
         let (req, dir) = complete(&mut f, "/s").unwrap();
@@ -9911,6 +9912,39 @@ mod tests {
             }),
         );
         assert_eq!(completion(&f).fill().as_deref(), Some("/srv/code/"));
+    }
+
+    #[test]
+    fn empty_input_offers_the_recents_before_the_roots() {
+        let mut f = Fixture::paired();
+        f.session("/home/me");
+        f.session("/srv/code/web");
+        let (req, dir) = complete(&mut f, "").unwrap();
+        assert_eq!(dir, "", "the roots");
+        assert_eq!(
+            candidates(&f),
+            vec![
+                ("/srv/code/web".to_owned(), CandidateSource::Recent),
+                ("/home/me".to_owned(), CandidateSource::Recent),
+            ],
+            "the recents show before the roots arrive, newest first"
+        );
+
+        f.model.dirs_listed(
+            req,
+            Ok(DirsResult::Roots {
+                roots: vec!["/srv/code".into(), "/home/me".into()],
+            }),
+        );
+        assert_eq!(
+            candidates(&f),
+            vec![
+                ("/srv/code/web".to_owned(), CandidateSource::Recent),
+                ("/home/me".to_owned(), CandidateSource::Recent),
+                ("/srv/code".to_owned(), CandidateSource::Server),
+            ],
+            "a root that is also recent is not listed twice"
+        );
     }
 
     #[test]
