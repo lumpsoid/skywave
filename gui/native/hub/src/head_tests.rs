@@ -3280,6 +3280,10 @@ fn enter_on_a_highlighted_row_descends_and_keeps_the_list() {
     let listed = shown_prompt(&rig).popup.expect("the candidates are listed");
     let paths: Vec<_> = listed.candidates.iter().map(|c| c.path.clone()).collect();
     assert!(!paths.is_empty(), "a recent workdir is listed");
+    assert!(listed.candidates.iter().any(|c| c.recent));
+    for c in listed.candidates.iter().filter(|c| c.recent) {
+        assert_eq!(c.label, c.path, "a recent row shows its full path");
+    }
 
     rig.intent(GuiIntent::CompletionMove { up: false });
     let before = shown_prompt(&rig).input_rev;
@@ -3353,6 +3357,7 @@ fn stale_rows_are_marked_and_cannot_be_picked() {
     assert_eq!(shown.input, "/srv/api/");
     let popup = shown.popup.expect("the list is shown");
     assert!(popup.stale, "the rows are for the earlier input");
+    assert!(popup.loading, "the new directory's listing is pending");
     assert!(
         !popup.candidates.is_empty(),
         "the stale rows are still shown"
@@ -3366,6 +3371,33 @@ fn stale_rows_are_marked_and_cannot_be_picked() {
     let after = shown_prompt(&rig);
     assert_eq!(after.input, "/srv/api/");
     assert_eq!(after.input_rev, shown.input_rev);
+
+    answer_listing(&mut rig, &requests, "/srv/api/", &["x"]);
+    let answered = shown_prompt(&rig).popup.expect("the list is shown");
+    assert!(!answered.loading, "the listing has answered");
+    assert!(!answered.stale, "the rows are for the input now");
+}
+
+#[test]
+fn a_listed_row_shows_its_name() {
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::CreateOpen);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/".into(),
+    });
+    rig.results();
+    rig.view();
+    answer_listing(&mut rig, &requests, "/srv/", &["api"]);
+    let popup = shown_prompt(&rig).popup.expect("the listing is shown");
+    let api = popup
+        .candidates
+        .iter()
+        .find(|c| !c.recent)
+        .expect("the server listed a directory");
+    assert_eq!(api.path, "/srv/api");
+    assert_eq!(api.label, "api", "under the input's directory: its name");
 }
 
 #[test]
