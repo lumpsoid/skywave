@@ -614,6 +614,73 @@ void main() {
       expect(scrolled(tester), greaterThan(50));
       expect(tester.takeException(), isNull);
     });
+
+    testWidgets('a hold that lands at the newest end follows from then on', (
+      tester,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(400, 600)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      final sent = <GuiIntent>[];
+      final timeline = holding([...sixty().take(59), detailed(59, count: 15)]);
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: timeline,
+        sent: sent,
+      );
+      final tall = tester.getSize(
+        find
+            .ancestor(of: find.text('row 59'), matching: find.byType(RowTile))
+            .first,
+      );
+      expect(tall.height, greaterThan(150), reason: 'the newest row is tall');
+
+      // Taller than the 100 px scrolled back, so the hold's target is past
+      // the newest end once it is removed.
+      await scrollTo(tester, 100);
+      expect(scrolled(tester), 100);
+      expect(
+        tester.state<TimelineViewState>(find.byType(TimelineView)).following,
+        isFalse,
+      );
+      expect(sent.last, const GuiIntentFollowingChanged(following: false));
+
+      timeline.apply(TimelineUpdateRemoved(key: 's:59'));
+      await tester.pumpAndSettle();
+
+      expect(scrolled(tester), 0);
+      expect(
+        tester.state<TimelineViewState>(find.byType(TimelineView)).following,
+        isTrue,
+      );
+      expect(sent.last, const GuiIntentFollowingChanged(following: true));
+
+      timeline.apply(upsert(row('s:60', 'row 60'), timeline.rows.length));
+      await tester.pumpAndSettle();
+
+      expect(scrolled(tester), 0);
+      expectInView(tester, 'row 60');
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('jumping to the newest row in the same frame as new rows is '
+        'not held', (tester) async {
+      final timeline = await scrolledBack(tester);
+
+      for (var i = 60; i < 63; i++) {
+        timeline.apply(upsert(row('s:$i', 'row $i'), i));
+      }
+      tester.state<TimelineViewState>(find.byType(TimelineView)).jumpToNewest();
+      await tester.pump();
+
+      expect(scrolled(tester), 0, reason: 'the first frame after the jump');
+      await tester.pumpAndSettle();
+      expect(scrolled(tester), 0);
+      expectInView(tester, 'row 62');
+      expect(tester.takeException(), isNull);
+    });
   });
 
   group('scroll hold, conversation only, reveals and gestures', () {
