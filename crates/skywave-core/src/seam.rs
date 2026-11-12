@@ -24,8 +24,8 @@ use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
 use crate::projection::BlobFate;
 use crate::store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, PendingCrop, ServerFacts,
-    Settings, StoreError,
+    Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
+    PendingCrop, ServerFacts, Settings, StoreError,
 };
 use crate::transport::TransportError;
 use crate::view::{
@@ -410,6 +410,24 @@ impl Seam {
         self.update(|state, _| {
             if state.store.record_undeliverable(id, now)? {
                 state.model.command_undeliverable(id, now);
+            }
+            Ok(())
+        })
+    }
+
+    /// The device gave up on the image of the message `id` before posting
+    /// it: the server refused its upload, or the local file is gone. The
+    /// message is never sent; a command already settled (or gone) stays as
+    /// it is.
+    pub fn command_attachment_refused(
+        &self,
+        id: CommandId,
+        reason: AttachmentRefusal,
+    ) -> Result<(), CoreError> {
+        let now = Utc::now();
+        self.update(|state, _| {
+            if state.store.record_attachment_refused(id, reason, now)? {
+                state.model.command_attachment_refused(id, reason, now);
             }
             Ok(())
         })

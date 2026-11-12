@@ -814,6 +814,21 @@ pub enum LogCheck {
     Lost { seen: Seq },
 }
 
+/// Why the outbox gave up on a message's image before posting it: the
+/// server refused the upload, or the local file is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentRefusal {
+    /// The server refused the upload as larger than it takes.
+    TooLarge,
+    /// The server did not read the upload as an image.
+    NotAnImage,
+    /// The server's hash of the upload differs from the one asked for.
+    HashMismatch,
+    /// The local file under the attachments directory is gone or unreadable.
+    Missing,
+}
+
 /// Delivery state of a queued command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboxStatus {
@@ -829,6 +844,9 @@ pub enum OutboxStatus {
     /// [`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS) server errors;
     /// final, never sent again.
     Undeliverable,
+    /// The message was never posted: its image could not be staged
+    /// ([`AttachmentRefusal`]). Final, never sent again.
+    AttachmentRefused(AttachmentRefusal),
 }
 
 /// What the outbox `result` column holds once a command is settled: the
@@ -845,18 +863,21 @@ enum Settled {
 #[serde(tag = "result", rename_all = "snake_case")]
 enum LocalResult {
     Undeliverable,
+    AttachmentRefused { reason: AttachmentRefusal },
 }
 
 impl OutboxStatus {
     /// Whether the command has its final outcome: the server's answer, or
-    /// given up on as [`Undeliverable`](OutboxStatus::Undeliverable). Only
+    /// given up on as [`Undeliverable`](OutboxStatus::Undeliverable) or
+    /// [`AttachmentRefused`](OutboxStatus::AttachmentRefused). Only
     /// an unsettled command (the outbox's `result IS NULL`) is still sent,
     /// claimed ([`Store::claim_send`]) or settled ([`Store::record_result`],
-    /// [`Store::record_undeliverable`]).
+    /// [`Store::record_undeliverable`], [`Store::record_attachment_refused`]).
     pub fn is_settled(&self) -> bool {
         match self {
             OutboxStatus::Queued | OutboxStatus::Sending => false,
             OutboxStatus::Done(_) | OutboxStatus::Undeliverable => true,
+            OutboxStatus::AttachmentRefused(_) => true,
         }
     }
 }
@@ -897,7 +918,7 @@ impl OutboxEntry {
         );
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
-            OutboxStatus::Undeliverable => true,
+            OutboxStatus::Undeliverable | OutboxStatus::AttachmentRefused(_) => true,
             OutboxStatus::Queued | OutboxStatus::Sending => true,
         }
     }
@@ -1652,6 +1673,9 @@ impl Store {
                 (Some(Settled::Local(LocalResult::Undeliverable)), _) => {
                     OutboxStatus::Undeliverable
                 }
+                (Some(Settled::Local(LocalResult::AttachmentRefused { reason })), _) => {
+                    OutboxStatus::AttachmentRefused(reason)
+                }
                 (None, true) => OutboxStatus::Sending,
                 (None, false) => OutboxStatus::Queued,
             };
@@ -1712,6 +1736,24 @@ impl Store {
         )
     }
 
+    /// Gives up on a message whose image the outbox could not stage, at
+    /// `now` ([`OutboxStatus::AttachmentRefused`]). Like an answer, it is
+    /// final and the first one is kept; `false` when nothing changed, as for
+    /// [`record_result`](Store::record_result).
+    pub fn record_attachment_refused(
+        &self,
+        id: CommandId,
+        reason: AttachmentRefusal,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        settle_in(
+            &self.conn,
+            id,
+            &Settled::Local(LocalResult::AttachmentRefused { reason }),
+            now,
+        )
+    }
+
     /// Takes a command back: deletes it from the outbox if the server has
     /// not answered it or refused it (or its request), and keeps `draft` as
     /// its session's draft in that mode. With `images`, the session's agent
@@ -1731,7 +1773,8 @@ impl Store {
         let deleted = tx.execute(
             "DELETE FROM outbox WHERE command_id = ?1
                 AND (result IS NULL
-                    OR json_extract(result, '$.result') IN ('rejected', 'undeliverable'))",
+                    OR json_extract(result, '$.result')
+                        IN ('rejected', 'undeliverable', 'attachment_refused'))",
             [id.0.to_string()],
         )?;
         if deleted == 0 {

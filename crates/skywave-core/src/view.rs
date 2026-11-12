@@ -29,7 +29,7 @@ pub use crate::projection::{SessionUsage, TurnRecord};
 
 use crate::address::ServerAddress;
 use crate::attachment::AttachedImage;
-use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
+use crate::store::{AttachmentRefusal, BlobPolicy, OutboxEntry, OutboxStatus};
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.
@@ -330,6 +330,9 @@ impl From<&OutboxStatus> for Outgoing {
                 Outgoing::Failed(FailReason::Rejected(*reason))
             }
             OutboxStatus::Undeliverable => Outgoing::Failed(FailReason::Undeliverable),
+            OutboxStatus::AttachmentRefused(reason) => {
+                Outgoing::Failed(FailReason::AttachmentRefused(*reason))
+            }
         }
     }
 }
@@ -345,6 +348,9 @@ pub enum FailReason {
     /// logged a command whose reply was unreadable. It never applied, and
     /// it is not sent again.
     Undeliverable,
+    /// The device gave up on the message's image before sending it; it
+    /// never applied.
+    AttachmentRefused(AttachmentRefusal),
 }
 
 impl FailReason {
@@ -353,7 +359,7 @@ impl FailReason {
     pub fn rules_out_answers(self) -> bool {
         match self {
             FailReason::Rejected(reason) => reason.rules_out_answers(),
-            FailReason::Undeliverable => false,
+            FailReason::Undeliverable | FailReason::AttachmentRefused(_) => false,
         }
     }
 }
