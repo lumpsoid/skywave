@@ -398,8 +398,16 @@ fn render_session_list(
 
     if let Some(prompt) = prompt {
         render_prompt(frame, prompt_area, app, prompt);
-        if let Some((completion, selected)) = app.completion_popup() {
-            render_completion(frame, area, prompt_area, app, completion, selected);
+        if let Some((completion, highlighted, stale)) = app.completion_popup() {
+            render_completion(
+                frame,
+                area,
+                prompt_area,
+                app,
+                completion,
+                highlighted,
+                stale,
+            );
         }
     }
 }
@@ -500,16 +508,19 @@ pub(crate) fn render_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: &P
     }
 }
 
-/// The workdir candidates, in a popup just above the new-session prompt.
+/// The workdir candidates, in a popup just above the new-session prompt. Its
+/// height is fixed, so it does not resize as the list changes; rows for an
+/// earlier input (`stale`) are dimmed, as they cannot be chosen.
 fn render_completion(
     frame: &mut Frame,
     area: Rect,
     prompt: Rect,
     app: &App,
     completion: &Completion,
-    selected: usize,
+    highlighted: Option<usize>,
+    stale: bool,
 ) {
-    let rows = completion.candidates.len().clamp(1, POPUP_ROWS) as u16 + 2;
+    let rows = POPUP_ROWS as u16 + 2;
     let top = prompt.y.saturating_sub(rows).max(area.y);
     let popup = Rect::new(prompt.x, top, prompt.width, prompt.y - top);
     let offline = matches!(
@@ -545,14 +556,19 @@ fn render_completion(
         .iter()
         .map(|candidate| {
             let path: String = candidate.path.chars().filter(|c| !c.is_control()).collect();
-            let mut spans = vec![Span::raw(path).reset()];
+            let path = Span::raw(path);
+            let mut spans = vec![if stale {
+                path.dark_gray()
+            } else {
+                path.reset()
+            }];
             if candidate.source == CandidateSource::Recent {
                 spans.push(Span::raw("  recent").dark_gray());
             }
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let mut state = ListState::default().with_selected(Some(selected));
+    let mut state = ListState::default().with_selected(highlighted);
     frame.render_stateful_widget(
         List::new(items)
             .block(block)
@@ -838,8 +854,8 @@ fn footer_keys(app: &App) -> &'static str {
             paired: Some(_), ..
         }) => "Tab next field · Enter next/submit · Esc cancel · F1 help · Ctrl-C quit",
         Screen::Pairing(_) => "Tab next field · Enter next/submit · F1 help · Ctrl-C quit",
-        Screen::SessionList(_) if app.completion_popup().is_some() => {
-            "↑↓ select · Tab/Enter accept · Esc close list · F1 help · Ctrl-C quit"
+        Screen::SessionList(_) if matches!(app.completion_popup(), Some((_, Some(_), _))) => {
+            "↑↓ select · Enter/Tab open · Esc unselect · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(_) | Screen::Session(_)
             if app
@@ -866,10 +882,10 @@ fn footer_keys(app: &App) -> &'static str {
                 .as_ref()
                 .is_some_and(|p| p.kind == PromptKind::Adopt) =>
         {
-            "Tab complete · Enter next: the id · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+            "↓ choose · Tab complete · Enter next: the id · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(_) if app.ui().prompt.is_some() => {
-            "Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+            "↓ choose · Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(_)
             if app
@@ -1093,7 +1109,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             ),
             key("type / paste", "the session's directory on the server"),
             key("Tab", "complete the directory under the roots"),
-            key("↑↓ Tab/Enter", "pick from the list"),
+            key("↓ Enter/Tab", "open a listed directory"),
             if app
                 .ui()
                 .prompt
@@ -1106,7 +1122,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             },
             key("Backspace", "delete a character"),
             key("Ctrl-U", "clear"),
-            key("Esc", "close the list, then cancel"),
+            key("Esc", "unselect, then cancel"),
         ]),
         Screen::SessionList(_) if app.conversation_picker().is_some() => lines.extend([
             section("Continue an outside conversation"),
