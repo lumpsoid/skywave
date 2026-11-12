@@ -27,7 +27,9 @@
 # One containing "stuck" gets the text "working", then the CLI answers
 # nothing more, interrupts included (each one gets the text "ignored").
 # A SIGTERM makes the CLI write ./term.txt and exit, reporting a running
-# call as killed first, as the real CLI does (§6).
+# call as killed first, as the real CLI does (§6). With ./term-writes it
+# first prints a 1 MiB line to stdout (more than a pipe holds), then writes
+# ./term.txt.
 # `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id,
 # with `--fork-session` too (the parent is unknown; §5). A fork otherwise
 # runs as its `--session-id`, as the real CLI does.
@@ -89,7 +91,7 @@
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
 running=""
-trap 'echo term > term.txt; if [ -n "$running" ]; then tool_result "Exit code 137" true; fi; exit 143' TERM
+trap 'if [ -e term-writes ]; then head -c 1048576 /dev/zero | tr "\0" x; echo; fi; echo term > term.txt; if [ -n "$running" ]; then tool_result "Exit code 137" true; fi; exit 143' TERM
 
 sid=""
 mode="default"
