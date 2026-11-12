@@ -1008,7 +1008,7 @@ fn footer_keys(app: &App) -> &'static str {
             "↑↓ select · D delete · K crop · r refresh · Tab list · Esc back · ? help · q quit"
         }
         Screen::Workdir(view) => match view.pane {
-            WorkdirPane::Changes | WorkdirPane::Dir { .. } => {
+            WorkdirPane::Changes | WorkdirPane::Commits | WorkdirPane::Dir { .. } => {
                 "↑↓ select · Enter open · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
             }
             WorkdirPane::Diff { .. } | WorkdirPane::File { .. } => {

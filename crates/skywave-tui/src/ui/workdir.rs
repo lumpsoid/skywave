@@ -64,6 +64,7 @@ pub(super) fn render(
                 rows(frame, body, ui, view, capped.into_iter().collect());
             }
         },
+        WorkdirBody::Log(_) => note(frame, body, "Commits are shown in the GUI.".to_owned()),
         WorkdirBody::Dir(result) => {
             let notes = list_wording(result)
                 .into_iter()
@@ -108,6 +109,7 @@ fn head_lines(view: &WorkdirView, now: DateTime<Utc>) -> Vec<Line<'static>> {
             (vec![Span::raw(clean(&head_label(set)))], Some(set.at))
         }
         (WorkdirPane::Changes, _) => (vec![Span::raw("Changes")], None),
+        (WorkdirPane::Commits, _) => (vec![Span::raw("Changes")], None),
         (WorkdirPane::Diff { path, untracked }, body) => {
             let file = match body {
                 WorkdirBody::Diff { file, .. } => file.as_ref(),

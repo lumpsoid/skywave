@@ -141,6 +141,8 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
     let now = DateTime::from_timestamp_millis(wall_ms).unwrap_or_default();
     let (pane, path) = match &view.pane {
         WorkdirPane::Changes => (WorkdirPaneKind::Changes, String::new()),
+        // Until the hub has a commits pane kind; nothing shows this pane yet.
+        WorkdirPane::Commits => (WorkdirPaneKind::Changes, String::new()),
         WorkdirPane::Diff { path, .. } => (WorkdirPaneKind::Diff, path.clone()),
         WorkdirPane::Dir { path } => (WorkdirPaneKind::Dir, path.clone()),
         WorkdirPane::File { path } => (WorkdirPaneKind::File, path.clone()),
@@ -151,6 +153,7 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
             (view.fetch != WorkdirFetch::Loading).then(|| NOT_FETCHED.to_owned())
         }
         WorkdirBody::Changes(result) => changes_wording(result),
+        WorkdirBody::Log(_) => None,
         WorkdirBody::Diff { file, .. } => diff_wording(file.as_ref()),
         WorkdirBody::Dir(result) => list_wording(result),
         WorkdirBody::File { result, .. } => file_wording(result),
@@ -228,6 +231,7 @@ fn header(view: &WorkdirView, now: DateTime<Utc>) -> String {
             (head_label(set), Some(set.at))
         }
         (WorkdirPane::Changes, _) => ("Changes".to_owned(), None),
+        (WorkdirPane::Commits, _) => ("Changes".to_owned(), None),
         (WorkdirPane::Diff { path, untracked }, body) => {
             let file = match body {
                 WorkdirBody::Diff { file, .. } => file.as_ref(),
