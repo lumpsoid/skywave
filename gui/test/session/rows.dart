@@ -84,6 +84,8 @@ const composerAt1 = ComposerView(
   mode: ComposerModeView.agent,
   shellEnabled: false,
   canStop: false,
+  images: [],
+  preparing: 0,
 );
 
 ModeOption _mode(

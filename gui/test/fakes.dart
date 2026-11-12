@@ -80,6 +80,8 @@ const _composer = ComposerView(
   mode: ComposerModeView.agent,
   shellEnabled: false,
   canStop: false,
+  images: [],
+  preparing: 0,
 );
 
 /// An agent that has not said its mode, model or effort yet.

@@ -1510,6 +1510,14 @@ skywave-core                 all logic, sync, replica
   ranges point. Copy takes the raw text. Only `http`, `https` and `mailto`
   links are tappable, and open (`url_launcher`) after a dialog showing the
   URL; images are never fetched.
+- **Images are prepared off the hub task.** An attach intent makes the head
+  emit `Out::Prepare`; `run` prepares the picked or pasted image on a
+  blocking thread (`attach::prepare_image`: read, `attachment::prepare`,
+  `attachment::store`). Its result returns to the loop as
+  `Head::on_prepared`, which dispatches `Action::Attach` with the metadata
+  only. The head counts each session's preparations in flight: a send waits
+  for them, and the image cap counts the draft's images and those still
+  being prepared.
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.

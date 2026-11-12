@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use chrono::{TimeZone, Utc};
-use skywave_core::{Core, CoreError, DeviceId, PairedCredentials, Seam};
+use skywave_core::attachment;
+use skywave_core::{ContentHash, Core, CoreError, DeviceId, PairedCredentials, Seam};
 use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
@@ -624,8 +625,9 @@ impl Rig {
         Rig::on(Head::with_target(Target::Mobile))
     }
 
-    fn on(head: Head) -> Rig {
+    fn on(mut head: Head) -> Rig {
         let dir = tempfile::tempdir().unwrap();
+        head.set_data_dir(dir.path().to_path_buf());
         let core = Core::open_detached(dir.path()).unwrap();
         let seam = core.seam();
         core.dispatch(Action::Pair {
@@ -693,6 +695,24 @@ impl Rig {
                     self.actions.push(action.clone());
                     let result = self.core.dispatch(action);
                     self.done.push(Dispatched { tag, result });
+                }
+                other => rest.push(other),
+            }
+        }
+        rest
+    }
+
+    /// Carries out the preparations in `outs` as `run` does, here and now,
+    /// handing each result to the head. What that adds is applied; the rest
+    /// of `outs` is returned.
+    fn prepare(&mut self, outs: Vec<Out>) -> Vec<Out> {
+        let mut rest = Vec::new();
+        for out in outs {
+            match out {
+                Out::Prepare { session_id, source } => {
+                    let result = crate::attach::prepare_image(self._dir.path(), source);
+                    let outs = self.head.on_prepared(session_id, result, self.clock);
+                    rest.extend(self.apply(outs));
                 }
                 other => rest.push(other),
             }
@@ -770,6 +790,8 @@ impl Rig {
                 Action::Discard(_) => "discard",
                 Action::SaveSnippet { .. } => "save snippet",
                 Action::UseSnippet(_) => "use snippet",
+                Action::Attach { .. } => "attach",
+                Action::Detach { .. } => "detach",
                 _ => "other",
             })
             .collect()
@@ -1231,6 +1253,140 @@ fn a_message_over_the_cap_is_refused_here_and_kept() {
     rig.edit(&longest);
     rig.submit();
     assert_eq!(rig.kinds(), ["send"]);
+}
+
+/// A PNG of a 4x4 image whose colour is `shade` in red: each shade is other
+/// content, so other bytes and another hash.
+fn png(shade: u8) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([shade, 0, 0, 255]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(image)
+        .write_with_encoder(image::codecs::png::PngEncoder::new(&mut out))
+        .unwrap();
+    out
+}
+
+/// The intent to attach `bytes` to the open session's draft.
+fn attach_intent(rig: &mut Rig, bytes: &[u8]) -> Vec<Out> {
+    rig.intent(GuiIntent::AttachImageBytes {
+        session_id: rig.session.0.to_string(),
+        bytes: bytes.to_vec(),
+        mime: "image/png".into(),
+    })
+}
+
+/// How many of `outs` ask for a preparation.
+fn prepares(outs: &[Out]) -> usize {
+    outs.iter()
+        .filter(|out| matches!(out, Out::Prepare { .. }))
+        .count()
+}
+
+/// Attaches `bytes` as the composer does: the intent, the preparation, then
+/// the core's answer and its snapshot. Returns the image's hash.
+fn attach(rig: &mut Rig, bytes: &[u8]) -> ContentHash {
+    let outs = attach_intent(rig, bytes);
+    rig.prepare(outs);
+    rig.results();
+    rig.view();
+    attachment::prepare(bytes).unwrap().sha256
+}
+
+#[test]
+fn an_image_is_prepared_before_it_is_attached() {
+    let mut rig = Rig::new();
+    let bytes = png(1);
+    let sha = attachment::prepare(&bytes).unwrap().sha256;
+    let stored = attachment::attachment_path(rig._dir.path(), sha);
+    let outs = attach_intent(&mut rig, &bytes);
+    assert_eq!(prepares(&outs), 1);
+    assert!(rig.actions.is_empty(), "{:?}", rig.kinds());
+    assert_eq!(rig.composer().preparing, 1);
+    assert!(!stored.exists(), "stored before it is prepared");
+
+    rig.prepare(outs);
+    assert!(stored.is_file(), "the image is stored");
+    assert_eq!(rig.kinds().last(), Some(&"attach"));
+    rig.results();
+    rig.view();
+    let composer = rig.composer();
+    assert_eq!(composer.images.len(), 1);
+    assert_eq!(composer.images[0].sha256, sha.to_string());
+    assert_eq!(composer.images[0].path, stored.display().to_string());
+    assert_eq!(composer.preparing, 0);
+}
+
+#[test]
+fn sending_waits_for_an_image_being_prepared() {
+    let mut rig = Rig::new();
+    rig.edit("look at this");
+    let attaching = attach_intent(&mut rig, &png(2));
+    let outs = rig.submit();
+    assert!(rig.actions.is_empty(), "{:?}", rig.kinds());
+    assert_eq!(
+        notices(&outs),
+        ["an image is still being prepared"],
+        "the message waits"
+    );
+    assert_eq!(rig.text(), "look at this", "the text stays");
+
+    rig.prepare(attaching);
+    rig.submit();
+    assert_eq!(rig.kinds().last(), Some(&"send"));
+}
+
+#[test]
+fn a_pdf_is_refused_with_a_note() {
+    let mut rig = Rig::new();
+    let outs = attach_intent(&mut rig, b"%PDF-1.4 not a picture");
+    assert_eq!(rig.composer().preparing, 1);
+    let outs = rig.prepare(outs);
+    assert_eq!(notices(&outs), ["not an image"]);
+    assert!(!rig.kinds().contains(&"attach"), "{:?}", rig.kinds());
+    assert_eq!(rig.composer().preparing, 0);
+}
+
+#[test]
+fn detaching_an_image_removes_it() {
+    let mut rig = Rig::new();
+    let sha = attach(&mut rig, &png(3));
+    assert_eq!(rig.composer().images.len(), 1);
+
+    let outs = rig.intent(GuiIntent::DetachImage {
+        session_id: rig.session.0.to_string(),
+        sha256: "nope".into(),
+    });
+    assert_eq!(errors(&outs), ["bad image hash"]);
+
+    rig.actions.clear();
+    rig.intent(GuiIntent::DetachImage {
+        session_id: rig.session.0.to_string(),
+        sha256: sha.to_string(),
+    });
+    assert_eq!(rig.kinds().last(), Some(&"detach"));
+    rig.results();
+    rig.view();
+    assert!(rig.composer().images.is_empty());
+}
+
+#[test]
+fn a_ninth_image_is_refused_here() {
+    let mut rig = Rig::new();
+    for shade in 0..7 {
+        attach(&mut rig, &png(shade));
+    }
+    // Positive control: the eighth is taken, and is being prepared.
+    let eighth = attach_intent(&mut rig, &png(7));
+    assert_eq!(prepares(&eighth), 1);
+    // The one being prepared counts: the ninth is refused here, unprepared.
+    let outs = attach_intent(&mut rig, &png(8));
+    assert_eq!(prepares(&outs), 0);
+    assert_eq!(notices(&outs), ["at most 8 images per message"]);
+
+    rig.prepare(eighth);
+    rig.results();
+    rig.view();
+    assert_eq!(rig.composer().images.len(), 8);
 }
 
 #[test]

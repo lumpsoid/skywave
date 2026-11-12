@@ -25,6 +25,7 @@ panic = "deny"
 [dependencies]
 skywave-core.workspace = true
 skywave-present.workspace = true
+skywave-proto.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 rinf.workspace = true
@@ -35,6 +36,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-skywave-proto.workspace = true
+image.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

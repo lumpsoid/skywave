@@ -39,6 +39,8 @@ pub struct Running {
     pub prefs: Prefs,
     /// Where they are written back: beside the core's data dir.
     pub prefs_path: PathBuf,
+    /// The core's data dir, under which the attachments are stored.
+    pub data_dir: PathBuf,
     subscription: SubscriptionId,
     slot: MutexGuard<'static, ()>,
 }
@@ -58,6 +60,7 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         dispatcher: None,
     };
     let dir = Path::new(&boot.dir).join(DATA_DIR);
+    let data_dir = dir.clone();
     let prefs_path = prefs::path_in(Path::new(&boot.dir));
     let config = EngineConfig {
         device_name: Some(boot.device_name),
@@ -125,6 +128,7 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         failed: core_failed,
         prefs: prefs::load(&prefs_path),
         prefs_path,
+        data_dir,
         subscription,
         slot,
     })
@@ -172,6 +176,7 @@ impl Running {
             failed,
             prefs: _,
             prefs_path: _,
+            data_dir: _,
             subscription,
             slot,
         } = self;
