@@ -87,6 +87,25 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::UserMessage {
             device_id: device(),
             text: "run the tests".into(),
+            attachments: Vec::new(),
+        },
+        EventKind::UserMessage {
+            device_id: device(),
+            text: "look at these".into(),
+            attachments: vec![
+                Attachment {
+                    blob: blob(),
+                    media_type: ImageType::Png,
+                },
+                Attachment {
+                    blob: BlobRef {
+                        id: Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0010).into(),
+                        size: 120_000,
+                        sha256: ContentHash::of(b"jpeg image"),
+                    },
+                    media_type: ImageType::Jpeg,
+                },
+            ],
         },
         EventKind::AgentMessage {
             parent: None,
@@ -662,6 +681,7 @@ fn storage_report() -> StorageReport {
             BlobUse::ApprovalInput,
             BlobUse::ShellOutput,
             BlobUse::Message,
+            BlobUse::Attachment,
         ]
         .into_iter()
         .map(|holds| BlobStorage {
@@ -770,6 +790,19 @@ fn all_login_finish_results() -> Vec<LoginFinishResult> {
     ]
 }
 
+fn all_upload_results() -> Vec<UploadResult> {
+    vec![
+        UploadResult::Stored {
+            size: 340_000,
+            media_type: ImageType::Png,
+        },
+        UploadResult::TooLarge,
+        UploadResult::NotAnImage,
+        UploadResult::HashMismatch,
+        UploadResult::DiskLow,
+    ]
+}
+
 fn all_shell_ends() -> Vec<ShellEnd> {
     vec![
         ShellEnd::Exited { code: 0 },
@@ -823,6 +856,16 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             context: context(),
             text: "hello".into(),
+            attachments: Vec::new(),
+        },
+        CommandKind::SendMessage {
+            session_id: session(),
+            context: context(),
+            text: "look at these".into(),
+            attachments: vec![
+                ContentHash::of(b"png image"),
+                ContentHash::of(b"jpeg image"),
+            ],
         },
         CommandKind::ResolveApproval {
             id: approval(),
@@ -959,6 +1002,9 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::BlobGone,
             RejectReason::NotCroppable,
             RejectReason::BadCrop,
+            RejectReason::UnknownAttachment,
+            RejectReason::TooManyAttachments,
+            RejectReason::AttachmentsTooLarge,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -1265,6 +1311,46 @@ fn turn_usage_decodes_with_figures_left_out() {
         })
     );
     assert!(TurnUsage::default().is_empty());
+}
+
+#[test]
+fn v29_messages_read_as_without_attachments() {
+    let kind = decode(
+        r#"{"type":"user_message","device_id":"01920000-0000-7000-8000-000000000003","text":"hi"}"#,
+    );
+    assert!(
+        matches!(&kind, EventKind::UserMessage { attachments, .. } if attachments.is_empty()),
+        "{kind:?}"
+    );
+    let command: CommandKind = serde_json::from_str(
+        r#"{"type":"send_message","session_id":"01920000-0000-7000-8000-000000000001","context":"01920000-0000-7000-8000-000000000008","text":"hi"}"#,
+    )
+    .unwrap();
+    assert!(
+        matches!(&command, CommandKind::SendMessage { attachments, .. } if attachments.is_empty()),
+        "{command:?}"
+    );
+    // A text-only message writes exactly its v29 JSON, with no attachments key.
+    let text_only = EventKind::UserMessage {
+        device_id: device(),
+        text: "hi".into(),
+        attachments: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_string(&text_only).unwrap(),
+        r#"{"type":"user_message","device_id":"01920000-0000-7000-8000-000000000003","text":"hi"}"#
+    );
+    // Positive control: with an image, the key is there.
+    let with_image = EventKind::UserMessage {
+        device_id: device(),
+        text: "hi".into(),
+        attachments: vec![Attachment {
+            blob: blob(),
+            media_type: ImageType::Png,
+        }],
+    };
+    let json = serde_json::to_string(&with_image).unwrap();
+    assert!(json.contains(r#""attachments":[{"#), "{json}");
 }
 
 #[test]
@@ -1594,6 +1680,13 @@ fn every_login_result_round_trips() {
 }
 
 #[test]
+fn every_upload_result_round_trips() {
+    for result in all_upload_results() {
+        round_trip(&result);
+    }
+}
+
+#[test]
 fn a_login_finish_never_prints_its_code() {
     let printed = format!("{:?}", login_finish());
     assert!(printed.contains("<redacted>"), "{printed}");
@@ -1649,13 +1742,16 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v29() {
-    assert_eq!(PROTOCOL_VERSION, 29);
+fn protocol_is_v30() {
+    assert_eq!(PROTOCOL_VERSION, 30);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
     assert_eq!(limits::MESSAGE_MAX_BYTES, 256 * 1024);
     assert_eq!(limits::FIRST_PROMPT_MAX_CHARS, 200);
+    assert_eq!(limits::ATTACHMENTS_MAX, 8);
+    assert_eq!(limits::ATTACHMENT_MAX_BYTES, 3_750_000);
+    assert_eq!(limits::ATTACHMENTS_MAX_TOTAL_BYTES, 10_000_000);
     // A session's first context has the session's own id.
     assert_eq!(ContextId::first_of(session()).0, session().0);
 }
@@ -1895,6 +1991,11 @@ fn api_paths() {
         path::blob(blob_id()),
         "/v1/blobs/01920000-0000-7000-8000-000000000005"
     );
+    assert_eq!(path::ATTACHMENT_ROUTE, "/v1/attachments/{sha256}");
+    assert_eq!(
+        path::attachment(ContentHash::of(b"")),
+        "/v1/attachments/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
 }
 
 #[test]
@@ -1940,6 +2041,7 @@ fn wire_format_snapshot() {
         login_start: Vec<LoginStartResult>,
         login_finish: LoginFinish,
         login_finish_results: Vec<LoginFinishResult>,
+        upload_results: Vec<UploadResult>,
     }
     let actual = serde_json::to_string_pretty(&Snapshot {
         protocol_version: PROTOCOL_VERSION,
@@ -1976,6 +2078,7 @@ fn wire_format_snapshot() {
         login_start: all_login_start_results(),
         login_finish: login_finish(),
         login_finish_results: all_login_finish_results(),
+        upload_results: all_upload_results(),
     })
     .unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/wire.json");

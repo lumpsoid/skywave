@@ -34,8 +34,8 @@
 //!   [`WORKDIR_TIMEOUT`], and answers with [`Seam::workdir_answered`].
 //!
 //! **The link** runs while the device is paired, not rejected and not
-//! suspended. Each connection starts with `hello`, then runs two loops side
-//! by side until either fails:
+//! suspended. Each connection starts with `hello`, then runs three loops side
+//! by side until one fails:
 //! - the *pull loop* long-polls `GET /v1/events` from the store's cursor and
 //!   applies every batch in one transaction ([`Seam::apply_events`]);
 //! - the *outbox sender* sends the oldest pending command, marking it
@@ -52,6 +52,10 @@
 //!   request has a connection of its own, so the pull's tells whether the
 //!   link is down. Taking a command back (`OutboxChanged`) ends the wait to
 //!   resend it, and the next command goes.
+//! - the *draft stager* uploads the images of a draft as soon as they are
+//!   attached ([`Request::DraftImagesChanged`]), so a message finds them
+//!   staged; a transport error makes it wait a backoff instead of ending the
+//!   connection ([`stage_drafts`]).
 //!
 //! `Link` moves as follows: `Connecting` when the link (re)starts; after
 //! `hello`, `CatchingUp { have, server }` while the cursor is behind the
@@ -113,16 +117,22 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
-use skywave_proto::{EventsQuery, Seq};
+use skywave_proto::limits::ATTACHMENT_MAX_BYTES;
+use skywave_proto::{
+    Command, CommandKind, CommandResult, ContentHash, EventsQuery, Seq, UploadResult,
+};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::address::ServerAddress;
+use crate::attachment::attachment_path;
 use crate::backoff::Backoff;
 use crate::blobs::{BlobCtx, BlobQueue, run_downloader};
 use crate::client::CoreError;
@@ -130,7 +140,7 @@ use crate::https::{HttpsTransport, TransportConfig};
 use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
-use crate::store::{LogCheck, OutboxEntry, StoreError};
+use crate::store::{AttachmentRefusal, LogCheck, OutboxEntry, StoreError};
 use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
 use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
@@ -314,6 +324,8 @@ pub(crate) struct Engine {
     suspended: watch::Receiver<bool>,
     /// Wakes the outbox sender; outlives each link so no wake-up is lost.
     outbox: Arc<Notify>,
+    /// Wakes the draft image stager; outlives each link so no wake-up is lost.
+    drafts: Arc<Notify>,
     /// Ends the link's backoff wait; outlives each link.
     retry_now: Arc<Notify>,
     link: Option<JoinHandle<()>>,
@@ -351,6 +363,7 @@ impl Engine {
             requests,
             suspended,
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             link: None,
             downloader: None,
@@ -407,6 +420,7 @@ impl Engine {
                 self.start_link();
             }
             Request::OutboxChanged => self.outbox.notify_one(),
+            Request::DraftImagesChanged => self.drafts.notify_one(),
             // Only a link already waiting is woken: no permit is stored, so
             // a press that lands mid-connect cannot skip the next wait.
             Request::RetryNow => self.retry_now.notify_waiters(),
@@ -587,6 +601,7 @@ impl Engine {
             seam,
             config: self.config.clone(),
             outbox: self.outbox.clone(),
+            drafts: self.drafts.clone(),
             retry_now: self.retry_now.clone(),
             blobs: self.blobs.clone(),
             address,
@@ -670,6 +685,8 @@ pub(crate) struct LinkCtx {
     pub(crate) seam: Seam,
     pub(crate) config: Arc<EngineConfig>,
     pub(crate) outbox: Arc<Notify>,
+    /// Wakes the draft image stager.
+    pub(crate) drafts: Arc<Notify>,
     /// Ends a backoff wait early.
     pub(crate) retry_now: Arc<Notify>,
     /// Where an `Eager` policy queues the blobs a batch registers.
@@ -900,10 +917,11 @@ impl Wait {
     }
 }
 
-/// One connection: `hello`, then pull and send until either fails. A
-/// server error for one command, or a failure of its request alone, is not
+/// One connection: `hello`, then pull, send and stage drafts until one fails.
+/// A server error for one command, or a failure of its request alone, is not
 /// a failure of the sender ([`send_entry`]), so it never cuts the pull
-/// short; the pull is what finds the link down.
+/// short; the pull is what finds the link down. A transport error in the
+/// draft stager waits instead ([`stage_drafts`]).
 async fn connection(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -947,6 +965,7 @@ async fn connection(
     let ended = tokio::select! {
         ended = pull(ctx, transport, reporter, &progress, hello.head, latency_ms) => ended,
         ended = send(ctx, transport, &progress, errors) => ended,
+        ended = stage_drafts(ctx, transport) => ended,
     };
     let Err(error) = ended;
     Ended {
@@ -1044,6 +1063,181 @@ async fn send(
     }
 }
 
+/// What staging a message's images came to.
+enum Staged {
+    /// Post the message: its images are staged, or a low disk stopped the
+    /// uploads.
+    Post,
+    /// The message cannot be posted, and why.
+    Refused(AttachmentRefusal),
+    /// The user took the message back meanwhile: it is not posted.
+    Withdrawn,
+}
+
+/// Uploads the images a `SendMessage` names, in order, so the server holds
+/// them staged when the message is posted. [`Staged::Post`] means post now;
+/// [`Staged::Refused`] means the message cannot be posted, and why.
+///
+/// Every hash is checked with a HEAD on every attempt, and the ones not
+/// staged are PUT from the local file. Nothing is remembered between
+/// attempts: the server unlinks the staged files a message used, so a
+/// cached "staged" would post an image the server no longer holds. A local
+/// file that is missing or unreadable, or over [`ATTACHMENT_MAX_BYTES`], is
+/// refused without an upload, as is an upload the server refuses as too
+/// large, not an image or a hash mismatch. A `DiskLow` answer stops the
+/// uploads and posts the message anyway: the server then refuses it with a
+/// stored `DiskLow` rejection like any message on a low disk. Waiting here
+/// would hold up the one outbox, interrupts and approvals included. A
+/// transport error is returned for [`send_entry`] to handle, as its
+/// request's error would be.
+///
+/// A message the user takes back while its images upload is not posted:
+/// it is checked to be still pending before each image's HEAD and once more
+/// after the last upload, and [`Staged::Withdrawn`] stops everything. A PUT
+/// already in flight may still finish; nothing after it is sent. A message
+/// without images is not checked.
+async fn stage_attachments(
+    ctx: &LinkCtx,
+    transport: &dyn Transport,
+    command: &Command,
+) -> Result<Staged, LinkError> {
+    let CommandKind::SendMessage { attachments, .. } = &command.kind else {
+        return Ok(Staged::Post);
+    };
+    if attachments.is_empty() {
+        return Ok(Staged::Post);
+    }
+    let data_dir = ctx.seam.data_dir();
+    for &sha in attachments {
+        if !still_pending(ctx, command.id)? {
+            return Ok(Staged::Withdrawn);
+        }
+        match stage_one(transport, &data_dir, sha).await? {
+            ImageStaging::Staged => {}
+            ImageStaging::DiskLow => break,
+            ImageStaging::Refused(reason) => return Ok(Staged::Refused(reason)),
+        }
+    }
+    if !still_pending(ctx, command.id)? {
+        return Ok(Staged::Withdrawn);
+    }
+    Ok(Staged::Post)
+}
+
+/// What staging one image came to.
+enum ImageStaging {
+    /// The server holds the image.
+    Staged,
+    /// A low disk stopped the upload.
+    DiskLow,
+    /// The image cannot be staged, and why.
+    Refused(AttachmentRefusal),
+}
+
+/// Stages one image: a HEAD, then, unless the server holds it, the local
+/// file is PUT. A missing, unreadable or oversized file is refused without an
+/// upload. A transport error is returned to the caller.
+async fn stage_one(
+    transport: &dyn Transport,
+    data_dir: &Path,
+    sha: ContentHash,
+) -> Result<ImageStaging, TransportError> {
+    if transport.attachment_staged(sha).await? {
+        return Ok(ImageStaging::Staged);
+    }
+    let path = attachment_path(data_dir, sha);
+    let size = match tokio::fs::metadata(&path).await {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
+            return Ok(ImageStaging::Refused(AttachmentRefusal::Missing));
+        }
+    };
+    if size > ATTACHMENT_MAX_BYTES {
+        tracing::warn!(sha256 = %sha.to_hex(), size, "attachment is over the upload limit");
+        return Ok(ImageStaging::Refused(AttachmentRefusal::TooLarge));
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
+            return Ok(ImageStaging::Refused(AttachmentRefusal::Missing));
+        }
+    };
+    let answer = transport.upload_attachment(sha, Bytes::from(bytes)).await?;
+    Ok(match answer {
+        UploadResult::Stored { .. } => ImageStaging::Staged,
+        UploadResult::DiskLow => ImageStaging::DiskLow,
+        UploadResult::TooLarge => ImageStaging::Refused(AttachmentRefusal::TooLarge),
+        UploadResult::NotAnImage => ImageStaging::Refused(AttachmentRefusal::NotAnImage),
+        UploadResult::HashMismatch => ImageStaging::Refused(AttachmentRefusal::HashMismatch),
+    })
+}
+
+/// The background stager for agent drafts: uploads the images a draft
+/// gains as soon as it gains them, so on a bad link the bytes are usually on
+/// the server before the message is sent. It runs beside the pull and the
+/// outbox sender, and wakes when a draft gains images
+/// ([`Request::DraftImagesChanged`]).
+///
+/// Each image is staged once per connection. `done` only stops this loop
+/// from repeating itself; nothing else trusts it. The outbox still HEADs
+/// every hash before it posts a message, since the server unlinks the staged
+/// files a message uses. Abandoned drafts leave staged files behind, which
+/// the server's own cap and age eviction remove. A refused or missing image
+/// is marked done and left for the outbox to report when its message is
+/// sent. A transport error waits a backoff and tries again: it never ends
+/// the connection, as the pull is what notices a dead link.
+async fn stage_drafts(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, LinkError> {
+    let data_dir = ctx.seam.data_dir();
+    let mut done: HashSet<ContentHash> = HashSet::new();
+    let mut failures = 0u32;
+    loop {
+        let wanted: Vec<ContentHash> = ctx
+            .seam
+            .draft_image_hashes()?
+            .into_iter()
+            .filter(|sha| !done.contains(sha))
+            .collect();
+        if wanted.is_empty() {
+            ctx.drafts.notified().await;
+            continue;
+        }
+        let mut failed = false;
+        for sha in wanted {
+            match stage_one(transport, &data_dir, sha).await {
+                Ok(ImageStaging::Staged) => {}
+                Ok(ImageStaging::DiskLow) => {
+                    tracing::debug!(sha256 = %sha.to_hex(), "disk low; left for the outbox");
+                }
+                Ok(ImageStaging::Refused(reason)) => {
+                    tracing::debug!(
+                        ?reason,
+                        sha256 = %sha.to_hex(),
+                        "refused; left for the outbox"
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "staging a draft image failed; trying again later");
+                    failed = true;
+                    break;
+                }
+            }
+            done.insert(sha);
+        }
+        if failed {
+            failures = failures.saturating_add(1);
+            let after = ctx.config.backoff.delay(failures);
+            tokio::select! {
+                () = tokio::time::sleep(after) => {}
+                () = ctx.drafts.notified() => {}
+            }
+        } else {
+            failures = 0;
+        }
+    }
+}
+
 /// Claims and sends one outbox entry read earlier, and says whether the
 /// server settled it: answered it or refused it for good. An entry that can no
 /// longer be claimed (gone from the outbox, or answered meanwhile) is
@@ -1079,6 +1273,14 @@ async fn send(
 /// cannot claim it, or the server answers the resend from its dedup. The
 /// user may take it back while it waits ([`resend_after`]); an answer to a
 /// request still out then settles nothing.
+///
+/// Before the request, a message's images are staged ([`stage_attachments`]).
+/// An image that cannot be staged settles the message as
+/// `AttachmentRefused`, final and never posted, and the link stays up. A
+/// transport error while staging is handled as the same error from the
+/// request itself, and the staging runs again on the resend. A message the
+/// user takes back while its images upload is not posted, and the sender
+/// moves on to the next entry ([`stage_attachments`]).
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -1090,22 +1292,45 @@ async fn send_entry(
     if !ctx.seam.command_sending(id)? {
         return Ok(false);
     }
-    match transport.send_command(&entry.command).await {
-        Ok(result) => {
+    let sent: Result<Result<CommandResult, AttachmentRefusal>, LinkError> =
+        match stage_attachments(ctx, transport, &entry.command).await {
+            Ok(Staged::Post) => transport
+                .send_command(&entry.command)
+                .await
+                .map(Ok)
+                .map_err(LinkError::Transport),
+            Ok(Staged::Refused(reason)) => Ok(Err(reason)),
+            Ok(Staged::Withdrawn) => {
+                tracing::debug!(?id, "withdrawn while its images uploaded; not posting it");
+                return Ok(false);
+            }
+            Err(error) => Err(error),
+        };
+    match sent {
+        Ok(Ok(result)) => {
             ctx.seam.command_result(id, &result)?;
             Ok(true)
         }
-        Err(error) if error.refuses_command() => {
+        Ok(Err(reason)) => {
+            tracing::warn!(
+                ?reason,
+                ?id,
+                "the outbox could not stage an image; giving up on the message"
+            );
+            ctx.seam.command_attachment_refused(id, reason)?;
+            Ok(true)
+        }
+        Err(LinkError::Transport(error)) if error.refuses_command() => {
             tracing::warn!(%error, ?id, "server refused the command; giving up on it");
             ctx.seam.command_undeliverable(id)?;
             Ok(true)
         }
-        Err(TransportError::Decode(error)) => {
+        Err(LinkError::Transport(TransportError::Decode(error))) => {
             tracing::warn!(%error, ?id, "unreadable reply; waiting for the log to settle it");
             settled_by_log(ctx, transport, id).await?;
             Ok(false)
         }
-        Err(error) if error.is_server_error() => {
+        Err(LinkError::Transport(error)) if error.is_server_error() => {
             let count = errors.note(id);
             if count < MAX_SERVER_ERRORS {
                 let after = ctx.config.backoff.delay(count);
@@ -1117,15 +1342,25 @@ async fn send_entry(
             }
             Ok(false)
         }
-        Err(error) if error.failed_request() => {
+        Err(LinkError::Transport(error)) if error.failed_request() => {
             let count = failures.note(id);
             let after = ctx.config.backoff.delay(count);
             tracing::debug!(%error, ?id, count, ?after, "command request failed; sending again");
             resend_after(ctx, id, after).await?;
             Ok(false)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
+}
+
+/// Whether the outbox still holds command `id` unanswered: the user has not
+/// taken it back (`Store::withdraw`), and the server has not answered it.
+fn still_pending(ctx: &LinkCtx, id: CommandId) -> Result<bool, LinkError> {
+    Ok(ctx
+        .seam
+        .pending_outbox()?
+        .iter()
+        .any(|e| e.command.id == id))
 }
 
 /// Waits `after` before the outbox command `id` is sent again, or less once
@@ -1139,12 +1374,7 @@ async fn resend_after(ctx: &LinkCtx, id: CommandId, after: Duration) -> Result<(
     loop {
         // Asked for before the look, so a change in between still wakes it.
         let changed = ctx.outbox.notified();
-        if !ctx
-            .seam
-            .pending_outbox()?
-            .iter()
-            .any(|e| e.command.id == id)
-        {
+        if !still_pending(ctx, id)? {
             return Ok(());
         }
         tokio::select! {
@@ -1182,15 +1412,18 @@ mod tests {
     use std::time::Duration;
 
     use skywave_proto::{
-        BlobId as ProtoBlobId, Command, CommandId, CommandKind, CommandResult, EventBatch,
-        HelloResponse, PROTOCOL_VERSION, ServerId, SessionId,
+        Attachment, BlobId as ProtoBlobId, BlobRef, Command, CommandId, CommandKind, CommandResult,
+        ContentHash, EventBatch, EventKind, HelloResponse, ImageType, PROTOCOL_VERSION, ServerId,
+        SessionId, UploadResult,
     };
 
     use super::*;
     use crate::Core;
+    use crate::attachment::{AttachedImage, attachment_dir};
     use crate::backoff::Jitter;
+    use crate::blobs::blob_dir;
     use crate::identity::PairedCredentials;
-    use crate::store::OutboxStatus;
+    use crate::store::{BlobStatus, OutboxStatus, Store};
     use crate::transport::{BlobDownload, BoxFuture};
     use crate::view::{DeviceId, FailReason, Link, Outgoing, Screen};
 
@@ -1394,6 +1627,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -1525,6 +1759,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: retry_now.clone(),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -1793,6 +2028,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now,
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -1908,7 +2144,7 @@ mod tests {
             [],
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 1)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 2)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(
@@ -2177,6 +2413,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(EngineConfig::default()),
             outbox: Arc::new(Notify::new()),
+            drafts: Arc::new(Notify::new()),
             retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".parse().unwrap(),
@@ -2186,12 +2423,17 @@ mod tests {
     }
 
     fn enqueue(seam: &Seam, text: &str) -> Command {
+        enqueue_with(seam, text, Vec::new())
+    }
+
+    fn enqueue_with(seam: &Seam, text: &str, attachments: Vec<ContentHash>) -> Command {
         let command = Command {
             id: CommandId::new(),
             kind: CommandKind::SendMessage {
                 session_id: SessionId::new(),
                 context: skywave_proto::ContextId::first_of(SessionId::new()),
                 text: text.into(),
+                attachments,
             },
         };
         crate::client::lock(&seam.core.shared.state)
@@ -2567,6 +2809,662 @@ mod tests {
         );
     }
 
+    /// Stages uploads the way the server does, and records every request as
+    /// `head`, `put` or `post` with the first eight hex digits of its hash.
+    struct StagingServer {
+        staged: Mutex<HashSet<ContentHash>>,
+        calls: Mutex<Vec<String>>,
+        seq: Mutex<u64>,
+        /// When set, every PUT answers this and stages nothing.
+        put_answer: Option<UploadResult>,
+        /// The first this many PUTs fail with a timeout.
+        put_failures: Mutex<u32>,
+        /// Whether a post must find each of its images staged.
+        check_staged: bool,
+        /// Runs on every PUT, after it is recorded and before it answers.
+        on_put: Option<Box<dyn Fn() + Send + Sync>>,
+    }
+
+    impl StagingServer {
+        fn new() -> Self {
+            StagingServer {
+                staged: Mutex::new(HashSet::new()),
+                calls: Mutex::new(Vec::new()),
+                seq: Mutex::new(0),
+                put_answer: None,
+                put_failures: Mutex::new(0),
+                check_staged: true,
+                on_put: None,
+            }
+        }
+
+        fn record(&self, call: String) {
+            let mut calls = self.calls.lock().unwrap();
+            // A stager that repeats itself never yields, so no timeout could
+            // end it: fail here instead.
+            assert!(calls.len() < 1000, "the sender repeats itself");
+            calls.push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn head_call(sha256: ContentHash) -> String {
+        format!("head {}", &sha256.to_hex()[..8])
+    }
+
+    fn put_call(sha256: ContentHash) -> String {
+        format!("put {}", &sha256.to_hex()[..8])
+    }
+
+    fn post_call(text: &str) -> String {
+        format!("post {text}")
+    }
+
+    impl Transport for StagingServer {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            Box::pin(async move {
+                if let CommandKind::SendMessage {
+                    text, attachments, ..
+                } = &command.kind
+                {
+                    {
+                        let mut staged = self.staged.lock().unwrap();
+                        for sha256 in attachments {
+                            if self.check_staged {
+                                assert!(
+                                    staged.contains(sha256),
+                                    "posted before its images were staged"
+                                );
+                            }
+                            // The server unlinks the staged files a message used.
+                            staged.remove(sha256);
+                        }
+                    }
+                    self.record(post_call(text));
+                }
+                let mut seq = self.seq.lock().unwrap();
+                *seq += 1;
+                Ok(CommandResult::Accepted { seq: Seq(*seq) })
+            })
+        }
+
+        fn events(&self, _query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn blob(
+            &self,
+            _id: ProtoBlobId,
+            _from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            Box::pin(async { Err(TransportError::NotFound) })
+        }
+
+        fn attachment_staged(
+            &self,
+            sha256: ContentHash,
+        ) -> BoxFuture<'_, Result<bool, TransportError>> {
+            Box::pin(async move {
+                self.record(head_call(sha256));
+                Ok(self.staged.lock().unwrap().contains(&sha256))
+            })
+        }
+
+        fn upload_attachment(
+            &self,
+            sha256: ContentHash,
+            bytes: Bytes,
+        ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
+            Box::pin(async move {
+                self.record(put_call(sha256));
+                if let Some(on_put) = &self.on_put {
+                    on_put();
+                }
+                {
+                    let mut failures = self.put_failures.lock().unwrap();
+                    if *failures > 0 {
+                        *failures -= 1;
+                        return Err(TransportError::Timeout);
+                    }
+                }
+                assert!(
+                    ContentHash::of(&bytes) == sha256,
+                    "the upload does not hash to its name"
+                );
+                match &self.put_answer {
+                    Some(answer) => Ok(answer.clone()),
+                    None => {
+                        self.staged.lock().unwrap().insert(sha256);
+                        Ok(UploadResult::Stored {
+                            size: bytes.len() as u64,
+                            media_type: ImageType::Png,
+                        })
+                    }
+                }
+            })
+        }
+    }
+
+    /// Writes `bytes` where the outbox looks for the image they hash to.
+    fn put_file(dir: &std::path::Path, bytes: &[u8]) -> ContentHash {
+        let sha256 = ContentHash::of(bytes);
+        std::fs::create_dir_all(attachment_dir(dir)).unwrap();
+        std::fs::write(attachment_path(dir, sha256), bytes).unwrap();
+        sha256
+    }
+
+    /// Runs the sender until the outbox is drained. The sender only ends on
+    /// an error, so the timeout is what ends it.
+    async fn drain(seam: &Seam, server: &StagingServer) {
+        let ctx = sender_ctx(seam);
+        let progress = AtomicBool::new(false);
+        let errors = &mut HeadCount::default();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(60),
+            send(&ctx, server, &progress, errors),
+        )
+        .await;
+        assert!(drained.is_err(), "the sender only ends on an error");
+    }
+
+    fn outbox(seam: &Seam) -> Vec<OutboxEntry> {
+        crate::client::lock(&seam.core.shared.state)
+            .store
+            .outbox()
+            .unwrap()
+    }
+
+    fn statuses(seam: &Seam) -> Vec<OutboxStatus> {
+        outbox(seam).into_iter().map(|entry| entry.status).collect()
+    }
+
+    /// Every image is staged before its message is posted, and one the
+    /// server already holds is not uploaded again.
+    #[tokio::test(start_paused = true)]
+    async fn images_are_uploaded_before_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = ContentHash::of(b"image b");
+        let server = StagingServer::new();
+        server.staged.lock().unwrap().insert(b);
+        enqueue_with(&seam, "m", vec![a, b]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), head_call(b), post_call("m")]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// The server unlinks the images a message used, so a later message
+    /// naming the same image uploads it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_reused_image_is_uploaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        enqueue_with(&seam, "one", vec![a]);
+        enqueue_with(&seam, "two", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(a),
+                put_call(a),
+                post_call("one"),
+                head_call(a),
+                put_call(a),
+                post_call("two"),
+            ]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(2) }),
+            ]
+        );
+    }
+
+    /// A failed upload is tried again from the head check, not from the
+    /// upload alone, and the message goes out once the image is staged.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_upload_is_retried_from_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        *server.put_failures.lock().unwrap() = 1;
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(a),
+                put_call(a),
+                head_call(a),
+                put_call(a),
+                post_call("m"),
+            ]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// On a low disk the uploads stop and the message is posted anyway, so
+    /// the server's own refusal shows it and the outbox keeps moving.
+    #[tokio::test(start_paused = true)]
+    async fn a_low_disk_posts_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = put_file(dir.path(), b"image b");
+        let mut server = StagingServer::new();
+        server.put_answer = Some(UploadResult::DiskLow);
+        server.check_staged = false;
+        enqueue_with(&seam, "m", vec![a, b]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a), post_call("m")]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// An image the server refuses fails its message for good, unposted and
+    /// discardable, and the message behind it goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_image_fails_the_message_and_the_next_goes_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"not really a picture");
+        let mut server = StagingServer::new();
+        server.put_answer = Some(UploadResult::NotAnImage);
+        enqueue_with(&seam, "one", vec![a]);
+        enqueue(&seam, "two");
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), post_call("two")]
+        );
+        let entries = outbox(&seam);
+        assert_eq!(
+            entries.iter().map(|e| e.status.clone()).collect::<Vec<_>>(),
+            [
+                OutboxStatus::AttachmentRefused(AttachmentRefusal::NotAnImage),
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
+            ]
+        );
+        assert!(entries[0].discardable());
+    }
+
+    /// A local image that was never written is refused without an upload.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_image_fails_without_uploading() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = ContentHash::of(b"never written");
+        let server = StagingServer::new();
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a)]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(AttachmentRefusal::Missing)]
+        );
+    }
+
+    /// A local image over the upload limit is refused without an upload.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_image_fails_without_uploading() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let big = vec![0u8; usize::try_from(ATTACHMENT_MAX_BYTES + 1).unwrap()];
+        let a = put_file(dir.path(), &big);
+        let server = StagingServer::new();
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a)]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(AttachmentRefusal::TooLarge)]
+        );
+    }
+
+    /// A message without images asks about none.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_without_images_never_asks_about_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        enqueue(&seam, "plain");
+        let server = StagingServer::new();
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [post_call("plain")]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// The user takes a message back while its first image uploads: the
+    /// second image is not uploaded and the message is not posted, so the
+    /// server never gets it twice (once from the outbox, once from the
+    /// edited draft). The message behind it goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_withdrawn_while_its_images_upload_is_not_posted() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = put_file(dir.path(), b"image b");
+        let one = enqueue_with(&seam, "one", vec![a, b]).id;
+        enqueue(&seam, "two");
+        let mut server = StagingServer::new();
+        let taker = seam.clone();
+        // Only the first PUT takes it back: a second withdraw would fail.
+        let once = std::sync::Once::new();
+        server.on_put = Some(Box::new(move || {
+            once.call_once(|| {
+                crate::client::lock(&taker.core.shared.state)
+                    .store
+                    .withdraw(one, None, None)
+                    .unwrap();
+            });
+        }));
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), post_call("two")]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// Attaches the image `bytes` make to a draft of `session`, as the model
+    /// does when the user attaches it.
+    fn attach_draft_image(seam: &Seam, session: SessionId, bytes: &[u8]) {
+        let image = AttachedImage {
+            sha256: ContentHash::of(bytes),
+            media_type: ImageType::Png,
+            size: bytes.len() as u64,
+            width: 4,
+            height: 3,
+        };
+        crate::client::lock(&seam.core.shared.state)
+            .store
+            .attach_to_draft(session, &image, Utc::now())
+            .unwrap();
+    }
+
+    /// A batch of a session's creation and one user message carrying an
+    /// image per `(blob, bytes)`, each blob the hash of its bytes.
+    fn message_with_images(session_id: SessionId, images: &[(ProtoBlobId, &[u8])]) -> EventBatch {
+        let attachments = images
+            .iter()
+            .map(|(id, bytes)| Attachment {
+                blob: BlobRef {
+                    id: *id,
+                    size: bytes.len() as u64,
+                    sha256: ContentHash::of(bytes),
+                },
+                media_type: ImageType::Png,
+            })
+            .collect();
+        let event = |kind| skywave_proto::Event {
+            session_id,
+            at: Utc::now(),
+            command_id: None,
+            context: skywave_proto::ContextId::first_of(session_id),
+            kind,
+        };
+        EventBatch {
+            from: Seq(1),
+            events: vec![
+                event(EventKind::SessionCreated {
+                    workdir: "/srv".into(),
+                    context_name: "start".into(),
+                    from: None,
+                }),
+                event(EventKind::UserMessage {
+                    device_id: DeviceId::new(),
+                    text: "look at these".into(),
+                    attachments,
+                }),
+            ],
+        }
+    }
+
+    /// A message's image this device attached is available from its local
+    /// file as soon as the batch lands, and no download of it is queued. The
+    /// message's other image, which this device never attached, still
+    /// downloads.
+    #[test]
+    fn an_own_image_is_available_without_a_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let session = SessionId::new();
+        let own = b"an image this device attached";
+        let other = b"an image another device attached";
+        put_file(dir.path(), own);
+        attach_draft_image(&seam, session, own);
+        let (own_blob, other_blob) = (ProtoBlobId::new(), ProtoBlobId::new());
+
+        let applied = seam
+            .apply_events(&message_with_images(
+                session,
+                &[(own_blob, own), (other_blob, other)],
+            ))
+            .unwrap();
+
+        let own_path = blob_dir(dir.path()).join(own_blob.0.to_string());
+        let own_record = seam.blob(own_blob).unwrap().unwrap();
+        assert_eq!(
+            own_record.status,
+            BlobStatus::Available {
+                path: own_path.clone()
+            }
+        );
+        assert_eq!(std::fs::read(&own_path).unwrap(), own);
+        let other_record = seam.blob(other_blob).unwrap().unwrap();
+        assert_eq!(other_record.status, BlobStatus::NotDownloaded);
+        assert_eq!(applied.blobs, [other_blob]);
+    }
+
+    /// An image this device attached whose local file is gone is no image
+    /// to use: its blob stays not downloaded and is queued as any other.
+    #[test]
+    fn an_own_image_without_its_file_still_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let session = SessionId::new();
+        let gone = b"an image whose file is gone";
+        put_file(dir.path(), gone);
+        attach_draft_image(&seam, session, gone);
+        std::fs::remove_file(attachment_path(dir.path(), ContentHash::of(gone))).unwrap();
+        let blob = ProtoBlobId::new();
+
+        let applied = seam
+            .apply_events(&message_with_images(session, &[(blob, gone)]))
+            .unwrap();
+
+        assert_eq!(
+            seam.blob(blob).unwrap().unwrap().status,
+            BlobStatus::NotDownloaded
+        );
+        assert!(!blob_dir(dir.path()).join(blob.0.to_string()).exists());
+        assert_eq!(applied.blobs, [blob]);
+    }
+
+    /// A batch leaves the file of an image detached from a draft alone: its
+    /// row and file stay until the store opens again, so an attach of the
+    /// same image that lands after the batch still finds both.
+    #[test]
+    fn an_applied_batch_keeps_a_detached_images_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let session = SessionId::new();
+        let image = b"an image attached, then detached";
+        let sha256 = put_file(dir.path(), image);
+        attach_draft_image(&seam, session, image);
+        crate::client::lock(&seam.core.shared.state)
+            .store
+            .detach_from_draft(session, sha256)
+            .unwrap();
+        let path = attachment_path(dir.path(), sha256);
+
+        seam.apply_events(&message_with_images(session, &[]))
+            .unwrap();
+
+        assert!(path.exists(), "a batch removed the image's file");
+        let rows = crate::client::lock(&seam.core.shared.state)
+            .store
+            .attachments()
+            .unwrap();
+        assert!(
+            rows.contains_key(&sha256),
+            "a batch removed the image's row"
+        );
+
+        drop(seam);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!path.exists(), "opening the store kept the image's file");
+        assert!(!store.attachments().unwrap().contains_key(&sha256));
+    }
+
+    /// Runs the stager for a minute of paused time. It only ends on an
+    /// error, so the timeout is what ends it.
+    async fn stage_for_a_minute(ctx: &LinkCtx, server: &StagingServer) {
+        let staged = tokio::time::timeout(Duration::from_secs(60), stage_drafts(ctx, server)).await;
+        assert!(staged.is_err(), "the stager only ends on an error");
+    }
+
+    /// A draft image is uploaded as soon as it is attached, and only once
+    /// per link: a local one is PUT, one the server holds is only checked,
+    /// and nothing repeats while the draft stays as it is.
+    #[tokio::test(start_paused = true)]
+    async fn draft_images_are_staged_once_per_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = ContentHash::of(b"image b");
+        let server = StagingServer::new();
+        server.staged.lock().unwrap().insert(b);
+        let session = SessionId::new();
+        attach_draft_image(&seam, session, b"image a");
+        attach_draft_image(&seam, session, b"image b");
+
+        stage_for_a_minute(&sender_ctx(&seam), &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a), head_call(b)]);
+    }
+
+    /// A failed upload waits a backoff, then tries again from the head
+    /// check; the stager does not end over it.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_draft_upload_is_tried_again_after_a_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let mut server = StagingServer::new();
+        *server.put_failures.lock().unwrap() = 1;
+        let puts = Arc::new(Mutex::new(Vec::new()));
+        let at_put = puts.clone();
+        server.on_put = Some(Box::new(move || {
+            at_put.lock().unwrap().push(tokio::time::Instant::now());
+        }));
+        attach_draft_image(&seam, SessionId::new(), b"image a");
+        // Jitter fixed at its top, so the first retry waits exactly `base`.
+        let ctx = LinkCtx {
+            config: Arc::new(EngineConfig {
+                backoff: Backoff {
+                    base: Duration::from_secs(1),
+                    cap: Duration::from_secs(8),
+                    jitter: Jitter::fixed(1.0),
+                },
+                ..EngineConfig::default()
+            }),
+            ..sender_ctx(&seam)
+        };
+
+        stage_for_a_minute(&ctx, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), head_call(a), put_call(a)]
+        );
+        let puts = puts.lock().unwrap();
+        assert!(
+            puts[1] - puts[0] >= Duration::from_secs(1),
+            "retried after {:?}, not after a backoff",
+            puts[1] - puts[0]
+        );
+    }
+
+    /// An image the server refuses is left for the outbox to report when its
+    /// message is sent: the stager does not upload it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_draft_image_is_left_to_the_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"not really a picture");
+        let mut server = StagingServer::new();
+        server.put_answer = Some(UploadResult::NotAnImage);
+        attach_draft_image(&seam, SessionId::new(), b"not really a picture");
+
+        stage_for_a_minute(&sender_ctx(&seam), &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a)]);
+    }
+
+    /// An image attached while the stager waits wakes it at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_image_wakes_the_stager() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        let ctx = sender_ctx(&seam);
+        let session = SessionId::new();
+        let attach = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            attach_draft_image(&seam, session, b"image a");
+            ctx.drafts.notify_one();
+        };
+
+        let ((), staged) = tokio::join!(attach, async {
+            tokio::time::timeout(Duration::from_secs(60), stage_drafts(&ctx, &server)).await
+        });
+        assert!(staged.is_err(), "the stager only ends on an error");
+        assert_eq!(server.calls(), [head_call(a), put_call(a)]);
+    }
+
     /// A command whose request never gets through can be taken back while
     /// the sender waits to resend it: the wait ends there, the command
     /// behind it goes out at once, and the link stays up.
@@ -2722,6 +3620,7 @@ mod tests {
                             kind: skywave_proto::EventKind::UserMessage {
                                 device_id: self.device,
                                 text: text.clone(),
+                                attachments: Vec::new(),
                             },
                         });
                         log.len() - 1
@@ -2972,6 +3871,7 @@ mod tests {
             event.kind = skywave_proto::EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             };
             let batch = EventBatch {
                 from: Seq(2),

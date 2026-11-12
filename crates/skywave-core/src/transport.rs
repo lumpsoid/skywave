@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
-    LoginStartResult, RunId, StorageReport, UsageLimitsResult, WorkdirQuery,
+    BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
+    EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LoginFinish, LoginFinishResult,
+    LoginStartResult, RunId, StorageReport, UploadResult, UsageLimitsResult, WorkdirQuery,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -152,6 +152,29 @@ pub trait Transport: Send + Sync {
         query: &'a WorkdirQuery,
     ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
         let _ = query;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `HEAD /v1/attachments/{sha256}`: whether the server holds a staged
+    /// upload with this hash. Defaults to [`TransportError::NotFound`] like
+    /// [`list_dirs`](Transport::list_dirs).
+    fn attachment_staged(
+        &self,
+        sha256: ContentHash,
+    ) -> BoxFuture<'_, Result<bool, TransportError>> {
+        let _ = sha256;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `PUT /v1/attachments/{sha256}`: stage an image's bytes under their
+    /// hash. A refusal is an `Ok` [`UploadResult`], not an error. Defaults to
+    /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
+    fn upload_attachment(
+        &self,
+        sha256: ContentHash,
+        bytes: Bytes,
+    ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
+        let _ = (sha256, bytes);
         Box::pin(async { Err(TransportError::NotFound) })
     }
 }

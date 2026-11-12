@@ -8,10 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use skywave_core::attachment::{AttachedImage, attachment_path};
 use skywave_core::{
     Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, DeviceRef, Entry,
-    ImportedEntry, Outgoing, QUESTION_TOOL, RuleSuggestion, Seq, SessionId, SessionView,
-    TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
+    FullView, ImportedEntry, MessageImage, Outgoing, QUESTION_TOOL, RuleSuggestion, Seq, SessionId,
+    SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
@@ -30,8 +31,8 @@ use skywave_present::text::{clean_line, clean_text};
 use crate::crop::target_view;
 use crate::signals::{
     BlobFacts, BlobStateKind, LineStyle, MarkdownAlign, MarkdownBlock, MarkdownCell, MarkdownKind,
-    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowKind, SectionFormat, SectionLine,
-    SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
+    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowImage, RowKind, SectionFormat,
+    SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
 };
 
 /// Most of a blob an expanded section shows.
@@ -126,11 +127,12 @@ pub struct Rows {
 }
 
 /// Every row of `view`'s timeline at `wall_ms`, the items whose seq is in
-/// `expanded` expanded.
+/// `expanded` expanded. `data_dir` is where a queued message's images are.
 pub fn rows(
     view: &SessionView,
     expanded: &HashSet<Seq>,
     heads: &mut BlobHeads,
+    data_dir: &Path,
     wall_ms: i64,
 ) -> Rows {
     let rule = rule_index(view);
@@ -154,7 +156,7 @@ pub fn rows(
         };
         let key = ItemKey::of(item);
         let open = matches!(key, ItemKey::Logged(seq) if expanded.contains(&seq));
-        let mut row = row(item, view.id, open, heads, wall_ms);
+        let mut row = row(item, view.id, open, heads, data_dir, wall_ms);
         row.time_label = time_label;
         row.unread_rule = rule == Some(index);
         row.turn_start = !row.unread_rule && index > 0 && starts_turn(item);
@@ -186,6 +188,7 @@ fn row(
     session: SessionId,
     expanded: bool,
     heads: &mut BlobHeads,
+    data_dir: &Path,
     wall_ms: i64,
 ) -> TimelineRow {
     let key = ItemKey::of(item);
@@ -211,11 +214,13 @@ fn row(
         tool: None,
         sections: Vec::new(),
         blob_target: None,
+        images: Vec::new(),
     };
     let (at, entry) = match item {
         TimelineItem::Pending {
             command_id,
             text,
+            images,
             outgoing,
             discardable,
             ..
@@ -226,6 +231,10 @@ fn row(
             row.text = clean_text(text);
             row.outgoing = Some(outgoing_view(outgoing));
             row.discardable = *discardable;
+            row.images = images
+                .iter()
+                .map(|image| pending_image(image, data_dir))
+                .collect();
             return row;
         }
         TimelineItem::Logged {
@@ -238,6 +247,7 @@ fn row(
     match entry {
         Entry::UserMessage {
             text,
+            images,
             from,
             outgoing,
             ..
@@ -250,6 +260,7 @@ fn row(
                 clean_line(&from.label())
             });
             row.outgoing = outgoing.as_ref().map(outgoing_view);
+            row.images = images.iter().map(logged_image).collect();
         }
         Entry::AgentMessage { text, .. } => {
             set(&mut row, RowKind::AgentMessage, clean_text(text));
@@ -418,6 +429,52 @@ fn row(
 fn set(row: &mut TimelineRow, kind: RowKind, text: String) {
     row.kind = kind;
     row.text = text;
+}
+
+/// A queued message's image: its own file, on this device.
+fn pending_image(image: &AttachedImage, data_dir: &Path) -> RowImage {
+    RowImage {
+        blob_id: None,
+        path: Some(
+            attachment_path(data_dir, image.sha256)
+                .display()
+                .to_string(),
+        ),
+        label: bytes(image.size),
+        can_download: false,
+    }
+}
+
+/// A logged message's image as its content stands. An image is a blob or
+/// deleted; inline or lost content is not expected for one, and reads as
+/// unavailable.
+fn logged_image(image: &MessageImage) -> RowImage {
+    match &image.content {
+        FullView::Blob(blob) => {
+            let facts = blob_facts(blob);
+            RowImage {
+                blob_id: Some(facts.blob_id),
+                path: match &blob.state {
+                    BlobState::Available { path } => Some(path.display().to_string()),
+                    _ => None,
+                },
+                label: facts.label,
+                can_download: facts.can_download,
+            }
+        }
+        FullView::Deleted { .. } => RowImage {
+            blob_id: None,
+            path: None,
+            label: "image deleted".to_owned(),
+            can_download: false,
+        },
+        FullView::Inline(_) | FullView::Lost => RowImage {
+            blob_id: None,
+            path: None,
+            label: "image unavailable".to_owned(),
+            can_download: false,
+        },
+    }
 }
 
 /// Whether the rows show a clock that runs: a tool call's elapsed time.
@@ -952,8 +1009,8 @@ pub fn content_lines(text: &str) -> Vec<&str> {
 mod tests {
     use chrono::{TimeZone, Utc};
     use skywave_core::{
-        AgentSetting, AgentView, CommandId, ContextId, DeviceId, FullView, Pause, PermissionMode,
-        SessionId, SessionState,
+        AgentSetting, AgentView, CommandId, ContentHash, ContextId, DeviceId, FullView, ImageType,
+        Pause, PermissionMode, SessionId, SessionState,
     };
     use skywave_present::sections::CONTENT_LOST;
 
@@ -987,6 +1044,7 @@ mod tests {
             task_stops: Vec::new(),
             mode: skywave_core::ComposerMode::Agent,
             draft: None,
+            draft_images: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
@@ -1013,6 +1071,7 @@ mod tests {
             command_id: id,
             context: ContextId::new(),
             text: text.into(),
+            images: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: None,
@@ -1028,6 +1087,7 @@ mod tests {
             entry: Entry::UserMessage {
                 command_id: id,
                 text: text.into(),
+                images: Vec::new(),
                 from: DeviceRef {
                     id: DeviceId::new(),
                     name: None,
@@ -1044,6 +1104,7 @@ mod tests {
             &session(timeline),
             &HashSet::new(),
             &mut BlobHeads::default(),
+            Path::new("/data"),
             0,
         )
     }
@@ -1255,7 +1316,14 @@ mod tests {
             })),
         }]);
         let labels = |expanded: &HashSet<Seq>| {
-            let rows = rows(&view, expanded, &mut BlobHeads::default(), 0).rows;
+            let rows = rows(
+                &view,
+                expanded,
+                &mut BlobHeads::default(),
+                Path::new("/data"),
+                0,
+            )
+            .rows;
             rows[0]
                 .sections
                 .iter()
@@ -1281,7 +1349,14 @@ mod tests {
             logged_message(4, CommandId::new(), "again"),
         ]);
         view.unread_from = Some(Seq(2));
-        let rows = rows(&view, &HashSet::new(), &mut BlobHeads::default(), 0).rows;
+        let rows = rows(
+            &view,
+            &HashSet::new(),
+            &mut BlobHeads::default(),
+            Path::new("/data"),
+            0,
+        )
+        .rows;
         let facts: Vec<_> = rows.iter().map(|r| (r.unread_rule, r.turn_start)).collect();
         assert_eq!(
             facts,
@@ -1474,5 +1549,134 @@ mod tests {
         assert_eq!(view(Some(&lost), true).note.as_deref(), Some(CONTENT_LOST));
         // Control: a preview that holds it all says nothing of the kind.
         assert_eq!(view(None, true).note, None);
+    }
+
+    /// A logged message carrying `images`.
+    fn logged_images(images: Vec<MessageImage>) -> TimelineItem {
+        TimelineItem::Logged {
+            parent: None,
+            seq: Seq(2),
+            at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap(),
+            context: ContextId::new(),
+            entry: Entry::UserMessage {
+                command_id: CommandId::new(),
+                text: "look".into(),
+                images,
+                from: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: true,
+                },
+                outgoing: None,
+                delivery: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_queued_message_image_is_its_own_file_on_this_device() {
+        let sha256 = ContentHash::of(b"png");
+        let item = TimelineItem::Pending {
+            command_id: CommandId::new(),
+            context: ContextId::new(),
+            text: "look".into(),
+            images: vec![AttachedImage {
+                sha256,
+                media_type: ImageType::Png,
+                size: 348_160,
+                width: 1,
+                height: 1,
+            }],
+            outgoing: Outgoing::Queued,
+            discardable: true,
+            delivery: None,
+        };
+        let rows = rows(
+            &session(vec![item]),
+            &HashSet::new(),
+            &mut BlobHeads::default(),
+            Path::new("/data"),
+            0,
+        )
+        .rows;
+        assert_eq!(
+            rows[0].images,
+            [RowImage {
+                blob_id: None,
+                path: Some(
+                    attachment_path(Path::new("/data"), sha256)
+                        .display()
+                        .to_string()
+                ),
+                label: bytes(348_160),
+                can_download: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_logged_message_image_shows_its_blob_as_it_stands() {
+        let id = BlobId::new();
+        let blob = |state| BlobView {
+            id,
+            state,
+            change: None,
+            pending: None,
+        };
+        let not_downloaded = blob(BlobState::NotDownloaded { size: 70 * 1024 });
+        let facts = blob_facts(&not_downloaded);
+        let rows = rows_of(vec![logged_images(vec![
+            MessageImage {
+                media_type: ImageType::Png,
+                content: FullView::Blob(not_downloaded),
+            },
+            MessageImage {
+                media_type: ImageType::Png,
+                content: FullView::Blob(blob(BlobState::Available {
+                    path: std::path::PathBuf::from("/data/image"),
+                })),
+            },
+            MessageImage {
+                media_type: ImageType::Png,
+                content: FullView::Deleted {
+                    by: DeviceRef {
+                        id: DeviceId::new(),
+                        name: Some("laptop".into()),
+                        me: false,
+                    },
+                },
+            },
+        ])])
+        .rows;
+        let blob_id = Some(id.0.to_string());
+        assert_eq!(rows[0].images[0].label, facts.label);
+        assert_eq!(
+            rows[0].images,
+            [
+                RowImage {
+                    blob_id: blob_id.clone(),
+                    path: None,
+                    label: "not downloaded · 70.0 KiB".to_owned(),
+                    can_download: true,
+                },
+                RowImage {
+                    blob_id,
+                    path: Some("/data/image".to_owned()),
+                    label: "downloaded".to_owned(),
+                    can_download: false,
+                },
+                RowImage {
+                    blob_id: None,
+                    path: None,
+                    label: "image deleted".to_owned(),
+                    can_download: false,
+                },
+            ]
+        );
+        // Control: a message with no images has none.
+        assert_eq!(
+            rows_of(vec![logged_message(3, CommandId::new(), "hi")]).rows[0].images,
+            []
+        );
     }
 }

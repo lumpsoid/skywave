@@ -22,6 +22,7 @@ TimelineRow anyRow(
   ToolFacts? tool,
   List<SectionView> sections = const [],
   List<MarkdownBlock> markdown = const [],
+  List<RowImage> images = const [],
   String? timeLabel,
   String? mark,
   bool turnStart = false,
@@ -46,6 +47,7 @@ TimelineRow anyRow(
   commandId: commandId,
   tool: tool,
   sections: sections,
+  images: images,
 );
 
 ToolFacts shellFacts(String title, {ToolState state = ToolState.done}) =>
@@ -84,6 +86,8 @@ const composerAt1 = ComposerView(
   mode: ComposerModeView.agent,
   shellEnabled: false,
   canStop: false,
+  images: [],
+  preparing: 0,
 );
 
 ModeOption _mode(

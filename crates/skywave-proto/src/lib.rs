@@ -170,7 +170,13 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`path::AGENT_LOGIN_FINISH`] taking [`LoginFinish`] and answering
 /// [`LoginFinishResult`]; [`limits::LOGIN_URL_MAX_BYTES`] and
 /// [`limits::LOGIN_CODE_MAX_BYTES`].
-pub const PROTOCOL_VERSION: u32 = 29;
+///
+/// v30: image attachments on user messages: [`ImageType`], [`Attachment`],
+/// [`BlobUse::Attachment`], `RejectReason`s `UnknownAttachment`,
+/// `TooManyAttachments` and `AttachmentsTooLarge`, the
+/// `limits::ATTACHMENT*` consts, and `HEAD` and `PUT`
+/// [`path::ATTACHMENT_ROUTE`] answering [`UploadResult`].
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -316,6 +322,53 @@ pub struct BlobRef {
     pub sha256: ContentHash,
 }
 
+/// An image type the agent accepts. The server and the device both sniff
+/// it from the bytes ([`ImageType::sniff`]); no one trusts a declared type.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageType {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+impl ImageType {
+    /// The type the leading bytes of an image name, or `None` if they name
+    /// none of the four (or are too short to tell).
+    pub fn sniff(bytes: &[u8]) -> Option<ImageType> {
+        if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+            Some(ImageType::Png)
+        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            Some(ImageType::Jpeg)
+        } else if bytes.starts_with(b"GIF8") {
+            Some(ImageType::Gif)
+        } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            Some(ImageType::Webp)
+        } else {
+            None
+        }
+    }
+
+    /// The MIME type of this image type.
+    pub fn mime(self) -> &'static str {
+        match self {
+            ImageType::Png => "image/png",
+            ImageType::Jpeg => "image/jpeg",
+            ImageType::Gif => "image/gif",
+            ImageType::Webp => "image/webp",
+        }
+    }
+}
+
+/// An image on a user message, kept as its own blob (D44: never shared
+/// between messages).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub blob: BlobRef,
+    pub media_type: ImageType,
+}
+
 /// The whole of some content a preview or summary does not hold all of.
 /// Where it is optional, `None` means there is nothing more: the preview
 /// holds it all.
@@ -408,6 +461,10 @@ pub enum EventKind {
     UserMessage {
         device_id: DeviceId,
         text: String,
+        /// The message's images, in the order the user attached them, each
+        /// its own blob (`BlobUse::Attachment`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     /// `text` is the whole message unless `full` is set: then it is the
     /// message's head ([`limits::MESSAGE_PREVIEW_MAX_BYTES`]) and `full`
@@ -966,9 +1023,10 @@ impl EventKind {
     /// The blobs the event references, with what each holds: a tool call's
     /// input and the whole of its display body, a result's output, an
     /// approval's input, a finished shell run's whole output, a long
-    /// message's whole text; the same for an imported call, result or
-    /// message. A [`Full::Inline`] or [`Full::Lost`] references none. A
-    /// `BlobCropped` yields its `into`, the blob it made, with what it holds.
+    /// message's whole text, a user message's images; the same for an
+    /// imported call, result or message. A [`Full::Inline`] or
+    /// [`Full::Lost`] references none. A `BlobCropped` yields its `into`,
+    /// the blob it made, with what it holds.
     pub fn blobs(&self) -> impl Iterator<Item = (BlobUse, &BlobRef)> {
         fn full(holds: BlobUse, full: &Option<Full>) -> Option<(BlobUse, &BlobRef)> {
             full.as_ref().and_then(Full::blob).map(|b| (holds, b))
@@ -1042,7 +1100,14 @@ impl EventKind {
             // It names a blob it deleted; it references none.
             | EventKind::BlobDeleted { .. } => (None, None),
         };
-        first.into_iter().chain(second)
+        let attachments: &[Attachment] = match self {
+            EventKind::UserMessage { attachments, .. } => attachments,
+            _ => &[],
+        };
+        first
+            .into_iter()
+            .chain(second)
+            .chain(attachments.iter().map(|a| (BlobUse::Attachment, &a.blob)))
     }
 }
 
@@ -1064,6 +1129,8 @@ pub enum BlobUse {
     /// and on an imported message). Not croppable: a message cut to some of
     /// its lines says something else.
     Message,
+    /// An image attached to a user message; deletable, not croppable.
+    Attachment,
 }
 
 /// Size caps on the bounded text in tool events. Producers (the server)
@@ -1188,6 +1255,18 @@ pub mod limits {
     /// command ids can write per request, which the HTTP body limit (2 MB)
     /// alone leaves near 2 MB.
     pub const MESSAGE_MAX_BYTES: usize = 256 * 1024;
+    /// Most [`Attachment`](crate::Attachment)s on one `SendMessage`; past it
+    /// the server refuses with `TooManyAttachments`.
+    pub const ATTACHMENTS_MAX: usize = 8;
+    /// Largest [`Attachment`](crate::Attachment), in raw bytes, once the
+    /// device has shrunk it. The API takes an image up to 5 MiB of base64,
+    /// 3,932,160 raw bytes; this keeps a margin. The device shrinks images
+    /// before this applies.
+    pub const ATTACHMENT_MAX_BYTES: u64 = 3_750_000;
+    /// Most raw bytes of one message's [`Attachment`](crate::Attachment)s
+    /// together. Bounds one message's upload and the images the agent's
+    /// conversation re-sends each turn.
+    pub const ATTACHMENTS_MAX_TOTAL_BYTES: u64 = 10_000_000;
     /// Longest [`LoginStartResult::Open`](crate::LoginStartResult::Open)
     /// URL, in UTF-8 bytes. The server answers a longer one as `Failed`
     /// rather than cut it, as a cut URL opens nothing. Real ones are a few
@@ -1862,11 +1941,18 @@ pub enum CommandKind {
     /// Send `text` to the agent. `context` is the session's context the
     /// message was written in; the server refuses it as `ContextChanged`
     /// when that is no longer the current one, and as `MessageTooLong` when
-    /// `text` is over [`limits::MESSAGE_MAX_BYTES`].
+    /// `text` is over [`limits::MESSAGE_MAX_BYTES`]. `attachments` are
+    /// images the device staged beforehand; the server refuses an image it
+    /// has none staged for as `UnknownAttachment`.
     SendMessage {
         session_id: SessionId,
         context: ContextId,
         text: String,
+        /// The sha256 of each image to attach, in order, each staged
+        /// beforehand with `PUT` [`path::ATTACHMENT_ROUTE`]; the server
+        /// refuses one it has none staged for as `UnknownAttachment`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ContentHash>,
     },
     /// Answer an approval. `rule` grants the request's suggestion with
     /// that index along with an approval; the server refuses it with a
@@ -2238,6 +2324,14 @@ pub enum RejectReason {
     /// a span of no lines, more than [`limits::CROP_SPANS_MAX`] spans, a
     /// span past the blob's last line, or every line kept.
     BadCrop,
+    /// A `SendMessage` names an image hash the server has no staged upload
+    /// for (never uploaded, or evicted); upload it and send again.
+    UnknownAttachment,
+    /// A `SendMessage` with more than [`limits::ATTACHMENTS_MAX`] attachments.
+    TooManyAttachments,
+    /// A `SendMessage` whose attachments together exceed
+    /// [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`].
+    AttachmentsTooLarge,
 }
 
 impl RejectReason {
@@ -2605,6 +2699,24 @@ pub enum LoginFinishResult {
     Failed { reason: String },
 }
 
+/// Response to `PUT` [`path::ATTACHMENT_ROUTE`], always 200: every outcome
+/// is a domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum UploadResult {
+    /// The image is staged, or already was. `size` is in bytes and
+    /// `media_type` is the sniffed type.
+    Stored { size: u64, media_type: ImageType },
+    /// Over [`limits::ATTACHMENT_MAX_BYTES`]; nothing stored.
+    TooLarge,
+    /// Not PNG, JPEG, GIF or WEBP.
+    NotAnImage,
+    /// The body does not hash to the path's sha256.
+    HashMismatch,
+    /// The server's disk is low; nothing stored.
+    DiskLow,
+}
+
 /// Response to `GET /v1/usage-limits` (no query), always 200: every outcome
 /// is a domain answer. The limits belong to the account the server's agent
 /// runs as, not to a session.
@@ -2845,7 +2957,7 @@ pub enum FileBody {
 
 /// HTTP paths of the v1 API.
 pub mod path {
-    use crate::BlobId;
+    use crate::{BlobId, ContentHash};
 
     pub const PAIR: &str = "/v1/pair";
     pub const HELLO: &str = "/v1/hello";
@@ -2875,6 +2987,15 @@ pub mod path {
     /// Concrete path for downloading one blob.
     pub fn blob(id: BlobId) -> String {
         format!("/v1/blobs/{}", id.0)
+    }
+
+    /// Route template for staging an image, `HEAD` and `PUT`; `{sha256}` is
+    /// a [`ContentHash`] in hex.
+    pub const ATTACHMENT_ROUTE: &str = "/v1/attachments/{sha256}";
+
+    /// Concrete path for staging one image.
+    pub fn attachment(sha256: ContentHash) -> String {
+        format!("/v1/attachments/{}", sha256.to_hex())
     }
 }
 
@@ -2974,6 +3095,44 @@ mod tests {
         // A whole or lost message references none.
         assert_eq!(agent(None).blobs().count(), 0);
         assert_eq!(agent(Some(Full::Lost)).blobs().count(), 0);
+        // A user message yields its images, in order, each as an attachment.
+        let (a, b) = (
+            Attachment {
+                blob: BlobRef {
+                    id: BlobId::new(),
+                    size: 4,
+                    sha256: ContentHash::of(b"png1"),
+                },
+                media_type: ImageType::Png,
+            },
+            Attachment {
+                blob: BlobRef {
+                    id: BlobId::new(),
+                    size: 4,
+                    sha256: ContentHash::of(b"jpg2"),
+                },
+                media_type: ImageType::Jpeg,
+            },
+        );
+        let with_images = EventKind::UserMessage {
+            device_id: DeviceId::new(),
+            text: "look".into(),
+            attachments: vec![a.clone(), b.clone()],
+        };
+        let uses: Vec<_> = with_images.blobs().collect();
+        assert_eq!(
+            uses,
+            [
+                (BlobUse::Attachment, &a.blob),
+                (BlobUse::Attachment, &b.blob)
+            ]
+        );
+        let text_only = EventKind::UserMessage {
+            device_id: DeviceId::new(),
+            text: "look".into(),
+            attachments: Vec::new(),
+        };
+        assert_eq!(text_only.blobs().count(), 0);
     }
 
     #[test]
@@ -2988,6 +3147,7 @@ mod tests {
         let message = EventKind::UserMessage {
             device_id: by,
             text: "back".into(),
+            attachments: Vec::new(),
         };
         assert_eq!(message.archived_effect(), Some(false));
         for kind in [
@@ -3403,5 +3563,33 @@ mod tests {
             normalise_model(&long).map(|m| m.chars().count()),
             Some(limits::MODEL_MAX_CHARS)
         );
+    }
+
+    #[test]
+    fn sniff_recognises_each_image_type_from_its_header() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0];
+        let gif = *b"GIF89a";
+        let webp = *b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+        assert_eq!(ImageType::sniff(&png), Some(ImageType::Png));
+        assert_eq!(ImageType::sniff(&jpeg), Some(ImageType::Jpeg));
+        assert_eq!(ImageType::sniff(&gif), Some(ImageType::Gif));
+        assert_eq!(ImageType::sniff(&webp), Some(ImageType::Webp));
+    }
+
+    #[test]
+    fn sniff_refuses_what_is_not_one_of_the_four() {
+        assert_eq!(ImageType::sniff(b"%PDF-1.4"), None);
+        assert_eq!(ImageType::sniff(b"RIFF\x24\x00\x00\x00WAVEfmt "), None);
+        assert_eq!(ImageType::sniff(b"RIFF\x00\x00\x00\x00WEB"), None);
+        assert_eq!(ImageType::sniff(&[]), None);
+    }
+
+    #[test]
+    fn an_image_type_has_its_mime_string() {
+        assert_eq!(ImageType::Png.mime(), "image/png");
+        assert_eq!(ImageType::Jpeg.mime(), "image/jpeg");
+        assert_eq!(ImageType::Gif.mime(), "image/gif");
+        assert_eq!(ImageType::Webp.mime(), "image/webp");
     }
 }

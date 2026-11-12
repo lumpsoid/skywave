@@ -356,6 +356,7 @@ fn resending_a_command_returns_the_stored_result_without_appending() {
             session_id: session,
             context: ContextId::first_of(session),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     };
     let first = f.log.handle(&mut f.storage.db, device, &command).unwrap();
@@ -376,6 +377,7 @@ fn resending_a_command_returns_the_stored_result_without_appending() {
         EventKind::UserMessage {
             device_id: device,
             text: "hello".into(),
+            attachments: Vec::new(),
         }
     );
 }
@@ -418,6 +420,7 @@ fn each_accepted_command_logs_one_event_naming_it() {
             session_id: session,
             context: ContextId::first_of(session),
             text: "hi".into(),
+            attachments: Vec::new(),
         },
         CommandKind::ResolveApproval {
             id: approval,
@@ -520,6 +523,7 @@ fn rejected_results_are_stored_and_stay_stable() {
             session_id: missing,
             context: ContextId::first_of(missing),
             text: "x".into(),
+            attachments: Vec::new(),
         },
     };
     let first = f.log.handle(&mut f.storage.db, device, &command).unwrap();
@@ -622,6 +626,7 @@ fn concurrent_writers_get_contiguous_seqs_in_commit_order() {
                                 session_id: session,
                                 context: ContextId::first_of(session),
                                 text,
+                                attachments: Vec::new(),
                             },
                         };
                         accepted(log.handle(&mut conn.db, device, &command).unwrap())
@@ -1398,6 +1403,7 @@ fn archive_logs_the_absolute_value_and_a_message_brings_it_back() {
         session_id: session,
         context: ContextId::first_of(session),
         text: "again".into(),
+        attachments: Vec::new(),
     }));
     assert!(!archived(&f));
     accepted(f.log.handle(&mut f.storage.db, device, &set(true)).unwrap());
@@ -1799,6 +1805,7 @@ impl OpenWork {
                 session_id: session,
                 context: first,
                 text: "hi".into(),
+                attachments: Vec::new(),
             },
             CommandKind::SetPermissionMode {
                 session_id: session,
@@ -1873,6 +1880,7 @@ impl OpenWork {
             session_id: self.session,
             context: ContextId::first_of(self.session),
             text: "hi".into(),
+            attachments: Vec::new(),
         }));
     }
 }
@@ -2933,6 +2941,7 @@ fn a_message_for_a_context_left_behind_is_refused() {
         session_id: session,
         context,
         text: "hi".into(),
+        attachments: Vec::new(),
     };
     accepted(f.handle(send(first)));
     assert_eq!(f.last_event().context, first);
@@ -2950,6 +2959,7 @@ fn a_message_for_a_context_left_behind_is_refused() {
             session_id: SessionId::new(),
             context: second,
             text: "x".into(),
+            attachments: Vec::new(),
         }),
         rejected(RejectReason::UnknownSession)
     );
@@ -2969,6 +2979,7 @@ fn a_message_over_the_cap_is_refused_and_logs_nothing() {
         session_id: session,
         context,
         text: text.into(),
+        attachments: Vec::new(),
     };
     let head = f.log.head();
     let too_long = "x".repeat(limits::MESSAGE_MAX_BYTES + 1);
@@ -2988,6 +2999,7 @@ fn a_message_over_the_cap_is_refused_and_logs_nothing() {
             session_id: session,
             context: ContextId::new(),
             text: too_long.clone(),
+            attachments: Vec::new(),
         }),
         rejected(RejectReason::ContextChanged)
     );
@@ -3188,6 +3200,7 @@ async fn rejected_commands_do_not_wake_waiters() {
         session_id: SessionId::new(),
         context: ContextId::first_of(SessionId::new()),
         text: "x".into(),
+        attachments: Vec::new(),
     });
     assert!(!rx.has_changed().unwrap());
 }

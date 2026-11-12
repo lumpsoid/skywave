@@ -161,6 +161,8 @@ every version.
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
+| `HEAD /v1/attachments/{sha256}` | 204 if an image with that sha256 is staged, else 404; lets a device skip a re-upload across reconnects. Since v30. |
+| `PUT /v1/attachments/{sha256}` | Stages an image (raw bytes, at most `limits::ATTACHMENT_MAX_BYTES`) for a later `SendMessage` to name, answering an `UploadResult` with 200: `Stored { size, media_type }`, `TooLarge`, `NotAnImage`, `HashMismatch` or `DiskLow`. The file is `attachments/<sha256 hex>`, with no table; staging is a cache, capped at 256 MiB (the oldest evicted on each upload) and swept of files older than 7 days at startup. A lost upload surfaces as `UnknownAttachment`. Since v30. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
@@ -210,10 +212,11 @@ every version.
   malformed, 401 wrong, used or expired code (indistinguishable), 429 too
   many failures (`Retry-After`). Elsewhere: 401 no client certificate, 403 a
   device unknown or revoked (checked on every request, so a revocation
-  applies to an open connection's next request), 400 malformed, 404 unknown
-  blob, 412 another run expected, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
+  applies to an open connection's next request), 400 malformed (including an
+  attachment path that is not a sha256), 404 unknown blob or attachment not
+  staged, 412 another run expected, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
   `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations`,
-  `/v1/usage-limits`, `/v1/agent-login/*` and `/v1/workdir/*` 200 for every result (never 401/403 beyond
+  `/v1/usage-limits`, `/v1/agent-login/*`, `/v1/attachments/{sha256}` (`PUT`) and `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
   `/v1/conversations`, `/v1/storage` and `/v1/workdir/*` answer 503 when
   they run out of time, or when 8 of their file-system reads are already
@@ -357,6 +360,29 @@ the daemon's appends, which would otherwise stop `serve` (below).
   run finds its output by its `ShellFinished` seq) and a later crop or
   delete is stamped like the first. Taken while the disk is low and while
   `serve` stops, like a delete.
+- **Images on a message** (v30, D50): `SendMessage { attachments }` names staged
+  images (`PUT /v1/attachments/{sha256}`) by hash, and is prepared like a
+  crop, before its transaction. Each staged image is hard-linked into a
+  fresh blob (`BlobStore::link`, a copy across file systems), not adopted,
+  so a refused message keeps its staged files for a resend and the same
+  image named twice is two blobs (D44). The transaction records those
+  blobs' rows, each `event_blobs` row holding `attachment`, and appends the
+  `UserMessage` with its attachments; the staged files go after the commit.
+  Refusals, in order: `ServerStopping`, `DiskLow` (nothing is linked),
+  `UnknownSession`, `ContextChanged`, `MessageTooLong`, then
+  `TooManyAttachments` (more than `ATTACHMENTS_MAX` names), then
+  `AttachmentsTooLarge` (the images total over `ATTACHMENTS_MAX_TOTAL_BYTES`),
+  then `UnknownAttachment` (a name not staged, or no longer an image or the
+  hash it names). A refused command's linked files go as a crop's do. A
+  crash between a link and the commit leaves blob files without rows, which
+  the startup sweep removes; one between the commit and the staged file's
+  removal leaves that file, which eviction removes. `DeleteBlob` takes an
+  attachment's blob; `CropBlob` answers `NotCroppable`. Delivery (the
+  supervisor's hand-over, `user_input`) opens each image's blob before the
+  agent gets the message: one that is gone or cannot be opened is left out,
+  `[image removed before delivery]` is appended to the text, and the message
+  is still delivered. An open file keeps its bytes if the blob is deleted
+  after, so the agent's copy outlives a delete that lands in the hand-over.
 - **Restart cost**: nothing prunes the log yet, so what a daemon start
   reads must not grow with it. Each lookup it makes, per session or over
   the log, reads a projection (`open_calls`: a `ToolCall` adds its call,
@@ -836,7 +862,17 @@ logs) an event that no longer decodes rather than failing.
   `blobs`, `settings`, and what is this device's alone (D5: drafts per
   session and composer mode, composer modes, snippets, read marks, local
   deletes, alerted approvals). A schema migration backfills a new
-  projection from the stored events. `workdir_snapshots` keeps the latest
+  projection from the stored events. `draft_attachments` keeps a session's
+  agent draft's images in order, and `attachments` each image once by
+  sha256 (its bytes are the file under `<data>/attachments/`); a blank
+  text leaves them, sending the message or deleting the session drops
+  them, and editing a queued message puts its images back before the
+  draft's. An image's row and file go once no draft holds it (D50), no queued or
+  failed (still editable) message names it, and no accepted message the
+  replica has not applied names it; this runs when the store opens (which
+  also clears files without a row), and not after each batch: a detached
+  image keeps its row and file until the next open, so attaching it again
+  in the meantime finds both. `workdir_snapshots` keeps the latest
   stored answer per workdir read (session, kind, requested path), so a
   workdir already browsed reads offline; `workdir_blob_refs` names the
   blobs each answer holds. A refresh replaces the answer, and a blob row
@@ -875,7 +911,22 @@ logs) an event that no longer decodes rather than failing.
   request has a connection of its own, so it does not end the link
   either: the pull goes on, and the command is resent, same id, after a
   backoff for the failures in a row, as often as it takes. A link that
-  is really down fails the pull, which ends the connection. The user may
+  is really down fails the pull, which ends the connection. Before a message
+  with images is posted (D50), the outbox stages them: each image is checked with a
+  HEAD on every attempt and PUT from its local file when the server does not
+  hold it, since the server unlinks the staged files a message used, so
+  nothing is cached. A missing or too-large local file, or an upload the
+  server refuses as too large, not an image or a hash mismatch, fails the
+  message as `AttachmentRefused`: final, discardable, never posted. A low disk
+  stops the uploads and posts the message anyway, so the server's stored
+  `DiskLow` refusal shows it and the outbox keeps moving. A HEAD or PUT that
+  fails in transport backs off like the command's own request. A third loop,
+  the draft stager, runs beside the pull and the sender: it uploads a draft's
+  images as soon as they are attached (woken when a draft gains images), HEAD
+  then PUT, each image once per connection. It only saves time, since the
+  outbox still checks every image before posting; a transport error makes it
+  wait a backoff and never ends the connection, and a refused image is left
+  for the outbox to report when the message is sent. The user may
   take back any message, shell run, session creation, context move, or
   blob delete or crop the
   server has not accepted, sent or not (`OutboxEntry::discardable`): the
@@ -973,8 +1024,15 @@ logs) an event that no longer decodes rather than failing.
   power loss never resumes past durable bytes), verified by size and by
   the `BlobRef`'s SHA-256 (the replica keeps it in `blob_hashes`), and
   renamed when complete. A blob already whole on disk (an empty one always
-  is) is checked the same way without a request. A wrong hash deletes the file; the first one a
-  worker sees while it holds the blob refetches it from zero at once (the
+  is) is checked the same way without a request. A newly registered blob
+  whose hash is an attachment this device holds (the image of its own
+  message, D50) is not downloaded, under any policy: after the batch commits it
+  is hard-linked (copied, and synced, where linking fails) from `attachments/`
+  to `blobs/<id>` and marked available, so a replica rebuilt from the log
+  while those files exist reads them too. A hard link outlives the
+  attachment's file, which only the next store open removes.
+  A wrong hash deletes the file; the first
+  one a worker sees while it holds the blob refetches it from zero at once (the
   bytes may be the device's own, kept from an earlier try), a second is
   the server's (every byte came from it since) and leaves the blob
   `Failed` until it is asked for again, as does a size mismatch, an
@@ -1457,6 +1515,26 @@ skywave-core                 all logic, sync, replica
   ranges point. Copy takes the raw text. Only `http`, `https` and `mailto`
   links are tappable, and open (`url_launcher`) after a dialog showing the
   URL; images are never fetched.
+- **Images are prepared off the hub task.** An attach intent makes the head
+  emit `Out::Prepare`; `run` prepares the picked or pasted image on a
+  blocking thread (`attach::prepare_image`: read, `attachment::prepare`,
+  `attachment::store`). Its result returns to the loop as
+  `Head::on_prepared`, which dispatches `Action::Attach` with the metadata
+  only. The head counts each session's preparations in flight: a send waits
+  for them, and the image cap counts the draft's images and those still
+  being prepared.
+- **Image input and display** (D50). The attach button sends file paths
+  (`AttachImageFile`): `file_selector` on desktop, the `image_picker` gallery
+  or camera sheet on Android and iOS. Desktop paste (Ctrl/Cmd+V) reads a
+  clipboard image with `pasteboard`, which wins over text (text alone is a
+  normal paste), and mobile keyboard insertion (the TextField's
+  `contentInsertionConfiguration`) sends bytes (`AttachImageBytes`), as paste
+  does. Desktop drop (`desktop_drop`) sends one `AttachImageFile` per dropped
+  path, and the hub refuses a non-image with a notice. Each goes through the
+  preparation above. The timeline shows an image as a thumbnail (160 px high)
+  above the text; while it loads, or until it is downloaded, a placeholder
+  shows its size. A tap downloads it (`DownloadBlob`) or, once loaded, opens
+  it (`OpenFull`, or the local file for a message still queued).
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.

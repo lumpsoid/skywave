@@ -252,7 +252,7 @@ impl Identity for Pairing {
 }
 
 /// Writes a file readable only by its owner where the platform allows it.
-fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -267,7 +267,7 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 /// Makes a rename in `dir` durable, where the platform allows it.
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     fs::File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]
@@ -523,7 +523,7 @@ mod tests {
         let creds = credentials("a");
         older_build(dir.path(), &[("server_address", " MyHost ")]);
         let conn = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 2)
             .unwrap();
         drop(conn);
         legacy::write(dir.path(), legacy::DIR, &creds);

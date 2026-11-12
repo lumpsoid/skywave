@@ -144,6 +144,7 @@ use self::protocol::{Output, Protocol, mode_name};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
     Conversation, Effort, INTERRUPT_UNANSWERED, PermissionMode, QuestionAnswer, StartSpec,
+    UserInput,
 };
 use crate::config::AgentConfig;
 use crate::process::{self, DEFAULT_TERM_GRACE, Group};
@@ -593,8 +594,8 @@ impl ClaudeCodeSession {
 }
 
 impl AgentSession for ClaudeCodeSession {
-    async fn send_message(&mut self, text: String) -> Result<(), AgentError> {
-        self.request(Request::Message(text))
+    async fn send_message(&mut self, input: UserInput) -> Result<(), AgentError> {
+        self.request(Request::Message(input))
     }
 
     async fn answer_approval(
@@ -650,7 +651,7 @@ impl AgentSession for ClaudeCodeSession {
 
 #[derive(Debug)]
 enum Request {
-    Message(String),
+    Message(UserInput),
     Answer(AgentRequestId, Decision, Option<u8>),
     AnswerQuestion(AgentRequestId, Vec<QuestionAnswer>),
     Interrupt,
@@ -908,7 +909,14 @@ impl Driver {
                 },
                 request = self.requests.recv() => {
                     let out = match request {
-                        Some(Request::Message(text)) => self.protocol.send_message(text),
+                        // Read off the runtime, before the stdin write: the
+                        // write's timeout must not count the reading.
+                        Some(Request::Message(input)) => {
+                            let read = tokio::task::spawn_blocking(move || input.read())
+                                .await
+                                .expect("reading a message's images does not panic");
+                            self.protocol.send_input(read)
+                        }
                         Some(Request::Answer(request, decision, rule)) => {
                             self.protocol.answer(&request, decision, rule)
                         }
@@ -1036,8 +1044,10 @@ impl Driver {
     fn refuse_requests(&mut self) {
         self.requests.close();
         while let Ok(request) = self.requests.try_recv() {
-            if let Request::Message(text) = request {
-                self.protocol.undelivered(text);
+            if let Request::Message(input) = request {
+                // Read on the runtime thread: this runs once, after the
+                // process exited, for messages it never read.
+                self.protocol.undelivered(input.read());
             }
         }
     }

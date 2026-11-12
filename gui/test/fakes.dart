@@ -53,6 +53,7 @@ TimelineRow row(String key, String text) => TimelineRow(
   expanded: false,
   discardable: false,
   sections: const [],
+  images: const [],
 );
 
 /// An own message, pending or logged.
@@ -71,6 +72,7 @@ TimelineRow message(String key, String text, {required bool pending}) =>
       expanded: false,
       discardable: pending,
       sections: const [],
+      images: const [],
     );
 
 const _composer = ComposerView(
@@ -80,6 +82,8 @@ const _composer = ComposerView(
   mode: ComposerModeView.agent,
   shellEnabled: false,
   canStop: false,
+  images: [],
+  preparing: 0,
 );
 
 /// An agent that has not said its mode, model or effort yet.

@@ -781,15 +781,23 @@ impl State {
                 Effect::SaveDraft((id, mode), draft) => {
                     self.store.set_draft(id, mode, draft.as_ref())
                 }
+                Effect::AttachToDraft(id, image) => {
+                    self.store.attach_to_draft(id, &image, Utc::now())
+                }
+                Effect::DetachFromDraft(id, sha256) => self.store.detach_from_draft(id, sha256),
                 Effect::SaveComposerMode(id, mode) => self.store.set_composer_mode(id, mode),
                 Effect::SaveReadMark(id, mark) => self.store.set_read_mark(id, mark),
                 Effect::SaveSnippet(snippet) => self.store.set_snippet(&snippet),
                 Effect::DeleteSnippet(id) => self.store.delete_snippet(id),
                 // Refused when the store disagrees with the model; the
                 // resync below then shows what the store holds.
-                Effect::Withdraw { id, draft } => self
-                    .store
-                    .withdraw(id, draft.as_ref().map(|(key, d)| (*key, d))),
+                Effect::Withdraw { id, draft, images } => self.store.withdraw(
+                    id,
+                    draft.as_ref().map(|(key, d)| (*key, d)),
+                    images
+                        .as_ref()
+                        .map(|(session, hashes)| (*session, hashes.as_slice())),
+                ),
                 Effect::LoadSession(id) => self
                     .store
                     .session_events(id)
@@ -1075,6 +1083,7 @@ mod tests {
             Effect::Withdraw {
                 id: CommandId::new(),
                 draft: None,
+                images: None,
             },
             Effect::Request(Request::RetryNow),
         ];

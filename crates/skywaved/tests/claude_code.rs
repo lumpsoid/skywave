@@ -12,8 +12,10 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
-use skywave_proto::{ContextId, Decision, SessionId};
+use skywave_proto::{ContextId, Decision, ImageType, SessionId};
 use skywaved::agent::claude_code::limits::{
     ClaudeUsageLimits, USAGE_REQUEST_ID, get_usage_request, usage_answer,
 };
@@ -29,9 +31,9 @@ use skywaved::agent::claude_code::{
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
     AgentSchedule, AgentSession, AgentTask, BodyFormat, CONVERSATION_GONE, Conversation,
-    DisplayBody, Effort, Grants, INTERRUPT_UNANSWERED, LoginSource, ModelChoice, PermissionMode,
-    QuestionAnswer, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec,
-    SubagentFigures, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    DisplayBody, Effort, Grants, INTERRUPT_UNANSWERED, Image, LoginSource, ModelChoice,
+    PermissionMode, QuestionAnswer, ReadInput, ResultDisplay, ResumeHandle, RuleScope,
+    RuleSuggestion, StartSpec, SubagentFigures, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::agent::{
     AgentLogin, LimitSeverity, LimitWindow, LimitsError, LoginAttempt, LoginError, NoAgentLogin,
@@ -186,8 +188,11 @@ fn replay_records(
                         .unwrap_or_default(),
                     // Written by the protocol on the answer it follows.
                     ("control_request", Some("get_settings")) => Default::default(),
-                    ("user", _) => protocol
-                        .send_message(msg["message"]["content"].as_str().unwrap().to_owned()),
+                    ("user", _) => match &msg["message"]["content"] {
+                        Value::String(text) => protocol.send_message(text.to_owned()),
+                        Value::Array(blocks) => protocol.send_input(recorded_input(name, blocks)),
+                        other => panic!("{name}: unexpected user content {other:?}"),
+                    },
                     // Written by the protocol on the hook call it answers.
                     ("control_response", _)
                         if hook_calls
@@ -285,6 +290,44 @@ fn replay_records(
     assert!(written.is_empty(), "{name}: left over writes {written:?}");
     assert!(!protocol.turn_open(), "{name}: a turn is still open");
     (events, protocol.version().map(str::to_owned))
+}
+
+/// The input a recorded user message with array content was sent as: its
+/// images in order, and the text of its text block (blank when it has none).
+fn recorded_input(name: &str, blocks: &[Value]) -> ReadInput {
+    let mut input = ReadInput {
+        text: String::new(),
+        images: Vec::new(),
+    };
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                input.text = block["text"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: a text block without text"))
+                    .to_owned();
+            }
+            Some("image") => {
+                let source = &block["source"];
+                let media_type = match source["media_type"].as_str() {
+                    Some("image/png") => ImageType::Png,
+                    Some("image/jpeg") => ImageType::Jpeg,
+                    Some("image/gif") => ImageType::Gif,
+                    Some("image/webp") => ImageType::Webp,
+                    other => panic!("{name}: unknown image media type {other:?}"),
+                };
+                let data = source["data"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: an image block without data"));
+                let bytes = STANDARD
+                    .decode(data)
+                    .unwrap_or_else(|e| panic!("{name}: image data is not base64: {e}"));
+                input.images.push(Image { media_type, bytes });
+            }
+            other => panic!("{name}: unknown content block {other:?}"),
+        }
+    }
+    input
 }
 
 /// The answers a recorded allow of a question carries, read back from
@@ -646,6 +689,27 @@ fn replay_basic_two_turns() {
             "turn ended: Completed".to_owned(),
             "turn started".to_owned(),
             "text: PING".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
+        ]
+    );
+}
+
+/// The image fixture's two user messages carry array content: an image and
+/// its text, then the image alone.
+#[test]
+fn replay_an_image_message_and_an_image_alone() {
+    let events = replay_process("image", 0);
+    assert_eq!(
+        describe(&events),
+        [
+            format!("resume handle: {}", first_session("image")),
+            "turn started".to_owned(),
+            "text: Red".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
+            "turn started".to_owned(),
+            "text: Red".to_owned(),
             "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
         ]
@@ -1981,7 +2045,82 @@ fn a_message_during_a_turn_waits_for_its_result() {
         panic!("{:?}", end.writes);
     };
     let id = Uuid::parse_str(written["uuid"].as_str().unwrap()).unwrap();
-    assert_eq!(*written, protocol::user_message("two", id));
+    assert_eq!(*written, protocol::user_message("two", &[], id));
+    take_up(&mut protocol, &mut end);
+    assert_eq!(
+        end.events,
+        [
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+            AdapterEvent::TurnStarted { message: true }
+        ]
+    );
+}
+
+#[test]
+fn a_message_with_images_writes_image_blocks_before_its_text() {
+    let png = Image {
+        media_type: ImageType::Png,
+        bytes: b"png-bytes".to_vec(),
+    };
+    let jpeg = Image {
+        media_type: ImageType::Jpeg,
+        bytes: b"jpeg-bytes".to_vec(),
+    };
+    let id = Uuid::new_v4();
+    let png_block = json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": STANDARD.encode(b"png-bytes"),
+        },
+    });
+    let jpeg_block = json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": STANDARD.encode(b"jpeg-bytes"),
+        },
+    });
+    let text_block = json!({ "type": "text", "text": "what colour?" });
+    let message = protocol::user_message("what colour?", &[png.clone(), jpeg.clone()], id);
+    assert_eq!(
+        message["message"]["content"],
+        json!([png_block, jpeg_block, text_block])
+    );
+    // A blank text adds no text block: the images alone.
+    let blank = protocol::user_message("  ", &[png, jpeg], id);
+    assert_eq!(blank["message"]["content"], json!([png_block, jpeg_block]));
+    // Without images the content stays the text itself.
+    let plain = protocol::user_message("what colour?", &[], id);
+    assert_eq!(plain["message"]["content"], json!("what colour?"));
+}
+
+#[test]
+fn a_message_queued_during_a_turn_keeps_its_images() {
+    let mut protocol = Protocol::new(Uuid::new_v4(), true);
+    protocol.start();
+    protocol.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"skywave_1","response":{}}}"#);
+    assert!(protocol.ready());
+    let first = send(&mut protocol, "one");
+    assert_eq!(first.events, [AdapterEvent::TurnStarted { message: true }]);
+    let png = Image {
+        media_type: ImageType::Png,
+        bytes: b"png-bytes".to_vec(),
+    };
+    let queued = protocol.send_input(ReadInput {
+        text: "two".into(),
+        images: vec![png.clone()],
+    });
+    assert_eq!(queued, Default::default());
+    let mut end =
+        protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
+    let [written] = end.writes.as_slice() else {
+        panic!("{:?}", end.writes);
+    };
+    let id = Uuid::parse_str(written["uuid"].as_str().unwrap()).unwrap();
+    assert_eq!(*written, protocol::user_message("two", &[png], id));
     take_up(&mut protocol, &mut end);
     assert_eq!(
         end.events,
@@ -2159,8 +2298,14 @@ fn undelivered_messages_are_unsent_and_leave_a_clean_exit_clean() {
     send(&mut protocol, "go");
     protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
     assert_eq!(protocol.unsent(), 0);
-    protocol.undelivered("one".to_owned());
-    protocol.undelivered("two".to_owned());
+    protocol.undelivered(ReadInput {
+        text: "one".into(),
+        images: Vec::new(),
+    });
+    protocol.undelivered(ReadInput {
+        text: "two".into(),
+        images: Vec::new(),
+    });
     assert_eq!(protocol.unsent(), 2);
     // The count travels in `Exited`; the reason stays the exit's own.
     assert_eq!(protocol.exit_error(None, exit_status(0)), None);
@@ -2175,7 +2320,10 @@ fn messages_queued_behind_a_turn_stay_unsent_once_shutting_down() {
     let (mut protocol, _) = ready_protocol();
     send(&mut protocol, "go");
     send(&mut protocol, "queued");
-    protocol.undelivered("unread".to_owned());
+    protocol.undelivered(ReadInput {
+        text: "unread".into(),
+        images: Vec::new(),
+    });
     assert_eq!(protocol.unsent(), 2);
     protocol.begin_shutdown();
     let end =
@@ -2532,7 +2680,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
         .unwrap();
 
     // The handle comes with the first turn, and names the --session-id.
-    session.send_message("hello".to_owned()).await.unwrap();
+    session.send_message("hello".into()).await.unwrap();
     let id = handle_then_turn(&mut events).await;
     let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
     expected.extend(["--session-id".to_owned(), id.to_string()]);
@@ -2541,10 +2689,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
 
     // Allow, with a message queued behind the approval and a stale answer.
-    session
-        .send_message("please approve".to_owned())
-        .await
-        .unwrap();
+    session.send_message("please approve".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -2553,7 +2698,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
             write_approval()
         ]
     );
-    session.send_message("queued".to_owned()).await.unwrap();
+    session.send_message("queued".into()).await.unwrap();
     session
         .answer_approval("not-pending".into(), Decision::Approve, None)
         .await
@@ -2575,10 +2720,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     );
 
     // Deny.
-    session
-        .send_message("approve again".to_owned())
-        .await
-        .unwrap();
+    session.send_message("approve again".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -2602,7 +2744,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
 
     // Interrupt while the approval waits: cancelled, then interrupted.
     session
-        .send_message("approve, then stop".to_owned())
+        .send_message("approve, then stop".into())
         .await
         .unwrap();
     assert_eq!(
@@ -2627,7 +2769,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     );
 
     // Interrupt while text streams; the session stays usable.
-    session.send_message("hang".to_owned()).await.unwrap();
+    session.send_message("hang".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 2).await,
         [AdapterEvent::TurnStarted { message: true }, text("working")]
@@ -2638,10 +2780,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
 
     // Idle: an interrupt does nothing, a message runs a normal turn.
     session.interrupt().await.unwrap();
-    session
-        .send_message("still there?".to_owned())
-        .await
-        .unwrap();
+    session.send_message("still there?".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -2698,10 +2837,7 @@ async fn a_restart_resumes_with_the_handle_and_the_sessions_grants() {
     assert_eq!(argv(tmp.path()), expected);
 
     // No new handle: the first event is the turn.
-    session
-        .send_message("hello again".to_owned())
-        .await
-        .unwrap();
+    session.send_message("hello again".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -2729,7 +2865,7 @@ async fn a_fresh_start_gets_a_new_session_id_and_the_sessions_grants() {
         ..spec(tmp.path(), Conversation::Fresh)
     };
     let (mut session, mut events) = adapter().start(spec).await.unwrap();
-    session.send_message("hello".to_owned()).await.unwrap();
+    session.send_message("hello".into()).await.unwrap();
     let id = handle_then_turn(&mut events).await;
     let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
     expected.extend(flags.map(str::to_owned));
@@ -2737,7 +2873,7 @@ async fn a_fresh_start_gets_a_new_session_id_and_the_sessions_grants() {
     assert_eq!(argv(tmp.path()), expected);
     assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
     // Reported once: the next turn brings none.
-    session.send_message("again".to_owned()).await.unwrap();
+    session.send_message("again".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -2784,7 +2920,7 @@ async fn a_fresh_process_stopped_before_any_message_reports_no_handle() {
         .unwrap();
     let second = session_id_arg(tmp.path());
     assert_ne!(first, second);
-    session.send_message("hello".to_owned()).await.unwrap();
+    session.send_message("hello".into()).await.unwrap();
     assert_eq!(handle_then_turn(&mut events).await, second);
     session.shutdown().await.unwrap();
 }
@@ -2796,7 +2932,7 @@ async fn one_turn_events(adapter: ClaudeCodeAdapter, workdir: &Path) -> Vec<Adap
         .start(spec(workdir, Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("hello".to_owned()).await.unwrap();
+    session.send_message("hello".into()).await.unwrap();
     let mut seen = Vec::new();
     loop {
         let event = next_raw(&mut events).await;
@@ -2998,7 +3134,7 @@ async fn a_fork_resumes_its_parent_under_a_new_session_id() {
     assert_eq!(argv(tmp.path()), expected);
 
     // The fork's handle comes with its first turn, as a fresh one's does.
-    session.send_message("hello".to_owned()).await.unwrap();
+    session.send_message("hello".into()).await.unwrap();
     assert_eq!(handle_then_turn(&mut events).await, fork);
     assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
     session.shutdown().await.unwrap();
@@ -3049,7 +3185,7 @@ async fn adopting_an_outside_conversation_forks_it_under_a_new_session_id() {
     assert_eq!(argv(tmp.path()), expected);
 
     // The adopting context's handle is the fork's id, never the outside one.
-    session.send_message("hello".to_owned()).await.unwrap();
+    session.send_message("hello".into()).await.unwrap();
     assert_eq!(handle_then_turn(&mut events).await, adopted);
     assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
     session.shutdown().await.unwrap();
@@ -3140,12 +3276,12 @@ async fn shutdown_after_an_interrupt_waits_for_the_result() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("hang".to_owned()).await.unwrap();
+    session.send_message("hang".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
     // A message queued behind the running turn is not begun by the
     // shutdown: the exit counts it.
-    session.send_message("never sent".to_owned()).await.unwrap();
+    session.send_message("never sent".into()).await.unwrap();
     session.interrupt().await.unwrap();
     session.shutdown().await.unwrap();
     assert_eq!(
@@ -3168,7 +3304,7 @@ async fn shutdown_mid_turn_abandons_the_turn_and_its_approval() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("approve".to_owned()).await.unwrap();
+    session.send_message("approve".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 2).await, [write_call(), write_approval()]);
     let pid = fake_pid(tmp.path());
@@ -3192,7 +3328,7 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("crash".to_owned()).await.unwrap();
+    session.send_message("crash".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(
         take(&mut events, 1).await,
@@ -3203,7 +3339,7 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
     );
     assert!(events.recv().await.is_none());
     assert!(matches!(
-        session.send_message("anyone?".to_owned()).await,
+        session.send_message("anyone?".into()).await,
         Err(AgentError::Closed)
     ));
 }
@@ -3215,10 +3351,7 @@ async fn a_crash_after_stray_output_is_explained_by_stderr() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session
-        .send_message("litter, crash".to_owned())
-        .await
-        .unwrap();
+    session.send_message("litter, crash".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(
         take(&mut events, 1).await,
@@ -3236,10 +3369,7 @@ async fn a_clean_exit_after_stray_output_is_no_error() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session
-        .send_message("litter, quit".to_owned())
-        .await
-        .unwrap();
+    session.send_message("litter, quit".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(
         take(&mut events, 1).await,
@@ -3257,7 +3387,7 @@ async fn a_cli_that_left_between_turns_refuses_requests_before_its_exit_is_repor
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("leave".to_owned()).await.unwrap();
+    session.send_message("leave".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
     // Its stdout has ended; the process lingers a second. An interrupt
@@ -3276,7 +3406,7 @@ async fn a_cli_that_left_between_turns_refuses_requests_before_its_exit_is_repor
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
     assert!(matches!(
-        session.send_message("hello".to_owned()).await,
+        session.send_message("hello".into()).await,
         Err(AgentError::Closed)
     ));
     // Nothing it was sent was owed: a clean exit.
@@ -3296,14 +3426,14 @@ async fn bytes_that_are_not_utf8_and_an_over_long_line_do_not_end_the_turn() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("garbage".to_owned()).await.unwrap();
+    session.send_message("garbage".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(
         take(&mut events, 3).await,
         [text("caf\u{fffd}"), text("still here"), COMPLETED]
     );
     // The agent is still being read.
-    session.send_message("again".to_owned()).await.unwrap();
+    session.send_message("again".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -3329,7 +3459,7 @@ async fn dropping_the_session_stops_the_agent() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("hang".to_owned()).await.unwrap();
+    session.send_message("hang".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
     let pid = fake_pid(tmp.path());
@@ -3381,7 +3511,7 @@ async fn a_clean_exit_kills_what_the_agent_left_running() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("orphan".to_owned()).await.unwrap();
+    session.send_message("orphan".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
     let child = orphan_pid(tmp.path());
@@ -3404,10 +3534,7 @@ async fn killing_the_agent_kills_what_it_started() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session
-        .send_message("orphan hang".to_owned())
-        .await
-        .unwrap();
+    session.send_message("orphan hang".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
     let (pid, child) = (fake_pid(tmp.path()), orphan_pid(tmp.path()));
@@ -3436,10 +3563,7 @@ async fn what_ignores_sigterm_is_killed_after_the_term_grace() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session
-        .send_message("stubborn hang".to_owned())
-        .await
-        .unwrap();
+    session.send_message("stubborn hang".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
     let child = orphan_pid(tmp.path());
@@ -3466,12 +3590,15 @@ async fn an_agent_that_stops_reading_is_killed_and_reported() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("deaf".to_owned()).await.unwrap();
+    session.send_message("deaf".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 2).await, [text("deaf"), COMPLETED]);
     let pid = fake_pid(tmp.path());
     // More than a pipe holds, to a process that no longer reads.
-    session.send_message("x".repeat(1 << 20)).await.unwrap();
+    session
+        .send_message("x".repeat(1 << 20).into())
+        .await
+        .unwrap();
     // Never taken up: no turn starts, and the exit counts it unsent.
     assert_eq!(
         next(&mut events).await,
@@ -3496,7 +3623,7 @@ async fn a_long_answer_reaches_an_agent_that_writes_while_it_arrives() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("flood".to_owned()).await.unwrap();
+    session.send_message("flood".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     let events_before = take(&mut events, 2).await;
     assert!(matches!(
@@ -3529,7 +3656,7 @@ async fn a_kill_reports_what_the_agent_says_as_it_stops() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("run".to_owned()).await.unwrap();
+    session.send_message("run".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [write_call()]);
     // Abandoned: on SIGTERM the CLI reports the call it killed, and no
@@ -3559,7 +3686,7 @@ async fn a_repeated_interrupt_the_agent_has_not_answered_stops_it() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("stuck".to_owned()).await.unwrap();
+    session.send_message("stuck".into()).await.unwrap();
     let id = handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
     let pid = fake_pid(tmp.path());
@@ -3580,7 +3707,7 @@ async fn a_repeated_interrupt_the_agent_has_not_answered_stops_it() {
     assert!(events.recv().await.is_none());
     assert!(!process_exists(pid), "agent process {pid} still exists");
     assert!(matches!(
-        session.send_message("anyone?".to_owned()).await,
+        session.send_message("anyone?".into()).await,
         Err(AgentError::Closed)
     ));
 
@@ -3592,10 +3719,7 @@ async fn a_repeated_interrupt_the_agent_has_not_answered_stops_it() {
         ))
         .await
         .unwrap();
-    session
-        .send_message("hello again".to_owned())
-        .await
-        .unwrap();
+    session.send_message("hello again".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -3614,11 +3738,11 @@ async fn messages_queued_behind_a_turn_stopped_by_an_escalation_are_counted_unse
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("stuck".to_owned()).await.unwrap();
+    session.send_message("stuck".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
-    session.send_message("queued one".to_owned()).await.unwrap();
-    session.send_message("queued two".to_owned()).await.unwrap();
+    session.send_message("queued one".into()).await.unwrap();
+    session.send_message("queued two".into()).await.unwrap();
     session.interrupt().await.unwrap();
     assert_eq!(next(&mut events).await, text("ignored"));
     session.escalate_interrupt().await.unwrap();
@@ -3639,10 +3763,10 @@ async fn messages_queued_behind_a_turn_the_cli_died_in_are_counted_unsent() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("stuck".to_owned()).await.unwrap();
+    session.send_message("stuck".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
-    session.send_message("queued".to_owned()).await.unwrap();
+    session.send_message("queued".into()).await.unwrap();
     // The interrupt follows the message on the request channel, so once
     // the CLI has seen it the message is queued in the driver.
     session.interrupt().await.unwrap();
@@ -3669,16 +3793,13 @@ async fn a_repeated_interrupt_after_the_answer_does_nothing() {
         .await
         .unwrap();
     // Answered, and the session idle: the repeat keeps it.
-    session.send_message("hang".to_owned()).await.unwrap();
+    session.send_message("hang".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
     session.interrupt().await.unwrap();
     assert_eq!(next(&mut events).await, INTERRUPTED);
     session.escalate_interrupt().await.unwrap();
-    session
-        .send_message("still there?".to_owned())
-        .await
-        .unwrap();
+    session.send_message("still there?".into()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
         [
@@ -3704,12 +3825,12 @@ async fn a_repeated_interrupt_leaves_the_turn_a_queued_message_started() {
         .start(spec(tmp.path(), Conversation::Fresh))
         .await
         .unwrap();
-    session.send_message("hang".to_owned()).await.unwrap();
+    session.send_message("hang".into()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
     // Queued behind the running turn; its result starts this one, which
     // ignores interrupts.
-    session.send_message("stuck".to_owned()).await.unwrap();
+    session.send_message("stuck".into()).await.unwrap();
     session.interrupt().await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
@@ -3835,7 +3956,7 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     let at = argv.iter().position(|a| a == "--permission-mode").unwrap();
     assert_eq!(argv[at + 1], "plan");
 
-    session.send_message("hello".to_owned()).await.unwrap();
+    session.send_message("hello".into()).await.unwrap();
     // The handle comes with the first turn.
     assert!(matches!(
         next_raw(&mut events).await,
@@ -5357,7 +5478,7 @@ fn subagent_approval_with_a_turn_between() -> Vec<Value> {
             .clone()
     };
     let id = Uuid::new_v4();
-    let message = protocol::user_message("meanwhile", id);
+    let message = protocol::user_message("meanwhile", &[], id);
     let turn = [
         json!({ "dir": "in", "msg": message }),
         json!({ "dir": "out", "msg": {

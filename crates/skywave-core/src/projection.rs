@@ -727,6 +727,7 @@ mod tests {
         let message = |text: &str| EventKind::UserMessage {
             device_id: DeviceId::new(),
             text: text.into(),
+            attachments: Vec::new(),
         };
         summary.apply(
             Seq(2),
@@ -882,6 +883,7 @@ mod tests {
         let message = EventKind::UserMessage {
             device_id: by,
             text: "hi".into(),
+            attachments: Vec::new(),
         };
         summary.apply(Seq(10), &event(sid, 40, message));
         assert_eq!(summary.last_seq, Seq(10));
@@ -911,6 +913,7 @@ mod tests {
         let message = EventKind::UserMessage {
             device_id: DeviceId::new(),
             text: "back".into(),
+            attachments: Vec::new(),
         };
         summary.apply(Seq(7), &event(sid, 12, message));
         assert!(!summary.archived);

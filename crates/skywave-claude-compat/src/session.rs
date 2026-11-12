@@ -25,7 +25,7 @@ use skywave_proto::Decision;
 use skywaved::agent::claude_code::protocol::{Output, Protocol};
 use skywaved::agent::claude_code::transcripts::{project_dir, projects_dir};
 use skywaved::agent::claude_code::{CliSession, REQUIRED_ARGS};
-use skywaved::agent::{AdapterEvent, TurnOutcome};
+use skywaved::agent::{AdapterEvent, ReadInput, TurnOutcome};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -336,6 +336,12 @@ impl Session {
     /// Sends a user message, as the adapter does.
     pub fn send(&mut self, text: &str) {
         let out = self.protocol.send_message(text.to_owned());
+        self.apply(out);
+    }
+
+    /// Sends a user message with images, as the adapter does once it read them.
+    pub fn send_input(&mut self, input: ReadInput) {
+        let out = self.protocol.send_input(input);
         self.apply(out);
     }
 

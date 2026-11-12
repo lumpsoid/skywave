@@ -308,6 +308,7 @@ fn message(
             EventKind::UserMessage {
                 device_id,
                 text: text.into(),
+                attachments: Vec::new(),
             },
         )
     }
@@ -1050,6 +1051,7 @@ fn sessions_created_elsewhere_appear_live_and_keep_the_selection() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "from the phone".into(),
+                attachments: Vec::new(),
             },
         )],
     );
@@ -1744,6 +1746,7 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
                 EventKind::UserMessage {
                     device_id: phone,
                     text: "from the phone".into(),
+                    attachments: Vec::new(),
                 },
             ),
             event(
@@ -1836,6 +1839,7 @@ fn every_timeline_entry_renders_distinctly() {
                 EventKind::UserMessage {
                     device_id: other,
                     text: "from the laptop".into(),
+                    attachments: Vec::new(),
                 },
             ),
             event(
@@ -4629,6 +4633,7 @@ fn user(device: DeviceId, text: &str) -> EventKind {
     EventKind::UserMessage {
         device_id: device,
         text: text.into(),
+        attachments: Vec::new(),
     }
 }
 
@@ -7446,6 +7451,7 @@ fn shift_d_confirms_and_removes_row() {
             EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "still here?".into(),
+                attachments: Vec::new(),
             },
         )],
     );

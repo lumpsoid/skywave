@@ -93,6 +93,24 @@ pub struct TimelineRow {
     /// A tool call's output kept as a blob, and what may be done to it:
     /// its menu goes beside the section whose `blob` is `blob_id`.
     pub blob_target: Option<BlobTargetView>,
+    /// A message's images in the order attached: a queued message's, or a
+    /// logged message's; empty for every other row.
+    pub images: Vec<RowImage>,
+}
+
+/// An image on a message's row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct RowImage {
+    /// The image's blob, for `OpenFull`; none for a queued message's image
+    /// or a deleted one.
+    pub blob_id: Option<String>,
+    /// The file to show, when it is on this device: an available blob, or
+    /// a queued message's own file.
+    pub path: Option<String>,
+    /// What a placeholder says, e.g. `340.0 KiB` or `image deleted`.
+    pub label: String,
+    /// Its download would fetch it: not downloaded, or failed.
+    pub can_download: bool,
 }
 
 /// What kind of item a row is.

@@ -140,6 +140,12 @@ pub const ALL: &[Scenario] = &[
         run: turns::basic,
     },
     Scenario {
+        name: "image",
+        tier: Tier::Full,
+        about: "a message with an image and text, then an image alone",
+        run: turns::image,
+    },
+    Scenario {
         name: "fork_turns",
         tier: Tier::Full,
         about: "a fork with model turns; resuming parent and fork shows the parent untouched",

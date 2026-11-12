@@ -4,6 +4,7 @@
 //! <data_dir>/
 //!   skywave.db   SQLite database (see `db`)
 //!   blobs/       blob files named by BlobId (see `blobs`)
+//!   attachments/ images staged for a message, named by sha256 (see `attachments`)
 //!   ca/          CA key and certificate (see `identity`)
 //!   server/      server key and certificate (see `identity`)
 //!   server_id    the stable ServerId (see `identity`)
@@ -74,6 +75,7 @@ impl DataDir {
         for path in [
             dir.root.clone(),
             dir.blobs_dir(),
+            dir.attachments_dir(),
             dir.ca_dir(),
             dir.server_dir(),
             dir.shell_dir(),
@@ -98,6 +100,11 @@ impl DataDir {
 
     pub fn blobs_dir(&self) -> PathBuf {
         self.root.join("blobs")
+    }
+
+    /// Where images uploaded for a message are staged (see `attachments`).
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.root.join("attachments")
     }
 
     pub fn ca_dir(&self) -> PathBuf {
@@ -134,7 +141,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("nested/data");
         let dir = DataDir::create(&root).unwrap();
-        for sub in ["blobs", "ca", "server", "shell"] {
+        for sub in ["blobs", "attachments", "ca", "server", "shell"] {
             assert!(root.join(sub).is_dir(), "{sub} missing");
         }
         assert_eq!(dir.db_path(), root.join("skywave.db"));

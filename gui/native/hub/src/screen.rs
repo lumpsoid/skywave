@@ -491,6 +491,8 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             shell_enabled: false,
             prompt: None,
             can_stop: false,
+            images: Vec::new(),
+            preparing: 0,
         }),
         // The composer's kind only: saved prompts in agent mode, saved
         // commands in shell mode.
@@ -1381,6 +1383,7 @@ mod tests {
             task_stops,
             mode: skywave_core::ComposerMode::Agent,
             draft: None,
+            draft_images: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
