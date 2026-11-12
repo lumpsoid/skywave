@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
@@ -935,5 +937,48 @@ void main() {
       expect(scrolled(tester), 0);
       expectInView(tester, 'row 62');
     });
+  });
+
+  testWidgets('the scrollbar keeps its size while scrolling over rows it has '
+      'seen', (tester) async {
+    await pumpRows(tester, [
+      for (var i = 0; i < 60; i++)
+        i % 3 == 0 ? detailed(i, count: 4 + i % 7) : row('s:$i', 'row $i'),
+    ]);
+    final position = tester.state<ScrollableState>(listScrollable()).position;
+
+    // Scrolls 150 px at a time, to the oldest end or back to the newest, and
+    // returns the extent after each step. The extent is re-read each step.
+    Future<List<double>> sweep({required bool older}) async {
+      final extents = <double>[];
+      while (older
+          ? position.pixels < position.maxScrollExtent
+          : position.pixels > 0) {
+        if (extents.length == 200) fail('the sweep did not end in 200 steps');
+        final next = position.pixels + (older ? 150 : -150);
+        await scrollTo(
+          tester,
+          math.min(math.max(next, 0.0), position.maxScrollExtent),
+        );
+        extents.add(position.maxScrollExtent);
+      }
+      return extents;
+    }
+
+    // Pass 1 measures every row: out to the oldest end and back.
+    await sweep(older: true);
+    await sweep(older: false);
+
+    // Pass 2 sweeps the same rows again: the extent must not change.
+    final extents = await sweep(older: true);
+    expect(extents.length, greaterThan(1), reason: 'the sweep moved');
+    for (var i = 0; i < extents.length; i++) {
+      expect(
+        extents[i],
+        closeTo(extents.first, 0.5),
+        reason: 'the extent at ${150 * (i + 1)} px',
+      );
+    }
+    expect(tester.takeException(), isNull);
   });
 }

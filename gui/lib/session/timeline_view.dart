@@ -63,6 +63,12 @@ class TimelineViewState extends State<TimelineView> {
   /// The rows that are built, by key.
   final _slots = <String, BuildContext>{};
 
+  /// The height each row was last laid out at, by key: the scroll extent of
+  /// the rows not built is estimated from them. Heights depend on the width
+  /// the text wraps at, so the map is cleared when that width changes.
+  final _heights = <String, double>{};
+  double? _heightsWidth;
+
   bool _following = true;
   String? _sessionId;
 
@@ -419,44 +425,52 @@ class TimelineViewState extends State<TimelineView> {
               onNotification: _onScroll,
               child: LayoutBuilder(
                 builder: (context, constraints) {
+                  if (constraints.maxWidth != _heightsWidth) {
+                    _heights.clear();
+                    _heightsWidth = constraints.maxWidth;
+                  }
                   final side = math.max(
                     0.0,
                     (constraints.maxWidth - timelineMaxWidth) / 2,
                   );
                   return Scrollbar(
                     controller: _scroll,
-                    child: ListView.builder(
+                    child: ListView.custom(
                       controller: _scroll,
                       physics: _physics,
                       reverse: true,
                       padding: EdgeInsets.fromLTRB(side, 8, side, 24),
-                      itemCount: rows.length,
-                      findChildIndexCallback: (key) {
-                        final index = widget.timeline.indexOf(
-                          (key as ValueKey<String>).value,
-                        );
-                        return index < 0 ? null : rows.length - 1 - index;
-                      },
-                      itemBuilder: (context, i) {
-                        final row = rows[rows.length - 1 - i];
-                        final current = row.key == currentKey;
-                        return _Slot(
-                          key: ValueKey(row.key),
-                          rowKey: row.key,
-                          slots: _slots,
-                          child: RowTile(
-                            sessionId: widget.sessionId,
-                            row: row,
-                            send: widget.send,
-                            hit: searching
-                                ? widget.search.hitFor(row.key)
-                                : null,
-                            current: current,
-                            currentLine: current ? search?.currentLine : null,
-                            currentLineKey: current ? _lineKey : null,
-                          ),
-                        );
-                      },
+                      childrenDelegate: _RowsDelegate(
+                        rows: rows,
+                        heights: _heights,
+                        findChildIndexCallback: (key) {
+                          final index = widget.timeline.indexOf(
+                            (key as ValueKey<String>).value,
+                          );
+                          return index < 0 ? null : rows.length - 1 - index;
+                        },
+                        itemBuilder: (context, i) {
+                          final row = rows[rows.length - 1 - i];
+                          final current = row.key == currentKey;
+                          return _Slot(
+                            key: ValueKey(row.key),
+                            rowKey: row.key,
+                            slots: _slots,
+                            heights: _heights,
+                            child: RowTile(
+                              sessionId: widget.sessionId,
+                              row: row,
+                              send: widget.send,
+                              hit: searching
+                                  ? widget.search.hitFor(row.key)
+                                  : null,
+                              current: current,
+                              currentLine: current ? search?.currentLine : null,
+                              currentLineKey: current ? _lineKey : null,
+                            ),
+                          );
+                        },
+                      ),
                     ),
                   );
                 },
@@ -534,6 +548,59 @@ class _HoldPhysics extends ScrollPhysics {
   }
 }
 
+/// The timeline's rows as the list's children. The default estimate of the
+/// extent of the rows not built extrapolates from the rows built right now,
+/// so the scrollbar's size changes with every scroll. This one sums the
+/// heights the rows were last laid out at, from [heights], and uses their
+/// mean only for a row never laid out.
+class _RowsDelegate extends SliverChildBuilderDelegate {
+  _RowsDelegate({
+    required this.rows,
+    required this.heights,
+    required NullableIndexedWidgetBuilder itemBuilder,
+    required int? Function(Key key) findChildIndexCallback,
+  }) : super(
+         itemBuilder,
+         findChildIndexCallback: findChildIndexCallback,
+         childCount: rows.length,
+       );
+
+  /// The timeline's rows, oldest first. The list is reversed: list index `i`
+  /// shows `rows[rows.length - 1 - i]`.
+  final List<TimelineRow> rows;
+
+  /// The heights of the rows laid out so far, by key.
+  final Map<String, double> heights;
+
+  @override
+  double? estimateMaxScrollOffset(
+    int firstIndex,
+    int lastIndex,
+    double leadingScrollOffset,
+    double trailingScrollOffset,
+  ) {
+    final count = childCount;
+    if (count == null) {
+      return super.estimateMaxScrollOffset(
+        firstIndex,
+        lastIndex,
+        leadingScrollOffset,
+        trailingScrollOffset,
+      );
+    }
+    if (lastIndex >= count - 1) return trailingScrollOffset;
+    final mean = heights.isEmpty
+        ? (trailingScrollOffset - leadingScrollOffset) /
+              (lastIndex - firstIndex + 1)
+        : heights.values.reduce((a, b) => a + b) / heights.length;
+    var extent = trailingScrollOffset;
+    for (var i = lastIndex + 1; i < count; i++) {
+      extent += heights[rows[rows.length - 1 - i].key] ?? mean;
+    }
+    return extent;
+  }
+}
+
 /// A built row, registered by key while it is in the tree so the timeline
 /// can find where it is. A removed row leaves at once, when it is
 /// deactivated: it is disposed only at the end of the frame, and asking
@@ -542,12 +609,14 @@ class _Slot extends StatefulWidget {
   const _Slot({
     required this.rowKey,
     required this.slots,
+    required this.heights,
     required this.child,
     super.key,
   });
 
   final String rowKey;
   final Map<String, BuildContext> slots;
+  final Map<String, double> heights;
   final Widget child;
 
   @override
@@ -576,26 +645,46 @@ class _SlotState extends State<_Slot> {
   }
 
   @override
-  Widget build(BuildContext context) => _SlotBox(child: widget.child);
+  Widget build(BuildContext context) => _SlotBox(
+    rowKey: widget.rowKey,
+    heights: widget.heights,
+    child: widget.child,
+  );
 }
 
 /// Sizes its child and keeps the height, so the hold can read a row's height
-/// from the row itself.
+/// from the row itself, and the row's height goes to [heights] by its key.
 class _SlotBox extends SingleChildRenderObjectWidget {
-  const _SlotBox({super.child});
+  const _SlotBox({required this.rowKey, required this.heights, super.child});
+
+  final String rowKey;
+  final Map<String, double> heights;
 
   @override
-  RenderObject createRenderObject(BuildContext context) => _RenderSlotBox();
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderSlotBox(rowKey: rowKey, heights: heights);
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderSlotBox renderObject) {
+    renderObject
+      ..rowKey = rowKey
+      ..heights = heights;
+  }
 }
 
 /// Keeps the row's height from its own layout: the hold needs it during the
 /// viewport's layout, when a row's size may not be read.
 class _RenderSlotBox extends RenderProxyBox {
+  _RenderSlotBox({required this.rowKey, required this.heights});
+
+  String rowKey;
+  Map<String, double> heights;
   double? height;
 
   @override
   void performLayout() {
     super.performLayout();
     height = size.height;
+    heights[rowKey] = size.height;
   }
 }
