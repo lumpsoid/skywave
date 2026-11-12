@@ -117,12 +117,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
-use skywave_proto::{EventsQuery, Seq};
+use skywave_proto::limits::ATTACHMENT_MAX_BYTES;
+use skywave_proto::{Command, CommandKind, CommandResult, EventsQuery, Seq, UploadResult};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::address::ServerAddress;
+use crate::attachment::attachment_path;
 use crate::backoff::Backoff;
 use crate::blobs::{BlobCtx, BlobQueue, run_downloader};
 use crate::client::CoreError;
@@ -130,7 +133,7 @@ use crate::https::{HttpsTransport, TransportConfig};
 use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
-use crate::store::{LogCheck, OutboxEntry, StoreError};
+use crate::store::{AttachmentRefusal, LogCheck, OutboxEntry, StoreError};
 use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
 use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
@@ -1044,6 +1047,64 @@ async fn send(
     }
 }
 
+/// Uploads the images a `SendMessage` names, in order, so the server holds
+/// them staged when the message is posted. `None` means post now; `Some`
+/// means the message cannot be posted, and why.
+///
+/// Every hash is checked with a HEAD on every attempt, and the ones not
+/// staged are PUT from the local file. Nothing is remembered between
+/// attempts: the server unlinks the staged files a message used, so a
+/// cached "staged" would post an image the server no longer holds. A local
+/// file that is missing or unreadable, or over [`ATTACHMENT_MAX_BYTES`], is
+/// refused without an upload, as is an upload the server refuses as too
+/// large, not an image or a hash mismatch. A `DiskLow` answer stops the
+/// uploads and posts the message anyway: the server then refuses it with a
+/// stored `DiskLow` rejection like any message on a low disk. Waiting here
+/// would hold up the one outbox, interrupts and approvals included. A
+/// transport error is returned as it is, for [`send_entry`] to handle.
+async fn stage_attachments(
+    ctx: &LinkCtx,
+    transport: &dyn Transport,
+    command: &Command,
+) -> Result<Option<AttachmentRefusal>, TransportError> {
+    let CommandKind::SendMessage { attachments, .. } = &command.kind else {
+        return Ok(None);
+    };
+    let data_dir = ctx.seam.data_dir();
+    for &sha in attachments {
+        if transport.attachment_staged(sha).await? {
+            continue;
+        }
+        let path = attachment_path(&data_dir, sha);
+        let size = match tokio::fs::metadata(&path).await {
+            Ok(meta) => meta.len(),
+            Err(error) => {
+                tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
+                return Ok(Some(AttachmentRefusal::Missing));
+            }
+        };
+        if size > ATTACHMENT_MAX_BYTES {
+            tracing::warn!(sha256 = %sha.to_hex(), size, "attachment is over the upload limit");
+            return Ok(Some(AttachmentRefusal::TooLarge));
+        }
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
+                return Ok(Some(AttachmentRefusal::Missing));
+            }
+        };
+        match transport.upload_attachment(sha, Bytes::from(bytes)).await? {
+            UploadResult::Stored { .. } => {}
+            UploadResult::DiskLow => return Ok(None),
+            UploadResult::TooLarge => return Ok(Some(AttachmentRefusal::TooLarge)),
+            UploadResult::NotAnImage => return Ok(Some(AttachmentRefusal::NotAnImage)),
+            UploadResult::HashMismatch => return Ok(Some(AttachmentRefusal::HashMismatch)),
+        }
+    }
+    Ok(None)
+}
+
 /// Claims and sends one outbox entry read earlier, and says whether the
 /// server settled it: answered it or refused it for good. An entry that can no
 /// longer be claimed (gone from the outbox, or answered meanwhile) is
@@ -1079,6 +1140,12 @@ async fn send(
 /// cannot claim it, or the server answers the resend from its dedup. The
 /// user may take it back while it waits ([`resend_after`]); an answer to a
 /// request still out then settles nothing.
+///
+/// Before the request, a message's images are staged ([`stage_attachments`]).
+/// An image that cannot be staged settles the message as
+/// `AttachmentRefused`, final and never posted, and the link stays up. A
+/// transport error while staging is handled as the same error from the
+/// request itself, and the staging runs again on the resend.
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -1090,9 +1157,25 @@ async fn send_entry(
     if !ctx.seam.command_sending(id)? {
         return Ok(false);
     }
-    match transport.send_command(&entry.command).await {
-        Ok(result) => {
+    let sent: Result<Result<CommandResult, AttachmentRefusal>, TransportError> = async {
+        if let Some(reason) = stage_attachments(ctx, transport, &entry.command).await? {
+            return Ok(Err(reason));
+        }
+        transport.send_command(&entry.command).await.map(Ok)
+    }
+    .await;
+    match sent {
+        Ok(Ok(result)) => {
             ctx.seam.command_result(id, &result)?;
+            Ok(true)
+        }
+        Ok(Err(reason)) => {
+            tracing::warn!(
+                ?reason,
+                ?id,
+                "the outbox could not stage an image; giving up on the message"
+            );
+            ctx.seam.command_attachment_refused(id, reason)?;
             Ok(true)
         }
         Err(error) if error.refuses_command() => {
@@ -1182,12 +1265,13 @@ mod tests {
     use std::time::Duration;
 
     use skywave_proto::{
-        BlobId as ProtoBlobId, Command, CommandId, CommandKind, CommandResult, EventBatch,
-        HelloResponse, PROTOCOL_VERSION, ServerId, SessionId,
+        BlobId as ProtoBlobId, Command, CommandId, CommandKind, CommandResult, ContentHash,
+        EventBatch, HelloResponse, ImageType, PROTOCOL_VERSION, ServerId, SessionId, UploadResult,
     };
 
     use super::*;
     use crate::Core;
+    use crate::attachment::attachment_dir;
     use crate::backoff::Jitter;
     use crate::identity::PairedCredentials;
     use crate::store::OutboxStatus;
@@ -2186,13 +2270,17 @@ mod tests {
     }
 
     fn enqueue(seam: &Seam, text: &str) -> Command {
+        enqueue_with(seam, text, Vec::new())
+    }
+
+    fn enqueue_with(seam: &Seam, text: &str, attachments: Vec<ContentHash>) -> Command {
         let command = Command {
             id: CommandId::new(),
             kind: CommandKind::SendMessage {
                 session_id: SessionId::new(),
                 context: skywave_proto::ContextId::first_of(SessionId::new()),
                 text: text.into(),
-                attachments: Vec::new(),
+                attachments,
             },
         };
         crate::client::lock(&seam.core.shared.state)
@@ -2565,6 +2653,361 @@ mod tests {
         assert!(
             !links.iter().any(|l| matches!(l, Link::Reconnecting { .. })),
             "{links:?}"
+        );
+    }
+
+    /// Stages uploads the way the server does, and records every request as
+    /// `head`, `put` or `post` with the first eight hex digits of its hash.
+    struct StagingServer {
+        staged: Mutex<HashSet<ContentHash>>,
+        calls: Mutex<Vec<String>>,
+        seq: Mutex<u64>,
+        /// When set, every PUT answers this and stages nothing.
+        put_answer: Option<UploadResult>,
+        /// The first this many PUTs fail with a timeout.
+        put_failures: Mutex<u32>,
+        /// Whether a post must find each of its images staged.
+        check_staged: bool,
+    }
+
+    impl StagingServer {
+        fn new() -> Self {
+            StagingServer {
+                staged: Mutex::new(HashSet::new()),
+                calls: Mutex::new(Vec::new()),
+                seq: Mutex::new(0),
+                put_answer: None,
+                put_failures: Mutex::new(0),
+                check_staged: true,
+            }
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn head_call(sha256: ContentHash) -> String {
+        format!("head {}", &sha256.to_hex()[..8])
+    }
+
+    fn put_call(sha256: ContentHash) -> String {
+        format!("put {}", &sha256.to_hex()[..8])
+    }
+
+    fn post_call(text: &str) -> String {
+        format!("post {text}")
+    }
+
+    impl Transport for StagingServer {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            Box::pin(async move {
+                if let CommandKind::SendMessage {
+                    text, attachments, ..
+                } = &command.kind
+                {
+                    {
+                        let mut staged = self.staged.lock().unwrap();
+                        for sha256 in attachments {
+                            if self.check_staged {
+                                assert!(
+                                    staged.contains(sha256),
+                                    "posted before its images were staged"
+                                );
+                            }
+                            // The server unlinks the staged files a message used.
+                            staged.remove(sha256);
+                        }
+                    }
+                    self.record(post_call(text));
+                }
+                let mut seq = self.seq.lock().unwrap();
+                *seq += 1;
+                Ok(CommandResult::Accepted { seq: Seq(*seq) })
+            })
+        }
+
+        fn events(&self, _query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn blob(
+            &self,
+            _id: ProtoBlobId,
+            _from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            Box::pin(async { Err(TransportError::NotFound) })
+        }
+
+        fn attachment_staged(
+            &self,
+            sha256: ContentHash,
+        ) -> BoxFuture<'_, Result<bool, TransportError>> {
+            Box::pin(async move {
+                self.record(head_call(sha256));
+                Ok(self.staged.lock().unwrap().contains(&sha256))
+            })
+        }
+
+        fn upload_attachment(
+            &self,
+            sha256: ContentHash,
+            bytes: Bytes,
+        ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
+            Box::pin(async move {
+                self.record(put_call(sha256));
+                {
+                    let mut failures = self.put_failures.lock().unwrap();
+                    if *failures > 0 {
+                        *failures -= 1;
+                        return Err(TransportError::Timeout);
+                    }
+                }
+                assert!(
+                    ContentHash::of(&bytes) == sha256,
+                    "the upload does not hash to its name"
+                );
+                match &self.put_answer {
+                    Some(answer) => Ok(answer.clone()),
+                    None => {
+                        self.staged.lock().unwrap().insert(sha256);
+                        Ok(UploadResult::Stored {
+                            size: bytes.len() as u64,
+                            media_type: ImageType::Png,
+                        })
+                    }
+                }
+            })
+        }
+    }
+
+    /// Writes `bytes` where the outbox looks for the image they hash to.
+    fn put_file(dir: &std::path::Path, bytes: &[u8]) -> ContentHash {
+        let sha256 = ContentHash::of(bytes);
+        std::fs::create_dir_all(attachment_dir(dir)).unwrap();
+        std::fs::write(attachment_path(dir, sha256), bytes).unwrap();
+        sha256
+    }
+
+    /// Runs the sender until the outbox is drained. The sender only ends on
+    /// an error, so the timeout is what ends it.
+    async fn drain(seam: &Seam, server: &StagingServer) {
+        let ctx = sender_ctx(seam);
+        let progress = AtomicBool::new(false);
+        let errors = &mut HeadCount::default();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(60),
+            send(&ctx, server, &progress, errors),
+        )
+        .await;
+        assert!(drained.is_err(), "the sender only ends on an error");
+    }
+
+    fn outbox(seam: &Seam) -> Vec<OutboxEntry> {
+        crate::client::lock(&seam.core.shared.state)
+            .store
+            .outbox()
+            .unwrap()
+    }
+
+    fn statuses(seam: &Seam) -> Vec<OutboxStatus> {
+        outbox(seam).into_iter().map(|entry| entry.status).collect()
+    }
+
+    /// Every image is staged before its message is posted, and one the
+    /// server already holds is not uploaded again.
+    #[tokio::test(start_paused = true)]
+    async fn images_are_uploaded_before_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = ContentHash::of(b"image b");
+        let server = StagingServer::new();
+        server.staged.lock().unwrap().insert(b);
+        enqueue_with(&seam, "m", vec![a, b]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), head_call(b), post_call("m")]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// The server unlinks the images a message used, so a later message
+    /// naming the same image uploads it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_reused_image_is_uploaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        enqueue_with(&seam, "one", vec![a]);
+        enqueue_with(&seam, "two", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(a),
+                put_call(a),
+                post_call("one"),
+                head_call(a),
+                put_call(a),
+                post_call("two"),
+            ]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(2) }),
+            ]
+        );
+    }
+
+    /// A failed upload is tried again from the head check, not from the
+    /// upload alone, and the message goes out once the image is staged.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_upload_is_retried_from_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        *server.put_failures.lock().unwrap() = 1;
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(a),
+                put_call(a),
+                head_call(a),
+                put_call(a),
+                post_call("m"),
+            ]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// On a low disk the uploads stop and the message is posted anyway, so
+    /// the server's own refusal shows it and the outbox keeps moving.
+    #[tokio::test(start_paused = true)]
+    async fn a_low_disk_posts_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = put_file(dir.path(), b"image b");
+        let mut server = StagingServer::new();
+        server.put_answer = Some(UploadResult::DiskLow);
+        server.check_staged = false;
+        enqueue_with(&seam, "m", vec![a, b]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a), post_call("m")]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// An image the server refuses fails its message for good, unposted and
+    /// discardable, and the message behind it goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_image_fails_the_message_and_the_next_goes_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"not really a picture");
+        let mut server = StagingServer::new();
+        server.put_answer = Some(UploadResult::NotAnImage);
+        enqueue_with(&seam, "one", vec![a]);
+        enqueue(&seam, "two");
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), post_call("two")]
+        );
+        let entries = outbox(&seam);
+        assert_eq!(
+            entries.iter().map(|e| e.status.clone()).collect::<Vec<_>>(),
+            [
+                OutboxStatus::AttachmentRefused(AttachmentRefusal::NotAnImage),
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
+            ]
+        );
+        assert!(entries[0].discardable());
+    }
+
+    /// A local image that was never written is refused without an upload.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_image_fails_without_uploading() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = ContentHash::of(b"never written");
+        let server = StagingServer::new();
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a)]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(AttachmentRefusal::Missing)]
+        );
+    }
+
+    /// A local image over the upload limit is refused without an upload.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_image_fails_without_uploading() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let big = vec![0u8; usize::try_from(ATTACHMENT_MAX_BYTES + 1).unwrap()];
+        let a = put_file(dir.path(), &big);
+        let server = StagingServer::new();
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a)]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(AttachmentRefusal::TooLarge)]
+        );
+    }
+
+    /// A message without images asks about none.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_without_images_never_asks_about_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        enqueue(&seam, "plain");
+        let server = StagingServer::new();
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [post_call("plain")]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
         );
     }
 

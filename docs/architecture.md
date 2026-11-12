@@ -901,7 +901,16 @@ logs) an event that no longer decodes rather than failing.
   request has a connection of its own, so it does not end the link
   either: the pull goes on, and the command is resent, same id, after a
   backoff for the failures in a row, as often as it takes. A link that
-  is really down fails the pull, which ends the connection. The user may
+  is really down fails the pull, which ends the connection. Before a message
+  with images is posted, the outbox stages them: each image is checked with a
+  HEAD on every attempt and PUT from its local file when the server does not
+  hold it, since the server unlinks the staged files a message used, so
+  nothing is cached. A missing or too-large local file, or an upload the
+  server refuses as too large, not an image or a hash mismatch, fails the
+  message as `AttachmentRefused`: final, discardable, never posted. A low disk
+  stops the uploads and posts the message anyway, so the server's stored
+  `DiskLow` refusal shows it and the outbox keeps moving. A HEAD or PUT that
+  fails in transport backs off like the command's own request. The user may
   take back any message, shell run, session creation, context move, or
   blob delete or crop the
   server has not accepted, sent or not (`OutboxEntry::discardable`): the
