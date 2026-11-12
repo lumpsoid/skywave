@@ -16,6 +16,8 @@
 //! - [`PromptHistory`]: recalling earlier prompts, or shell commands, with
 //!   a stash.
 //! - [`CompletionSettle`]: workdir completion.
+//! - [`WorkdirPicker`]: the workdir candidate list, always shown, with its
+//!   highlight and descent into a directory.
 //! - [`TimelineSearch`]: the timeline search's query, matches and current
 //!   match.
 //! - [`ExpandFetch`]: the downloads expanded items need, each asked for
@@ -35,6 +37,7 @@ mod history;
 mod read;
 mod search;
 mod shell;
+mod workdir_picker;
 
 pub use alert::{
     Alert, AlertUpdate, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise,
@@ -47,6 +50,7 @@ pub use history::{PromptHistory, Recall};
 pub use read::{READ_MARK_EVERY, ReadMarker};
 pub use search::{Jump, TimelineSearch};
 pub use shell::shell_stop;
+pub use workdir_picker::{WorkdirPicker, choosable};
 
 use skywave_core::{
     AgentWork, Answer, ApprovalPrompt, Outgoing, PendingSession, QuestionPrompt, SessionListView,
