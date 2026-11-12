@@ -1047,9 +1047,20 @@ async fn send(
     }
 }
 
+/// What staging a message's images came to.
+enum Staged {
+    /// Post the message: its images are staged, or a low disk stopped the
+    /// uploads.
+    Post,
+    /// The message cannot be posted, and why.
+    Refused(AttachmentRefusal),
+    /// The user took the message back meanwhile: it is not posted.
+    Withdrawn,
+}
+
 /// Uploads the images a `SendMessage` names, in order, so the server holds
-/// them staged when the message is posted. `None` means post now; `Some`
-/// means the message cannot be posted, and why.
+/// them staged when the message is posted. [`Staged::Post`] means post now;
+/// [`Staged::Refused`] means the message cannot be posted, and why.
 ///
 /// Every hash is checked with a HEAD on every attempt, and the ones not
 /// staged are PUT from the local file. Nothing is remembered between
@@ -1061,17 +1072,30 @@ async fn send(
 /// uploads and posts the message anyway: the server then refuses it with a
 /// stored `DiskLow` rejection like any message on a low disk. Waiting here
 /// would hold up the one outbox, interrupts and approvals included. A
-/// transport error is returned as it is, for [`send_entry`] to handle.
+/// transport error is returned for [`send_entry`] to handle, as its
+/// request's error would be.
+///
+/// A message the user takes back while its images upload is not posted:
+/// it is checked to be still pending before each image's HEAD and once more
+/// after the last upload, and [`Staged::Withdrawn`] stops everything. A PUT
+/// already in flight may still finish; nothing after it is sent. A message
+/// without images is not checked.
 async fn stage_attachments(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     command: &Command,
-) -> Result<Option<AttachmentRefusal>, TransportError> {
+) -> Result<Staged, LinkError> {
     let CommandKind::SendMessage { attachments, .. } = &command.kind else {
-        return Ok(None);
+        return Ok(Staged::Post);
     };
+    if attachments.is_empty() {
+        return Ok(Staged::Post);
+    }
     let data_dir = ctx.seam.data_dir();
     for &sha in attachments {
+        if !still_pending(ctx, command.id)? {
+            return Ok(Staged::Withdrawn);
+        }
         if transport.attachment_staged(sha).await? {
             continue;
         }
@@ -1080,29 +1104,34 @@ async fn stage_attachments(
             Ok(meta) => meta.len(),
             Err(error) => {
                 tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
-                return Ok(Some(AttachmentRefusal::Missing));
+                return Ok(Staged::Refused(AttachmentRefusal::Missing));
             }
         };
         if size > ATTACHMENT_MAX_BYTES {
             tracing::warn!(sha256 = %sha.to_hex(), size, "attachment is over the upload limit");
-            return Ok(Some(AttachmentRefusal::TooLarge));
+            return Ok(Staged::Refused(AttachmentRefusal::TooLarge));
         }
         let bytes = match tokio::fs::read(&path).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
-                return Ok(Some(AttachmentRefusal::Missing));
+                return Ok(Staged::Refused(AttachmentRefusal::Missing));
             }
         };
         match transport.upload_attachment(sha, Bytes::from(bytes)).await? {
             UploadResult::Stored { .. } => {}
-            UploadResult::DiskLow => return Ok(None),
-            UploadResult::TooLarge => return Ok(Some(AttachmentRefusal::TooLarge)),
-            UploadResult::NotAnImage => return Ok(Some(AttachmentRefusal::NotAnImage)),
-            UploadResult::HashMismatch => return Ok(Some(AttachmentRefusal::HashMismatch)),
+            UploadResult::DiskLow => break,
+            UploadResult::TooLarge => return Ok(Staged::Refused(AttachmentRefusal::TooLarge)),
+            UploadResult::NotAnImage => return Ok(Staged::Refused(AttachmentRefusal::NotAnImage)),
+            UploadResult::HashMismatch => {
+                return Ok(Staged::Refused(AttachmentRefusal::HashMismatch));
+            }
         }
     }
-    Ok(None)
+    if !still_pending(ctx, command.id)? {
+        return Ok(Staged::Withdrawn);
+    }
+    Ok(Staged::Post)
 }
 
 /// Claims and sends one outbox entry read earlier, and says whether the
@@ -1145,7 +1174,9 @@ async fn stage_attachments(
 /// An image that cannot be staged settles the message as
 /// `AttachmentRefused`, final and never posted, and the link stays up. A
 /// transport error while staging is handled as the same error from the
-/// request itself, and the staging runs again on the resend.
+/// request itself, and the staging runs again on the resend. A message the
+/// user takes back while its images upload is not posted, and the sender
+/// moves on to the next entry ([`stage_attachments`]).
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -1157,13 +1188,20 @@ async fn send_entry(
     if !ctx.seam.command_sending(id)? {
         return Ok(false);
     }
-    let sent: Result<Result<CommandResult, AttachmentRefusal>, TransportError> = async {
-        if let Some(reason) = stage_attachments(ctx, transport, &entry.command).await? {
-            return Ok(Err(reason));
-        }
-        transport.send_command(&entry.command).await.map(Ok)
-    }
-    .await;
+    let sent: Result<Result<CommandResult, AttachmentRefusal>, LinkError> =
+        match stage_attachments(ctx, transport, &entry.command).await {
+            Ok(Staged::Post) => transport
+                .send_command(&entry.command)
+                .await
+                .map(Ok)
+                .map_err(LinkError::Transport),
+            Ok(Staged::Refused(reason)) => Ok(Err(reason)),
+            Ok(Staged::Withdrawn) => {
+                tracing::debug!(?id, "withdrawn while its images uploaded; not posting it");
+                return Ok(false);
+            }
+            Err(error) => Err(error),
+        };
     match sent {
         Ok(Ok(result)) => {
             ctx.seam.command_result(id, &result)?;
@@ -1178,17 +1216,17 @@ async fn send_entry(
             ctx.seam.command_attachment_refused(id, reason)?;
             Ok(true)
         }
-        Err(error) if error.refuses_command() => {
+        Err(LinkError::Transport(error)) if error.refuses_command() => {
             tracing::warn!(%error, ?id, "server refused the command; giving up on it");
             ctx.seam.command_undeliverable(id)?;
             Ok(true)
         }
-        Err(TransportError::Decode(error)) => {
+        Err(LinkError::Transport(TransportError::Decode(error))) => {
             tracing::warn!(%error, ?id, "unreadable reply; waiting for the log to settle it");
             settled_by_log(ctx, transport, id).await?;
             Ok(false)
         }
-        Err(error) if error.is_server_error() => {
+        Err(LinkError::Transport(error)) if error.is_server_error() => {
             let count = errors.note(id);
             if count < MAX_SERVER_ERRORS {
                 let after = ctx.config.backoff.delay(count);
@@ -1200,15 +1238,25 @@ async fn send_entry(
             }
             Ok(false)
         }
-        Err(error) if error.failed_request() => {
+        Err(LinkError::Transport(error)) if error.failed_request() => {
             let count = failures.note(id);
             let after = ctx.config.backoff.delay(count);
             tracing::debug!(%error, ?id, count, ?after, "command request failed; sending again");
             resend_after(ctx, id, after).await?;
             Ok(false)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
+}
+
+/// Whether the outbox still holds command `id` unanswered: the user has not
+/// taken it back (`Store::withdraw`), and the server has not answered it.
+fn still_pending(ctx: &LinkCtx, id: CommandId) -> Result<bool, LinkError> {
+    Ok(ctx
+        .seam
+        .pending_outbox()?
+        .iter()
+        .any(|e| e.command.id == id))
 }
 
 /// Waits `after` before the outbox command `id` is sent again, or less once
@@ -1222,12 +1270,7 @@ async fn resend_after(ctx: &LinkCtx, id: CommandId, after: Duration) -> Result<(
     loop {
         // Asked for before the look, so a change in between still wakes it.
         let changed = ctx.outbox.notified();
-        if !ctx
-            .seam
-            .pending_outbox()?
-            .iter()
-            .any(|e| e.command.id == id)
-        {
+        if !still_pending(ctx, id)? {
             return Ok(());
         }
         tokio::select! {
@@ -2668,6 +2711,8 @@ mod tests {
         put_failures: Mutex<u32>,
         /// Whether a post must find each of its images staged.
         check_staged: bool,
+        /// Runs on every PUT, after it is recorded and before it answers.
+        on_put: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl StagingServer {
@@ -2679,6 +2724,7 @@ mod tests {
                 put_answer: None,
                 put_failures: Mutex::new(0),
                 check_staged: true,
+                on_put: None,
             }
         }
 
@@ -2770,6 +2816,9 @@ mod tests {
         ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
             Box::pin(async move {
                 self.record(put_call(sha256));
+                if let Some(on_put) = &self.on_put {
+                    on_put();
+                }
                 {
                     let mut failures = self.put_failures.lock().unwrap();
                     if *failures > 0 {
@@ -3005,6 +3054,42 @@ mod tests {
 
         drain(&seam, &server).await;
         assert_eq!(server.calls(), [post_call("plain")]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// The user takes a message back while its first image uploads: the
+    /// second image is not uploaded and the message is not posted, so the
+    /// server never gets it twice (once from the outbox, once from the
+    /// edited draft). The message behind it goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_withdrawn_while_its_images_upload_is_not_posted() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let b = put_file(dir.path(), b"image b");
+        let one = enqueue_with(&seam, "one", vec![a, b]).id;
+        enqueue(&seam, "two");
+        let mut server = StagingServer::new();
+        let taker = seam.clone();
+        // Only the first PUT takes it back: a second withdraw would fail.
+        let once = std::sync::Once::new();
+        server.on_put = Some(Box::new(move || {
+            once.call_once(|| {
+                crate::client::lock(&taker.core.shared.state)
+                    .store
+                    .withdraw(one, None, None)
+                    .unwrap();
+            });
+        }));
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), post_call("two")]
+        );
         assert_eq!(
             statuses(&seam),
             [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
