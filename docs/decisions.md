@@ -245,8 +245,8 @@ and rejections, UTF-16 cursor conversion, the filter agent content goes
 through before it is shown (control characters dropped, bidi controls
 escaped visibly so an approval reads as what will run), and the
 clock-free policies:
-draft debounce, read marks, approval alerts, prompt history, completion,
-timeline search, the downloads expanded items need) lives in one crate above `skywave-core`. The TUI and the
+draft debounce, read marks, approval alerts, prompt history, the workdir
+picker, timeline search, the downloads expanded items need) lives in one crate above `skywave-core`. The TUI and the
 Flutter hub both import it; each keeps only what is purely UI (key maps,
 key hints, geometry, colours).
 - Policies never read the clock: they take `Instant` and return the actions
