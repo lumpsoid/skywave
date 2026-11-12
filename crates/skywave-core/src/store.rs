@@ -1025,6 +1025,8 @@ pub struct Snapshot {
     /// The images each session's agent draft holds, in order
     /// ([`Store::draft_images`]).
     pub draft_images: HashMap<SessionId, Vec<AttachedImage>>,
+    /// Every known image's metadata, by its sha256 ([`Store::attachments`]).
+    pub attachments: HashMap<ContentHash, AttachedImage>,
     /// Sessions whose composer does not write to the agent
     /// ([`Store::set_composer_mode`]).
     pub composer_modes: HashMap<SessionId, ComposerMode>,
@@ -1128,6 +1130,7 @@ impl Store {
             settings: self.settings()?,
             drafts: self.drafts()?,
             draft_images: self.draft_images()?,
+            attachments: self.attachments()?,
             composer_modes: self.composer_modes()?,
             read_marks: self.read_marks()?,
             deleted: read_deleted(&self.conn)?,
@@ -1711,15 +1714,17 @@ impl Store {
 
     /// Takes a command back: deletes it from the outbox if the server has
     /// not answered it or refused it (or its request), and keeps `draft` as
-    /// its session's draft in that mode, in one transaction, so a crash
-    /// keeps the text in exactly one place. An accepted command stays and
-    /// the call fails with [`StoreError::NotWithdrawable`], writing nothing.
-    /// One already sent may still reach the server
-    /// ([`OutboxEntry::discardable`]).
+    /// its session's draft in that mode. With `images`, the session's agent
+    /// draft images become these hashes, in order, too. All of it is one
+    /// transaction, so a crash keeps the text and the images in exactly one
+    /// place. An accepted command stays and the call fails with
+    /// [`StoreError::NotWithdrawable`], writing nothing. One already sent may
+    /// still reach the server ([`OutboxEntry::discardable`]).
     pub fn withdraw(
         &self,
         id: CommandId,
         draft: Option<((SessionId, ComposerMode), &Draft)>,
+        images: Option<(SessionId, &[ContentHash])>,
     ) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
@@ -1734,6 +1739,20 @@ impl Store {
         }
         if let Some((key, draft)) = draft {
             upsert_draft(&tx, key, draft)?;
+        }
+        if let Some((session_id, hashes)) = images {
+            let session = session_id.0.to_string();
+            tx.execute(
+                "DELETE FROM draft_attachments WHERE session_id = ?1 AND mode = 'agent'",
+                [&session],
+            )?;
+            for (position, hash) in hashes.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO draft_attachments (session_id, mode, position, sha256)
+                     VALUES (?1, 'agent', ?2, ?3)",
+                    params![session, u64_sql(position as u64)?, hash.to_hex()],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -2056,6 +2075,21 @@ impl Store {
         for row in rows {
             let (session_id, image) = row?;
             images.entry(session_id).or_default().push(image);
+        }
+        Ok(images)
+    }
+
+    /// Every image row, by sha256. A row outlives its draft: a queued
+    /// message names its images by hash, so the model can show them again.
+    pub fn attachments(&self) -> Result<HashMap<ContentHash, AttachedImage>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sha256, media_type, size, width, height FROM attachments")?;
+        let rows = stmt.query_map([], |row| attached_image_cols(row, 0))?;
+        let mut images = HashMap::new();
+        for row in rows {
+            let image = row?;
+            images.insert(image.sha256, image);
         }
         Ok(images)
     }
