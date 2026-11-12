@@ -91,6 +91,8 @@
 //! session's current one: the message was written for a conversation the
 //! agent has left. Then `MessageTooLong` when its text is over
 //! [`limits::MESSAGE_MAX_BYTES`]: logged verbatim or not at all, never cut.
+//! Then `UnknownAttachment` when it names any image: staging uploads is not
+//! built yet, so the server has none to name.
 //!
 //! **ClearContext.** The new context's id is the client's, so an offline
 //! device can address it before the server answers; one that is already a
@@ -420,6 +422,7 @@ impl EventLog {
                 session_id,
                 context,
                 text,
+                attachments,
             } => {
                 let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
@@ -430,9 +433,14 @@ impl EventLog {
                 if text.len() > limits::MESSAGE_MAX_BYTES {
                     return Ok(Err(RejectReason::MessageTooLong));
                 }
+                // No upload can be staged yet, so no image can be named.
+                if !attachments.is_empty() {
+                    return Ok(Err(RejectReason::UnknownAttachment));
+                }
                 let kind = EventKind::UserMessage {
                     device_id: device,
                     text: text.clone(),
+                    attachments: Vec::new(),
                 };
                 (*session_id, session.context, kind)
             }

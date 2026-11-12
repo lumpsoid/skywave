@@ -2192,6 +2192,7 @@ mod tests {
                 session_id: SessionId::new(),
                 context: skywave_proto::ContextId::first_of(SessionId::new()),
                 text: text.into(),
+                attachments: Vec::new(),
             },
         };
         crate::client::lock(&seam.core.shared.state)
@@ -2722,6 +2723,7 @@ mod tests {
                             kind: skywave_proto::EventKind::UserMessage {
                                 device_id: self.device,
                                 text: text.clone(),
+                                attachments: Vec::new(),
                             },
                         });
                         log.len() - 1
@@ -2972,6 +2974,7 @@ mod tests {
             event.kind = skywave_proto::EventKind::UserMessage {
                 device_id: DeviceId::new(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             };
             let batch = EventBatch {
                 from: Seq(2),

@@ -237,6 +237,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         session_id: f.session_id,
         context: ContextId::first_of(f.session_id),
         text: "look around".into(),
+        attachments: Vec::new(),
     }));
     session.send_message("look around".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, approval_requested).await;

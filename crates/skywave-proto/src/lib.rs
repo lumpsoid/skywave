@@ -461,6 +461,10 @@ pub enum EventKind {
     UserMessage {
         device_id: DeviceId,
         text: String,
+        /// The message's images, in the order the user attached them, each
+        /// its own blob (`BlobUse::Attachment`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     /// `text` is the whole message unless `full` is set: then it is the
     /// message's head ([`limits::MESSAGE_PREVIEW_MAX_BYTES`]) and `full`
@@ -1019,9 +1023,10 @@ impl EventKind {
     /// The blobs the event references, with what each holds: a tool call's
     /// input and the whole of its display body, a result's output, an
     /// approval's input, a finished shell run's whole output, a long
-    /// message's whole text; the same for an imported call, result or
-    /// message. A [`Full::Inline`] or [`Full::Lost`] references none. A
-    /// `BlobCropped` yields its `into`, the blob it made, with what it holds.
+    /// message's whole text, a user message's images; the same for an
+    /// imported call, result or message. A [`Full::Inline`] or
+    /// [`Full::Lost`] references none. A `BlobCropped` yields its `into`,
+    /// the blob it made, with what it holds.
     pub fn blobs(&self) -> impl Iterator<Item = (BlobUse, &BlobRef)> {
         fn full(holds: BlobUse, full: &Option<Full>) -> Option<(BlobUse, &BlobRef)> {
             full.as_ref().and_then(Full::blob).map(|b| (holds, b))
@@ -1095,7 +1100,14 @@ impl EventKind {
             // It names a blob it deleted; it references none.
             | EventKind::BlobDeleted { .. } => (None, None),
         };
-        first.into_iter().chain(second)
+        let attachments: &[Attachment] = match self {
+            EventKind::UserMessage { attachments, .. } => attachments,
+            _ => &[],
+        };
+        first
+            .into_iter()
+            .chain(second)
+            .chain(attachments.iter().map(|a| (BlobUse::Attachment, &a.blob)))
     }
 }
 
@@ -1929,11 +1941,18 @@ pub enum CommandKind {
     /// Send `text` to the agent. `context` is the session's context the
     /// message was written in; the server refuses it as `ContextChanged`
     /// when that is no longer the current one, and as `MessageTooLong` when
-    /// `text` is over [`limits::MESSAGE_MAX_BYTES`].
+    /// `text` is over [`limits::MESSAGE_MAX_BYTES`]. `attachments` are
+    /// images the device staged beforehand; the server refuses an image it
+    /// has none staged for as `UnknownAttachment`.
     SendMessage {
         session_id: SessionId,
         context: ContextId,
         text: String,
+        /// The sha256 of each image to attach, in order, each staged
+        /// beforehand with `PUT` [`path::ATTACHMENT_ROUTE`]; the server
+        /// refuses one it has none staged for as `UnknownAttachment`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ContentHash>,
     },
     /// Answer an approval. `rule` grants the request's suggestion with
     /// that index along with an approval; the server refuses it with a
@@ -3076,6 +3095,44 @@ mod tests {
         // A whole or lost message references none.
         assert_eq!(agent(None).blobs().count(), 0);
         assert_eq!(agent(Some(Full::Lost)).blobs().count(), 0);
+        // A user message yields its images, in order, each as an attachment.
+        let (a, b) = (
+            Attachment {
+                blob: BlobRef {
+                    id: BlobId::new(),
+                    size: 4,
+                    sha256: ContentHash::of(b"png1"),
+                },
+                media_type: ImageType::Png,
+            },
+            Attachment {
+                blob: BlobRef {
+                    id: BlobId::new(),
+                    size: 4,
+                    sha256: ContentHash::of(b"jpg2"),
+                },
+                media_type: ImageType::Jpeg,
+            },
+        );
+        let with_images = EventKind::UserMessage {
+            device_id: DeviceId::new(),
+            text: "look".into(),
+            attachments: vec![a.clone(), b.clone()],
+        };
+        let uses: Vec<_> = with_images.blobs().collect();
+        assert_eq!(
+            uses,
+            [
+                (BlobUse::Attachment, &a.blob),
+                (BlobUse::Attachment, &b.blob)
+            ]
+        );
+        let text_only = EventKind::UserMessage {
+            device_id: DeviceId::new(),
+            text: "look".into(),
+            attachments: Vec::new(),
+        };
+        assert_eq!(text_only.blobs().count(), 0);
     }
 
     #[test]
@@ -3090,6 +3147,7 @@ mod tests {
         let message = EventKind::UserMessage {
             device_id: by,
             text: "back".into(),
+            attachments: Vec::new(),
         };
         assert_eq!(message.archived_effect(), Some(false));
         for kind in [

@@ -746,6 +746,7 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
             session_id: SessionId::new(),
             context: ContextId::first_of(SessionId::new()),
             text: "hi".into(),
+            attachments: Vec::new(),
         },
     };
     let rejected = CommandResult::Rejected {
@@ -766,6 +767,7 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
             session_id: session,
             context: ContextId::first_of(session),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     };
     assert_eq!(
@@ -2222,6 +2224,7 @@ async fn a_crop_is_taken_while_the_disk_is_low_or_the_server_stops() {
             session_id: session,
             context: ContextId::first_of(session),
             text: text.into(),
+            attachments: Vec::new(),
         },
     };
 
