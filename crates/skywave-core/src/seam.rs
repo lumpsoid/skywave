@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
@@ -19,7 +19,8 @@ use skywave_proto::{
 };
 
 use crate::address::ServerAddress;
-use crate::blobs::{remove_all_blob_files, remove_blob_files};
+use crate::attachment::attachment_path;
+use crate::blobs::{blob_dir, remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
 use crate::projection::BlobFate;
@@ -326,7 +327,7 @@ impl Seam {
         let now = Utc::now();
         let data_dir = self.data_dir();
         self.update(|state, requests| {
-            let applied = state.store.apply_batch(batch, now)?;
+            let mut applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
             for (id, seq) in &applied.settled {
@@ -341,6 +342,8 @@ impl Seam {
                 state.model.session_loaded(id, events);
             }
             mark_alerted(state, &alerted);
+            // After the model took the batch: it registers the blobs there.
+            own_images_available(state, &data_dir, &mut applied)?;
             for blob in &applied.purged {
                 remove_blob_files(&data_dir, *blob);
             }
@@ -889,6 +892,51 @@ fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
     if let Err(error) = state.store.mark_alerted(approvals) {
         tracing::warn!(%error, "cannot store alerted approvals");
     }
+}
+
+/// Makes the device's own message images available from their local files,
+/// rather than downloading them: each blob the batch registered whose hash
+/// is an attachment here. Those are taken out of `applied.blobs`, so the
+/// engine does not queue them. A blob whose file cannot be had stays as it
+/// is and downloads as normal.
+fn own_images_available(
+    state: &mut State,
+    data_dir: &Path,
+    applied: &mut Applied,
+) -> Result<(), CoreError> {
+    for (id, sha256) in state.store.own_images(&applied.blobs)? {
+        let path = match own_image_file(data_dir, id, sha256) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::debug!(?id, %error, "cannot use the local image; it downloads");
+                continue;
+            }
+        };
+        let status = BlobStatus::Available { path };
+        state.store.set_blob_status(id, &status)?;
+        state.model.blob_status(id, status);
+        applied.blobs.retain(|blob| *blob != id);
+    }
+    Ok(())
+}
+
+/// Puts the attachment `sha256` at the blob file of `id`: a hard link, or a
+/// copy where linking fails. A file already at that path is replaced, as it
+/// is no proof of the content.
+fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<PathBuf> {
+    let dir = blob_dir(data_dir);
+    std::fs::create_dir_all(&dir)?;
+    let dst = dir.join(id.0.to_string());
+    match std::fs::remove_file(&dst) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let src = attachment_path(data_dir, sha256);
+    if std::fs::hard_link(&src, &dst).is_err() {
+        std::fs::copy(&src, &dst)?;
+    }
+    Ok(dst)
 }
 
 #[cfg(test)]

@@ -1934,6 +1934,27 @@ impl Store {
         Ok(())
     }
 
+    /// Of these blobs, the ones not downloaded yet whose content is an image
+    /// this device attached (its hash is an `attachments` row), with that
+    /// image's hash: their bytes are on this device already.
+    pub fn own_images(&self, ids: &[BlobId]) -> Result<Vec<(BlobId, ContentHash)>, StoreError> {
+        let ids: Vec<String> = ids.iter().map(|id| id.0.to_string()).collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, h.sha256 FROM blobs b
+                JOIN blob_hashes h ON h.blob_id = b.id
+                JOIN attachments a ON a.sha256 = h.sha256
+             WHERE b.state = 'not_downloaded' AND b.id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = stmt.query_map([to_json(&ids)?], |row| {
+            let sha256: String = row.get(1)?;
+            Ok((
+                BlobId(uuid_col(row, 0)?),
+                sha256.parse().map_err(|e| bad_value(1, Type::Text, e))?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     // ---- workdir answers ------------------------------------------------------
 
     /// Keeps `answer` as the latest to `ask`, in one transaction: it replaces
