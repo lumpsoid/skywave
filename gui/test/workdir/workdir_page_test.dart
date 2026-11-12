@@ -16,6 +16,7 @@ void main() {
     String? wording,
     List<String> notes = const [],
     List<WorkdirChangeRow> changes = const [],
+    List<WorkdirCommitRow> commits = const [],
     bool canGoUp = false,
     List<WorkdirEntryRow> entries = const [],
     WorkdirContent? content,
@@ -32,6 +33,7 @@ void main() {
     wording: wording,
     notes: notes,
     changes: changes,
+    commits: commits,
     canGoUp: canGoUp,
     entries: entries,
     content: content,
@@ -100,6 +102,7 @@ void main() {
     await tester.tap(find.byKey(const Key('workdir-tab-files')));
     // Already on the changes: nothing to show again.
     await tester.tap(find.byKey(const Key('workdir-tab-changes')));
+    await tester.tap(find.byKey(const Key('workdir-tab-commits')));
     await tester.tap(find.byTooltip('Refresh'));
     await tester.tap(find.byType(BackButton));
     expect(sent, [
@@ -117,8 +120,73 @@ void main() {
           untracked: false,
         ),
       ),
+      const GuiIntentAct(
+        action: ActionIntentShowWorkdir(
+          pane: WorkdirPaneKind.commits,
+          path: '',
+          untracked: false,
+        ),
+      ),
       const GuiIntentAct(action: ActionIntentRefreshWorkdir()),
       const GuiIntentAct(action: ActionIntentBack()),
+    ]);
+  });
+
+  testWidgets('the commits list their commits', (tester) async {
+    final sent = await pump(
+      tester,
+      screen(
+        pane: WorkdirPaneKind.commits,
+        header: 'main · taken 12:00:00',
+        notes: ['Showing the newest 2 commits.'],
+        commits: const [
+          WorkdirCommitRow(
+            short: 'a1b2c3d',
+            subject: 'Add the log',
+            author: 'Ada',
+            timeLabel: '3 h ago',
+          ),
+          WorkdirCommitRow(short: 'e4f5a6b', subject: 'First', author: 'Zoë'),
+        ],
+      ),
+    );
+    for (final text in [
+      'a1b2c3d',
+      'Add the log',
+      'Ada · 3 h ago',
+      'e4f5a6b',
+      'First',
+      'Zoë',
+      'Showing the newest 2 commits.',
+    ]) {
+      expect(find.text(text), findsOneWidget, reason: text);
+    }
+    bool selected(String key) =>
+        tester.widget<ChoiceChip>(find.byKey(Key(key))).selected;
+    expect(selected('workdir-tab-commits'), isTrue);
+    expect(selected('workdir-tab-files'), isFalse);
+    expect(selected('workdir-tab-changes'), isFalse);
+
+    // A commit opens nothing; the chips move the pane as the others do.
+    await tester.tap(find.text('Add the log'));
+    await tester.tap(find.byKey(const Key('workdir-tab-commits')));
+    await tester.tap(find.byKey(const Key('workdir-tab-changes')));
+    await tester.tap(find.byKey(const Key('workdir-tab-files')));
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentShowWorkdir(
+          pane: WorkdirPaneKind.changes,
+          path: '',
+          untracked: false,
+        ),
+      ),
+      const GuiIntentAct(
+        action: ActionIntentShowWorkdir(
+          pane: WorkdirPaneKind.dir,
+          path: 'src',
+          untracked: false,
+        ),
+      ),
     ]);
   });
 

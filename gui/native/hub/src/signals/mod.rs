@@ -59,6 +59,6 @@ pub use timeline::{
     SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
 };
 pub use workdir::{
-    WorkdirChangeKind, WorkdirChangeRow, WorkdirContent, WorkdirEntryRow, WorkdirLine,
-    WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
+    WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent, WorkdirEntryRow,
+    WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
 };

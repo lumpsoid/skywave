@@ -15,13 +15,15 @@ use skywave_core::{
 use skywave_present::format::bytes;
 use skywave_present::workdir::{
     DiffLine, NOT_FETCHED, change_label, change_mark, changes_capped, changes_wording,
-    counts_label, diff_lines, diff_wording, entry_detail, entry_name, fetch_label, file_wording,
-    head_label, list_truncated, list_wording, sorted_entries, taken_label,
+    commit_time_label, counts_label, diff_lines, diff_wording, entry_detail, entry_name,
+    fetch_label, file_wording, head_label, list_truncated, list_wording, log_capped, log_label,
+    log_wording, sorted_entries, taken_label,
 };
+use skywave_proto::LogResult;
 
 use crate::signals::{
-    ScreenView, WorkdirChangeKind, WorkdirChangeRow, WorkdirContent, WorkdirEntryRow, WorkdirLine,
-    WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
+    ScreenView, WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent,
+    WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
 };
 use skywave_present::text::clean_line;
 
@@ -141,8 +143,7 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
     let now = DateTime::from_timestamp_millis(wall_ms).unwrap_or_default();
     let (pane, path) = match &view.pane {
         WorkdirPane::Changes => (WorkdirPaneKind::Changes, String::new()),
-        // Until the hub has a commits pane kind; nothing shows this pane yet.
-        WorkdirPane::Commits => (WorkdirPaneKind::Changes, String::new()),
+        WorkdirPane::Commits => (WorkdirPaneKind::Commits, String::new()),
         WorkdirPane::Diff { path, .. } => (WorkdirPaneKind::Diff, path.clone()),
         WorkdirPane::Dir { path } => (WorkdirPaneKind::Dir, path.clone()),
         WorkdirPane::File { path } => (WorkdirPaneKind::File, path.clone()),
@@ -153,13 +154,14 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
             (view.fetch != WorkdirFetch::Loading).then(|| NOT_FETCHED.to_owned())
         }
         WorkdirBody::Changes(result) => changes_wording(result),
-        WorkdirBody::Log(_) => None,
+        WorkdirBody::Log(result) => log_wording(result),
         WorkdirBody::Diff { file, .. } => diff_wording(file.as_ref()),
         WorkdirBody::Dir(result) => list_wording(result),
         WorkdirBody::File { result, .. } => file_wording(result),
     };
     let notes = match &view.body {
         WorkdirBody::Changes(ChangesResult::Changes(set)) => changes_capped(set),
+        WorkdirBody::Log(LogResult::Log(log)) => log_capped(log),
         WorkdirBody::Dir(result) => list_truncated(result),
         _ => None,
     };
@@ -167,6 +169,19 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
         WorkdirBody::Changes(ChangesResult::Changes(set)) => {
             set.files.iter().map(change_row).collect()
         }
+        _ => Vec::new(),
+    };
+    let commits = match &view.body {
+        WorkdirBody::Log(LogResult::Log(log)) => log
+            .commits
+            .iter()
+            .map(|commit| WorkdirCommitRow {
+                short: clean_line(&commit.short),
+                subject: clean_line(&commit.subject),
+                author: clean_line(&commit.author),
+                time_label: commit_time_label(commit, now),
+            })
+            .collect(),
         _ => Vec::new(),
     };
     let entries = match &view.body {
@@ -218,6 +233,7 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
             wording,
             notes: notes.into_iter().collect(),
             changes,
+            commits,
             entries,
             content,
         },
@@ -231,7 +247,10 @@ fn header(view: &WorkdirView, now: DateTime<Utc>) -> String {
             (head_label(set), Some(set.at))
         }
         (WorkdirPane::Changes, _) => ("Changes".to_owned(), None),
-        (WorkdirPane::Commits, _) => ("Changes".to_owned(), None),
+        (WorkdirPane::Commits, WorkdirBody::Log(LogResult::Log(log))) => {
+            (log_label(log), Some(log.at))
+        }
+        (WorkdirPane::Commits, _) => ("Commits".to_owned(), None),
         (WorkdirPane::Diff { path, untracked }, body) => {
             let file = match body {
                 WorkdirBody::Diff { file, .. } => file.as_ref(),
