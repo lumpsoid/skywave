@@ -327,6 +327,7 @@ impl SessionSummary {
             | EventKind::TurnInterrupted
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::PermissionModeChanged { .. }
             | EventKind::PermissionModeRefused { .. }
@@ -418,6 +419,7 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
+        | EventKind::WorktreeRemoved { .. }
         | EventKind::TurnUsage(_)
         | EventKind::SubagentUsage(_)
         | EventKind::PermissionModeRequested { .. }

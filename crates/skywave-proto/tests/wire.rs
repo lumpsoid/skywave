@@ -368,6 +368,7 @@ fn all_event_kinds() -> Vec<EventKind> {
             archived: false,
             by: device(),
         },
+        EventKind::WorktreeRemoved { by: device() },
         EventKind::SessionStateChanged(SessionState::Idle),
         EventKind::SessionStateChanged(SessionState::AgentWorking),
         EventKind::SessionStateChanged(SessionState::Errored {
@@ -930,6 +931,9 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             archived: false,
         },
+        CommandKind::RemoveWorktree {
+            session_id: session(),
+        },
         CommandKind::SetPermissionMode {
             session_id: session(),
             mode: PermissionMode::AcceptEdits,
@@ -996,6 +1000,10 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::NotARepository,
             RejectReason::BranchExists,
             RejectReason::WorktreeFailed,
+            RejectReason::NotAWorktree,
+            RejectReason::WorktreeDirty,
+            RejectReason::BranchUnmerged,
+            RejectReason::TurnRunning,
             RejectReason::UnknownSession,
             RejectReason::UnknownApproval,
             RejectReason::ApprovalAlreadyResolved,

@@ -3667,6 +3667,8 @@ impl Model {
                     archived: *archived,
                     by: self.device_ref(*by),
                 }),
+                // No timeline entry yet.
+                EventKind::WorktreeRemoved { .. } => None,
                 // Calls a turn leaves open stay running until the server
                 // logs them unanswered.
                 EventKind::SessionStateChanged(state) => match state {
@@ -4487,6 +4489,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::StopSession { session_id }
         | CommandKind::RenameSession { session_id, .. }
         | CommandKind::SetSessionArchived { session_id, .. }
+        | CommandKind::RemoveWorktree { session_id }
         | CommandKind::SetPermissionMode { session_id, .. }
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }

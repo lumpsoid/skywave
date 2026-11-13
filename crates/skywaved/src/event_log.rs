@@ -457,6 +457,7 @@ impl EventLog {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
@@ -961,6 +962,7 @@ pub(crate) fn append_in(
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
+        | EventKind::WorktreeRemoved { .. }
         | EventKind::TurnUsage(_)
         | EventKind::SubagentUsage(_)
         | EventKind::ModelsOffered { .. }
@@ -1454,6 +1456,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::SessionStopped => "SessionStopped",
         EventKind::SessionRenamed { .. } => "SessionRenamed",
         EventKind::SessionArchived { .. } => "SessionArchived",
+        EventKind::WorktreeRemoved { .. } => "WorktreeRemoved",
         EventKind::SessionStateChanged(_) => "SessionStateChanged",
         EventKind::TurnUsage(_) => "TurnUsage",
         EventKind::SubagentUsage(_) => "SubagentUsage",
