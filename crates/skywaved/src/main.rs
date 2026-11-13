@@ -22,6 +22,7 @@ use skywaved::logging::LogFile;
 use skywaved::pairing;
 use skywaved::server::{Server, ServerOptions};
 use skywaved::shell::ShellRunner;
+use skywaved::workdir::Git;
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig};
 
 #[derive(Parser)]
@@ -337,6 +338,8 @@ async fn serve(
     .await?;
     // Before the supervisor, shell runner and API can write blobs.
     storage.collect_blobs()?;
+    // Before the API can create worktrees: undoes any a crash left.
+    storage.sweep_worktrees(&Git::default())?;
     let adapter = ClaudeCodeAdapter::new(config.agent.clone());
     let mut supervisor = Supervisor::start(
         adapter,

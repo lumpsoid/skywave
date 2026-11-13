@@ -56,6 +56,7 @@ use crate::db::Db;
 use crate::disk::Disk;
 use crate::error::{Error, Result};
 use crate::storage;
+use crate::worktree;
 
 /// Batch size used when `GET /v1/events` names no `limit`.
 pub const DEFAULT_BATCH_LIMIT: u32 = 500;
@@ -692,6 +693,19 @@ impl EventLog {
         worktree_removed_in(db.conn(), id)
     }
 
+    /// Whether a session in `workdir` has work the supervisor has not seen
+    /// through: a running turn, a message handed to its agent whose turn has
+    /// not started, or a message the supervisor has not handled yet.
+    pub fn workdir_turn_busy(&self, db: &Db, workdir: &str) -> Result<bool> {
+        workdir_turn_busy_in(db.conn(), workdir)
+    }
+
+    /// Whether a session in `workdir` has a shell command queued or running
+    /// (a `RunShell` with no `ShellFinished` yet).
+    pub fn workdir_shell_busy(&self, db: &Db, workdir: &str) -> Result<bool> {
+        workdir_shell_busy_in(db.conn(), workdir)
+    }
+
     /// Every session, oldest first.
     pub fn sessions(&self, db: &Db) -> Result<Vec<SessionInfo>> {
         let mut stmt = db.conn().prepare_cached(
@@ -1100,6 +1114,37 @@ const WORKTREE_SQL: &str = "SELECT kind FROM events WHERE session_id = ?1
 const WORKTREE_REMOVED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM events
      WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'worktree_removed')";
 
+/// Whether the newest worktree made at `workdir` was removed: the
+/// directory is gone for every session there, until a worktree is made at that
+/// path again.
+const WORKDIR_WORKTREE_REMOVED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM events
+     WHERE session_id = (
+         SELECT c.session_id FROM events c JOIN sessions s ON s.id = c.session_id
+         WHERE s.workdir = ?1
+           AND json_extract(c.kind, '$.type') = 'session_created'
+           AND json_extract(c.kind, '$.worktree') IS NOT NULL
+         ORDER BY c.seq DESC LIMIT 1)
+       AND json_extract(kind, '$.type') = 'worktree_removed')";
+
+/// [`EventLog::workdir_turn_busy`]: a session in the directory that runs a
+/// turn, has a message handed to its agent (`supervisor_owed`), or has a
+/// `UserMessage` past its supervisor's position: the held seq if the session
+/// is held, else the cursor.
+const WORKDIR_TURN_BUSY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM sessions s
+     WHERE s.workdir = ?1 AND (s.turn_active = 1
+       OR EXISTS (SELECT 1 FROM supervisor_owed o WHERE o.session_id = s.id)
+       OR EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.id
+             AND json_extract(e.kind, '$.type') = 'user_message'
+             AND e.seq > COALESCE(
+                 (SELECT h.seq FROM supervisor_held h WHERE h.session_id = s.id),
+                 (SELECT c.seq FROM supervisor_cursor c WHERE c.id = 1)))))";
+
+/// [`EventLog::workdir_shell_busy`]: a shell run of a session in the
+/// directory with no `ShellFinished`, queued or running.
+const WORKDIR_SHELL_BUSY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM shell_runs r
+     JOIN sessions s ON s.id = r.session_id
+     WHERE s.workdir = ?1 AND r.finished_seq IS NULL)";
+
 /// The context of the session's newest `BackgroundTasksChanged` or
 /// `SchedulesChanged`.
 pub(crate) fn last_work_context_in(
@@ -1295,6 +1340,97 @@ pub(crate) fn worktree_removed_in(conn: &Connection, id: SessionId) -> Result<bo
         .prepare_cached(WORKTREE_REMOVED_SQL)?
         .query_row([id.0.to_string()], |r| r.get(0))?;
     Ok(removed)
+}
+
+/// [`WORKDIR_WORKTREE_REMOVED_SQL`]: whether the newest worktree made at
+/// `workdir` (a session's `workdir`) has a `WorktreeRemoved`.
+pub(crate) fn workdir_worktree_removed_in(conn: &Connection, workdir: &str) -> Result<bool> {
+    let removed = conn
+        .prepare_cached(WORKDIR_WORKTREE_REMOVED_SQL)?
+        .query_row([workdir], |r| r.get(0))?;
+    Ok(removed)
+}
+
+/// [`EventLog::workdir_turn_busy`]: whether any session in `workdir` has
+/// [`WORKDIR_TURN_BUSY_SQL`]'s work queued or running.
+pub(crate) fn workdir_turn_busy_in(conn: &Connection, workdir: &str) -> Result<bool> {
+    let busy = conn
+        .prepare_cached(WORKDIR_TURN_BUSY_SQL)?
+        .query_row([workdir], |r| r.get(0))?;
+    Ok(busy)
+}
+
+/// [`EventLog::workdir_shell_busy`]: whether any session in `workdir` has a
+/// shell run with no `ShellFinished`.
+pub(crate) fn workdir_shell_busy_in(conn: &Connection, workdir: &str) -> Result<bool> {
+    let busy = conn
+        .prepare_cached(WORKDIR_SHELL_BUSY_SQL)?
+        .query_row([workdir], |r| r.get(0))?;
+    Ok(busy)
+}
+
+/// Records `intent`, a worktree [`worktree::create`] is about to add, for
+/// `command`. The create holds [`worktree`]'s lock, so a row with the same
+/// repository and branch is one whose branch is gone: replaced, and its
+/// attempt's later [`forget_worktree_intent_in`] then matches nothing.
+pub(crate) fn record_worktree_intent_in(
+    conn: &Connection,
+    intent: &worktree::Intent,
+    command: CommandId,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO worktree_intents
+             (repo, branch, target, start, command, attempt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            intent.repo,
+            intent.branch,
+            intent.target,
+            intent.start,
+            command.0.to_string(),
+            intent.attempt,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Deletes the intent row of `branch` in `repo` if `attempt` wrote it. A row
+/// a later attempt has replaced is that attempt's, and is kept.
+pub(crate) fn forget_worktree_intent_in(
+    conn: &Connection,
+    repo: &str,
+    branch: &str,
+    attempt: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM worktree_intents WHERE repo = ?1 AND branch = ?2 AND attempt = ?3",
+        params![repo, branch, attempt],
+    )?;
+    Ok(())
+}
+
+/// Every worktree intent row, with the command that recorded it, for the
+/// startup sweep.
+pub(crate) fn worktree_intents_in(conn: &Connection) -> Result<Vec<(worktree::Intent, CommandId)>> {
+    let mut stmt = conn.prepare(
+        "SELECT repo, branch, target, start, command, attempt FROM worktree_intents
+         ORDER BY repo, branch",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let intent = worktree::Intent {
+            repo: r.get(0)?,
+            branch: r.get(1)?,
+            target: r.get(2)?,
+            start: r.get(3)?,
+            attempt: r.get(5)?,
+        };
+        Ok((intent, r.get::<_, String>(4)?))
+    })?;
+    rows.map(|row| {
+        let (intent, command) = row?;
+        Ok((intent, parse_id(&command)?))
+    })
+    .collect()
 }
 
 /// The session's newest `SessionStateChanged` or `TurnInterrupted`, with
@@ -1777,5 +1913,38 @@ mod tests {
         let (s_steps, _) = steps(&short, old, &[s_session.0.to_string()]);
         let (l_steps, _) = steps(&long, old, &[l_session.0.to_string()]);
         assert!(l_steps > s_steps * 100, "{s_steps} then {l_steps}");
+    }
+
+    /// A row another attempt replaced is that attempt's: forgetting with the
+    /// first attempt's token keeps it, and only the replacing attempt's removes
+    /// it. Both attempts are one command's (a resend's), so the command cannot
+    /// tell them apart.
+    #[test]
+    fn a_replaced_worktree_intent_is_forgotten_only_by_its_own_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        let conn = db.conn();
+        let intent = |attempt: &str| worktree::Intent {
+            repo: "/r".into(),
+            branch: "feat/x".into(),
+            target: "/r.worktrees/feat/x".into(),
+            start: "abc".into(),
+            attempt: attempt.into(),
+        };
+        let rows = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM worktree_intents", [], |r| r.get(0))
+                .unwrap()
+        };
+        let command = CommandId::new();
+        let (a, b) = (intent("a"), intent("b"));
+        record_worktree_intent_in(conn, &a, command).unwrap();
+        // Positive control: A's row is there to be forgotten.
+        assert_eq!(rows(), 1);
+        // The resend's attempt records the same repository and branch, replacing A's row.
+        record_worktree_intent_in(conn, &b, command).unwrap();
+        forget_worktree_intent_in(conn, &a.repo, &a.branch, &a.attempt).unwrap();
+        assert_eq!(rows(), 1, "A's late forget removed B's row");
+        forget_worktree_intent_in(conn, &b.repo, &b.branch, &b.attempt).unwrap();
+        assert_eq!(rows(), 0);
     }
 }

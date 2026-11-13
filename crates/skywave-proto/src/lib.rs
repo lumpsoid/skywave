@@ -186,7 +186,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `CommandKind::RemoveWorktree` and `EventKind::WorktreeRemoved`, with the
 /// `RejectReason`s `NotAWorktree`, `WorktreeDirty`, `BranchUnmerged` and
 /// `TurnRunning`.
-pub const PROTOCOL_VERSION: u32 = 32;
+///
+/// v33: the `RejectReason` `ShellRunning`, for a `RemoveWorktree` while a
+/// shell command runs or waits in the worktree.
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2305,6 +2308,9 @@ pub enum RejectReason {
     BranchUnmerged,
     /// `RemoveWorktree` while the session's agent is running a turn.
     TurnRunning,
+    /// `RemoveWorktree` while a shell command runs, or waits to run, in the
+    /// worktree's directory.
+    ShellRunning,
     UnknownSession,
     UnknownApproval,
     /// Another answer already won (D5).

@@ -42,6 +42,20 @@ pub struct Created {
     pub branch: String,
 }
 
+/// A worktree `create` is about to add, recorded before git runs so a
+/// crash before its session is logged leaves a trace to undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Intent {
+    pub repo: String,
+    pub branch: String,
+    pub target: String,
+    /// The commit the new branch starts at.
+    pub start: String,
+    /// The token of the preparation that made this intent: a resend's
+    /// preparation has its own, so one attempt's undo never drops another's row.
+    pub attempt: String,
+}
+
 /// How long git may take to create or discard a worktree; git is killed past it.
 pub const WORKTREE_DEADLINE: Duration = Duration::from_secs(20);
 
@@ -58,12 +72,20 @@ static CREATING: Mutex<()> = Mutex::new(());
 /// at the workdir's `HEAD`. Refusals: `WorkdirNotAllowed` or
 /// `WorkdirNotFound` from the roots check, `NotARepository`, `BranchExists`;
 /// anything else that stops the create is `WorktreeFailed`.
+///
+/// `record` gets the [`Intent`] once the checks pass and before git adds
+/// anything; its refusal is the create's, and git does not run. A branch
+/// that already exists is refused before `record`, so an intent never names
+/// a branch or target this create did not make. `attempt` is the caller's
+/// token for this preparation, carried into the intent.
 pub fn create(
     git: &Git,
     roots: &[PathBuf],
     workdir: &str,
     branch: &str,
     deadline: Instant,
+    attempt: &str,
+    record: impl FnOnce(&Intent) -> Result<(), RejectReason>,
 ) -> Result<Created, RejectReason> {
     let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     check_name(branch)?;
@@ -80,6 +102,13 @@ pub fn create(
         return Err(RejectReason::WorktreeFailed);
     }
     let head = head_of(git, Path::new(&workdir), deadline)?;
+    record(&Intent {
+        repo: repo_text.clone(),
+        branch: branch.to_owned(),
+        target: target_text.clone(),
+        start: head.clone(),
+        attempt: attempt.to_owned(),
+    })?;
     let add = [
         "worktree",
         "add",
@@ -230,6 +259,39 @@ fn is_registered(
     Ok(out.lines().any(|line| line == wanted))
 }
 
+/// Whether `repo` has a worktree at `path` that an add of `branch` registered:
+/// one block of `git worktree list --porcelain` (blocks are blank-line
+/// separated, one per worktree) has the `worktree <path>` line and either the
+/// `branch` line or an all-zero `HEAD` line. The zero HEAD is an add killed
+/// after it registered the worktree but before it wrote the branch into HEAD;
+/// such a block lists no branch at all.
+fn registered_as_ours(
+    git: &Git,
+    repo: &Path,
+    path: &str,
+    branch: &str,
+    deadline: Instant,
+) -> Result<bool, RejectReason> {
+    let done = run(git, repo, deadline, &["worktree", "list", "--porcelain"])?;
+    if !done.status.success() {
+        let stderr = String::from_utf8_lossy(&done.stderr);
+        tracing::warn!(stderr = %stderr.trim_end(), "git worktree list failed");
+        return Err(RejectReason::WorktreeFailed);
+    }
+    let wanted_path = format!("worktree {path}");
+    let wanted_branch = format!("branch refs/heads/{branch}");
+    let out = String::from_utf8_lossy(&done.out);
+    Ok(out.split("\n\n").any(|block| {
+        let lines: Vec<&str> = block.lines().collect();
+        let null_head = lines.iter().any(|line| {
+            line.strip_prefix("HEAD ")
+                .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|b| b == b'0'))
+        });
+        lines.contains(&wanted_path.as_str())
+            && (lines.contains(&wanted_branch.as_str()) || null_head)
+    }))
+}
+
 /// `rev` (a branch or a commit) is merged into `repo`'s `HEAD`: `git
 /// merge-base --is-ancestor` exits 0 for that and 1 for not. Any other exit is
 /// a failure.
@@ -278,6 +340,9 @@ fn check_clean(git: &Git, path: &Path, deadline: Instant) -> Result<(), RejectRe
 pub struct Prepared {
     git: Git,
     result: Result<Created, RejectReason>,
+    /// The intent [`create`] recorded, if it got that far. Its row is the
+    /// caller's to delete once the command is not committed.
+    intent: Option<Intent>,
     /// Set once apply has checked the worktree and logs its session.
     logged: bool,
     /// Set by [`Prepared::kept`] when `logged`.
@@ -285,10 +350,15 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    pub(crate) fn new(git: Git, result: Result<Created, RejectReason>) -> Prepared {
+    pub(crate) fn new(
+        git: Git,
+        result: Result<Created, RejectReason>,
+        intent: Option<Intent>,
+    ) -> Prepared {
         Prepared {
             git,
             result,
+            intent,
             logged: false,
             kept: false,
         }
@@ -297,6 +367,11 @@ impl Prepared {
     /// The worktree, or the refusal it came to.
     pub(crate) fn created(&self) -> Result<Created, RejectReason> {
         self.result.clone()
+    }
+
+    /// The intent [`create`] recorded for this worktree, if any.
+    pub(crate) fn intent(&self) -> Option<Intent> {
+        self.intent.clone()
     }
 
     /// Marks the worktree as one apply logs a session for.
@@ -398,6 +473,24 @@ fn branch_exists(
     Ok(run(git, repo, deadline, &args)?.status.success())
 }
 
+/// The commit `branch` names in `repo`, or `None` when there is no such
+/// branch. A run that gave no answer is an error.
+fn branch_tip(
+    git: &Git,
+    repo: &Path,
+    branch: &str,
+    deadline: Instant,
+) -> Result<Option<String>, RejectReason> {
+    let full = format!("refs/heads/{branch}^{{commit}}");
+    let args = ["rev-parse", "--verify", "--quiet", full.as_str()];
+    let done = run(git, repo, deadline, &args)?;
+    if !done.status.success() {
+        return Ok(None);
+    }
+    let printed = String::from_utf8_lossy(&done.out);
+    Ok(Some(printed.trim_end().to_owned()))
+}
+
 /// Whether every directory from `worktrees` down to `target`, the target
 /// itself excluded, that exists is a real directory. `symlink_metadata` does
 /// not follow a link, so a symlink or a file in the way is refused: git would
@@ -430,11 +523,48 @@ fn head_of(git: &Git, dir: &Path, deadline: Instant) -> Result<String, RejectRea
     Ok(printed.trim_end().to_owned())
 }
 
+/// Deletes what a killed `git worktree add` leaves at `target` once git has
+/// had its turn: a real directory holding nothing but a `.git` file, or
+/// nothing at all. Git refuses to remove such a directory because it is not a
+/// registered worktree, so the caller cannot leave it to `git worktree remove`.
+/// Any other entry is the user's: the directory is kept with a warning.
+fn remove_half_made(target: &Path, branch: &str) {
+    if !fs::symlink_metadata(target).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
+    let git_file = target.join(".git");
+    let listed = fs::read_dir(target).and_then(|dir| {
+        dir.map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()
+    });
+    let only_git = listed.is_ok_and(|names| names.iter().all(|name| name == OsStr::new(".git")));
+    let git_is_file = match fs::symlink_metadata(&git_file) {
+        Ok(meta) => meta.is_file(),
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+    };
+    if !only_git || !git_is_file {
+        tracing::warn!(branch = %branch, dir = %target.display(), "a failed worktree add left a directory with files; keeping it");
+        return;
+    }
+    let deleted = match fs::remove_file(&git_file) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => fs::remove_dir(target),
+    };
+    if let Err(e) = deleted {
+        tracing::warn!(branch = %branch, dir = %target.display(), error = %e, "cannot delete a failed worktree add's directory");
+    }
+}
+
 /// Undoes a `git worktree add` that did not succeed: git may have made the
 /// branch, the target or both before it failed or was killed. Under
 /// [`CREATING`] neither existed before the add, so what exists now is this
 /// create's, and nothing else is touched. Its own deadline: the create's may
 /// be spent.
+///
+/// A killed add can leave the target as a plain directory that git never
+/// registered, which `git worktree remove` refuses. [`remove_half_made`]
+/// deletes it, but only when it holds nothing but a `.git` file. A lock the
+/// killed add left is why the remove is given `--force` twice.
 fn undo_failed_add(git: &Git, repo: &Path, branch: &str, target: &str) {
     let deadline = Instant::now() + WORKTREE_DEADLINE;
     let target_made = fs::symlink_metadata(target).is_ok();
@@ -443,7 +573,7 @@ fn undo_failed_add(git: &Git, repo: &Path, branch: &str, target: &str) {
         return;
     }
     if target_made {
-        let remove = ["worktree", "remove", "--force", target];
+        let remove = ["worktree", "remove", "--force", "--force", target];
         succeeded(
             git,
             repo,
@@ -462,9 +592,66 @@ fn undo_failed_add(git: &Git, repo: &Path, branch: &str, target: &str) {
         branch,
         "git worktree prune failed",
     );
+    if fs::symlink_metadata(target).is_ok() {
+        remove_half_made(Path::new(target), branch);
+    }
     if branch_made {
         let delete = ["branch", "-D", branch];
         succeeded(git, repo, deadline, &delete, branch, "git branch -D failed");
+    }
+}
+
+/// Undoes what a crash left of a worktree [`create`] made for a session that
+/// was never committed: its branch and its worktree, or a half-made directory.
+/// The intent is recorded before `git worktree add`, so the row can name a
+/// worktree the crash left; it can also be stale, when the create was refused
+/// or a later step dropped its request. So each step runs only while git still
+/// matches the intent. A branch whose tip is no longer its start has been
+/// committed on since the crash, and both it and its worktree are kept. The
+/// branch is deleted only when this sweep can show the target was its own: a
+/// worktree an add of the branch registered ([`registered_as_ours`]), or a
+/// half-made directory that [`remove_half_made`] deleted. A branch at its start
+/// with no such target is kept, as a user's `git branch` looks the same. Git
+/// failures are logged, not returned: startup goes on. No `git worktree prune`
+/// runs: it would also drop the user's worktrees whose directories are missing.
+pub fn sweep(git: &Git, intent: &Intent) {
+    let deadline = Instant::now() + WORKTREE_DEADLINE;
+    let repo = Path::new(&intent.repo);
+    if !repo.is_dir() {
+        return;
+    }
+    let (branch, target) = (intent.branch.as_str(), intent.target.as_str());
+    let tip = match branch_tip(git, repo, branch, deadline) {
+        Ok(tip) => tip,
+        Err(_) => {
+            tracing::warn!(branch = %branch, "cannot read a worktree intent's branch; keeping it");
+            return;
+        }
+    };
+    if tip.as_deref().is_some_and(|t| t != intent.start) {
+        tracing::warn!(branch = %branch, "branch moved past its start after a crash; keeping it");
+        return;
+    }
+    let mut ours = false;
+    if let Ok(true) = registered_as_ours(git, repo, target, branch, deadline) {
+        let remove = ["worktree", "remove", "--force", "--force", target];
+        let what = "git worktree remove failed";
+        succeeded(git, repo, deadline, &remove, branch, what);
+        ours = true;
+    }
+    if fs::symlink_metadata(target).is_ok() {
+        remove_half_made(Path::new(target), branch);
+        ours |= fs::symlink_metadata(target).is_err();
+    }
+    if tip.is_none() {
+        return;
+    }
+    if ours {
+        let delete = ["branch", "-D", branch];
+        let what = "git branch -D failed";
+        succeeded(git, repo, deadline, &delete, branch, what);
+    } else {
+        tracing::warn!(branch = %branch, "keeping a branch at its start with no worktree of ours");
     }
 }
 
@@ -612,6 +799,8 @@ mod tests {
                 text(workdir).unwrap(),
                 branch,
                 deadline(),
+                "attempt",
+                |_| Ok(()),
             )
         }
     }
@@ -687,7 +876,9 @@ mod tests {
                 &roots,
                 text(&project).unwrap(),
                 "feat/x",
-                deadline()
+                deadline(),
+                "attempt",
+                |_| Ok(()),
             ),
             Err(RejectReason::WorkdirNotAllowed)
         );
@@ -749,6 +940,64 @@ mod tests {
         let b_head = head_at(Path::new(&b.path));
         assert_eq!(b_head, head_at(&a_path));
         assert_ne!(b_head, head_at(&f.project()));
+    }
+
+    /// The intent is recorded before git adds anything: the target and the
+    /// branch are absent when it is, and it names what the create made.
+    #[test]
+    fn create_records_its_intent_before_git_adds() {
+        let f = Fixture::new();
+        let target = f.root.join("project.worktrees/feat/x");
+        let mut recorded = None;
+        let record = |intent: &Intent| {
+            assert!(!target.exists(), "the target exists before git adds it");
+            assert!(!has_branch(&f.project(), "feat/x"));
+            recorded = Some(intent.clone());
+            Ok(())
+        };
+        let created = create(
+            &git(),
+            &f.roots(),
+            text(&f.project()).unwrap(),
+            "feat/x",
+            deadline(),
+            "a1",
+            record,
+        )
+        .unwrap();
+        assert_eq!(
+            recorded,
+            Some(Intent {
+                repo: created.repo,
+                branch: "feat/x".to_owned(),
+                target: text(&target).unwrap().to_owned(),
+                start: head_at(&f.project()),
+                attempt: "a1".to_owned(),
+            })
+        );
+        assert!(target.is_dir());
+        assert!(has_branch(&f.project(), "feat/x"));
+    }
+
+    /// A refused record ends the create before git runs: nothing is added.
+    #[test]
+    fn a_refused_record_adds_nothing() {
+        let f = Fixture::new();
+        let target = f.root.join("project.worktrees/feat/x");
+        let refused = create(
+            &git(),
+            &f.roots(),
+            text(&f.project()).unwrap(),
+            "feat/x",
+            deadline(),
+            "a1",
+            |_| Err(RejectReason::WorktreeFailed),
+        );
+        assert_eq!(refused, Err(RejectReason::WorktreeFailed));
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        // Positive control: a record that accepts lets the same branch be made.
+        assert!(f.create(&f.project(), "feat/x").is_ok());
     }
 
     #[test]
@@ -831,5 +1080,273 @@ mod tests {
         // Positive control: without the hook the same branch is created.
         setup_git(&f.project(), &["config", "--unset", "core.hooksPath"]);
         assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    /// A killed add after its `mkdir` of the target: an empty directory git
+    /// never registered, which `git worktree remove` refuses.
+    #[test]
+    fn a_worktree_add_killed_after_its_mkdir_is_undone() {
+        let f = Fixture::new();
+        setup_git(&f.project(), &["branch", "feat/x"]);
+        let target = f.root.join("project.worktrees/feat/x");
+        fs::create_dir_all(&target).unwrap();
+        undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    /// A killed add after it wrote `.git`: the worktree is registered and
+    /// locked, and the directory holds only the `.git` file.
+    #[test]
+    fn a_worktree_add_killed_after_its_git_file_is_undone() {
+        let f = Fixture::new();
+        let target = f.root.join("project.worktrees/feat/x");
+        setup_git(
+            &f.project(),
+            &["worktree", "add", "-b", "feat/x", text(&target).unwrap()],
+        );
+        let locked = git_in(&f.project(), &["worktree", "lock", text(&target).unwrap()]);
+        assert!(locked.status.success());
+        for entry in fs::read_dir(&target).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name() == Some(OsStr::new(".git")) {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    /// A directory with a user's file in it is never deleted, even when the
+    /// add that made it failed. The branch is still undone.
+    #[test]
+    fn a_failed_add_keeps_a_target_with_files() {
+        let f = Fixture::new();
+        setup_git(&f.project(), &["branch", "feat/x"]);
+        let target = f.root.join("project.worktrees/feat/x");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), "mine").unwrap();
+        undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
+        assert!(target.join("keep.txt").exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+    }
+
+    /// The target a session's `create` would add for `feat/x`.
+    fn sweep_target(f: &Fixture) -> PathBuf {
+        f.root.join("project.worktrees/feat/x")
+    }
+
+    /// The intent `create` records for `feat/x` in the fixture's project.
+    fn sweep_intent(f: &Fixture, target: &Path, start: &str) -> Intent {
+        Intent {
+            repo: text(&f.project()).unwrap().to_owned(),
+            branch: "feat/x".to_owned(),
+            target: text(target).unwrap().to_owned(),
+            start: start.to_owned(),
+            attempt: "a".to_owned(),
+        }
+    }
+
+    /// A crash after `git worktree add -b feat/x <target> <start>`: the
+    /// worktree is registered on the branch, and nothing committed it.
+    #[test]
+    fn the_sweep_removes_an_orphaned_worktree_and_its_branch() {
+        let f = Fixture::new();
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        let add = [
+            "worktree",
+            "add",
+            "-b",
+            "feat/x",
+            text(&target).unwrap(),
+            start.as_str(),
+        ];
+        setup_git(&f.project(), &add);
+        assert!(target.is_dir());
+        assert!(has_branch(&f.project(), "feat/x"));
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+    }
+
+    /// The branch moved past its start after the crash: someone committed on
+    /// it, so both the worktree and the branch are kept.
+    #[test]
+    fn the_sweep_keeps_a_branch_moved_past_its_start() {
+        let f = Fixture::new();
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        let add = [
+            "worktree",
+            "add",
+            "-b",
+            "feat/x",
+            text(&target).unwrap(),
+            start.as_str(),
+        ];
+        setup_git(&f.project(), &add);
+        setup_git(&target, &["commit", "--allow-empty", "-m", "x"]);
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(target.is_dir());
+        assert!(has_branch(&f.project(), "feat/x"));
+    }
+
+    /// A branch at its start with no worktree is indistinguishable from a
+    /// user's `git branch`, so it is kept.
+    #[test]
+    fn the_sweep_keeps_a_branch_at_its_start_without_a_worktree() {
+        let f = Fixture::new();
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        setup_git(&f.project(), &["branch", "feat/x"]);
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(!target.exists());
+        assert!(has_branch(&f.project(), "feat/x"));
+    }
+
+    /// A killed add that left only a `.git` file in its directory: git never
+    /// registered it, so the sweep deletes the directory and the branch.
+    #[test]
+    fn the_sweep_removes_a_half_made_worktree_dir() {
+        let f = Fixture::new();
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        setup_git(&f.project(), &["branch", "feat/x"]);
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join(".git"), "gitdir: nowhere\n").unwrap();
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+    }
+
+    /// A row whose branch and target are both gone changes nothing: the
+    /// project keeps its only branch.
+    #[test]
+    fn the_sweep_ignores_a_stale_intent() {
+        let f = Fixture::new();
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(!target.exists());
+        let refs = git_in(
+            &f.project(),
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        );
+        assert_eq!(String::from_utf8_lossy(&refs.stdout), "refs/heads/main\n");
+    }
+
+    /// A directory with a user's file is never deleted, and its branch at its
+    /// start is kept, since the sweep cannot prove it made either.
+    #[test]
+    fn the_sweep_leaves_a_users_files_in_the_target() {
+        let f = Fixture::new();
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        setup_git(&f.project(), &["branch", "feat/x"]);
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("notes.txt"), "mine").unwrap();
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(target.join("notes.txt").exists());
+        assert!(has_branch(&f.project(), "feat/x"));
+    }
+
+    /// The `git worktree list --porcelain` block for the worktree at `path`,
+    /// or nothing when no block names it.
+    fn porcelain_block(repo: &Path, path: &str) -> String {
+        let listed = git_in(repo, &["worktree", "list", "--porcelain"]);
+        let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+        let wanted = format!("worktree {path}");
+        listed
+            .split("\n\n")
+            .find(|block| block.lines().any(|line| line == wanted))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// A `git worktree add` killed after it registered the worktree but before
+    /// it wrote the branch into HEAD: the registration is locked, its HEAD is
+    /// all zeros and no `branch` line is listed. Left alone, a later add of the
+    /// same path fails as a missing but locked worktree.
+    #[test]
+    fn the_sweep_clears_a_worktree_add_killed_before_its_branch() {
+        let f = Fixture::new();
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        let add = [
+            "worktree",
+            "add",
+            "-b",
+            "feat/x",
+            text(&target).unwrap(),
+            start.as_str(),
+        ];
+        setup_git(&f.project(), &add);
+        let locked = [
+            "worktree",
+            "lock",
+            "--reason",
+            "initializing",
+            text(&target).unwrap(),
+        ];
+        setup_git(&f.project(), &locked);
+        let file = fs::read_to_string(target.join(".git")).unwrap();
+        let admin = PathBuf::from(file.trim_end().strip_prefix("gitdir: ").unwrap());
+        let zeros = "0".repeat(40);
+        fs::write(admin.join("HEAD"), format!("{zeros}\n")).unwrap();
+        for entry in fs::read_dir(&target).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name() == Some(OsStr::new(".git")) {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        let block = porcelain_block(&f.project(), text(&target).unwrap());
+        assert!(
+            block.lines().any(|line| line == format!("HEAD {zeros}")),
+            "{block}"
+        );
+        assert!(
+            !block.lines().any(|line| line.starts_with("branch ")),
+            "{block}"
+        );
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        let again = git_in(&f.project(), &add);
+        assert!(
+            again.status.success(),
+            "{}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+    }
+
+    /// A user's worktree whose directory is gone (an unmounted drive) stays
+    /// registered: a sweep of some other row never prunes it.
+    #[test]
+    fn the_sweep_keeps_a_users_missing_worktree_registered() {
+        let f = Fixture::new();
+        let user = f.root.join("elsewhere/y");
+        let user_text = text(&user).unwrap();
+        let add = ["worktree", "add", "-b", "user/y", user_text];
+        setup_git(&f.project(), &add);
+        fs::remove_dir_all(&user).unwrap();
+        assert!(!porcelain_block(&f.project(), user_text).is_empty());
+        let target = sweep_target(&f);
+        let start = head_at(&f.project());
+        sweep(&git(), &sweep_intent(&f, &target, &start));
+        assert!(!porcelain_block(&f.project(), user_text).is_empty());
     }
 }
