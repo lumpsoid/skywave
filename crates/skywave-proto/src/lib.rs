@@ -579,7 +579,7 @@ pub enum EventKind {
     },
     /// The session's git worktree and its branch were removed by a
     /// `RemoveWorktree` command. The agent is stopped and the session cannot
-    /// run again.
+    /// run again: later work for it is refused `WorkdirNotFound`.
     WorktreeRemoved {
         by: DeviceId,
     },
@@ -2285,7 +2285,9 @@ pub enum CommandResult {
 pub enum RejectReason {
     /// `CreateSession.workdir` is outside the configured roots (D14).
     WorkdirNotAllowed,
-    /// `CreateSession.workdir` does not exist or is not a directory.
+    /// `CreateSession.workdir` does not exist or is not a directory. Also
+    /// refuses work (`SendMessage`, `RunShell`, ...) for a session whose
+    /// worktree was removed (`EventKind::WorktreeRemoved`).
     WorkdirNotFound,
     /// `CreateSession.worktree` names a branch, but the workdir is not in a
     /// git repository.

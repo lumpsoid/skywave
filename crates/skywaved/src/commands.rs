@@ -407,6 +407,13 @@ impl EventLog {
             if self.disk().refresh() {
                 return Ok(Err(RejectReason::DiskLow));
             }
+            // A session whose worktree was removed has no directory to run
+            // in: the log says so, where the disk would only say it now.
+            if let Some(id) = work_session(&command.kind)
+                && event_log::worktree_removed_in(tx, id)?
+            {
+                return Ok(Err(RejectReason::WorkdirNotFound));
+            }
         }
         let known = |id: SessionId| event_log::session_in(tx, id);
         let (session_id, context, kind) = match &command.kind {
@@ -936,6 +943,37 @@ fn starts_work(kind: &CommandKind) -> bool {
         // Freeing space is what a low disk needs.
         | CommandKind::DeleteBlob { .. }
         | CommandKind::CropBlob { .. } => false,
+    }
+}
+
+/// The session a work-starting command runs in, whose worktree must still
+/// exist (`WorkdirNotFound` once `WorktreeRemoved` is logged for it). `None`
+/// for `CreateSession`, which makes a session, and for the kinds
+/// [`starts_work`] does not count. Exhaustive, so a new command must be
+/// placed.
+fn work_session(kind: &CommandKind) -> Option<SessionId> {
+    match kind {
+        CommandKind::SendMessage { session_id, .. }
+        | CommandKind::SetPermissionMode { session_id, .. }
+        | CommandKind::SetModel { session_id, .. }
+        | CommandKind::SetEffort { session_id, .. }
+        | CommandKind::ClearContext { session_id, .. }
+        // The moved context would run in this session's workdir.
+        | CommandKind::MoveContext { session_id, .. }
+        | CommandKind::RunShell { session_id, .. } => Some(*session_id),
+        CommandKind::CreateSession { .. }
+        | CommandKind::ResolveApproval { .. }
+        | CommandKind::AnswerQuestion { .. }
+        | CommandKind::Interrupt { .. }
+        | CommandKind::StopSession { .. }
+        | CommandKind::StopTask { .. }
+        | CommandKind::StopShell { .. }
+        | CommandKind::RenameSession { .. }
+        | CommandKind::SetSessionArchived { .. }
+        | CommandKind::RemoveWorktree { .. }
+        | CommandKind::SwitchContext { .. }
+        | CommandKind::DeleteBlob { .. }
+        | CommandKind::CropBlob { .. } => None,
     }
 }
 

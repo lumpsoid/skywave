@@ -1090,6 +1090,54 @@ async fn removing_a_merged_clean_worktree_deletes_it_and_its_branch() {
     assert!(accepted_seq(&again).0 > seq.0, "{again:?}");
 }
 
+/// Work for a session whose worktree was removed is refused `WorkdirNotFound`:
+/// its directory is gone, or may belong to another worktree since. Control for
+/// it, a rename, is still accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_for_a_removed_worktree_session_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let context = ContextId::first_of(session);
+    // Positive control: before the removal, the same message is accepted.
+    accepted_seq(
+        &device
+            .command(&message_command(session, context, "hello", Vec::new()))
+            .await,
+    );
+    accepted_seq(&device.command(&remove_command(session)).await);
+
+    assert_eq!(
+        device
+            .command(&message_command(session, context, "again", Vec::new()))
+            .await,
+        rejected(RejectReason::WorkdirNotFound)
+    );
+    let model = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetModel {
+            session_id: session,
+            model: "opus".into(),
+        },
+    };
+    assert_eq!(
+        device.command(&model).await,
+        rejected(RejectReason::WorkdirNotFound)
+    );
+    let rename = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RenameSession {
+            session_id: session,
+            name: Some("renamed".into()),
+        },
+    };
+    accepted_seq(&device.command(&rename).await);
+}
+
 /// Uncommitted work keeps the worktree and its branch. Once the file is gone,
 /// the same session's removal goes through.
 #[tokio::test(flavor = "multi_thread")]
