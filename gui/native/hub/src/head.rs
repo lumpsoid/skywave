@@ -1082,6 +1082,11 @@ impl Head {
                         conversation.chars().filter(|c| !c.is_control()).collect();
                 }
             }
+            GuiIntent::CreateWorktreeTyped { worktree } => {
+                if let Some(create) = &mut self.create {
+                    create.worktree = worktree.chars().filter(|c| !c.is_control()).collect();
+                }
+            }
             GuiIntent::CompletionComplete => {
                 let completion = self.completion();
                 let Some(create) = &mut self.create else {
@@ -1123,7 +1128,7 @@ impl Head {
                     let action = Action::CreateSession {
                         conversation: Some(create.conversation.clone()),
                         workdir: create.input.clone(),
-                        worktree: None,
+                        worktree: Some(create.worktree.clone()),
                     };
                     let tag = self.dispatch_user(action, Purpose::Create, clock, out);
                     self.create_tag = Some(tag);

@@ -87,6 +87,9 @@ pub struct CreateUi {
     /// The optional outside agent conversation id the user typed. The
     /// user's alone: the hub never rewrites it, so it needs no rev.
     pub conversation: String,
+    /// The optional new branch to run the session in a git worktree of. The
+    /// user's alone, like `conversation`.
+    pub worktree: String,
 }
 
 /// The screen for `view` with the head's `ui`.
