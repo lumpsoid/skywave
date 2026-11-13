@@ -1,5 +1,5 @@
 //! Git worktrees for sessions that ask for one (`CreateSession.worktree`):
-//! created next to the repository, under `<repo>.worktrees/<branch>`.
+//! created next to the repository, under `<repo>.worktrees/<branch with / as ->`.
 //!
 //! The repository is found from the workdir with `--git-common-dir`, so a
 //! subdirectory resolves to the repository's root and a worktree resolves to
@@ -92,7 +92,7 @@ pub fn create(
     let workdir = dirs::canonical_under_roots(roots, workdir)?;
     let main = main_working_tree(git, Path::new(&workdir), deadline)?;
     let (repo, worktrees) = layout(roots, &main)?;
-    let (repo_text, target) = (text(&repo)?.to_owned(), worktrees.join(branch));
+    let (repo_text, target) = (text(&repo)?.to_owned(), worktrees.join(dir_name(branch)));
     let target_text = text(&target)?.to_owned();
     check_ref_format(git, &repo, branch, deadline)?;
     if branch_exists(git, &repo, branch, deadline)? {
@@ -406,6 +406,15 @@ fn check_name(branch: &str) -> Result<(), RejectReason> {
         return Err(RejectReason::WorktreeFailed);
     }
     Ok(())
+}
+
+/// The directory a worktree for `branch` gets under `<repo>.worktrees`:
+/// the branch with each `/` as `-`, so `feat/x` is one flat `feat-x`
+/// rather than nested directories. Two branches can share a name
+/// (`feat/a-b`, `feat-a/b`); `create` refuses the second because its
+/// target exists.
+fn dir_name(branch: &str) -> String {
+    branch.replace('/', "-")
 }
 
 /// The main working tree of the repository `dir` is in: the parent of its
@@ -809,7 +818,7 @@ mod tests {
     fn creates_a_worktree_next_to_the_repository() {
         let f = Fixture::new();
         let created = f.create(&f.project(), "feat/login").unwrap();
-        let path = f.root.join("project.worktrees/feat/login");
+        let path = f.root.join("project.worktrees/feat-login");
         assert_eq!(
             created,
             Created {
@@ -819,6 +828,7 @@ mod tests {
             }
         );
         assert!(path.is_dir());
+        assert!(!f.root.join("project.worktrees/feat").exists());
         let head = git_in(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(String::from_utf8_lossy(&head.stdout), "feat/login\n");
     }
@@ -947,7 +957,7 @@ mod tests {
     #[test]
     fn create_records_its_intent_before_git_adds() {
         let f = Fixture::new();
-        let target = f.root.join("project.worktrees/feat/x");
+        let target = f.root.join("project.worktrees/feat-x");
         let mut recorded = None;
         let record = |intent: &Intent| {
             assert!(!target.exists(), "the target exists before git adds it");
@@ -983,7 +993,7 @@ mod tests {
     #[test]
     fn a_refused_record_adds_nothing() {
         let f = Fixture::new();
-        let target = f.root.join("project.worktrees/feat/x");
+        let target = f.root.join("project.worktrees/feat-x");
         let refused = create(
             &git(),
             &f.roots(),
@@ -1019,13 +1029,13 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_for_a_branch_component_is_refused() {
+    fn a_symlink_at_the_target_is_refused() {
         let f = Fixture::new();
         let outside = f.root.parent().unwrap().join("outside");
         fs::create_dir(&outside).unwrap();
         let worktrees = f.root.join("project.worktrees");
         fs::create_dir(&worktrees).unwrap();
-        let link = worktrees.join("feat");
+        let link = worktrees.join("feat-x");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert_eq!(
             f.create(&f.project(), "feat/x"),
@@ -1036,6 +1046,21 @@ mod tests {
         // Positive control: without the link the same branch is created.
         fs::remove_file(&link).unwrap();
         assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    #[test]
+    fn branches_that_flatten_to_one_directory_are_refused() {
+        let f = Fixture::new();
+        assert!(f.create(&f.project(), "feat/a-b").is_ok());
+        assert_eq!(
+            f.create(&f.project(), "feat-a/b"),
+            Err(RejectReason::WorktreeFailed)
+        );
+        assert!(!has_branch(&f.project(), "feat-a/b"));
+        // The first worktree keeps its own branch in the shared directory.
+        let dir = f.root.join("project.worktrees/feat-a-b");
+        let head = git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&head.stdout), "feat/a-b\n");
     }
 
     #[test]
@@ -1070,7 +1095,7 @@ mod tests {
             &f.project(),
             &["config", "core.hooksPath", text(&hooks).unwrap()],
         );
-        let target = f.root.join("project.worktrees/feat/x");
+        let target = f.root.join("project.worktrees/feat-x");
         assert_eq!(
             f.create(&f.project(), "feat/x"),
             Err(RejectReason::WorktreeFailed)
@@ -1088,7 +1113,7 @@ mod tests {
     fn a_worktree_add_killed_after_its_mkdir_is_undone() {
         let f = Fixture::new();
         setup_git(&f.project(), &["branch", "feat/x"]);
-        let target = f.root.join("project.worktrees/feat/x");
+        let target = f.root.join("project.worktrees/feat-x");
         fs::create_dir_all(&target).unwrap();
         undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
         assert!(!target.exists());
@@ -1101,7 +1126,7 @@ mod tests {
     #[test]
     fn a_worktree_add_killed_after_its_git_file_is_undone() {
         let f = Fixture::new();
-        let target = f.root.join("project.worktrees/feat/x");
+        let target = f.root.join("project.worktrees/feat-x");
         setup_git(
             &f.project(),
             &["worktree", "add", "-b", "feat/x", text(&target).unwrap()],
@@ -1131,7 +1156,7 @@ mod tests {
     fn a_failed_add_keeps_a_target_with_files() {
         let f = Fixture::new();
         setup_git(&f.project(), &["branch", "feat/x"]);
-        let target = f.root.join("project.worktrees/feat/x");
+        let target = f.root.join("project.worktrees/feat-x");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("keep.txt"), "mine").unwrap();
         undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
@@ -1141,7 +1166,7 @@ mod tests {
 
     /// The target a session's `create` would add for `feat/x`.
     fn sweep_target(f: &Fixture) -> PathBuf {
-        f.root.join("project.worktrees/feat/x")
+        f.root.join("project.worktrees/feat-x")
     }
 
     /// The intent `create` records for `feat/x` in the fixture's project.
