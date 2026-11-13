@@ -917,7 +917,7 @@ async fn create_session_makes_a_worktree_and_runs_there() {
     else {
         panic!("{batch:?}");
     };
-    let made = f.root.join("project.worktrees/feat/x");
+    let made = f.root.join("project.worktrees/feat-x");
     assert!(made.is_dir());
     assert_eq!(from, &None);
     assert_eq!(
@@ -956,7 +956,7 @@ async fn create_session_refuses_an_existing_branch() {
     // Positive control: a free branch from the same fixture is created.
     let free = device.command(&worktree_command(&f, "feat/x")).await;
     assert_eq!(accepted_seq(&free), Seq(1));
-    assert!(f.root.join("project.worktrees/feat/x").is_dir());
+    assert!(f.root.join("project.worktrees/feat-x").is_dir());
 }
 
 /// A worktree needs a repository: a plain directory is refused and nothing
@@ -1029,7 +1029,7 @@ async fn a_worktree_whose_session_is_rejected_is_discarded() {
         rejected(RejectReason::ServerStopping)
     );
     assert_eq!(f.log.head(), Seq::ZERO);
-    assert!(!f.root.join("project.worktrees/feat/x").exists());
+    assert!(!f.root.join("project.worktrees/feat-x").exists());
     assert!(!has_branch(&project, "feat/x"));
     // Positive control: running again, the same branch is created.
     f.log.set_stopping(false);
@@ -1131,7 +1131,7 @@ async fn removing_a_merged_clean_worktree_deletes_it_and_its_branch() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     assert!(dir.is_dir());
 
     let command = remove_command(session);
@@ -1212,7 +1212,7 @@ async fn work_for_a_session_sharing_a_removed_worktree_is_refused() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let owner = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let plain = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
@@ -1253,7 +1253,7 @@ async fn a_recreated_worktree_lets_a_sharing_session_work_again() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let owner = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let plain = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
@@ -1293,7 +1293,7 @@ async fn a_dirty_worktree_is_not_removed() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let scratch = dir.join("notes.txt");
     std::fs::write(&scratch, "untracked").unwrap();
 
@@ -1321,7 +1321,7 @@ async fn an_unmerged_worktree_branch_is_not_removed() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     setup_git(&dir, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
 
     assert_eq!(
@@ -1368,7 +1368,7 @@ async fn a_worktree_is_not_removed_while_a_turn_runs() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let context = f
         .log
         .session(&f.storage.db, session)
@@ -1408,7 +1408,7 @@ async fn a_worktree_is_not_removed_while_a_message_waits_for_the_supervisor() {
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
     let context = ContextId::first_of(session);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     accepted_seq(
         &device
             .command(&message_command(session, context, "hello", Vec::new()))
@@ -1439,7 +1439,7 @@ async fn a_worktree_is_not_removed_while_a_handed_message_waits_for_its_turn() {
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
     let context = ContextId::first_of(session);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let message = accepted_seq(
         &device
             .command(&message_command(session, context, "hello", Vec::new()))
@@ -1484,7 +1484,7 @@ async fn a_worktree_is_not_removed_while_a_held_message_waits() {
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
     let context = ContextId::first_of(session);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let message = accepted_seq(
         &device
             .command(&message_command(session, context, "hello", Vec::new()))
@@ -1527,7 +1527,7 @@ async fn a_worktree_is_not_removed_while_a_shell_command_waits() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let run = Command {
         id: CommandId::new(),
         kind: CommandKind::RunShell {
@@ -1585,7 +1585,7 @@ async fn a_removed_worktree_session_does_not_remove_a_recreated_worktree() {
     accepted_seq(&device.command(&remove_command(old)).await);
     let second = device.command(&worktree_command(&f, "feat/x")).await;
     let current = session_of(&second, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     assert_ne!(old, current);
 
     accepted_seq(&device.command(&remove_command(old)).await);
@@ -1607,7 +1607,7 @@ async fn a_worktree_is_not_removed_while_another_session_there_runs_a_turn() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let owner = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     let plain = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
@@ -1656,7 +1656,7 @@ async fn a_merged_worktree_branch_with_an_unmerged_upstream_is_removed() {
     setup_git(&project, &["branch", "base"]);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     setup_git(&dir, &["commit", "-q", "--allow-empty", "-m", "work"]);
     setup_git(&project, &["merge", "-q", "--ff-only", "feat/x"]);
     setup_git(&project, &["branch", "--set-upstream-to=base", "feat/x"]);
@@ -1677,12 +1677,12 @@ async fn a_worktree_deleted_by_hand_is_removed() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     std::fs::remove_dir_all(&dir).unwrap();
 
     accepted_seq(&device.command(&remove_command(session)).await);
     assert!(!has_branch(&project, "feat/x"));
-    assert!(!worktree_list(&project).contains("project.worktrees/feat/x"));
+    assert!(!worktree_list(&project).contains("project.worktrees/feat-x"));
     // Positive control: the same branch name is free again.
     accepted_seq(&device.command(&worktree_command(&f, "feat/x")).await);
     assert!(dir.is_dir());
@@ -1699,7 +1699,7 @@ async fn a_worktree_with_detached_commits_is_not_removed() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     setup_git(&dir, &["checkout", "-q", "--detach"]);
     setup_git(&dir, &["commit", "-q", "--allow-empty", "-m", "lost"]);
 
@@ -1727,7 +1727,7 @@ async fn untracked_files_hidden_by_config_keep_the_worktree() {
     make_repo(&project);
     let created = device.command(&worktree_command(&f, "feat/x")).await;
     let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
-    let dir = f.root.join("project.worktrees/feat/x");
+    let dir = f.root.join("project.worktrees/feat-x");
     setup_git(&project, &["config", "status.showUntrackedFiles", "no"]);
     let scratch = dir.join("notes.txt");
     std::fs::write(&scratch, "untracked").unwrap();
