@@ -76,6 +76,7 @@ mod tests {
                 repo: repo.into(),
                 branch: branch.into(),
             }),
+            worktree_removed: false,
         }
     }
 
