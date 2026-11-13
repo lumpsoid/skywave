@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BlobId, BlobRef, ContextId, DeviceId, Event, EventKind,
-    ImportedItem, LineSpan, Seq, SessionId, SessionOrigin, SessionState, TurnUsage,
+    ImportedItem, LineSpan, Seq, SessionId, SessionOrigin, SessionState, TurnUsage, Worktree,
 };
 
 /// What the session list needs to know about one session.
@@ -66,6 +66,8 @@ pub struct SessionSummary {
     /// `SessionCreated` came from `SessionOrigin::Agent`): what the
     /// conversation picker's `continued_in` looks up.
     pub adopted: Option<String>,
+    /// The git worktree the session runs in, from its `SessionCreated`.
+    pub worktree: Option<Worktree>,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -198,6 +200,7 @@ impl SessionSummary {
             context: ContextId::first_of(event.session_id),
             importing: false,
             adopted: None,
+            worktree: None,
         };
         summary.apply(seq, event);
         summary
@@ -278,8 +281,14 @@ impl SessionSummary {
             self.notable += 1;
         }
         match &event.kind {
-            EventKind::SessionCreated { workdir, from, .. } => {
+            EventKind::SessionCreated {
+                workdir,
+                from,
+                worktree,
+                ..
+            } => {
                 self.workdir = Some(workdir.clone());
+                self.worktree = worktree.clone();
                 self.context = event.context;
                 self.adopted = match from {
                     Some(SessionOrigin::Agent { conversation }) => Some(conversation.clone()),
@@ -633,6 +642,31 @@ mod tests {
         assert_eq!(fill(&summary).unwrap().tokens, 9_000);
         summary.apply(Seq(9), &at(first, EventKind::ContextSwitched { by }));
         assert_eq!(fill(&summary), None);
+    }
+
+    #[test]
+    fn session_created_keeps_its_worktree() {
+        let sid = SessionId::new();
+        let worktree = Worktree {
+            repo: "/srv/app".into(),
+            branch: "feat/x".into(),
+        };
+        let created = |worktree| {
+            event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/app".into(),
+                    context_name: "start".into(),
+                    from: None,
+                    worktree,
+                },
+            )
+        };
+        let summary = SessionSummary::new(Seq(1), &created(Some(worktree.clone())));
+        assert_eq!(summary.worktree, Some(worktree));
+        let plain = SessionSummary::new(Seq(1), &created(None));
+        assert_eq!(plain.worktree, None, "a session without one has none");
     }
 
     #[test]

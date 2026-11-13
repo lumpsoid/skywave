@@ -481,6 +481,19 @@ INSERT INTO workdir_snapshots_with_log (session_id, kind, path, result)
 DROP TABLE workdir_snapshots;
 ALTER TABLE workdir_snapshots_with_log RENAME TO workdir_snapshots;
 "#),
+    Sql(r#"
+-- `SessionSummary::worktree` (protocol v32): the git worktree a session runs
+-- in, as its `SessionCreated` names it. json_extract returns the object's JSON
+-- text, which is what the column holds; NULL when the event has none.
+-- Backfilled from the stored log.
+ALTER TABLE sessions ADD COLUMN worktree TEXT;
+UPDATE sessions SET worktree = (SELECT json_extract(event, '$.kind.worktree')
+    FROM events
+    WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'session_created'
+    ORDER BY seq
+    LIMIT 1);
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -3007,7 +3020,7 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
     stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted, \
-    last_message_seq";
+    last_message_seq, worktree";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -3022,7 +3035,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
         ),
         params![
             summary.id.0.to_string(),
@@ -3043,6 +3056,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.importing,
             summary.adopted,
             seq_sql(summary.last_message_seq)?,
+            summary.worktree.as_ref().map(to_json).transpose()?,
         ],
     )?;
     Ok(())
@@ -3068,6 +3082,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         importing: row.get(15)?,
         adopted: row.get(16)?,
         last_message_seq: seq_col(row, 17)?,
+        worktree: opt_json_col(row, 18)?,
     })
 }
 
