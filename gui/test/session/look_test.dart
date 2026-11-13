@@ -79,6 +79,9 @@ void main() {
     final working = SessionRowView(
       sessionId: 'w',
       title: 'busy',
+      group: '',
+      groupName: 'no directory',
+      branch: null,
       state: AgentState.working,
       badgeLabel: 'working',
       unread: 0,
@@ -87,6 +90,8 @@ void main() {
       lastActivityLabel: sessionRow('a').lastActivityLabel,
       lastActivityMs: 0,
       deletable: false,
+      removable: false,
+      worktreeRemoved: false,
       archived: false,
     );
     Color badge() => tester.widget<Text>(find.text('working')).style!.color!;

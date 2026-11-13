@@ -42,9 +42,13 @@ pub enum Action {
     /// outside Skywave, which the session continues; blank is `None`.
     /// Whether it is usable is the server's and the agent's call. Ends the
     /// conversation picker and the workdir completion.
+    ///
+    /// `worktree` is a new branch to create a git worktree on; the session
+    /// runs in that worktree. `None` or blank: run in `workdir`.
     CreateSession {
         workdir: String,
         conversation: Option<String>,
+        worktree: Option<String>,
     },
     /// Start a session in the session's workdir, from its page or from a
     /// session list, and open it once its `SessionCreated` reaches the
@@ -285,6 +289,13 @@ pub enum Action {
     SetSessionArchived {
         session_id: SessionId,
         archived: bool,
+    },
+    /// Remove the git worktree the session runs in and delete its branch on the
+    /// server. Refused there while a turn runs, when the worktree has changes or
+    /// when its branch is not merged. Nothing changes here until
+    /// `WorktreeRemoved` is in the replica.
+    RemoveWorktree {
+        session_id: SessionId,
     },
     /// Ask the session's agent to run in `mode`. The agent is started for
     /// it if it is not running; the session view's

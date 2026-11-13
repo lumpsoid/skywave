@@ -212,6 +212,9 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         },
         ActionIntent::RetryAgentLogin => Action::RetryAgentLogin,
         ActionIntent::DismissAgentLogin => Action::DismissAgentLogin,
+        ActionIntent::RemoveWorktree { session_id } => Action::RemoveWorktree {
+            session_id: id("session", &session_id)?,
+        },
     })
 }
 

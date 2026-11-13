@@ -47,6 +47,7 @@ fn an_adopted_session_starts_with_a_divider_row() {
             from: Some(skywave_proto::SessionOrigin::Agent {
                 conversation: "3f2a-91bc".into(),
             }),
+            worktree: None,
         },
     }];
     rig.seam
@@ -96,6 +97,7 @@ fn adopted_created(conversation: &str) -> EventKind {
         from: Some(skywave_proto::SessionOrigin::Agent {
             conversation: conversation.into(),
         }),
+        worktree: None,
     }
 }
 
@@ -401,6 +403,7 @@ fn the_conversation_picker_lists_and_continues_one() {
         Some(&Action::CreateSession {
             workdir: "/home/me/personal/skywave".into(),
             conversation: Some("bbb".into()),
+            worktree: None,
         })
     );
     rig.results();
@@ -615,6 +618,64 @@ fn an_adopted_session_row_says_its_history_is_importing() {
     assert_eq!(label(&rig, new), None);
 }
 
+#[test]
+fn the_list_groups_worktree_sessions_by_repo() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let (in_worktree, plain) = (SessionId::new(), SessionId::new());
+    let created =
+        |workdir: &str, worktree: Option<skywave_proto::Worktree>| EventKind::SessionCreated {
+            workdir: workdir.into(),
+            context_name: "start".into(),
+            from: None,
+            worktree,
+        };
+    let feature = skywave_proto::Worktree {
+        repo: "/srv/app".into(),
+        branch: "feat-x".into(),
+    };
+    for (session, kind) in [
+        (
+            in_worktree,
+            created("/srv/app.worktrees/feat-x", Some(feature)),
+        ),
+        (plain, created("/srv/app", None)),
+    ] {
+        rig.seam
+            .apply_events(&EventBatch {
+                from: Seq(rig.seam.cursor().unwrap().0 + 1),
+                events: vec![event_at(session, at, kind)],
+            })
+            .unwrap();
+    }
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    let rows = match rig.list() {
+        ScreenView::SessionList { rows, .. } => rows,
+        _ => unreachable!(),
+    };
+    let position = |id: SessionId| {
+        rows.iter()
+            .position(|r| r.session_id == id.0.to_string())
+            .unwrap()
+    };
+    let grouping = |id: SessionId| {
+        let row = &rows[position(id)];
+        (
+            row.group.as_str(),
+            row.group_name.as_str(),
+            row.branch.as_deref(),
+        )
+    };
+    assert_eq!(grouping(in_worktree), ("/srv/app", "app", Some("feat-x")));
+    assert_eq!(grouping(plain), ("/srv/app", "app", None));
+    assert_eq!(grouping(rig.session), ("/srv/work", "work", None));
+    assert_eq!(position(in_worktree).abs_diff(position(plain)), 1);
+}
+
 impl Rig {
     fn new() -> Rig {
         Rig::on(Head::new(Prefs::default()))
@@ -652,6 +713,7 @@ impl Rig {
             workdir: "/srv/work".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         seam.apply_events(&EventBatch {
             from: Seq(seam.cursor().unwrap().0 + 1),
@@ -1746,6 +1808,7 @@ fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
             workdir: "/srv/other".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         }],
     );
     let approval = |id| EventKind::ApprovalRequested {
@@ -2198,6 +2261,7 @@ fn a_tapped_candidate_fills_the_create_prompt() {
         workdir: "/srv/other".into(),
         context_name: "start".into(),
         from: None,
+        worktree: None,
     };
     rig.seam
         .apply_events(&EventBatch {
@@ -2383,6 +2447,7 @@ fn a_moved_context_is_a_divider_row() {
                         context: start,
                     },
                 )),
+                worktree: None,
             },
         },
         Event {
@@ -2430,6 +2495,158 @@ fn a_moved_context_is_a_divider_row() {
             false
         )]
     );
+}
+
+#[test]
+fn a_removed_worktree_is_an_archive_style_row() {
+    let mut rig = Rig::new();
+    let me = rig.seam.pairing().unwrap().credentials.device_id;
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let events = vec![Event {
+        session_id: rig.session,
+        at,
+        command_id: Some(CommandId::new()),
+        context: skywave_proto::ContextId::first_of(rig.session),
+        kind: EventKind::WorktreeRemoved { by: me },
+    }];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.view();
+    let rows: Vec<_> = rig
+        .rows()
+        .iter()
+        .map(|row| (row.kind, row.text.clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        [(RowKind::Archived, "worktree removed by you".to_owned())]
+    );
+}
+
+/// A session created in `/srv/app`, or in its git worktree `branch`.
+fn created_session(branch: Option<&str>) -> EventKind {
+    EventKind::SessionCreated {
+        workdir: match branch {
+            Some(branch) => format!("/srv/app.worktrees/{branch}"),
+            None => "/srv/app".into(),
+        },
+        context_name: "start".into(),
+        from: None,
+        worktree: branch.map(|branch| skywave_proto::Worktree {
+            repo: "/srv/app".into(),
+            branch: branch.into(),
+        }),
+    }
+}
+
+#[test]
+fn an_archived_worktree_row_is_removable() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let me = rig.me;
+    let (archived_worktree, archived_plain, active_worktree) =
+        (SessionId::new(), SessionId::new(), SessionId::new());
+    let archive = EventKind::SessionArchived {
+        archived: true,
+        by: me,
+    };
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![
+                event_at(archived_worktree, at, created_session(Some("feat-x"))),
+                event_at(archived_worktree, at, archive.clone()),
+                event_at(archived_plain, at, created_session(None)),
+                event_at(archived_plain, at, archive),
+                event_at(active_worktree, at, created_session(Some("feat-y"))),
+            ],
+        })
+        .unwrap();
+    let flags = |rig: &Rig, id: SessionId| {
+        let row = match rig.list() {
+            ScreenView::SessionList { rows, .. } => rows
+                .into_iter()
+                .find(|r| r.session_id == id.0.to_string())
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        (row.removable, row.worktree_removed)
+    };
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::ArchivedSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(flags(&rig, archived_worktree), (true, false));
+    assert_eq!(flags(&rig, archived_plain), (false, false));
+
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(
+                archived_worktree,
+                at,
+                EventKind::WorktreeRemoved { by: me },
+            )],
+        })
+        .unwrap();
+    rig.view();
+    assert_eq!(flags(&rig, archived_worktree), (false, true));
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(flags(&rig, active_worktree), (false, false));
+}
+
+#[test]
+fn the_remove_worktree_intent_queues_the_command() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let session = SessionId::new();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![
+                event_at(session, at, created_session(Some("feat-x"))),
+                event_at(
+                    session,
+                    at,
+                    EventKind::SessionArchived {
+                        archived: true,
+                        by: rig.me,
+                    },
+                ),
+            ],
+        })
+        .unwrap();
+    rig.view();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::RemoveWorktree {
+            session_id: session.0.to_string(),
+        },
+    });
+    let entry = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.command.kind, CommandKind::RemoveWorktree { .. }))
+        .unwrap();
+    assert!(matches!(
+        entry.command.kind,
+        CommandKind::RemoveWorktree { session_id } if session_id == session
+    ));
 }
 
 impl Rig {
@@ -2618,6 +2835,7 @@ fn a_moved_context_row_names_where_it_went() {
                                 context: start,
                             },
                         )),
+                        worktree: None,
                     },
                 },
                 Event {
@@ -3246,12 +3464,46 @@ fn accepting_with_a_conversation_id_adopts_it() {
         Some(&Action::CreateSession {
             workdir: "/srv/app".into(),
             conversation: Some("  abc-123 ".into()),
+            worktree: Some(String::new()),
         })
     );
     assert_eq!(
         queued_creations(&rig),
         [("/srv/app".to_owned(), Some("abc-123".to_owned()))]
     );
+}
+
+#[test]
+fn accepting_with_a_worktree_branch_asks_for_it() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateWorktreeTyped {
+        worktree: "  feat/x\u{7}".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::CreateSession {
+            workdir: "/srv/app".into(),
+            conversation: Some(String::new()),
+            worktree: Some("  feat/x".into()),
+        })
+    );
+    // The core trims the branch; queued_creations ignores it, so read it here.
+    let worktrees: Vec<Option<String>> = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { worktree, .. } => Some(worktree),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(worktrees, [Some("feat/x".to_owned())]);
 }
 
 #[test]

@@ -335,6 +335,7 @@ fn created(session_id: SessionId, minute: u32, workdir: &str) -> Event {
             workdir: workdir.into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         },
     )
 }
@@ -539,12 +540,14 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/a".into(),
+            worktree: None,
         })
         .unwrap();
     h.core
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/b".into(),
+            worktree: None,
         })
         .unwrap();
     // The killed server: the engine reports it is backing off.
@@ -569,6 +572,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/c".into(),
+            worktree: None,
         })
         .unwrap();
     h.sync();
@@ -1191,7 +1195,8 @@ fn create_session_goes_from_queued_to_the_real_row() {
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
             conversation: None,
-            workdir: "/srv/new".into()
+            workdir: "/srv/new".into(),
+            worktree: None,
         })
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
@@ -1362,7 +1367,8 @@ fn tab_fills_in_the_only_directory() {
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
             conversation: None,
-            workdir: "/srv/api/".into()
+            workdir: "/srv/api/".into(),
+            worktree: None,
         })
     );
 }
@@ -1419,6 +1425,7 @@ fn pasting_an_outside_conversation_asks_the_workdir_then_the_id() {
         Some(Action::CreateSession {
             workdir: "/srv/api/".into(),
             conversation: Some("0b6c1a2e-1111-4222-8333-444455556666".into()),
+            worktree: None,
         })
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
@@ -1530,6 +1537,7 @@ fn c_lists_the_servers_conversations_and_enter_continues_one() {
         Some(Action::CreateSession {
             workdir: "/srv/web".into(),
             conversation: Some("c-old".into()),
+            worktree: None,
         })
     );
     assert!(h.app.conversation_picker().is_none(), "the core closes it");
@@ -1574,6 +1582,7 @@ fn a_listed_conversation_already_in_a_session_opens_it() {
                     from: Some(SessionOrigin::Agent {
                         conversation: "c-twice".into(),
                     }),
+                    worktree: None,
                 },
             ),
             event(
@@ -1803,7 +1812,8 @@ fn stale_rows_cannot_be_chosen_while_a_new_directory_loads() {
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
             conversation: None,
-            workdir: "/srv/api/".into()
+            workdir: "/srv/api/".into(),
+            worktree: None,
         })
     );
 }
@@ -2898,6 +2908,7 @@ fn a_moved_context_is_a_divider_in_both_sessions() {
                         session: id,
                         context: ContextId::first_of(id),
                     })),
+                    worktree: None,
                 },
             ),
             event(
@@ -2943,6 +2954,7 @@ fn an_adopted_session_starts_with_a_divider_naming_the_conversation() {
                 from: Some(SessionOrigin::Agent {
                     conversation: "3f2a-91bc".into(),
                 }),
+                worktree: None,
             },
         )],
     );
@@ -2988,6 +3000,7 @@ fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionI
                     from: Some(SessionOrigin::Agent {
                         conversation: "3f2a".into(),
                     }),
+                    worktree: None,
                 },
             ),
             imported(
@@ -3122,6 +3135,7 @@ fn an_adopted_session_says_it_imports_until_its_history_is_in() {
                 from: Some(SessionOrigin::Agent {
                     conversation: "3f2a".into(),
                 }),
+                worktree: None,
             },
         )],
     );
@@ -3333,6 +3347,7 @@ fn a_moved_context_shows_where_it_went_and_enter_opens_that_session() {
                         session: id,
                         context: ContextId::first_of(id),
                     })),
+                    worktree: None,
                 },
             ),
             event(
@@ -7451,6 +7466,20 @@ fn a_message_brings_an_archived_session_back() {
     assert_contains(&screen, "Sessions (1) ");
     assert_contains(&screen, "/srv/work");
     assert!(!screen.contains("1 archived"), "{screen}");
+}
+
+#[test]
+fn a_removed_worktree_shows_on_the_timeline() {
+    let (mut h, id, _) = open_session();
+    let phone = DeviceId::new();
+    pull(
+        &mut h,
+        vec![event(id, 1, EventKind::WorktreeRemoved { by: phone })],
+    );
+    assert_contains(
+        &h.screen(),
+        &format!("worktree removed by device …{}", tail(phone)),
+    );
 }
 
 #[test]

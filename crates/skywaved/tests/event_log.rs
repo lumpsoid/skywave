@@ -75,6 +75,7 @@ impl Fixture {
         let seq = accepted(self.handle(CommandKind::CreateSession {
             workdir,
             conversation: None,
+            worktree: None,
         }));
         let batch = self.log.read(&self.storage.db, Seq(seq.0 - 1), 1).unwrap();
         assert!(matches!(
@@ -406,6 +407,7 @@ fn each_accepted_command_logs_one_event_naming_it() {
         CommandKind::CreateSession {
             workdir,
             conversation: None,
+            worktree: None,
         },
     );
     let seq = accepted(result);
@@ -469,6 +471,7 @@ fn each_accepted_command_logs_one_event_naming_it() {
         kind: CommandKind::CreateSession {
             workdir: f.root.join("project").display().to_string(),
             conversation: Some(CONVERSATION.into()),
+            worktree: None,
         },
     };
     let prepared = f.prepare_import(two_items());
@@ -573,6 +576,7 @@ fn concurrent_resends_of_one_command_append_once() {
         kind: CommandKind::CreateSession {
             workdir,
             conversation: None,
+            worktree: None,
         },
     };
     let device = DeviceId::new();
@@ -680,6 +684,7 @@ fn create_session_records_the_canonical_workdir() {
     let seq = accepted(f.handle(CommandKind::CreateSession {
         workdir: workdir(&dotted),
         conversation: None,
+        worktree: None,
     }));
     let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
     let canonical = workdir(&std::fs::canonicalize(f.root.join("project")).unwrap());
@@ -687,6 +692,7 @@ fn create_session_records_the_canonical_workdir() {
         workdir: logged,
         context_name,
         from: None,
+        worktree: None,
     } = &batch.events[0].kind
     else {
         panic!("not SessionCreated: {:?}", batch.events[0].kind);
@@ -709,6 +715,7 @@ fn create_session_records_the_canonical_workdir() {
     accepted(f.handle(CommandKind::CreateSession {
         workdir: workdir(&f.root),
         conversation: None,
+        worktree: None,
     }));
 }
 
@@ -742,6 +749,7 @@ fn create_session_rejects_workdirs_outside_roots() {
             f.handle(CommandKind::CreateSession {
                 workdir: dir.clone(),
                 conversation: None,
+                worktree: None,
             }),
             rejected(reason),
             "{dir}"
@@ -762,6 +770,7 @@ fn create_session_follows_symlinks_before_checking_roots() {
         f.handle(CommandKind::CreateSession {
             workdir: workdir(&f.root.join("escape")),
             conversation: None,
+            worktree: None,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
@@ -772,6 +781,7 @@ fn create_session_follows_symlinks_before_checking_roots() {
     accepted(f.handle(CommandKind::CreateSession {
         workdir: workdir(&link_in),
         conversation: None,
+        worktree: None,
     }));
 }
 
@@ -783,6 +793,7 @@ fn no_roots_allow_nothing() {
         f.handle(CommandKind::CreateSession {
             workdir: workdir(&f.root.join("project")),
             conversation: None,
+            worktree: None,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
@@ -796,6 +807,7 @@ fn adopt_kind(workdir: String, conversation: &str) -> CommandKind {
     CommandKind::CreateSession {
         workdir,
         conversation: Some(conversation.to_owned()),
+        worktree: None,
     }
 }
 
@@ -1800,6 +1812,7 @@ impl OpenWork {
             CommandKind::CreateSession {
                 workdir: workdir(&f.root.join("project")),
                 conversation: None,
+                worktree: None,
             },
             CommandKind::SendMessage {
                 session_id: session,
@@ -2651,6 +2664,7 @@ fn agent_appends_are_checked() {
             workdir: "/".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         },
         EventKind::ContextStarted {
             by: DeviceId::new(),
@@ -2667,6 +2681,7 @@ fn agent_appends_are_checked() {
             workdir: "/".into(),
             context_name: "moved".into(),
             from: Some(SessionOrigin::Context(ContextRef { session, context })),
+            worktree: None,
         },
         EventKind::SessionCreated {
             workdir: "/".into(),
@@ -2674,6 +2689,7 @@ fn agent_appends_are_checked() {
             from: Some(SessionOrigin::Agent {
                 conversation: "abc".into(),
             }),
+            worktree: None,
         },
         EventKind::ApprovalCancelled {
             id: ApprovalId::new(),
@@ -3156,6 +3172,7 @@ async fn waiters_wake_on_append() {
                 kind: CommandKind::CreateSession {
                     workdir,
                     conversation: None,
+                    worktree: None,
                 },
             };
             log.handle(&mut conn.db, DeviceId::new(), &command).unwrap()
@@ -3220,6 +3237,7 @@ impl Fixture {
         let seq = accepted(self.handle(CommandKind::CreateSession {
             workdir: workdir(dir),
             conversation: None,
+            worktree: None,
         }));
         let session = self.all_events()[(seq.0 - 1) as usize].session_id;
         let first = ContextId::first_of(session);
@@ -3274,6 +3292,7 @@ fn a_move_logs_the_new_session_then_the_move_naming_the_command() {
                 session,
                 context: first,
             })),
+            worktree: None,
         }
     );
     // Then the move itself, at the command's seq, stamped with the moved

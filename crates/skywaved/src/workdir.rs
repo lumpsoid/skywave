@@ -228,7 +228,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::event_log::{self, parse_id};
 
 mod changes;
-mod git;
+pub(crate) mod git;
 mod log;
 
 pub use git::Git;
@@ -773,6 +773,7 @@ mod tests {
                 kind: CommandKind::CreateSession {
                     workdir: workdir.to_str().unwrap().to_owned(),
                     conversation: None,
+                    worktree: None,
                 },
             };
             log.handle(&mut storage.db, DeviceId::new(), &create)
@@ -884,6 +885,7 @@ mod tests {
                 kind: CommandKind::CreateSession {
                     workdir: self.workdir.to_str().unwrap().to_owned(),
                     conversation: None,
+                    worktree: None,
                 },
             };
             log.handle(&mut self.storage.db, DeviceId::new(), &create)

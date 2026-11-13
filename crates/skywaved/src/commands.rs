@@ -15,6 +15,7 @@
 //! - `StopSession` → `SessionStopped`;
 //! - `RenameSession` → `SessionRenamed` with the normalised name;
 //! - `SetSessionArchived` → `SessionArchived`;
+//! - `RemoveWorktree` → `WorktreeRemoved`;
 //! - `SetPermissionMode` → `PermissionModeRequested`;
 //! - `SetModel` → `ModelRequested` with the normalised model;
 //! - `SetEffort` → `EffortRequested`;
@@ -223,11 +224,13 @@
 //! after the commit, like a deleted one's. Without a preparation (plain
 //! [`EventLog::handle`]) a crop that passes its checks is an error.
 
+use std::path::PathBuf;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     BlobUse, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
     DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, Seq, SessionId,
-    SessionOrigin, answers_fit, check_conversation_id, context_name, limits,
+    SessionOrigin, Worktree, answers_fit, check_conversation_id, context_name, limits,
     normalise_context_name,
 };
 
@@ -238,6 +241,7 @@ use crate::db::Db;
 use crate::dirs;
 use crate::error::{Error, Result};
 use crate::event_log::{self, Closed, EventLog};
+use crate::worktree;
 
 /// What a command needs done before its transaction, off the database
 /// ([`EventLog::handle_with`]). Each owns the blob files it wrote and
@@ -251,6 +255,12 @@ pub enum Preparation {
     /// A `SendMessage`'s staged images, linked as blobs
     /// ([`attachments::prepare`]).
     Attachments(attachments::Prepared),
+    /// A `CreateSession` naming a worktree: the worktree
+    /// ([`worktree::create`]), removed when its session is not committed.
+    Worktree(worktree::Prepared),
+    /// A `RemoveWorktree`'s outcome: the worktree and branch are gone when
+    /// `Ok` ([`worktree::remove`]).
+    Removal(std::result::Result<(), RejectReason>),
 }
 
 impl Preparation {
@@ -259,6 +269,8 @@ impl Preparation {
             Preparation::Import(prepared) => prepared.kept(),
             Preparation::Crop(prepared) => prepared.kept(),
             Preparation::Attachments(prepared) => prepared.kept(),
+            Preparation::Worktree(prepared) => prepared.kept(),
+            Preparation::Removal(_) => {}
         }
     }
 }
@@ -278,6 +290,12 @@ impl From<crop::Prepared> for Preparation {
 impl From<attachments::Prepared> for Preparation {
     fn from(prepared: attachments::Prepared) -> Preparation {
         Preparation::Attachments(prepared)
+    }
+}
+
+impl From<worktree::Prepared> for Preparation {
+    fn from(prepared: worktree::Prepared) -> Preparation {
+        Preparation::Worktree(prepared)
     }
 }
 
@@ -389,12 +407,47 @@ impl EventLog {
             if self.disk().refresh() {
                 return Ok(Err(RejectReason::DiskLow));
             }
+            // A session whose worktree was removed has no directory to run
+            // in: the log says so, where the disk would only say it now.
+            if let Some(id) = work_session(&command.kind)
+                && event_log::worktree_removed_in(tx, id)?
+            {
+                return Ok(Err(RejectReason::WorkdirNotFound));
+            }
         }
         let known = |id: SessionId| event_log::session_in(tx, id);
         let (session_id, context, kind) = match &command.kind {
+            // D30: a conversation resumed from another cwd is untested, so
+            // the refusal comes before anything is created.
+            CommandKind::CreateSession {
+                conversation: Some(_),
+                worktree: Some(_),
+                ..
+            } => return Ok(Err(RejectReason::BadConversation)),
+            CommandKind::CreateSession {
+                worktree: Some(_), ..
+            } => {
+                let created = match prepared_worktree(self.roots(), prepared) {
+                    Ok(created) => created,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                let session = SessionId::new();
+                let context = ContextId::first_of(session);
+                let kind = EventKind::SessionCreated {
+                    workdir: created.path,
+                    context_name: context_name::random(),
+                    from: None,
+                    worktree: Some(Worktree {
+                        repo: created.repo,
+                        branch: created.branch,
+                    }),
+                };
+                (session, context, kind)
+            }
             CommandKind::CreateSession {
                 workdir,
                 conversation,
+                worktree: None,
             } => {
                 let workdir = match dirs::canonical_under_roots(self.roots(), workdir) {
                     Ok(workdir) => workdir,
@@ -414,6 +467,7 @@ impl EventLog {
                     workdir: workdir.clone(),
                     context_name: context_name::random(),
                     from,
+                    worktree: None,
                 };
                 if !adopting {
                     (session, context, kind)
@@ -434,9 +488,13 @@ impl EventLog {
                         Some(Preparation::Import(_)) => ImportOutcome::Failed {
                             reason: import::WORKDIR_CHANGED.to_owned(),
                         },
-                        None | Some(Preparation::Crop(_) | Preparation::Attachments(_)) => {
-                            ImportOutcome::Unavailable
-                        }
+                        None
+                        | Some(
+                            Preparation::Crop(_)
+                            | Preparation::Attachments(_)
+                            | Preparation::Worktree(_)
+                            | Preparation::Removal(_),
+                        ) => ImportOutcome::Unavailable,
                     };
                     (session, context, EventKind::ImportFinished { outcome })
                 }
@@ -627,6 +685,7 @@ impl EventLog {
                             session: *session_id,
                             context: *context,
                         })),
+                        worktree: None,
                     },
                 )?;
                 (
@@ -667,6 +726,22 @@ impl EventLog {
                     archived: *archived,
                     by: device,
                 };
+                (*session_id, session.context, kind)
+            }
+            CommandKind::RemoveWorktree { session_id } => {
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                let Some(Preparation::Removal(outcome)) = prepared else {
+                    return Ok(Err(RejectReason::WorktreeFailed));
+                };
+                if let Err(reason) = *outcome {
+                    return Ok(Err(reason));
+                }
+                // Not checked for a running turn again: the git removal has
+                // happened and this event records it. A turn started since is
+                // stopped by the supervisor on this event.
+                let kind = EventKind::WorktreeRemoved { by: device };
                 (*session_id, session.context, kind)
             }
             CommandKind::SetPermissionMode { session_id, mode } => {
@@ -820,6 +895,23 @@ impl EventLog {
     }
 }
 
+/// The worktree `prepare_worktree` made for a `CreateSession` naming one,
+/// its path checked under the roots again. It is marked logged only once
+/// that passes: a refusal after that would keep a worktree whose session
+/// was never logged.
+fn prepared_worktree(
+    roots: &[PathBuf],
+    prepared: Option<&mut Preparation>,
+) -> std::result::Result<worktree::Created, RejectReason> {
+    let Some(Preparation::Worktree(prepared)) = prepared else {
+        return Err(RejectReason::WorktreeFailed);
+    };
+    let created = prepared.created()?;
+    dirs::canonical_under_roots(roots, &created.path)?;
+    prepared.logged();
+    Ok(created)
+}
+
 /// Whether a command of this kind starts new work, which a low disk refuses
 /// (`DiskLow`), as does a server stopping after its work (`ServerStopping`): it creates a session or context, gives the agent a message
 /// or a setting request (either may start an agent), or runs a shell
@@ -846,10 +938,42 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::StopShell { .. }
         | CommandKind::RenameSession { .. }
         | CommandKind::SetSessionArchived { .. }
+        | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         // Freeing space is what a low disk needs.
         | CommandKind::DeleteBlob { .. }
         | CommandKind::CropBlob { .. } => false,
+    }
+}
+
+/// The session a work-starting command runs in, whose worktree must still
+/// exist (`WorkdirNotFound` once `WorktreeRemoved` is logged for it). `None`
+/// for `CreateSession`, which makes a session, and for the kinds
+/// [`starts_work`] does not count. Exhaustive, so a new command must be
+/// placed.
+fn work_session(kind: &CommandKind) -> Option<SessionId> {
+    match kind {
+        CommandKind::SendMessage { session_id, .. }
+        | CommandKind::SetPermissionMode { session_id, .. }
+        | CommandKind::SetModel { session_id, .. }
+        | CommandKind::SetEffort { session_id, .. }
+        | CommandKind::ClearContext { session_id, .. }
+        // The moved context would run in this session's workdir.
+        | CommandKind::MoveContext { session_id, .. }
+        | CommandKind::RunShell { session_id, .. } => Some(*session_id),
+        CommandKind::CreateSession { .. }
+        | CommandKind::ResolveApproval { .. }
+        | CommandKind::AnswerQuestion { .. }
+        | CommandKind::Interrupt { .. }
+        | CommandKind::StopSession { .. }
+        | CommandKind::StopTask { .. }
+        | CommandKind::StopShell { .. }
+        | CommandKind::RenameSession { .. }
+        | CommandKind::SetSessionArchived { .. }
+        | CommandKind::RemoveWorktree { .. }
+        | CommandKind::SwitchContext { .. }
+        | CommandKind::DeleteBlob { .. }
+        | CommandKind::CropBlob { .. } => None,
     }
 }
 

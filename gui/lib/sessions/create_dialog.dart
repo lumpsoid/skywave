@@ -257,6 +257,22 @@ class _CreateDialogState extends State<CreateDialog> {
                 ),
               ),
               const SizedBox(height: 8),
+              Focus(
+                onKeyEvent: _idKey,
+                child: TextField(
+                  key: const Key('create-worktree'),
+                  autocorrect: false,
+                  style: monoText,
+                  decoration: const InputDecoration(
+                    labelText: 'New worktree on branch (optional)',
+                    hintText: 'leave empty to run in the directory itself',
+                  ),
+                  onChanged: (text) =>
+                      _send(GuiIntentCreateWorktreeTyped(worktree: text)),
+                  onSubmitted: (_) => _send(const GuiIntentCompletionAccept()),
+                ),
+              ),
+              const SizedBox(height: 8),
               Align(
                 alignment: Alignment.centerLeft,
                 child: TextButton.icon(

@@ -642,6 +642,16 @@ impl Layout<'_> {
                 spans.push(Span::raw(what).dark_gray());
                 return vec![Line::from(spans)];
             }
+            Entry::WorktreeRemoved { by } => {
+                let who = if by.me {
+                    "you".to_owned()
+                } else {
+                    device_label(by)
+                };
+                let mut spans = lead;
+                spans.push(Span::raw(format!("worktree removed by {who}")).dark_gray());
+                return vec![Line::from(spans)];
+            }
             Entry::AgentSetting {
                 setting,
                 by,

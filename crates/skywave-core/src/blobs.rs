@@ -1761,6 +1761,7 @@ mod tests {
                         workdir: "/srv".into(),
                         context_name: "start".into(),
                         from: None,
+                        worktree: None,
                     }),
                     event(EventKind::ToolResult(ToolResult {
                         call: None,
@@ -3359,6 +3360,7 @@ mod tests {
                                 workdir: "/srv".into(),
                                 context_name: "start".into(),
                                 from: None,
+                                worktree: None,
                             }),
                             event(EventKind::ToolResult(ToolResult {
                                 call: None,
@@ -3463,6 +3465,7 @@ mod tests {
                 workdir: "/srv".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             })];
             for b in [&available, &downloading, &stopped, &failed, &not_downloaded] {
                 events.push(event(EventKind::ToolResult(ToolResult {

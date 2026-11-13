@@ -199,6 +199,7 @@ fn a_new_server_address_reconnects_keeps_the_pairing_and_survives_restart() {
     core.dispatch(Action::CreateSession {
         workdir: "/srv/a".into(),
         conversation: None,
+        worktree: None,
     })
     .unwrap();
     drain(&requests);
@@ -316,6 +317,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )],
     })
@@ -450,6 +452,7 @@ fn a_late_answer_leaves_an_undeliverable_command_failed() {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )],
     })
@@ -519,6 +522,7 @@ fn draft_survives_restart() {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )],
     })
@@ -588,6 +592,7 @@ fn draft_images_survive_a_restart_and_an_edit() {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )],
     })
@@ -647,6 +652,7 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -723,6 +729,7 @@ fn gap_is_refused_and_changes_nothing() {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             )],
         })
@@ -758,6 +765,7 @@ fn blob_progress_is_persisted_and_shown() {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(
@@ -859,6 +867,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             requested(1, news),
@@ -937,6 +946,7 @@ fn deleted_session_stays_gone_after_restart() {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -1131,6 +1141,7 @@ fn a_message_after_an_acked_switch_not_yet_pulled_goes_to_the_switch_context() {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             Event {
@@ -1240,6 +1251,7 @@ fn a_moved_context_opens_its_new_session_once_the_move_is_pulled() {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(
@@ -1315,6 +1327,7 @@ fn a_moved_context_opens_its_new_session_once_the_move_is_pulled() {
                                 context: start,
                             },
                         )),
+                        worktree: None,
                     },
                 )
             },
@@ -1386,6 +1399,7 @@ fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_time
         kind: CommandKind::CreateSession {
             workdir: workdir.to_str().unwrap().to_owned(),
             conversation: None,
+            worktree: None,
         },
     };
     let CommandResult::Accepted { .. } = log
@@ -1493,6 +1507,7 @@ fn core_with_session(dir: &Path) -> (Core, Seam, Receiver<Request>, SessionId) {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )],
     })
@@ -1769,6 +1784,7 @@ impl ShellLog {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )]);
         log.core.dispatch(Action::OpenSession(sid)).unwrap();
@@ -2277,6 +2293,7 @@ fn replica_to_reset() -> ToReset {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(
