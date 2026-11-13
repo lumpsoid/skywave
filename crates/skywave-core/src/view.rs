@@ -6,6 +6,7 @@
 //! snapshot can cross threads and, later, the FFI boundary (D13).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -49,6 +50,9 @@ pub struct ViewState {
     pub can_go_back: bool,
     /// This device's saved prompts, the most recently used or saved first.
     pub snippets: Vec<Snippet>,
+    /// Shell commands from every session on this device, newest first, each
+    /// once (its newest run), at most a thousand.
+    pub shell_history: Arc<Vec<String>>,
     /// When the agent's login on the server expires, as the server's last
     /// `hello` said; `None` when it does not or the server cannot tell.
     /// Present on every screen: heads warn as it nears

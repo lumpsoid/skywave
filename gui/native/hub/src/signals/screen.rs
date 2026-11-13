@@ -2,6 +2,7 @@ use rinf::{RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
 use super::crop::{BlobTargetView, CropScreen};
+use super::search::Utf16Range;
 use super::timeline::{OutgoingView, SectionView, ToolKindView};
 use super::workdir::WorkdirScreen;
 
@@ -882,6 +883,9 @@ pub struct ComposerView {
     pub rev: u32,
     /// While browsing earlier prompts: `2 of 5`, 1 the newest.
     pub history_label: Option<String>,
+    /// The shell history picker, while open: every session's commands the
+    /// text matches, the newest first.
+    pub history_search: Option<HistorySearchView>,
     /// `to the main agent` in a subagent's view, which takes no message
     /// of its own.
     pub to_label: Option<String>,
@@ -901,6 +905,28 @@ pub struct ComposerView {
     /// Images picked or pasted and still being prepared: a message waits
     /// for them.
     pub preparing: u32,
+}
+
+/// The shell history picker, as shown above the composer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct HistorySearchView {
+    /// Row 0 is the newest; at most a hundred.
+    pub rows: Vec<HistoryRowView>,
+    /// None when there are no rows.
+    pub selected: Option<u32>,
+    /// `matching/total`, e.g. `3/120`.
+    pub count_label: String,
+    /// Shown instead of rows: "No shell commands yet" when the history is
+    /// empty, "No match" when nothing matches.
+    pub empty_label: Option<String>,
+}
+
+/// One command the picker shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct HistoryRowView {
+    pub command: String,
+    /// The chars the query matched, in UTF-16 code units.
+    pub matched: Vec<Utf16Range>,
 }
 
 /// An image of the composer's draft.

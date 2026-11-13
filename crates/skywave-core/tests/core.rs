@@ -1876,6 +1876,27 @@ fn run_of(shell: &ShellView, run: CommandId) -> &ShellRun {
 }
 
 #[test]
+fn shell_history_follows_the_log() {
+    let mut log = ShellLog::new();
+    let me = log.me;
+    log.batch(vec![
+        (1, None, requested("ls", me)),
+        (2, None, requested("make", me)),
+    ]);
+    assert_eq!(*log.core.view().shell_history, vec!["make", "ls"]);
+
+    log.batch(vec![(3, None, requested("ls", me))]);
+    assert_eq!(*log.core.view().shell_history, vec!["ls", "make"]);
+
+    // Reopened, the list is loaded from the log. The seam holds a core handle
+    // too, and with it the data dir's lock.
+    drop(log.seam);
+    drop(log.core);
+    let reopened = Core::open_detached(log.dir.path()).unwrap();
+    assert_eq!(*reopened.view().shell_history, vec!["ls", "make"]);
+}
+
+#[test]
 fn shell_runs_fold_from_the_log_and_this_devices_outbox() {
     let mut log = ShellLog::new();
     let other = DeviceId::new();

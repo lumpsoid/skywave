@@ -42,6 +42,20 @@ pub enum GuiIntent {
     /// in shell mode, the earlier shell commands.
     HistoryOlder,
     HistoryNewer,
+    /// Opens the shell history picker (Ctrl-R); the composer text is its query.
+    HistorySearchOpen,
+    /// Moves the picker's selection: `older` to the next row, else the previous.
+    HistorySearchMove {
+        older: bool,
+    },
+    /// Puts the selected command into the composer, without running it.
+    HistorySearchAccept,
+    /// Puts row `index`'s command into the composer (a tap).
+    HistorySearchPick {
+        index: u32,
+    },
+    /// Closes the picker, keeping the text as typed.
+    HistorySearchClose,
     /// Switch the composer between agent and shell mode. The text written
     /// so far stays as its mode's draft, and the other mode's draft shows.
     /// Into shell mode only while the server runs shell commands.
