@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart' hide listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/session/history_picker.dart';
 import 'package:skywave_gui/session/image_picking.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/snippets.dart';
@@ -247,6 +248,43 @@ class ComposerState extends State<Composer> {
         _field.value.composing.isValid && !_field.value.composing.isCollapsed;
     if (composing) return KeyEventResult.ignored;
 
+    final picking = _shell && widget.composer.historySearch != null;
+    if (ctrl && key == LogicalKeyboardKey.keyR && _shell) {
+      // Toggles on the key down only: a held key's repeats would flicker it
+      // open and closed. The repeats are still handled, so no R is typed.
+      if (event is KeyDownEvent) {
+        widget.send(
+          picking
+              ? const GuiIntentHistorySearchClose()
+              : const GuiIntentHistorySearchOpen(),
+        );
+      }
+      return KeyEventResult.handled;
+    }
+    if (picking) {
+      final intent = switch (key) {
+        LogicalKeyboardKey.enter ||
+        LogicalKeyboardKey.numpadEnter ||
+        LogicalKeyboardKey.tab => const GuiIntentHistorySearchAccept(),
+        LogicalKeyboardKey.escape => const GuiIntentHistorySearchClose(),
+        LogicalKeyboardKey.arrowUp => const GuiIntentHistorySearchMove(
+          older: true,
+        ),
+        LogicalKeyboardKey.arrowDown => const GuiIntentHistorySearchMove(
+          older: false,
+        ),
+        _ when ctrl && key == LogicalKeyboardKey.keyP =>
+          const GuiIntentHistorySearchMove(older: true),
+        _ when ctrl && key == LogicalKeyboardKey.keyN =>
+          const GuiIntentHistorySearchMove(older: false),
+        _ => null,
+      };
+      if (intent != null) {
+        widget.send(intent);
+        return KeyEventResult.handled;
+      }
+    }
+
     final paste = defaultTargetPlatform == TargetPlatform.macOS
         ? keyboard.isMetaPressed
         : keyboard.isControlPressed;
@@ -366,6 +404,8 @@ class ComposerState extends State<Composer> {
                   preparing: composer.preparing,
                   send: widget.send,
                 ),
+              if (shell && composer.historySearch != null)
+                HistoryPicker(view: composer.historySearch!, send: widget.send),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
@@ -390,6 +430,14 @@ class ComposerState extends State<Composer> {
                         title: 'Previous prompt',
                         onTap: () => widget.send(const GuiIntentHistoryOlder()),
                       ),
+                      if (shell)
+                        _InputAction(
+                          key: const Key('history-search'),
+                          icon: Icons.manage_search,
+                          title: 'Search history',
+                          onTap: () =>
+                              widget.send(const GuiIntentHistorySearchOpen()),
+                        ),
                     ],
                   ),
                   const SizedBox(width: 2),
