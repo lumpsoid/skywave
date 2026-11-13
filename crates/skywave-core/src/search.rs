@@ -347,6 +347,7 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         Entry::Interrupted
         | Entry::Stopped
         | Entry::Archived { .. }
+        | Entry::WorktreeRemoved { .. }
         | Entry::TurnUsage(_)
         | Entry::ImportFinished { .. } => Vec::new(),
     }

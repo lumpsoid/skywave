@@ -411,6 +411,44 @@ the daemon's appends, which would otherwise stop `serve` (below).
   request prepares waits for it; one after it is answered from the stored
   result. Imported items are records: never delivered to the agent, never
   open calls.
+- **Worktrees** (D52): `CreateSession { workdir, conversation, worktree }`
+  with a branch name in `worktree` makes a git worktree of the workdir's
+  repository on that new branch, at `<parent>/<repo>.worktrees/<branch>`
+  beside the repository, starting at the workdir's `HEAD`. The session runs
+  at the worktree's root. The repository is the parent of
+  `git rev-parse --git-common-dir`, so a workdir inside a linked worktree
+  resolves to the main repository; a bare one is `NotARepository`. The
+  parent must lie under a root, else `WorkdirNotAllowed`. The branch name
+  goes through `git check-ref-format`; an existing branch is `BranchExists`,
+  any other git failure `WorktreeFailed` (git's stderr is logged). With a
+  `conversation` too, the command is `BadConversation` and no worktree is
+  made. As for an import (D37), the git work runs in the command's
+  preparation, on a blocking thread and outside the transaction, under
+  `WORKTREE_DEADLINE` (20 s). The git runner kills git past it; a tokio
+  timeout would answer while git still ran. Disk-low and server-stopping
+  are checked before git runs. Create and remove share one process-wide
+  mutex (`crates/skywaved/src/worktree.rs`). A worktree whose command is
+  refused, or whose transaction does not commit, is discarded
+  (`worktree remove --force`, `branch -D`); only a worktree just made is
+  ever discarded. `RemoveWorktree { session_id }` is the only thing that
+  removes one:
+  archiving never does. It answers `WorktreeRemoved { by }` after these
+  checks, in order: the session has a worktree (else `NotAWorktree`); no
+  session in the same workdir has a running turn (`TurnRunning`); the branch
+  and the worktree's `HEAD` are merged into the main repository's `HEAD`
+  (`merge-base --is-ancestor`, else `BranchUnmerged`); the worktree is clean
+  (`status --porcelain`, untracked files included, else `WorktreeDirty`).
+  Then `git worktree remove` (pruned instead when the directory was deleted
+  by hand) and `branch -D`, after the branch's own merge check. Nothing is
+  forced. The server reads a session's worktree from its `SessionCreated`,
+  the first event it logs; there is no server column for it. A session that
+  already has `WorktreeRemoved` skips git, so a resend after a failed
+  transaction is accepted.
+  `WorktreeRemoved` makes the supervisor stop the agents of every session in
+  that workdir. Afterwards the removed session's work (messages, settings,
+  `ClearContext`, `MoveContext`, `RunShell`) is refused `WorkdirNotFound`,
+  decided from the log. Other sessions in that directory are stopped, not
+  refused (D52).
 - **Agent supervisor** (D3, D4, D8): at most one agent process per session,
   started lazily for the context a message or setting request is stamped
   with: resumed from that context's opaque handle, else forked from the
@@ -494,7 +532,7 @@ the daemon's appends, which would otherwise stop `serve` (below).
     Control is taken as usual (`ResolveApproval`, `AnswerQuestion`, `Interrupt`,
     `StopSession`, `StopTask`, `StopShell`), and so is what logs one small
     event and starts nothing (`RenameSession`, `SetSessionArchived`,
-    `SwitchContext`, `DeleteBlob`, `CropBlob`). Reads and long-polls are untouched. The refusal is
+    `RemoveWorktree`, `SwitchContext`, `DeleteBlob`, `CropBlob`). Reads and long-polls are untouched. The refusal is
     stored like any other; the heads show its reason, which is how a
     device learns the server is paused.
   - The supervisor stops reading its agents' events. An adapter reports on
@@ -901,7 +939,22 @@ logs) an event that no longer decodes rather than failing.
   one). Only a message someone writes moves a session up. The agent's
   replies, tool calls, approvals and state changes do not, so a row does
   not jump while it is being read. `last_seq` and `last_activity` still
-  follow every activity event, for read marks and the row's time.
+  follow every activity event, for read marks and the row's time. The GUI
+  then groups the list by repo (the key is under **Worktrees** below): a
+  group sits where its newest row does, and its rows keep this order within
+  it.
+- **Worktrees** (D52): the replica's `sessions` table has a `worktree`
+  column (the JSON `{repo, branch}` of the session's `SessionCreated`, NULL
+  when it has none) and a `worktree_removed` column (set by
+  `WorktreeRemoved`). Both are in `SessionSummary` and `SessionRow`. A
+  schema migration backfills them from the stored events. The worktree stays
+  recorded after removal, so grouping holds. `Action::CreateSession` takes a
+  `worktree`; `Action::RemoveWorktree` enqueues only for a session that has
+  one. The timeline shows `WorktreeRemoved`. Heads group the list by repo
+  (`skywave_present::session_list::by_repo`) with this key: the session's
+  own worktree's repo; else the repo of a worktree session in the same
+  workdir (a plain session started in a worktree joins its repo); else the
+  workdir. A plain create makes no git call. The TUI has no worktree UI yet.
 - **Sync engine** (D7): the pull loop long-polls from the cursor and applies
   each batch and the new cursor in one transaction. The outbox sends oldest
   first, one command in flight, so the server sees commands in the order
@@ -1192,7 +1245,7 @@ logs) an event that no longer decodes rather than failing.
   deleted here, already pulled). Only the latest request's answer is kept;
   offline (or with the server unreachable) it is `Unavailable(Offline)`,
   at once when the link is down, and nothing is asked later. Continuing is
-  `CreateSession { workdir, conversation }`, which ends the picker, as do `EndConversations` and leaving the list.
+  `CreateSession { workdir, conversation, worktree }` (no worktree), which ends the picker, as do `EndConversations` and leaving the list.
   Nothing is stored: the listing goes stale at once.
 - **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
   changes; `ShowWorkdir` switches between the changes, one file's diff (a

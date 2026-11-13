@@ -481,6 +481,27 @@ INSERT INTO workdir_snapshots_with_log (session_id, kind, path, result)
 DROP TABLE workdir_snapshots;
 ALTER TABLE workdir_snapshots_with_log RENAME TO workdir_snapshots;
 "#),
+    Sql(r#"
+-- `SessionSummary::worktree` (protocol v32): the git worktree a session runs
+-- in, as its `SessionCreated` names it. json_extract returns the object's JSON
+-- text, which is what the column holds; NULL when the event has none.
+-- Backfilled from the stored log.
+ALTER TABLE sessions ADD COLUMN worktree TEXT;
+UPDATE sessions SET worktree = (SELECT json_extract(event, '$.kind.worktree')
+    FROM events
+    WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'session_created'
+    ORDER BY seq
+    LIMIT 1);
+"#),
+    Sql(r#"
+-- `SessionSummary::worktree_removed` (protocol v32): the session's worktree
+-- was removed by `RemoveWorktree`. Backfilled from the stored log.
+ALTER TABLE sessions ADD COLUMN worktree_removed INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET worktree_removed = EXISTS (SELECT 1 FROM events
+    WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'worktree_removed');
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -553,6 +574,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
+    v31_to_v32,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -631,6 +653,14 @@ fn v29_to_v30(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// workdir commit log, a new read; no stored workdir answer or event
 /// changes shape. Nothing stored changes.
 fn v30_to_v31(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v31 to v32, as the server's step of the same name. v32 added an optional
+/// `worktree` to `session_created` events, which v31 JSON lacks and reads as
+/// `None`. v32 also added `RemoveWorktree` and `WorktreeRemoved`, which v31
+/// data cannot hold, so nothing stored changes.
+fn v31_to_v32(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -2999,7 +3029,7 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
     stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted, \
-    last_message_seq";
+    last_message_seq, worktree, worktree_removed";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -3014,7 +3044,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
         ),
         params![
             summary.id.0.to_string(),
@@ -3035,6 +3065,8 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.importing,
             summary.adopted,
             seq_sql(summary.last_message_seq)?,
+            summary.worktree.as_ref().map(to_json).transpose()?,
+            summary.worktree_removed,
         ],
     )?;
     Ok(())
@@ -3060,6 +3092,8 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         importing: row.get(15)?,
         adopted: row.get(16)?,
         last_message_seq: seq_col(row, 17)?,
+        worktree: opt_json_col(row, 18)?,
+        worktree_removed: row.get(19)?,
     })
 }
 

@@ -2399,6 +2399,7 @@ impl App {
             KeyCode::Enter => item.map(|item| Action::CreateSession {
                 workdir: item.workdir.clone(),
                 conversation: Some(item.id.clone()),
+                worktree: None,
             }),
             KeyCode::Char('o') => match item?.session {
                 Some(session) => Some(Action::OpenSession(session)),
@@ -2468,6 +2469,7 @@ impl App {
                 return Some(Action::CreateSession {
                     conversation: None,
                     workdir: create.text.clone(),
+                    worktree: None,
                 });
             }
             KeyCode::Backspace => {
@@ -2499,6 +2501,7 @@ impl App {
                 return Some(Action::CreateSession {
                     workdir: prompt.workdir.clone().unwrap_or_default(),
                     conversation: Some(prompt.text.clone()),
+                    worktree: None,
                 });
             }
             KeyCode::Backspace => {

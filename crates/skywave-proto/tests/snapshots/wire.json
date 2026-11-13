@@ -1,7 +1,7 @@
 {
-  "protocol_version": 31,
+  "protocol_version": 32,
   "hello": {
-    "protocol_version": 31,
+    "protocol_version": 32,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -104,6 +104,22 @@
           "from": {
             "kind": "agent",
             "conversation": "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8"
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "session_created",
+          "workdir": "/srv/code/skywave",
+          "context_name": "quiet fern",
+          "from": null,
+          "worktree": {
+            "repo": "/srv/code/skywave",
+            "branch": "feat/login"
           }
         }
       },
@@ -659,6 +675,16 @@
         "kind": {
           "type": "session_archived",
           "archived": false,
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "worktree_removed",
           "by": "01920000-0000-7000-8000-000000000003"
         }
       },
@@ -1470,6 +1496,15 @@
     {
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
+        "type": "create_session",
+        "workdir": "/srv/code/skywave",
+        "conversation": null,
+        "worktree": "feat/login"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
         "type": "send_message",
         "session_id": "01920000-0000-7000-8000-000000000001",
         "context": "01920000-0000-7000-8000-000000000008",
@@ -1573,6 +1608,13 @@
         "type": "set_session_archived",
         "session_id": "01920000-0000-7000-8000-000000000001",
         "archived": false
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "remove_worktree",
+        "session_id": "01920000-0000-7000-8000-000000000001"
       }
     },
     {
@@ -1701,6 +1743,34 @@
     {
       "result": "rejected",
       "reason": "workdir_not_found"
+    },
+    {
+      "result": "rejected",
+      "reason": "not_a_repository"
+    },
+    {
+      "result": "rejected",
+      "reason": "branch_exists"
+    },
+    {
+      "result": "rejected",
+      "reason": "worktree_failed"
+    },
+    {
+      "result": "rejected",
+      "reason": "not_a_worktree"
+    },
+    {
+      "result": "rejected",
+      "reason": "worktree_dirty"
+    },
+    {
+      "result": "rejected",
+      "reason": "branch_unmerged"
+    },
+    {
+      "result": "rejected",
+      "reason": "turn_running"
     },
     {
       "result": "rejected",

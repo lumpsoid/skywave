@@ -29,6 +29,7 @@ pub mod shell;
 pub mod storage;
 pub mod supervisor;
 pub mod workdir;
+pub mod worktree;
 
 use std::io::Read;
 use std::path::PathBuf;

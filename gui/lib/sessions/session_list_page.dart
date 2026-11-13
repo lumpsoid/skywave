@@ -28,6 +28,7 @@ class SessionListPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final active = screen.kind == ListKindView.active;
+    final entries = _groupEntries(screen.rows);
     return Stack(
       children: [
         Scaffold(
@@ -106,13 +107,23 @@ class SessionListPage extends StatelessWidget {
                     ),
                   ),
                 SliverList.separated(
-                  itemCount: screen.rows.length,
-                  separatorBuilder: (_, _) => const Divider(height: 1),
-                  itemBuilder: (context, i) => SessionRow(
-                    key: ValueKey(screen.rows[i].sessionId),
-                    row: screen.rows[i],
-                    send: send,
-                  ),
+                  itemCount: entries.length,
+                  // A divider only between two rows; a header has none.
+                  separatorBuilder: (_, i) =>
+                      entries[i] is _RowEntry && entries[i + 1] is _RowEntry
+                      ? const Divider(height: 1)
+                      : const SizedBox.shrink(),
+                  itemBuilder: (context, i) => switch (entries[i]) {
+                    _GroupEntry(:final row) => _Header(
+                      row.groupName,
+                      key: ValueKey('group:${row.group}'),
+                    ),
+                    _RowEntry(:final row) => SessionRow(
+                      key: ValueKey(row.sessionId),
+                      row: row,
+                      send: send,
+                    ),
+                  },
                 ),
                 // Room for the floating button over the last row.
                 const SliverToBoxAdapter(child: SizedBox(height: 88)),
@@ -182,8 +193,32 @@ class _KindToggle extends StatelessWidget {
   }
 }
 
+/// One line of the rows sliver: the header that opens a group, or a row.
+sealed class _Entry {
+  const _Entry(this.row);
+
+  final SessionRowView row;
+}
+
+final class _GroupEntry extends _Entry {
+  const _GroupEntry(super.row);
+}
+
+final class _RowEntry extends _Entry {
+  const _RowEntry(super.row);
+}
+
+/// Each row, preceded by a header where its group starts. Rows of one group
+/// are adjacent, so comparing `group` with the row before is enough.
+List<_Entry> _groupEntries(List<SessionRowView> rows) => [
+  for (var i = 0; i < rows.length; i++) ...[
+    if (i == 0 || rows[i].group != rows[i - 1].group) _GroupEntry(rows[i]),
+    _RowEntry(rows[i]),
+  ],
+];
+
 class _Header extends StatelessWidget {
-  const _Header(this.text);
+  const _Header(this.text, {super.key});
 
   final String text;
 

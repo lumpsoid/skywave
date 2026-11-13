@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BlobId, BlobRef, ContextId, DeviceId, Event, EventKind,
-    ImportedItem, LineSpan, Seq, SessionId, SessionOrigin, SessionState, TurnUsage,
+    ImportedItem, LineSpan, Seq, SessionId, SessionOrigin, SessionState, TurnUsage, Worktree,
 };
 
 /// What the session list needs to know about one session.
@@ -66,6 +66,10 @@ pub struct SessionSummary {
     /// `SessionCreated` came from `SessionOrigin::Agent`): what the
     /// conversation picker's `continued_in` looks up.
     pub adopted: Option<String>,
+    /// The git worktree the session runs in, from its `SessionCreated`.
+    pub worktree: Option<Worktree>,
+    /// The session's worktree was removed (`WorktreeRemoved`); its work is refused.
+    pub worktree_removed: bool,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -198,6 +202,8 @@ impl SessionSummary {
             context: ContextId::first_of(event.session_id),
             importing: false,
             adopted: None,
+            worktree: None,
+            worktree_removed: false,
         };
         summary.apply(seq, event);
         summary
@@ -278,8 +284,14 @@ impl SessionSummary {
             self.notable += 1;
         }
         match &event.kind {
-            EventKind::SessionCreated { workdir, from, .. } => {
+            EventKind::SessionCreated {
+                workdir,
+                from,
+                worktree,
+                ..
+            } => {
                 self.workdir = Some(workdir.clone());
+                self.worktree = worktree.clone();
                 self.context = event.context;
                 self.adopted = match from {
                     Some(SessionOrigin::Agent { conversation }) => Some(conversation.clone()),
@@ -287,6 +299,7 @@ impl SessionSummary {
                 };
                 self.importing = self.adopted.is_some();
             }
+            EventKind::WorktreeRemoved { .. } => self.worktree_removed = true,
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
             EventKind::ApprovalRequested { id, .. } | EventKind::QuestionAsked { id, .. } => {
                 if !self.pending_approvals.contains(id) {
@@ -409,6 +422,7 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
+        | EventKind::WorktreeRemoved { .. }
         | EventKind::TurnUsage(_)
         | EventKind::SubagentUsage(_)
         | EventKind::PermissionModeRequested { .. }
@@ -529,6 +543,7 @@ mod tests {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
         );
@@ -578,6 +593,7 @@ mod tests {
             workdir: "/srv/x".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let turn = |tokens: Option<u64>| {
@@ -634,6 +650,60 @@ mod tests {
     }
 
     #[test]
+    fn session_created_keeps_its_worktree() {
+        let sid = SessionId::new();
+        let worktree = Worktree {
+            repo: "/srv/app".into(),
+            branch: "feat/x".into(),
+        };
+        let created = |worktree| {
+            event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/app".into(),
+                    context_name: "start".into(),
+                    from: None,
+                    worktree,
+                },
+            )
+        };
+        let summary = SessionSummary::new(Seq(1), &created(Some(worktree.clone())));
+        assert_eq!(summary.worktree, Some(worktree));
+        let plain = SessionSummary::new(Seq(1), &created(None));
+        assert_eq!(plain.worktree, None, "a session without one has none");
+    }
+
+    #[test]
+    fn worktree_removed_marks_the_session() {
+        let sid = SessionId::new();
+        let worktree = Worktree {
+            repo: "/srv/app".into(),
+            branch: "feat/x".into(),
+        };
+        let created = event(
+            sid,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/app".into(),
+                context_name: "start".into(),
+                from: None,
+                worktree: Some(worktree.clone()),
+            },
+        );
+        let mut summary = SessionSummary::new(Seq(1), &created);
+        assert!(!summary.worktree_removed);
+        let by = DeviceId::new();
+        summary.apply(Seq(2), &event(sid, 1, EventKind::WorktreeRemoved { by }));
+        assert!(summary.worktree_removed);
+        assert_eq!(
+            summary.worktree,
+            Some(worktree),
+            "heads still group it by repo"
+        );
+    }
+
+    #[test]
     fn folds_workdir_state_and_approvals() {
         let sid = SessionId::new();
         let (a1, a2) = (ApprovalId::new(), ApprovalId::new());
@@ -644,6 +714,7 @@ mod tests {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         );
         let mut summary = SessionSummary::new(Seq(1), &created);
@@ -720,6 +791,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.title(), "app");
@@ -770,6 +842,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let renamed = EventKind::SessionRenamed {
@@ -794,6 +867,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let deleted = EventKind::BlobDeleted {
@@ -846,6 +920,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let first = ContextId::first_of(sid);
@@ -896,6 +971,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert!(!summary.archived);
@@ -930,6 +1006,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.usage, None);
@@ -999,6 +1076,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         summary.apply(Seq(2), &event(sid, 1, unanswered));
@@ -1044,6 +1122,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let archive = EventKind::SessionArchived { archived: true, by };

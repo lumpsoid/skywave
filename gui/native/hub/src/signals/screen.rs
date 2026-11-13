@@ -366,6 +366,14 @@ pub struct SessionRowView {
     pub workdir: Option<String>,
     /// The workdir's last component, `skywave`, for a narrow list.
     pub workdir_name: Option<String>,
+    /// The repo (else the directory) this row is grouped under. Rows of one
+    /// group are adjacent; a head shows a header where it changes.
+    pub group: String,
+    /// The group's last path component, `skywave`; "no directory" for the
+    /// empty group.
+    pub group_name: String,
+    /// The branch of the git worktree the session runs in.
+    pub branch: Option<String>,
     pub state: AgentState,
     /// `idle`, `working`, `approval`, `error`, `stopped`.
     pub badge_label: String,
@@ -395,6 +403,11 @@ pub struct SessionRowView {
     /// Why it cannot be deleted yet, for an archived row that is not
     /// deletable.
     pub delete_blocked_label: Option<String>,
+    /// `RemoveWorktree` is offered: the row is archived and runs in a git
+    /// worktree that is not removed yet.
+    pub removable: bool,
+    /// The session's worktree was removed; its work is refused.
+    pub worktree_removed: bool,
     pub archived: bool,
 }
 

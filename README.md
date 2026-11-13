@@ -78,6 +78,12 @@ session's workdir to see its net git changes, with a diff per file, or browse
 its files. It is read-only and fetched only when you ask, and what you read
 stays on the device, so you can still read it offline.
 
+### 🌿 Parallel sessions on one repo
+Give a new session a branch name and it runs in its own git worktree on that
+branch, so several sessions can work one repo at once. The list groups them
+under their repo. Once an archived session's branch is merged, remove its
+worktree from the session's menu in the GUI.
+
 ### 📡 You always know where you stand
 The link's state is always one glance away: `Connecting…`, `Syncing · 4/9`
 or `Offline · retry in 08s · 3 queued`, under the title on phones and

@@ -59,6 +59,19 @@ void main() {
     ]);
   });
 
+  testWidgets('the worktree field sends its edits; Enter in it creates', (
+    tester,
+  ) async {
+    await pump(tester, const CreatePrompt(input: '', inputRev: 0));
+    expect(find.text('New worktree on branch (optional)'), findsOneWidget);
+    await tester.enterText(find.byKey(const Key('create-worktree')), 'feat/x');
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    expect(sent, [
+      const GuiIntentCreateWorktreeTyped(worktree: 'feat/x'),
+      const GuiIntentCompletionAccept(),
+    ]);
+  });
+
   testWidgets('the popup lists candidates; arrows move, a tap takes one', (
     tester,
   ) async {

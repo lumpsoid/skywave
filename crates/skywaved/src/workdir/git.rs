@@ -63,7 +63,7 @@ impl Git {
 
 /// Why a git run gave no answer to build on.
 #[derive(Debug)]
-pub(super) enum GitError {
+pub(crate) enum GitError {
     /// The domain answer `ChangesResult::Failed { reason }`.
     Failed(String),
     /// A server fault (a 500).
@@ -80,22 +80,22 @@ impl From<Error> for GitError {
 }
 
 /// A child that ran to its end.
-pub(super) struct Finished<T> {
-    pub(super) status: ExitStatus,
-    pub(super) stderr: Vec<u8>,
+pub(crate) struct Finished<T> {
+    pub(crate) status: ExitStatus,
+    pub(crate) stderr: Vec<u8>,
     /// What the reader made of stdout.
-    pub(super) out: T,
+    pub(crate) out: T,
 }
 
 impl<T> Finished<T> {
     /// The first line of stderr, bounded, or the exit status when there is
     /// none.
-    pub(super) fn reason(&self) -> String {
+    pub(crate) fn reason(&self) -> String {
         first_line(&self.stderr).unwrap_or_else(|| format!("git exited with {}", self.status))
     }
 
     /// `out` when the child exited 0, else its [`Finished::reason`].
-    pub(super) fn ok(self) -> Result<T, GitError> {
+    pub(crate) fn ok(self) -> Result<T, GitError> {
         if self.status.success() {
             Ok(self.out)
         } else {
@@ -105,7 +105,7 @@ impl<T> Finished<T> {
 }
 
 /// git run in one workdir until one deadline.
-pub(super) struct Repo<'a> {
+pub(crate) struct Repo<'a> {
     git: &'a Git,
     dir: &'a Path,
     deadline: Instant,
@@ -115,7 +115,7 @@ pub(super) struct Repo<'a> {
 }
 
 impl<'a> Repo<'a> {
-    pub(super) fn new(git: &'a Git, dir: &'a Path, deadline: Instant) -> Repo<'a> {
+    pub(crate) fn new(git: &'a Git, dir: &'a Path, deadline: Instant) -> Repo<'a> {
         Repo {
             git,
             dir,
@@ -254,7 +254,7 @@ impl<'a> Repo<'a> {
     }
 
     /// [`Repo::run`] keeping all of stdout.
-    pub(super) fn output(&self, args: &[&str]) -> Result<Finished<Vec<u8>>, GitError> {
+    pub(crate) fn output(&self, args: &[&str]) -> Result<Finished<Vec<u8>>, GitError> {
         self.run(args, |stdout| {
             let mut all = Vec::new();
             stdout.read_to_end(&mut all)?;

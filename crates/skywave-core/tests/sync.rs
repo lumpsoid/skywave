@@ -113,6 +113,7 @@ async fn offline_queue_drains_exactly_once() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: daemon.workdir(),
+            worktree: None,
         })
         .unwrap();
     let queued = client.seam.pending_outbox().unwrap();
@@ -339,6 +340,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: daemon.workdir(),
+            worktree: None,
         })
         .unwrap();
     client
@@ -354,6 +356,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: daemon.workdir(),
+            worktree: None,
         })
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -566,6 +569,7 @@ async fn suspend_pauses_and_resume_syncs() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: daemon.workdir(),
+            worktree: None,
         })
         .unwrap();
     // A quiet period: the suspended engine sends nothing.
@@ -1604,6 +1608,7 @@ fn create_on_server(daemon: &mut Daemon, device: skywave_core::DeviceId) {
         kind: CommandKind::CreateSession {
             workdir: daemon.workdir(),
             conversation: None,
+            worktree: None,
         },
     };
     let result = daemon
@@ -1841,6 +1846,7 @@ fn queue_session(client: &Client, daemon: &Daemon) -> CommandId {
     client.dispatch(Action::CreateSession {
         conversation: None,
         workdir: daemon.workdir(),
+        worktree: None,
     });
     client.outbox().last().unwrap().command.id
 }

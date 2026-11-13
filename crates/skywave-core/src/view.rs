@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use skywave_proto::{Fingerprint, ImageType};
+use skywave_proto::{Fingerprint, ImageType, Worktree};
 use uuid::Uuid;
 
 pub use skywave_proto::{
@@ -891,6 +891,10 @@ pub struct SessionRow {
     /// pulled): a long import arrives over several pulls. Its
     /// [`PendingSession`] may show beside it until then.
     pub importing: bool,
+    /// The git worktree the session runs in; heads group sessions by its repo.
+    pub worktree: Option<Worktree>,
+    /// The worktree was removed: work for the session is refused.
+    pub worktree_removed: bool,
 }
 
 /// What the usage screen totals: every turn in the replica that reported
@@ -1704,6 +1708,8 @@ pub enum Entry {
     /// The session was archived (`true`) or brought back from the archive.
     /// A message brings it back too, without an entry of its own.
     Archived { archived: bool, by: DeviceRef },
+    /// The session's git worktree and its branch were removed; its work is refused from here on.
+    WorktreeRemoved { by: DeviceRef },
     /// The agent reported an error.
     AgentErrored { message: String },
     /// The agent started as `version`, not `confirmed`, the version the

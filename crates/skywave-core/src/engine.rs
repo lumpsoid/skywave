@@ -1568,6 +1568,7 @@ mod tests {
                     workdir: "/srv".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             }],
         };
@@ -1807,6 +1808,7 @@ mod tests {
             .dispatch(crate::Action::CreateSession {
                 conversation: None,
                 workdir: "/srv".into(),
+                worktree: None,
             })
             .unwrap();
         while links.lock().unwrap().len() == published {
@@ -2145,7 +2147,12 @@ mod tests {
             [],
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 3)
+        db.execute_batch(
+            "ALTER TABLE sessions DROP COLUMN worktree_removed;
+             ALTER TABLE sessions DROP COLUMN worktree;",
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 5)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(
@@ -2570,6 +2577,7 @@ mod tests {
             .dispatch(crate::Action::CreateSession {
                 conversation: None,
                 workdir: workdir.into(),
+                worktree: None,
             })
             .unwrap();
     }
@@ -3255,6 +3263,7 @@ mod tests {
                     workdir: "/srv".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 }),
                 event(EventKind::UserMessage {
                     device_id: DeviceId::new(),
@@ -3552,6 +3561,7 @@ mod tests {
                         workdir: "/srv".into(),
                         context_name: "start".into(),
                         from: None,
+                        worktree: None,
                     },
                 }]),
                 grew: Notify::new(),

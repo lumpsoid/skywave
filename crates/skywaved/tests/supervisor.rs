@@ -137,6 +137,7 @@ impl Fixture {
             kind: CommandKind::CreateSession {
                 workdir,
                 conversation,
+                worktree: None,
             },
         };
         let seq = accepted(
@@ -448,6 +449,7 @@ impl Fixture {
             CommandKind::CreateSession {
                 workdir: workdir.to_str().unwrap().to_owned(),
                 conversation: None,
+                worktree: None,
             },
         ));
         self.log
@@ -5335,6 +5337,7 @@ async fn a_low_disk_pauses_the_agent_refuses_new_work_and_still_interrupts_and_s
     let create = CommandKind::CreateSession {
         workdir: f.root.join("project").to_str().unwrap().to_owned(),
         conversation: None,
+        worktree: None,
     };
     assert_eq!(
         rejected(f.handle(DeviceId::new(), create)),

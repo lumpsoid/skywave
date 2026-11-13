@@ -592,6 +592,7 @@ impl Model {
             Action::CreateSession {
                 workdir,
                 conversation,
+                worktree,
             } => {
                 let workdir = workdir.trim();
                 if workdir.is_empty() {
@@ -608,9 +609,15 @@ impl Model {
                     .map(str::trim)
                     .filter(|c| !c.is_empty())
                     .map(str::to_owned);
+                let worktree = worktree
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_owned);
                 self.enqueue(CommandKind::CreateSession {
                     workdir: workdir.to_owned(),
                     conversation,
+                    worktree,
                 })
             }
             Action::CreateSessionLike(from) => {
@@ -626,6 +633,7 @@ impl Model {
                 let effects = self.enqueue(CommandKind::CreateSession {
                     workdir,
                     conversation: None,
+                    worktree: None,
                 });
                 if let Some(Effect::Enqueue(command)) = effects.first() {
                     self.opening = Some((command.id, at));
@@ -956,6 +964,15 @@ impl Model {
                     session_id,
                     archived,
                 })
+            }
+            Action::RemoveWorktree { session_id } => {
+                let has_worktree = self
+                    .summary(session_id)
+                    .is_some_and(|s| s.worktree.is_some());
+                if !has_worktree {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::RemoveWorktree { session_id })
             }
             Action::SetPermissionMode { session_id, mode } => {
                 if self.summary(session_id).is_none() {
@@ -2604,6 +2621,8 @@ impl Model {
                     named: title.named,
                     rename: title.rename,
                     workdir: s.workdir.clone(),
+                    worktree: s.worktree.clone(),
+                    worktree_removed: s.worktree_removed,
                     state: session_state(s),
                     pending_approvals: s.pending_approvals.len(),
                     last_activity: s.last_activity,
@@ -2642,6 +2661,7 @@ impl Model {
                 CommandKind::CreateSession {
                     workdir,
                     conversation,
+                    ..
                 } => {
                     let outgoing = Outgoing::from(&e.status);
                     (!self.in_replica(outgoing)).then(|| PendingSession {
@@ -3657,6 +3677,9 @@ impl Model {
                     archived: *archived,
                     by: self.device_ref(*by),
                 }),
+                EventKind::WorktreeRemoved { by } => Some(Entry::WorktreeRemoved {
+                    by: self.device_ref(*by),
+                }),
                 // Calls a turn leaves open stay running until the server
                 // logs them unanswered.
                 EventKind::SessionStateChanged(state) => match state {
@@ -4477,6 +4500,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::StopSession { session_id }
         | CommandKind::RenameSession { session_id, .. }
         | CommandKind::SetSessionArchived { session_id, .. }
+        | CommandKind::RemoveWorktree { session_id }
         | CommandKind::SetPermissionMode { session_id, .. }
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }
@@ -4652,6 +4676,7 @@ mod tests {
                     workdir: workdir.into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 }],
             );
             id
@@ -4753,7 +4778,8 @@ mod tests {
             model
                 .dispatch(Action::CreateSession {
                     conversation: None,
-                    workdir: "/srv/x".into()
+                    workdir: "/srv/x".into(),
+                    worktree: None,
                 })
                 .is_empty()
         );
@@ -6499,6 +6525,40 @@ mod tests {
         EventKind::SessionArchived { archived, by }
     }
 
+    #[test]
+    fn remove_worktree_queues_only_for_a_worktree_session() {
+        let mut f = Fixture::paired();
+        let plain = f.session("/srv/plain");
+        assert!(
+            f.dispatch(Action::RemoveWorktree { session_id: plain })
+                .is_empty(),
+            "a session without a worktree has none to remove"
+        );
+
+        let in_worktree = SessionId::new();
+        f.log(
+            in_worktree,
+            vec![EventKind::SessionCreated {
+                workdir: "/srv/app".into(),
+                context_name: "start".into(),
+                from: None,
+                worktree: Some(skywave_proto::Worktree {
+                    repo: "/srv/app".into(),
+                    branch: "feat/x".into(),
+                }),
+            }],
+        );
+        let command = queued(&f.dispatch(Action::RemoveWorktree {
+            session_id: in_worktree,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::RemoveWorktree {
+                session_id: in_worktree,
+            }
+        );
+    }
+
     /// The active and the archived list, each most recently active first.
     fn lists(f: &mut Fixture) -> (Vec<SessionId>, Vec<SessionId>) {
         let ids = |view: SessionListView| view.sessions.iter().map(|r| r.id).collect::<Vec<_>>();
@@ -6562,6 +6622,25 @@ mod tests {
         assert!(
             f.dispatch(archive(SessionId::new(), true)).is_empty(),
             "unknown here"
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_has_a_timeline_entry() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        let by = f.me;
+        f.log(old, vec![EventKind::WorktreeRemoved { by }]);
+        f.open(old);
+        assert_eq!(
+            entries(&f),
+            vec![Entry::WorktreeRemoved {
+                by: DeviceRef {
+                    id: f.me,
+                    name: None,
+                    me: true,
+                },
+            }]
         );
     }
 
@@ -7293,13 +7372,15 @@ mod tests {
         assert!(
             f.dispatch(Action::CreateSession {
                 conversation: None,
-                workdir: "   ".into()
+                workdir: "   ".into(),
+                worktree: None,
             })
             .is_empty()
         );
         let command = queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: " /srv/new ".into(),
+            worktree: None,
         }));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
@@ -7346,6 +7427,7 @@ mod tests {
             CommandKind::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: None,
+                worktree: None,
             }
         );
         assert_eq!(f.model.unloaded_session(), None);
@@ -7359,6 +7441,7 @@ mod tests {
             workdir: "/srv/a".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         f.log_commands(new, vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(new));
@@ -7379,6 +7462,7 @@ mod tests {
             CommandKind::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: None,
+                worktree: None,
             }
         );
         let new = SessionId::new();
@@ -8033,12 +8117,14 @@ mod tests {
             queued(&f.dispatch(Action::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: conversation.map(str::to_owned),
+                worktree: None,
             }))
             .kind
         };
         let kind = |conversation: Option<&str>| CommandKind::CreateSession {
             workdir: "/srv/a".into(),
             conversation: conversation.map(str::to_owned),
+            worktree: None,
         };
         assert_eq!(create(&mut f, Some(" id ")), kind(Some("id")));
         assert_eq!(create(&mut f, Some("  ")), kind(None));
@@ -8048,11 +8134,32 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_session_asks_for_a_trimmed_worktree() {
+        let mut f = Fixture::paired();
+        let create = |f: &mut Fixture, worktree: Option<&str>| {
+            queued(&f.dispatch(Action::CreateSession {
+                workdir: "/srv/app".into(),
+                conversation: None,
+                worktree: worktree.map(str::to_owned),
+            }))
+            .kind
+        };
+        let kind = |worktree: Option<&str>| CommandKind::CreateSession {
+            workdir: "/srv/app".into(),
+            conversation: None,
+            worktree: worktree.map(str::to_owned),
+        };
+        assert_eq!(create(&mut f, Some("  feat/x ")), kind(Some("feat/x")));
+        assert_eq!(create(&mut f, Some("   ")), kind(None));
+    }
+
+    #[test]
     fn a_refused_conversation_is_a_discardable_failed_creation() {
         let mut f = Fixture::paired();
         let command = queued(&f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("nope".into()),
+            worktree: None,
         }));
         f.model.command_sending(command.id, Utc::now());
         f.model.command_result(
@@ -8091,6 +8198,7 @@ mod tests {
             from: Some(SessionOrigin::Agent {
                 conversation: "conv-1".into(),
             }),
+            worktree: None,
         };
         f.log_stamped(adopted, vec![(None, ContextId::first_of(adopted), created)]);
         f.log(adopted, vec![message("go on")]);
@@ -8124,6 +8232,7 @@ mod tests {
             from: Some(SessionOrigin::Agent {
                 conversation: "conv-1".into(),
             }),
+            worktree: None,
         }
     }
 
@@ -8504,6 +8613,7 @@ mod tests {
         let command = queued(&f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("conv-1".into()),
+            worktree: None,
         }));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
@@ -8573,10 +8683,12 @@ mod tests {
         let refused = queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/etc".into(),
+            worktree: None,
         }));
         let waiting = queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/new".into(),
+            worktree: None,
         }));
         f.model.command_sending(refused.id, Utc::now());
         f.model.command_sending(waiting.id, Utc::now());
@@ -10018,6 +10130,7 @@ mod tests {
         queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/x".into(),
+            worktree: None,
         }));
         assert_eq!(f.list_view().completion, None);
 
@@ -10085,6 +10198,7 @@ mod tests {
                 from: Some(SessionOrigin::Agent {
                     conversation: conversation.into(),
                 }),
+                worktree: None,
             }],
         );
         id
@@ -10919,12 +11033,14 @@ mod tests {
         let command = queued(&f.dispatch(Action::CreateSession {
             workdir: pick.workdir,
             conversation: Some(pick.id),
+            worktree: None,
         }));
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
                 workdir: workdir.into(),
                 conversation: Some(id.into()),
+                worktree: None,
             }
         );
         assert_eq!(f.list_view().conversations, None);
@@ -11472,6 +11588,7 @@ mod tests {
                 session: from,
                 context,
             })),
+            worktree: None,
         };
         assert!(!created.logged_by_command());
         f.log_stamped(new, vec![(None, ContextId::first_of(new), created)]);
@@ -12899,6 +13016,7 @@ mod tests {
                             workdir: "/srv".into(),
                             context_name: "start".into(),
                             from: None,
+                            worktree: None,
                         },
                     }],
                 })

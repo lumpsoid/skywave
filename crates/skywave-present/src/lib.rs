@@ -28,6 +28,7 @@
 //!   needs, and how a head reads a downloaded one.
 //! - [`session_info`]: a session's info page: what it is, what its turns
 //!   took and by which models, how its agent is set, and its subagents.
+//! - [`session_list`]: how the session list groups its rows by repo.
 //! - [`usage`]: cost and tokens totalled across sessions for the usage
 //!   screen.
 //! - [`text`]: agent content made safe to show: control characters
@@ -56,6 +57,7 @@ pub mod policy;
 pub mod question;
 pub mod sections;
 pub mod session_info;
+pub mod session_list;
 pub mod storage;
 pub mod text;
 pub mod usage;

@@ -59,6 +59,7 @@ impl Fixture {
         let seq = accepted(fixture.handle(CommandKind::CreateSession {
             workdir: workdir.to_str().unwrap().to_owned(),
             conversation: None,
+            worktree: None,
         }));
         let batch = fixture
             .log

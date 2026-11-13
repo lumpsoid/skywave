@@ -1055,6 +1055,7 @@ mod tests {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 }),
                 event(EventKind::ToolResult(ToolResult {
                     call: None,

@@ -179,7 +179,14 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v31: the workdir commit log: `GET` [`path::WORKDIR_LOG`] answering
 /// [`LogResult`] ([`CommitLog`], [`Commit`]) and [`limits::WORKDIR_LOG_MAX`].
-pub const PROTOCOL_VERSION: u32 = 31;
+///
+/// v32: git worktree sessions: `worktree` on `CommandKind::CreateSession`
+/// and on `EventKind::SessionCreated` ([`Worktree`]), and the `RejectReason`s
+/// `NotARepository`, `BranchExists` and `WorktreeFailed`. Also
+/// `CommandKind::RemoveWorktree` and `EventKind::WorktreeRemoved`, with the
+/// `RejectReason`s `NotAWorktree`, `WorktreeDirty`, `BranchUnmerged` and
+/// `TurnRunning`.
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -291,6 +298,16 @@ pub enum SessionOrigin {
     Context(ContextRef),
     /// A conversation the agent had outside Skywave, by the agent's own id.
     Agent { conversation: String },
+}
+
+/// A git worktree a session runs in (`EventKind::SessionCreated::worktree`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Worktree {
+    /// The canonical path of the repository's main working tree, which
+    /// heads group sessions by.
+    pub repo: String,
+    /// The branch the worktree has checked out.
+    pub branch: String,
 }
 
 /// Position in the server's global event log (D12).
@@ -441,6 +458,10 @@ pub enum EventKind {
         workdir: String,
         context_name: String,
         from: Option<SessionOrigin>,
+        /// The git worktree the session runs in, when `CreateSession` asked
+        /// for one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<Worktree>,
     },
     /// A `ClearContext` command started a new, empty context named `name`
     /// and made it current; the event is stamped with the new context. The
@@ -554,6 +575,12 @@ pub enum EventKind {
     /// activity and does not stop the agent.
     SessionArchived {
         archived: bool,
+        by: DeviceId,
+    },
+    /// The session's git worktree and its branch were removed by a
+    /// `RemoveWorktree` command. The agent is stopped and the session cannot
+    /// run again: later work for it is refused `WorkdirNotFound`.
+    WorktreeRemoved {
         by: DeviceId,
     },
     SessionStateChanged(SessionState),
@@ -867,6 +894,7 @@ impl EventKind {
             | EventKind::QuestionAnswered { by, .. }
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
+            | EventKind::WorktreeRemoved { by }
             | EventKind::PermissionModeRequested { by, .. }
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
@@ -930,6 +958,7 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
@@ -990,6 +1019,7 @@ impl EventKind {
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
             | EventKind::SubagentUsage(_)
@@ -1073,6 +1103,7 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
             | EventKind::SubagentUsage(_)
@@ -1943,6 +1974,11 @@ pub enum CommandKind {
         /// `workdir`; the session's first context continues a copy of it.
         /// `None`: a fresh conversation.
         conversation: Option<String>,
+        /// A new branch to create a git worktree on, next to the workdir's
+        /// repository; the session runs in that worktree. `None`: run in
+        /// `workdir` itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
     },
     /// Send `text` to the agent. `context` is the session's context the
     /// message was written in; the server refuses it as `ContextChanged`
@@ -1998,6 +2034,11 @@ pub enum CommandKind {
         session_id: SessionId,
         archived: bool,
     },
+    /// Remove the git worktree the session runs in and delete its branch, then
+    /// stop the session's agent. Refused while a turn runs, when the worktree
+    /// has uncommitted changes, or when the branch is not merged into the
+    /// repo's HEAD. Idempotent: a resend after it was removed is accepted.
+    RemoveWorktree { session_id: SessionId },
     /// Ask the session's agent to run in `mode`, starting the agent if it
     /// is not running. Accepted for any known session; the agent's answer
     /// comes as a `PermissionModeChanged` or `PermissionModeRefused` naming
@@ -2244,8 +2285,26 @@ pub enum CommandResult {
 pub enum RejectReason {
     /// `CreateSession.workdir` is outside the configured roots (D14).
     WorkdirNotAllowed,
-    /// `CreateSession.workdir` does not exist or is not a directory.
+    /// `CreateSession.workdir` does not exist or is not a directory. Also
+    /// refuses work (`SendMessage`, `RunShell`, ...) for a session whose
+    /// worktree was removed (`EventKind::WorktreeRemoved`).
     WorkdirNotFound,
+    /// `CreateSession.worktree` names a branch, but the workdir is not in a
+    /// git repository.
+    NotARepository,
+    /// `CreateSession.worktree` names a branch that already exists.
+    BranchExists,
+    /// git could not create the worktree; the server log has its stderr.
+    WorktreeFailed,
+    /// `RemoveWorktree` for a session that was not created in a git worktree.
+    NotAWorktree,
+    /// `RemoveWorktree` while the worktree has uncommitted or untracked changes.
+    WorktreeDirty,
+    /// `RemoveWorktree` while the worktree's branch is not merged into the
+    /// repo's HEAD.
+    BranchUnmerged,
+    /// `RemoveWorktree` while the session's agent is running a turn.
+    TurnRunning,
     UnknownSession,
     UnknownApproval,
     /// Another answer already won (D5).
@@ -3542,6 +3601,7 @@ mod tests {
             workdir: "/w".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         assert_eq!(created.device(), None);
         assert!(created.logged_by_command());
@@ -3568,6 +3628,7 @@ mod tests {
                 session,
                 context: ContextId::new(),
             })),
+            worktree: None,
         };
         assert!(!moved.logged_by_command());
         assert_eq!(moved.device(), None);
@@ -3585,6 +3646,7 @@ mod tests {
             from: Some(SessionOrigin::Agent {
                 conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
             }),
+            worktree: None,
         };
         assert!(!adopted.logged_by_command());
         assert_eq!(adopted.device(), None);

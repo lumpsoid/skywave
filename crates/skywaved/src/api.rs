@@ -100,8 +100,9 @@
 //! work returns: stuck threads hold theirs, so at most [`FS_PERMITS`] can
 //! pile up. Hello, commands, events, blobs and attachments never take one.
 //!
-//! **Prepared commands** (an adopting create and a crop) are prepared off
-//! the API's connection, then handed to [`EventLog::handle_with`]. A
+//! **Prepared commands** (an adopting create, a create naming a worktree, and
+//! a crop) are prepared off the API's connection, then handed to
+//! [`EventLog::handle_with`]. A
 //! command already handled is answered from its stored result without
 //! preparing anything; a resend that arrives while the first request is
 //! still preparing waits for that request's reply.
@@ -146,8 +147,8 @@ use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContentHash,
     ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery,
     HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult, LoginStartResult,
-    PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, UploadResult, UsageLimit, UsageLimitsResult,
-    WorkdirQuery, check_conversation_id, limits, path,
+    PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId, UploadResult,
+    UsageLimit, UsageLimitsResult, WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -172,7 +173,8 @@ use crate::event_log::{self, DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
 use crate::login::LoginFlows;
 use crate::server::{JoinedHook, ServerOptions};
 use crate::storage::{self, StorageReader};
-use crate::workdir::{self, Snapshot, WorkdirReader};
+use crate::workdir::{self, Git, Snapshot, WorkdirReader};
+use crate::worktree;
 use crate::{EventLog, lock};
 
 /// Longest a `GET /v1/events` waits, whatever `wait` asks for.
@@ -233,6 +235,9 @@ pub(crate) struct Api {
     /// Workdir reads, on a second connection of their own (behind its own
     /// mutex), so file I/O never holds `db`.
     workdir: WorkdirReader,
+    /// How the git a `CreateSession` naming a worktree runs, as workdir
+    /// reads do.
+    git: Git,
     /// Storage reports, on a third connection of their own.
     storage: StorageReader,
     log: EventLog,
@@ -290,6 +295,7 @@ impl Api {
         );
         Ok(Api {
             db: Mutex::new(Db::open(&dir.db_path())?),
+            git: options.git.clone(),
             workdir: WorkdirReader::new(
                 Db::open(&dir.db_path())?,
                 blobs.clone(),
@@ -509,7 +515,11 @@ async fn commands(
         CommandKind::CreateSession {
             conversation: Some(_),
             ..
+        } | CommandKind::CreateSession {
+            worktree: Some(_),
+            ..
         } | CommandKind::CropBlob { .. }
+            | CommandKind::RemoveWorktree { .. }
     ) || matches!(
         &command.kind,
         CommandKind::SendMessage { attachments, .. } if !attachments.is_empty()
@@ -530,8 +540,9 @@ async fn commands(
 /// Handles a command prepared before its transaction, outside the API's
 /// connection: an adopting `CreateSession`, whose history is read and
 /// bounded, a `CropBlob`, whose new blob is written, or a `SendMessage`
-/// naming images, whose staged images are linked. Slow file work must not
-/// hold up every other device's commands. A resend that arrives while the
+/// naming images, whose staged images are linked, or a `RemoveWorktree`, whose
+/// git work runs first. Slow file work must not hold up every other device's
+/// commands. A resend that arrives while the
 /// command is being prepared waits for that one's reply, so a command is
 /// never prepared twice.
 async fn prepared(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
@@ -599,6 +610,14 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
         CommandKind::SendMessage { attachments, .. } => {
             Some(prepare_attachments(api, attachments.clone()).await?)
         }
+        CommandKind::CreateSession {
+            worktree: Some(_), ..
+        } => prepare_worktree(api, &command)
+            .await?
+            .map(Preparation::from),
+        CommandKind::RemoveWorktree { session_id } => Some(Preparation::Removal(
+            prepare_removal(api, *session_id).await?,
+        )),
         _ => prepare_import(api, &command).await?.map(Preparation::from),
     };
     api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
@@ -710,6 +729,7 @@ async fn prepare_import(
     let CommandKind::CreateSession {
         workdir,
         conversation: Some(conversation),
+        ..
     } = &command.kind
     else {
         return Ok(None);
@@ -763,6 +783,109 @@ async fn prepare_import(
             }
         },
     ))
+}
+
+/// The worktree a `CreateSession` naming one asks for, created on a blocking
+/// thread off the API's connection: git is slow and changes the disk, so it
+/// never runs inside the transaction, and once per command, since a resend
+/// is answered from the log. Git is bounded by its own deadline
+/// ([`worktree::WORKTREE_DEADLINE`]), not by a timeout here: a timeout would
+/// answer while git still ran, and the worktree it made would have no one to
+/// discard it. The [`worktree::Prepared`] is built on that thread, so a request
+/// dropped while git runs leaves its worktree with an owner: the task's output,
+/// dropped with its handle, discards it.
+///
+/// A server stopping or a low disk is refused `ServerStopping` or `DiskLow` by
+/// `apply`, before the session, so nothing is prepared for it, as
+/// `prepare_import` does.
+async fn prepare_worktree(
+    api: &Arc<Api>,
+    command: &Command,
+) -> std::result::Result<Option<worktree::Prepared>, StatusCode> {
+    let CommandKind::CreateSession {
+        workdir,
+        conversation: None,
+        worktree: Some(branch),
+    } = &command.kind
+    else {
+        return Ok(None);
+    };
+    if api.log.stopping() || api.log.disk().refresh() {
+        return Ok(None);
+    }
+    let deadline = Instant::now() + worktree::WORKTREE_DEADLINE;
+    let (git, roots) = (api.git.clone(), api.log.roots().to_vec());
+    let (workdir, branch) = (workdir.clone(), branch.clone());
+    let prepared = tokio::task::spawn_blocking(move || {
+        worktree::Prepared::new(
+            git.clone(),
+            worktree::create(&git, &roots, &workdir, &branch, deadline),
+        )
+    })
+    .await;
+    Ok(Some(match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            tracing::error!(error = %e, "creating a worktree failed");
+            worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed))
+        }
+    }))
+}
+
+/// The outcome of a `RemoveWorktree` of `session_id`. Its checks run on a
+/// blocking thread off the API's connection, before git: an unknown session, a
+/// session with no worktree, and a turn running in any session of the same
+/// directory are refused there. The directory may be shared with sessions that
+/// name no worktree, or with a worktree made at the same path since. A session
+/// whose worktree was already removed is accepted without git, so nothing
+/// made at that path since is touched. Otherwise [`worktree::remove`] runs,
+/// bounded by its own deadline as git in [`prepare_worktree`] is. A removal
+/// starts no work, so a stopping server or a low disk does not refuse it here.
+async fn prepare_removal(
+    api: &Arc<Api>,
+    session_id: SessionId,
+) -> std::result::Result<std::result::Result<(), RejectReason>, StatusCode> {
+    let target = api
+        .blocking(move |api, db| {
+            let Some(info) = api.log.session(db, session_id)? else {
+                return Ok(Err(RejectReason::UnknownSession));
+            };
+            let Some(recorded) = api.log.worktree_of(db, session_id)? else {
+                return Ok(Err(RejectReason::NotAWorktree));
+            };
+            // The session itself is one of these. The turn check comes before
+            // the removed check: an accepted removal logs `WorktreeRemoved`,
+            // which stops every session of the directory.
+            let sessions = api.log.sessions(db)?;
+            if sessions
+                .iter()
+                .any(|s| s.workdir == info.workdir && s.turn_active)
+            {
+                return Ok(Err(RejectReason::TurnRunning));
+            }
+            if api.log.worktree_removed(db, session_id)? {
+                return Ok(Ok(None));
+            }
+            Ok(Ok(Some((recorded, info.workdir))))
+        })
+        .await?;
+    let (recorded, path) = match target {
+        Ok(Some(target)) => target,
+        Ok(None) => return Ok(Ok(())),
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let deadline = Instant::now() + worktree::WORKTREE_DEADLINE;
+    let git = api.git.clone();
+    let removed =
+        tokio::task::spawn_blocking(move || worktree::remove(&git, &recorded, &path, deadline))
+            .await;
+    Ok(match removed {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "removing a worktree failed");
+            Err(RejectReason::WorktreeFailed)
+        }
+    })
 }
 
 async fn events(

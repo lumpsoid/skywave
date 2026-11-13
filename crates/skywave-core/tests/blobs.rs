@@ -165,6 +165,7 @@ impl Daemon {
             .dispatch(Action::CreateSession {
                 conversation: None,
                 workdir: self.tmp.path().join("root/project").display().to_string(),
+                worktree: None,
             })
             .unwrap();
         self.wait_log("the session", |events| !events.is_empty())
@@ -931,6 +932,7 @@ async fn imported_blobs_download_under_eager_and_wait_under_on_demand() {
         .dispatch(Action::CreateSession {
             conversation: Some("conv-1".into()),
             workdir: workdir.display().to_string(),
+            worktree: None,
         })
         .unwrap();
     daemon

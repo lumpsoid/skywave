@@ -181,6 +181,10 @@ pub enum GuiIntent {
     CreateConversationTyped {
         conversation: String,
     },
+    /// The new-worktree branch field changed.
+    CreateWorktreeTyped {
+        worktree: String,
+    },
     /// Tab: open the highlighted row, else fill or list again.
     CompletionComplete,
     /// Move the highlight: ↓ from none highlights the first row, ↑ from
@@ -481,6 +485,10 @@ pub enum ActionIntent {
     RetryAgentLogin,
     /// Forget this device's login, the code included.
     DismissAgentLogin,
+    /// Remove the archived session's git worktree and delete its branch.
+    RemoveWorktree {
+        session_id: String,
+    },
 }
 
 /// A login code as pasted. A secret: `Debug` prints `<redacted>`, so an

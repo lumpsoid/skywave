@@ -23,8 +23,8 @@ use skywave_proto::{
     DiffBody, DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange,
     FileResult, HelloResponse, ImageType, ImportOutcome, LimitSeverity, LimitWindow, LineSpan,
     ListResult, LogResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason,
-    RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage, StorageReport,
-    ToolResult, UploadResult, UsageLimit, UsageLimitsResult, limits, path,
+    RunId, RunsSince, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, ShellRunStorage,
+    StorageReport, ToolResult, UploadResult, UsageLimit, UsageLimitsResult, Worktree, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -211,6 +211,7 @@ impl Fixture {
             kind: CommandKind::CreateSession {
                 workdir: self.root.join("project").display().to_string(),
                 conversation: None,
+                worktree: None,
             },
         }
     }
@@ -805,6 +806,7 @@ async fn create_session_adopts_a_conversation_by_its_id() {
         kind: CommandKind::CreateSession {
             workdir: f.root.join("project").display().to_string(),
             conversation: Some(conversation.to_owned()),
+            worktree: None,
         },
     };
 
@@ -840,6 +842,599 @@ async fn create_session_adopts_a_conversation_by_its_id() {
             conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
         })
     );
+}
+
+/// Makes `dir` a repository with one commit on `main`: a worktree starts
+/// from the commit.
+fn make_repo(dir: &std::path::Path) {
+    setup_git(dir, &["init", "-q"]);
+    setup_git(dir, &["commit", "-q", "--allow-empty", "-m", "first"]);
+}
+
+/// Whether the repository at `dir` has the local branch `branch`.
+fn has_branch(dir: &std::path::Path, branch: &str) -> bool {
+    let full = format!("refs/heads/{branch}");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--verify", "--quiet", full.as_str()])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("this test needs `git` on PATH: {e}"))
+        .status
+        .success()
+}
+
+/// A `CreateSession` of the fixture's `project` on a new worktree `branch`.
+fn worktree_command(f: &Fixture, branch: &str) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: f.root.join("project").display().to_string(),
+            conversation: None,
+            worktree: Some(branch.into()),
+        },
+    }
+}
+
+/// A `CreateSession` naming a worktree makes it next to the repository and
+/// starts the session there. Resending it answers the same and logs nothing
+/// more.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_makes_a_worktree_and_runs_there() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let command = worktree_command(&f, "feat/x");
+
+    let accepted = device.command(&command).await;
+    assert_eq!(accepted, CommandResult::Accepted { seq: Seq(1) });
+    assert_eq!(device.command(&command).await, accepted);
+    assert_eq!(f.log.head(), Seq(1));
+    let batch = device.events(Seq::ZERO, 0).await;
+    assert_eq!(batch.events.len(), 1);
+    let event = &batch.events[0];
+    assert_eq!(event.command_id, Some(command.id));
+    let EventKind::SessionCreated {
+        workdir,
+        from,
+        worktree,
+        ..
+    } = &event.kind
+    else {
+        panic!("{batch:?}");
+    };
+    let made = f.root.join("project.worktrees/feat/x");
+    assert!(made.is_dir());
+    assert_eq!(from, &None);
+    assert_eq!(
+        workdir,
+        &std::fs::canonicalize(&made).unwrap().display().to_string()
+    );
+    assert_eq!(
+        worktree,
+        &Some(Worktree {
+            repo: std::fs::canonicalize(&project)
+                .unwrap()
+                .display()
+                .to_string(),
+            branch: "feat/x".into(),
+        })
+    );
+}
+
+/// A worktree on a branch that already exists is refused and makes no
+/// directory. The same create on a free branch then goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_refuses_an_existing_branch() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    make_repo(&f.root.join("project"));
+
+    assert_eq!(
+        device.command(&worktree_command(&f, "main")).await,
+        rejected(RejectReason::BranchExists)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees").exists());
+    // Positive control: a free branch from the same fixture is created.
+    let free = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&free), Seq(1));
+    assert!(f.root.join("project.worktrees/feat/x").is_dir());
+}
+
+/// A worktree needs a repository: a plain directory is refused and nothing
+/// is created.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_refuses_a_worktree_outside_a_repository() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+
+    assert_eq!(
+        device.command(&worktree_command(&f, "feat/x")).await,
+        rejected(RejectReason::NotARepository)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees").exists());
+    // Positive control: once the directory is a repository, the same command
+    // is accepted.
+    make_repo(&f.root.join("project"));
+    let made = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&made), Seq(1));
+}
+
+/// D30: a worktree with a conversation is refused before anything is
+/// created, the branch included.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_refuses_a_worktree_with_a_conversation() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let adopting = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: project.display().to_string(),
+            conversation: Some("9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into()),
+            worktree: Some("feat/x".into()),
+        },
+    };
+
+    assert_eq!(
+        device.command(&adopting).await,
+        rejected(RejectReason::BadConversation)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees").exists());
+    assert!(!has_branch(&project, "feat/x"));
+    // Positive control: the same branch without the conversation is created.
+    let made = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&made), Seq(1));
+    assert!(has_branch(&project, "feat/x"));
+}
+
+/// A worktree made for a session the log then refuses is discarded with its
+/// branch. Were the branch left behind, creating it again would be refused
+/// with `BranchExists`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_whose_session_is_rejected_is_discarded() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+
+    // A stopping server refuses new work after the worktree is made.
+    f.log.set_stopping(true);
+    assert_eq!(
+        device.command(&worktree_command(&f, "feat/x")).await,
+        rejected(RejectReason::ServerStopping)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees/feat/x").exists());
+    assert!(!has_branch(&project, "feat/x"));
+    // Positive control: running again, the same branch is created.
+    f.log.set_stopping(false);
+    let made = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&made), Seq(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_worktree_of_an_unknown_session_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+
+    let remove = |session_id| Command {
+        id: CommandId::new(),
+        kind: CommandKind::RemoveWorktree { session_id },
+    };
+    assert_eq!(
+        device.command(&remove(SessionId::new())).await,
+        rejected(RejectReason::UnknownSession)
+    );
+    // Positive control: the same command for a known session is not refused
+    // as unknown, so the refusal above is about the session id.
+    assert_ne!(
+        device.command(&remove(session)).await,
+        rejected(RejectReason::UnknownSession)
+    );
+}
+
+/// A `RemoveWorktree` of `session`, under a new command id.
+fn remove_command(session: SessionId) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::RemoveWorktree {
+            session_id: session,
+        },
+    }
+}
+
+/// A merged, clean worktree is removed with its branch, and the removal is
+/// logged. Resending the same command answers the same. A new command for the
+/// same session is accepted too: the removal is already done.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_merged_clean_worktree_deletes_it_and_its_branch() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    assert!(dir.is_dir());
+
+    let command = remove_command(session);
+    let accepted = device.command(&command).await;
+    let seq = accepted_seq(&accepted);
+    assert!(!dir.exists());
+    assert!(!has_branch(&project, "feat/x"));
+    let batch = device.events(Seq::ZERO, 0).await;
+    let removed = batch.iter().find(|(s, _)| *s == seq).map(|(_, e)| e);
+    let removed = removed.expect("the accepted removal is in the log");
+    assert!(
+        matches!(removed.kind, EventKind::WorktreeRemoved { .. }),
+        "{removed:?}"
+    );
+    assert_eq!(device.command(&command).await, accepted);
+    let again = device.command(&remove_command(session)).await;
+    assert!(accepted_seq(&again).0 > seq.0, "{again:?}");
+}
+
+/// Work for a session whose worktree was removed is refused `WorkdirNotFound`:
+/// its directory is gone, or may belong to another worktree since. Control for
+/// it, a rename, is still accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_for_a_removed_worktree_session_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let context = ContextId::first_of(session);
+    // Positive control: before the removal, the same message is accepted.
+    accepted_seq(
+        &device
+            .command(&message_command(session, context, "hello", Vec::new()))
+            .await,
+    );
+    accepted_seq(&device.command(&remove_command(session)).await);
+
+    assert_eq!(
+        device
+            .command(&message_command(session, context, "again", Vec::new()))
+            .await,
+        rejected(RejectReason::WorkdirNotFound)
+    );
+    let model = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetModel {
+            session_id: session,
+            model: "opus".into(),
+        },
+    };
+    assert_eq!(
+        device.command(&model).await,
+        rejected(RejectReason::WorkdirNotFound)
+    );
+    let rename = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RenameSession {
+            session_id: session,
+            name: Some("renamed".into()),
+        },
+    };
+    accepted_seq(&device.command(&rename).await);
+}
+
+/// Uncommitted work keeps the worktree and its branch. Once the file is gone,
+/// the same session's removal goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dirty_worktree_is_not_removed() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let scratch = dir.join("notes.txt");
+    std::fs::write(&scratch, "untracked").unwrap();
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::WorktreeDirty)
+    );
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: once the file is gone, the same worktree is removed.
+    std::fs::remove_file(&scratch).unwrap();
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+    assert!(!has_branch(&project, "feat/x"));
+}
+
+/// A branch with a commit its `HEAD` lacks is not merged, so the worktree and
+/// branch stay. Once the branch is merged, the removal goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unmerged_worktree_branch_is_not_removed() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    setup_git(&dir, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::BranchUnmerged)
+    );
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: once the branch is merged, the removal goes through.
+    setup_git(&project, &["merge", "-q", "--ff-only", "feat/x"]);
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+    assert!(!has_branch(&project, "feat/x"));
+}
+
+/// A session that runs in no worktree has nothing to remove.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_session_has_no_worktree_to_remove() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let plain = new_session(&f, &mut device).await;
+
+    assert_eq!(
+        device.command(&remove_command(plain)).await,
+        rejected(RejectReason::NotAWorktree)
+    );
+    // Positive control: a session that does run in a worktree is removed, so
+    // the refusal above is about the session, not about the command.
+    make_repo(&f.root.join("project"));
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    accepted_seq(&device.command(&remove_command(session)).await);
+}
+
+/// A running turn keeps the worktree: the refusal comes before git runs. Once
+/// the turn is over, the removal goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_is_not_removed_while_a_turn_runs() {
+    let mut f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let context = f
+        .log
+        .session(&f.storage.db, session)
+        .unwrap()
+        .unwrap()
+        .context;
+    let working = EventKind::SessionStateChanged(SessionState::AgentWorking);
+    f.log
+        .append(&mut f.storage.db, session, context, working)
+        .unwrap();
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: once the turn is idle, the same worktree is removed.
+    let idle = EventKind::SessionStateChanged(SessionState::Idle);
+    f.log
+        .append(&mut f.storage.db, session, context, idle)
+        .unwrap();
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+}
+
+/// `git worktree list --porcelain` of the repository at `dir`.
+fn worktree_list(dir: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["worktree", "list", "--porcelain"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("this test needs `git` on PATH: {e}"));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A session whose worktree was removed does not remove a worktree made at
+/// the same path since: its removal is already done, so git does not run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_worktree_session_does_not_remove_a_recreated_worktree() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let first = device.command(&worktree_command(&f, "feat/x")).await;
+    let old = session_of(&first, &device.events(Seq::ZERO, 0).await);
+    accepted_seq(&device.command(&remove_command(old)).await);
+    let second = device.command(&worktree_command(&f, "feat/x")).await;
+    let current = session_of(&second, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    assert_ne!(old, current);
+
+    accepted_seq(&device.command(&remove_command(old)).await);
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: the session that owns the new worktree removes it.
+    accepted_seq(&device.command(&remove_command(current)).await);
+    assert!(!dir.exists());
+}
+
+/// A turn in another session of the worktree's directory keeps the worktree,
+/// as one in the session that owns it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_is_not_removed_while_another_session_there_runs_a_turn() {
+    let mut f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let owner = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let plain = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: dir.display().to_string(),
+            conversation: None,
+            worktree: None,
+        },
+    };
+    let made = device.command(&plain).await;
+    let other = session_of(&made, &device.events(Seq::ZERO, 0).await);
+    let context = f
+        .log
+        .session(&f.storage.db, other)
+        .unwrap()
+        .unwrap()
+        .context;
+    let working = EventKind::SessionStateChanged(SessionState::AgentWorking);
+    f.log
+        .append(&mut f.storage.db, other, context, working)
+        .unwrap();
+
+    assert_eq!(
+        device.command(&remove_command(owner)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: once the other session is idle, the removal goes through.
+    let idle = EventKind::SessionStateChanged(SessionState::Idle);
+    f.log
+        .append(&mut f.storage.db, other, context, idle)
+        .unwrap();
+    accepted_seq(&device.command(&remove_command(owner)).await);
+    assert!(!dir.exists());
+}
+
+/// `-d` checks the branch's upstream, not HEAD. A branch merged into HEAD is
+/// removed even when its upstream does not have it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merged_worktree_branch_with_an_unmerged_upstream_is_removed() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    setup_git(&project, &["branch", "base"]);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    setup_git(&dir, &["commit", "-q", "--allow-empty", "-m", "work"]);
+    setup_git(&project, &["merge", "-q", "--ff-only", "feat/x"]);
+    setup_git(&project, &["branch", "--set-upstream-to=base", "feat/x"]);
+
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+    assert!(!has_branch(&project, "feat/x"));
+}
+
+/// A worktree whose directory was deleted by hand is pruned from the
+/// repository, and its branch is deleted with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_deleted_by_hand_is_removed() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!has_branch(&project, "feat/x"));
+    assert!(!worktree_list(&project).contains("project.worktrees/feat/x"));
+    // Positive control: the same branch name is free again.
+    accepted_seq(&device.command(&worktree_command(&f, "feat/x")).await);
+    assert!(dir.is_dir());
+}
+
+/// A worktree detached on a commit its branch lacks keeps the worktree: the
+/// commit is not merged into HEAD.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_with_detached_commits_is_not_removed() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    setup_git(&dir, &["checkout", "-q", "--detach"]);
+    setup_git(&dir, &["commit", "-q", "--allow-empty", "-m", "lost"]);
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::BranchUnmerged)
+    );
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: back on the branch, whose commit is merged, the
+    // removal goes through.
+    setup_git(&dir, &["checkout", "-q", "feat/x"]);
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+}
+
+/// `status.showUntrackedFiles = no` hides untracked files from a plain `git
+/// status`. The removal lists them anyway, so the worktree is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn untracked_files_hidden_by_config_keep_the_worktree() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    setup_git(&project, &["config", "status.showUntrackedFiles", "no"]);
+    let scratch = dir.join("notes.txt");
+    std::fs::write(&scratch, "untracked").unwrap();
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::WorktreeDirty)
+    );
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: once the file is gone, the removal goes through.
+    std::fs::remove_file(&scratch).unwrap();
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
