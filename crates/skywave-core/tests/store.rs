@@ -314,6 +314,63 @@ fn sessions_are_projected_from_events() {
 }
 
 #[test]
+fn shell_history_spans_sessions_newest_first_once() {
+    let mut store = Store::open_in_memory().unwrap();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let by = DeviceId::new();
+    let created = |session_id, minute| {
+        event(
+            session_id,
+            minute,
+            EventKind::SessionCreated {
+                workdir: "/srv".into(),
+                context_name: "start".into(),
+                from: None,
+                worktree: None,
+            },
+        )
+    };
+    let shell = |session_id, minute, command: &str| {
+        event(
+            session_id,
+            minute,
+            EventKind::ShellRequested {
+                command: command.into(),
+                when: RunWhen::Always,
+                by,
+            },
+        )
+    };
+    let events = vec![
+        created(a, 0),
+        created(b, 1),
+        shell(a, 2, "ls"),
+        shell(b, 3, "make test"),
+        event(
+            a,
+            4,
+            EventKind::SessionStateChanged(SessionState::AgentWorking),
+        ),
+        shell(b, 5, "ls"),
+        shell(a, 6, "git status"),
+    ];
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+    let expected = ["git status", "ls", "make test"];
+    assert_eq!(store.shell_history(10).unwrap(), expected);
+    assert_eq!(store.shell_history(2).unwrap(), ["git status", "ls"]);
+    assert_eq!(store.load().unwrap().shell_history, expected);
+}
+
+#[test]
 fn referenced_blobs_are_registered_and_track_state() {
     let log = Log::new();
     let mut store = Store::open_in_memory().unwrap();
