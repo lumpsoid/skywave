@@ -485,6 +485,10 @@ pub enum ActionIntent {
     RetryAgentLogin,
     /// Forget this device's login, the code included.
     DismissAgentLogin,
+    /// Remove the archived session's git worktree and delete its branch.
+    RemoveWorktree {
+        session_id: String,
+    },
 }
 
 /// A login code as pasted. A secret: `Debug` prints `<redacted>`, so an

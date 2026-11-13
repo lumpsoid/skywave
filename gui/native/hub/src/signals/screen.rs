@@ -403,6 +403,11 @@ pub struct SessionRowView {
     /// Why it cannot be deleted yet, for an archived row that is not
     /// deletable.
     pub delete_blocked_label: Option<String>,
+    /// `RemoveWorktree` is offered: the row is archived and runs in a git
+    /// worktree that is not removed yet.
+    pub removable: bool,
+    /// The session's worktree was removed; its work is refused.
+    pub worktree_removed: bool,
     pub archived: bool,
 }
 

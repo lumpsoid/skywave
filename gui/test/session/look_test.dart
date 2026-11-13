@@ -90,6 +90,8 @@ void main() {
       lastActivityLabel: sessionRow('a').lastActivityLabel,
       lastActivityMs: 0,
       deletable: false,
+      removable: false,
+      worktreeRemoved: false,
       archived: false,
     );
     Color badge() => tester.widget<Text>(find.text('working')).style!.color!;
