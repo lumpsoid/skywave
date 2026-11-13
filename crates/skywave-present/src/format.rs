@@ -336,6 +336,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::WorktreeDirty => "the worktree has uncommitted changes",
         RejectReason::BranchUnmerged => "the branch is not merged yet",
         RejectReason::TurnRunning => "the agent is running a turn",
+        RejectReason::ShellRunning => "a shell command is running",
         RejectReason::UnknownSession => "the server does not know this session",
         RejectReason::UnknownApproval => "the server does not know this approval",
         RejectReason::ApprovalAlreadyResolved => "already answered on another device",
