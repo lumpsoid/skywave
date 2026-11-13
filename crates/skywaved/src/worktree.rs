@@ -8,12 +8,16 @@
 //! between `<repo>.worktrees` and the new worktree that already exists: a
 //! symlink there would send git's writes outside the roots. A new branch starts
 //! at the workdir's `HEAD`, which is the main tree's only when the workdir is
-//! the main tree. [`create`] runs one at a time. Outcomes come from git's exit
+//! the main tree. [`create`] and [`remove`] run one at a time. Outcomes come from git's exit
 //! statuses; a timeout is a failure.
 //!
 //! [`discard`] is rollback only: the caller uses it for a worktree [`create`]
 //! made for a session that was not committed ([`Prepared`]). `--force` is
 //! safe there because only a worktree just made is ever discarded.
+//!
+//! [`remove`] is the explicit removal of a session's worktree. It never
+//! forces: a dirty worktree or an unmerged branch is refused, and a removal
+//! that is already done is accepted, so a resend is safe.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -22,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use skywave_proto::RejectReason;
+use skywave_proto::{RejectReason, Worktree};
 
 use crate::dirs;
 use crate::workdir::Git;
@@ -41,7 +45,8 @@ pub struct Created {
 /// How long git may take to create or discard a worktree; git is killed past it.
 pub const WORKTREE_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Serialises [`create`]. Its checks and its `git worktree add` are one step:
+/// Serialises [`create`] and [`remove`]. A create's checks and its `git
+/// worktree add` are one step:
 /// two creates naming one branch would both pass [`branch_exists`] and the
 /// target check, and the loser would fail as `WorktreeFailed` instead of
 /// `BranchExists`. It also keeps a failed add's cleanup to what this create
@@ -125,6 +130,142 @@ pub fn discard(git: &Git, created: &Created, deadline: Instant) {
         &created.branch,
         "git branch -D failed",
     );
+}
+
+/// Removes a session's worktree at `path` and deletes its branch, both in the
+/// repository's main working tree. Refused: `BranchUnmerged` when the branch,
+/// or the worktree's own `HEAD`, is not merged into the repository's `HEAD`;
+/// `WorktreeDirty` when the worktree has changes; anything else git cannot do
+/// is `WorktreeFailed`. It never forces a dirty or unmerged removal. The branch
+/// is deleted with `-D`, but only after [`check_merged`] passed in this same
+/// call: `-d` checks the upstream rather than `HEAD`, so it could fail after
+/// the worktree is gone and never recover. Each step is skipped when already
+/// done, so a removal whose worktree and branch are both gone is `Ok`: a resend
+/// after a failed transaction is accepted. A directory deleted by hand is
+/// pruned from the repository. The checks run again on every call.
+pub fn remove(
+    git: &Git,
+    worktree: &Worktree,
+    path: &str,
+    deadline: Instant,
+) -> Result<(), RejectReason> {
+    let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
+    let repo = Path::new(&worktree.repo);
+    let registered = is_registered(git, repo, path, deadline)?;
+    let branch = branch_exists(git, repo, &worktree.branch, deadline)?;
+    if !registered && !branch {
+        return Ok(());
+    }
+    if branch {
+        check_merged(git, repo, &worktree.branch, deadline)?;
+    }
+    if registered {
+        take_off(git, repo, &worktree.branch, path, deadline)?;
+    }
+    if branch {
+        let delete = ["branch", "-D", worktree.branch.as_str()];
+        let what = "git branch -D failed";
+        if !succeeded(git, repo, deadline, &delete, &worktree.branch, what) {
+            return Err(RejectReason::WorktreeFailed);
+        }
+    }
+    Ok(())
+}
+
+/// Takes a registered worktree off `repo`. A directory still there is checked
+/// (its own `HEAD` merged, no changes) and removed with `git worktree remove`,
+/// never with `--force`. A directory deleted by hand has nothing to check: git
+/// prunes its registration instead.
+fn take_off(
+    git: &Git,
+    repo: &Path,
+    branch: &str,
+    path: &str,
+    deadline: Instant,
+) -> Result<(), RejectReason> {
+    let dir = Path::new(path);
+    if is_gone(dir) {
+        let prune = ["worktree", "prune"];
+        let what = "git worktree prune failed";
+        return if succeeded(git, repo, deadline, &prune, branch, what) {
+            Ok(())
+        } else {
+            Err(RejectReason::WorktreeFailed)
+        };
+    }
+    let head = head_of(git, dir, deadline)?;
+    check_merged(git, repo, &head, deadline)?;
+    check_clean(git, dir, deadline)?;
+    let remove = ["worktree", "remove", path];
+    let what = "git worktree remove failed";
+    if succeeded(git, repo, deadline, &remove, branch, what) {
+        Ok(())
+    } else {
+        Err(RejectReason::WorktreeFailed)
+    }
+}
+
+/// Whether nothing is at `dir`: a directory deleted by hand. A file or a link
+/// in its place is something, and is not pruned.
+fn is_gone(dir: &Path) -> bool {
+    matches!(fs::symlink_metadata(dir), Err(e) if e.kind() == io::ErrorKind::NotFound)
+}
+
+/// Whether `repo` has a worktree at `path`: some line of `git worktree list
+/// --porcelain` is `worktree <path>`, exactly.
+fn is_registered(
+    git: &Git,
+    repo: &Path,
+    path: &str,
+    deadline: Instant,
+) -> Result<bool, RejectReason> {
+    let done = run(git, repo, deadline, &["worktree", "list", "--porcelain"])?;
+    if !done.status.success() {
+        let stderr = String::from_utf8_lossy(&done.stderr);
+        tracing::warn!(stderr = %stderr.trim_end(), "git worktree list failed");
+        return Err(RejectReason::WorktreeFailed);
+    }
+    let wanted = format!("worktree {path}");
+    let out = String::from_utf8_lossy(&done.out);
+    Ok(out.lines().any(|line| line == wanted))
+}
+
+/// `rev` (a branch or a commit) is merged into `repo`'s `HEAD`: `git
+/// merge-base --is-ancestor` exits 0 for that and 1 for not. Any other exit is
+/// a failure.
+fn check_merged(git: &Git, repo: &Path, rev: &str, deadline: Instant) -> Result<(), RejectReason> {
+    let done = run(
+        git,
+        repo,
+        deadline,
+        &["merge-base", "--is-ancestor", rev, "HEAD"],
+    )?;
+    match done.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => Err(RejectReason::BranchUnmerged),
+        _ => {
+            let stderr = String::from_utf8_lossy(&done.stderr);
+            tracing::warn!(rev = %rev, stderr = %stderr.trim_end(), "git merge-base failed");
+            Err(RejectReason::WorktreeFailed)
+        }
+    }
+}
+
+/// The worktree at `path` has no changes: `git status --porcelain` prints
+/// nothing. Untracked files are listed whatever `status.showUntrackedFiles`
+/// says, so a config cannot hide them.
+fn check_clean(git: &Git, path: &Path, deadline: Instant) -> Result<(), RejectReason> {
+    let args = ["status", "--porcelain", "--untracked-files=normal"];
+    let done = run(git, path, deadline, &args)?;
+    if !done.status.success() {
+        tracing::warn!(dir = %path.display(), "git status failed");
+        return Err(RejectReason::WorktreeFailed);
+    }
+    if done.out.is_empty() {
+        Ok(())
+    } else {
+        Err(RejectReason::WorktreeDirty)
+    }
 }
 
 /// A worktree [`create`] made for a session, or the refusal it came to, held
