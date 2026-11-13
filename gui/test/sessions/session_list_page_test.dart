@@ -14,6 +14,9 @@ SessionRowView sessionRow(
   String? title,
   bool hasWorkdir = true,
   String? group,
+  String? branch,
+  bool removable = false,
+  bool worktreeRemoved = false,
 }) => SessionRowView(
   sessionId: id,
   title: title ?? 'title $id',
@@ -22,7 +25,7 @@ SessionRowView sessionRow(
   group: group ?? (hasWorkdir ? '/srv/proj-$id' : ''),
   groupName:
       group?.split('/').last ?? (hasWorkdir ? 'proj-$id' : 'no directory'),
-  branch: null,
+  branch: branch,
   state: AgentState.awaitingApproval,
   badgeLabel: 'approval',
   unread: 3,
@@ -35,8 +38,8 @@ SessionRowView sessionRow(
   renameLabel: 'queued',
   deletable: deletable,
   deleteBlockedLabel: blocked,
-  removable: false,
-  worktreeRemoved: false,
+  removable: removable,
+  worktreeRemoved: worktreeRemoved,
   archived: archived,
 );
 
@@ -207,6 +210,67 @@ void main() {
         action: ActionIntentDeleteSessionLocally(sessionId: 'a'),
       ),
     ]);
+  });
+
+  testWidgets('remove worktree asks first, then removes', (tester) async {
+    await pump(
+      tester,
+      list(
+        kind: ListKindView.archived,
+        rows: [
+          sessionRow('a', archived: true, removable: true, branch: 'feat-x'),
+        ],
+      ),
+    );
+    await tester.tap(find.byKey(const Key('row-menu-a')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remove worktree'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('feat-x'), findsOneWidget);
+    expect(find.textContaining('not merged'), findsOneWidget);
+    await tester.tap(find.text('Keep'));
+    await tester.pumpAndSettle();
+    expect(sent, isEmpty);
+
+    await tester.tap(find.byKey(const Key('row-menu-a')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remove worktree'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remove'));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentRemoveWorktree(sessionId: 'a')),
+    ]);
+  });
+
+  testWidgets('remove worktree is offered only when removable', (tester) async {
+    await pump(
+      tester,
+      list(
+        kind: ListKindView.archived,
+        rows: [sessionRow('a', archived: true)],
+      ),
+    );
+    await tester.tap(find.byKey(const Key('row-menu-a')));
+    await tester.pumpAndSettle();
+    // The menu is open: its archive entry is there.
+    expect(find.text('Unarchive'), findsOneWidget);
+    expect(find.text('Remove worktree'), findsNothing);
+  });
+
+  testWidgets('a removed worktree shows a marker', (tester) async {
+    final semantics = tester.ensureSemantics();
+    await pump(tester, list(rows: [sessionRow('a', worktreeRemoved: true)]));
+    expect(find.byKey(const Key('row-worktree-removed')), findsOneWidget);
+    expect(find.text('worktree removed'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel(RegExp(', worktree removed, ')),
+      findsOneWidget,
+    );
+
+    await pump(tester, list(rows: [sessionRow('a')]));
+    expect(find.byKey(const Key('row-worktree-removed')), findsNothing);
+    semantics.dispose();
   });
 
   testWidgets('a blocked delete says why and sends nothing', (tester) async {
@@ -619,6 +683,39 @@ void main() {
         const GuiIntentAct(
           action: ActionIntentDeleteSessionLocally(sessionId: 'a'),
         ),
+      ]);
+    });
+
+    testWidgets('remove worktree from the sheet asks first, then removes', (
+      tester,
+    ) async {
+      await phone(
+        tester,
+        list(
+          kind: ListKindView.archived,
+          rows: [
+            sessionRow('a', archived: true, removable: true, branch: 'feat-x'),
+          ],
+        ),
+      );
+      await openSheet(tester);
+      final remove = tester.widget<Text>(
+        find.descendant(
+          of: find.byType(BottomSheet),
+          matching: find.text('Remove worktree'),
+        ),
+      );
+      expect(
+        remove.style?.color,
+        Theme.of(tester.element(find.byType(BottomSheet))).colorScheme.error,
+      );
+      await tapInSheet(tester, 'Remove worktree');
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(find.textContaining('not merged'), findsOneWidget);
+      await tester.tap(find.text('Remove'));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(action: ActionIntentRemoveWorktree(sessionId: 'a')),
       ]);
     });
 
