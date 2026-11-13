@@ -182,7 +182,8 @@ class LinkBanner extends StatelessWidget {
 
 /// Desktop shortcuts that work on every screen, as in the TUI: Ctrl+R
 /// retries the link now, Ctrl+G opens the next approval elsewhere. Rust
-/// ignores either when it does not apply.
+/// ignores either when it does not apply. In the shell composer Ctrl+R opens
+/// the history picker instead (D53).
 class LinkShortcuts extends StatelessWidget {
   const LinkShortcuts({required this.send, required this.child, super.key});
 

@@ -1243,6 +1243,13 @@ logs) an event that no longer decodes rather than failing.
   from an adopting `SessionCreated` until its `ImportFinished` is stored:
   an import longer than one pull shows the session beside its still
   pending creation (`PendingSession::conversation`) until then.
+- **Shell history** (D53): `ViewState::shell_history` holds this device's
+  shell commands from every session, newest first, each once, at most
+  `SHELL_HISTORY_MAX` (1000). `Store::load` rebuilds it from the log
+  (`Store::shell_history`, in `Snapshot`). `apply_batch` keeps it current:
+  each `ShellRequested` moves its command to the front, and events of a
+  session deleted here are skipped. Only logged commands are in it, never
+  the outbox's. Nothing is stored for it.
 - **Conversation picker** (D37): `ListConversations` on the active session
   list asks `GET /v1/conversations` on the side transport within
   `CONVERSATIONS_TIMEOUT` (12 s, above the server's 10 s) and shows
@@ -1659,3 +1666,19 @@ skywave-core                 all logic, sync, replica
   tap launched it.
 - **Platforms:** Linux and Android verified; macOS, iOS and Windows
   scaffolded only; no web (D26).
+- **Shell history picker** (D53). The hub owns its state. In shell mode
+  `HistorySearchOpen` opens it (Ctrl-R toggles it; the input menu's "Search
+  history" opens it too), and the composer text is the query. The hub
+  re-filters on every `DraftEdited` with
+  `skywave_present::policy::search_history`, and the selection goes back to
+  the newest row. `HistorySearchMove`, `HistorySearchAccept` (fills the
+  field, caret at the end, never runs it), `HistorySearchPick` (a row tap)
+  and `HistorySearchClose` (Esc, keeps the text) are the other intents;
+  `ToggleShellMode` and `ComposerSubmit` close it.
+  `ComposerView::history_search` carries at most 100 rows, the selected row,
+  a `matching/total` count and an empty label, each row's matched chars as
+  `Utf16Range`s. Dart only
+  draws it: an inline list directly above the composer field (the field
+  keeps focus), newest row at the bottom as in fzf, matched chars
+  highlighted. Up/Down and Ctrl-P/N move while it is open, Enter and Tab
+  accept, Esc closes.
