@@ -228,7 +228,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::event_log::{self, parse_id};
 
 mod changes;
-mod git;
+pub(crate) mod git;
 mod log;
 
 pub use git::Git;
