@@ -79,6 +79,9 @@ void main() {
     final working = SessionRowView(
       sessionId: 'w',
       title: 'busy',
+      group: '',
+      groupName: 'no directory',
+      branch: null,
       state: AgentState.working,
       badgeLabel: 'working',
       unread: 0,

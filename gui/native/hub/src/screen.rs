@@ -30,6 +30,7 @@ use skywave_present::sections::{
     ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
 };
 use skywave_present::session_info;
+use skywave_present::session_list::by_repo;
 use skywave_present::storage::{self, Grouping as StorageGrouping};
 use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 
@@ -194,10 +195,14 @@ fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
         kind,
         title,
         empty_label,
-        rows: list
-            .sessions
+        rows: by_repo(&list.sessions)
             .iter()
-            .map(|row| row_view(row, archived))
+            .flat_map(|group| {
+                group
+                    .rows
+                    .iter()
+                    .map(move |row| row_view(row, archived, group.key))
+            })
             .collect(),
         other_count: count(list.other_count),
         creating: list.creating.iter().map(creating_view).collect(),
@@ -244,12 +249,20 @@ fn conversations_view(
     }
 }
 
-fn row_view(row: &SessionRow, archived: bool) -> SessionRowView {
+/// `group` is the key [`by_repo`] put the row under.
+fn row_view(row: &SessionRow, archived: bool, group: &str) -> SessionRowView {
     let title = clean_line(&row.title);
     SessionRowView {
         session_id: row.id.0.to_string(),
         workdir: row.workdir.as_deref().map(clean_line),
         workdir_name: row.workdir.as_deref().map(|w| clean_line(dir_name(w))),
+        group: group.to_owned(),
+        group_name: if group.is_empty() {
+            "no directory".to_owned()
+        } else {
+            clean_line(dir_name(group))
+        },
+        branch: row.worktree.as_ref().map(|w| clean_line(&w.branch)),
         state: agent_state(&row.state),
         badge_label: badge(&row.state).to_owned(),
         unread: u32::try_from(row.unread).unwrap_or(u32::MAX),

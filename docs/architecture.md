@@ -901,7 +901,9 @@ logs) an event that no longer decodes rather than failing.
   one). Only a message someone writes moves a session up. The agent's
   replies, tool calls, approvals and state changes do not, so a row does
   not jump while it is being read. `last_seq` and `last_activity` still
-  follow every activity event, for read marks and the row's time.
+  follow every activity event, for read marks and the row's time. The GUI
+  then groups the list by repo (`skywave_present::session_list`): a group
+  sits where its newest row does, and its rows keep this order within it.
 - **Sync engine** (D7): the pull loop long-polls from the cursor and applies
   each batch and the new cursor in one transaction. The outbox sends oldest
   first, one command in flight, so the server sees commands in the order
