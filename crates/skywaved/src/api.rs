@@ -147,8 +147,8 @@ use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContentHash,
     ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery,
     HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult, LoginStartResult,
-    PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, UploadResult, UsageLimit,
-    UsageLimitsResult, WorkdirQuery, check_conversation_id, limits, path,
+    PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId, UploadResult,
+    UsageLimit, UsageLimitsResult, WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -519,6 +519,7 @@ async fn commands(
             worktree: Some(_),
             ..
         } | CommandKind::CropBlob { .. }
+            | CommandKind::RemoveWorktree { .. }
     ) || matches!(
         &command.kind,
         CommandKind::SendMessage { attachments, .. } if !attachments.is_empty()
@@ -539,8 +540,9 @@ async fn commands(
 /// Handles a command prepared before its transaction, outside the API's
 /// connection: an adopting `CreateSession`, whose history is read and
 /// bounded, a `CropBlob`, whose new blob is written, or a `SendMessage`
-/// naming images, whose staged images are linked. Slow file work must not
-/// hold up every other device's commands. A resend that arrives while the
+/// naming images, whose staged images are linked, or a `RemoveWorktree`, whose
+/// git work runs first. Slow file work must not hold up every other device's
+/// commands. A resend that arrives while the
 /// command is being prepared waits for that one's reply, so a command is
 /// never prepared twice.
 async fn prepared(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
@@ -613,6 +615,9 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
         } => prepare_worktree(api, &command)
             .await?
             .map(Preparation::from),
+        CommandKind::RemoveWorktree { session_id } => Some(Preparation::Removal(
+            prepare_removal(api, *session_id).await?,
+        )),
         _ => prepare_import(api, &command).await?.map(Preparation::from),
     };
     api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
@@ -825,6 +830,62 @@ async fn prepare_worktree(
             worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed))
         }
     }))
+}
+
+/// The outcome of a `RemoveWorktree` of `session_id`. Its checks run on a
+/// blocking thread off the API's connection, before git: an unknown session, a
+/// session with no worktree, and a turn running in any session of the same
+/// directory are refused there. The directory may be shared with sessions that
+/// name no worktree, or with a worktree made at the same path since. A session
+/// whose worktree was already removed is accepted without git, so nothing
+/// made at that path since is touched. Otherwise [`worktree::remove`] runs,
+/// bounded by its own deadline as git in [`prepare_worktree`] is. A removal
+/// starts no work, so a stopping server or a low disk does not refuse it here.
+async fn prepare_removal(
+    api: &Arc<Api>,
+    session_id: SessionId,
+) -> std::result::Result<std::result::Result<(), RejectReason>, StatusCode> {
+    let target = api
+        .blocking(move |api, db| {
+            let Some(info) = api.log.session(db, session_id)? else {
+                return Ok(Err(RejectReason::UnknownSession));
+            };
+            let Some(recorded) = api.log.worktree_of(db, session_id)? else {
+                return Ok(Err(RejectReason::NotAWorktree));
+            };
+            // The session itself is one of these. The turn check comes before
+            // the removed check: an accepted removal logs `WorktreeRemoved`,
+            // which stops every session of the directory.
+            let sessions = api.log.sessions(db)?;
+            if sessions
+                .iter()
+                .any(|s| s.workdir == info.workdir && s.turn_active)
+            {
+                return Ok(Err(RejectReason::TurnRunning));
+            }
+            if api.log.worktree_removed(db, session_id)? {
+                return Ok(Ok(None));
+            }
+            Ok(Ok(Some((recorded, info.workdir))))
+        })
+        .await?;
+    let (recorded, path) = match target {
+        Ok(Some(target)) => target,
+        Ok(None) => return Ok(Ok(())),
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let deadline = Instant::now() + worktree::WORKTREE_DEADLINE;
+    let git = api.git.clone();
+    let removed =
+        tokio::task::spawn_blocking(move || worktree::remove(&git, &recorded, &path, deadline))
+            .await;
+    Ok(match removed {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "removing a worktree failed");
+            Err(RejectReason::WorktreeFailed)
+        }
+    })
 }
 
 async fn events(

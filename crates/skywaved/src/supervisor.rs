@@ -1192,6 +1192,15 @@ impl<A: AgentAdapter> Supervisor<A> {
                 tracing::info!(session = %session_id.0, "stopping agent on request");
                 self.stop_on_request(session_id).await?;
             }
+            EventKind::WorktreeRemoved { .. } => {
+                tracing::info!(
+                    session = %session_id.0,
+                    "stopping agents: their worktree was removed"
+                );
+                for id in self.sessions_in_workdir(session_id)? {
+                    self.stop_on_request(id).await?;
+                }
+            }
             EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
                 // The event is stamped with the context it makes current.
                 // That context starts lazily, on its next message or
@@ -1335,6 +1344,23 @@ impl<A: AgentAdapter> Supervisor<A> {
             tracing::warn!(session = %session_id.0, %error, "cannot ask the agent to stop a task");
         }
         Ok(())
+    }
+
+    /// The sessions whose workdir is `session_id`'s, itself included. A
+    /// removed worktree's directory may be shared with sessions that were not
+    /// created in it (a plain `CreateSession`, or a context moved there).
+    fn sessions_in_workdir(&self, session_id: SessionId) -> Result<Vec<SessionId>> {
+        let db = &self.storage.db;
+        let Some(workdir) = self.log.session(db, session_id)?.map(|s| s.workdir) else {
+            return Ok(vec![session_id]);
+        };
+        Ok(self
+            .log
+            .sessions(db)?
+            .into_iter()
+            .filter(|s| s.workdir == workdir)
+            .map(|s| s.id)
+            .collect())
     }
 
     /// Stops the session's agent, if one runs, ending its turn first.

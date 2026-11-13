@@ -46,7 +46,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BlobId, BlobUse, CallId, CommandId, ContextId, DeviceId,
     Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, Question, RunId, RunWhen, RunsSince,
-    Seq, SessionId, SessionState, ShellEnd, ToolCall, ToolResult, limits,
+    Seq, SessionId, SessionState, ShellEnd, ToolCall, ToolResult, Worktree, limits,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -680,6 +680,18 @@ impl EventLog {
         session_in(db.conn(), id)
     }
 
+    /// The git worktree session `id` runs in, as its `SessionCreated` names
+    /// it; `None` for a session that is not in one, or an unknown session.
+    pub fn worktree_of(&self, db: &Db, id: SessionId) -> Result<Option<Worktree>> {
+        worktree_in(db.conn(), id)
+    }
+
+    /// Whether session `id` has logged a `WorktreeRemoved`: its worktree was
+    /// removed by a command already, whatever is in that directory now.
+    pub fn worktree_removed(&self, db: &Db, id: SessionId) -> Result<bool> {
+        worktree_removed_in(db.conn(), id)
+    }
+
     /// Every session, oldest first.
     pub fn sessions(&self, db: &Db) -> Result<Vec<SessionInfo>> {
         let mut stmt = db.conn().prepare_cached(
@@ -1079,6 +1091,15 @@ const LAST_WORK_CONTEXT_SQL: &str = "SELECT context FROM events WHERE seq = MAX(
      COALESCE((SELECT MAX(seq) FROM events WHERE session_id = ?1
                AND json_extract(kind, '$.type') = 'schedules_changed'), 0))";
 
+/// [`worktree_in`]: the session's `SessionCreated`, the only event that
+/// names a worktree.
+const WORKTREE_SQL: &str = "SELECT kind FROM events WHERE session_id = ?1
+     AND json_extract(kind, '$.type') = 'session_created'";
+
+/// [`worktree_removed_in`]: whether the session has a `WorktreeRemoved`.
+const WORKTREE_REMOVED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM events
+     WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'worktree_removed')";
+
 /// The context of the session's newest `BackgroundTasksChanged` or
 /// `SchedulesChanged`.
 pub(crate) fn last_work_context_in(
@@ -1249,6 +1270,31 @@ pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<Sess
     .optional()?
     .map(|row| row.info(id))
     .transpose()
+}
+
+/// [`EventLog::worktree_of`]: the worktree its `SessionCreated` names. A
+/// session with no such event is unknown here, so `None`.
+pub(crate) fn worktree_in(conn: &Connection, id: SessionId) -> Result<Option<Worktree>> {
+    let kind: Option<String> = conn
+        .prepare_cached(WORKTREE_SQL)?
+        .query_row([id.0.to_string()], |r| r.get(0))
+        .optional()?;
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+    let EventKind::SessionCreated { worktree, .. } = serde_json::from_str(&kind)? else {
+        return Err(Error::Corrupt(format!("session_created row for {id:?}")));
+    };
+    Ok(worktree)
+}
+
+/// [`EventLog::worktree_removed`]: whether the session's events include a
+/// `WorktreeRemoved`.
+pub(crate) fn worktree_removed_in(conn: &Connection, id: SessionId) -> Result<bool> {
+    let removed = conn
+        .prepare_cached(WORKTREE_REMOVED_SQL)?
+        .query_row([id.0.to_string()], |r| r.get(0))?;
+    Ok(removed)
 }
 
 /// The session's newest `SessionStateChanged` or `TurnInterrupted`, with

@@ -258,6 +258,9 @@ pub enum Preparation {
     /// A `CreateSession` naming a worktree: the worktree
     /// ([`worktree::create`]), removed when its session is not committed.
     Worktree(worktree::Prepared),
+    /// A `RemoveWorktree`'s outcome: the worktree and branch are gone when
+    /// `Ok` ([`worktree::remove`]).
+    Removal(std::result::Result<(), RejectReason>),
 }
 
 impl Preparation {
@@ -267,6 +270,7 @@ impl Preparation {
             Preparation::Crop(prepared) => prepared.kept(),
             Preparation::Attachments(prepared) => prepared.kept(),
             Preparation::Worktree(prepared) => prepared.kept(),
+            Preparation::Removal(_) => {}
         }
     }
 }
@@ -481,7 +485,8 @@ impl EventLog {
                         | Some(
                             Preparation::Crop(_)
                             | Preparation::Attachments(_)
-                            | Preparation::Worktree(_),
+                            | Preparation::Worktree(_)
+                            | Preparation::Removal(_),
                         ) => ImportOutcome::Unavailable,
                     };
                     (session, context, EventKind::ImportFinished { outcome })
@@ -717,11 +722,20 @@ impl EventLog {
                 (*session_id, session.context, kind)
             }
             CommandKind::RemoveWorktree { session_id } => {
-                if known(*session_id)?.is_none() {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
+                };
+                let Some(Preparation::Removal(outcome)) = prepared else {
+                    return Ok(Err(RejectReason::WorktreeFailed));
+                };
+                if let Err(reason) = *outcome {
+                    return Ok(Err(reason));
                 }
-                // The git work lands in the next step.
-                return Ok(Err(RejectReason::NotAWorktree));
+                // Not checked for a running turn again: the git removal has
+                // happened and this event records it. A turn started since is
+                // stopped by the supervisor on this event.
+                let kind = EventKind::WorktreeRemoved { by: device };
+                (*session_id, session.context, kind)
             }
             CommandKind::SetPermissionMode { session_id, mode } => {
                 if *mode == PermissionMode::Bypass && !self.bypass_allowed() {
