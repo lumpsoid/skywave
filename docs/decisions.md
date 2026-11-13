@@ -1376,12 +1376,14 @@ recovery).
 
 ## D52. Sessions in git worktrees
 A session can run in a git worktree of its repo. `CreateSession` with a
-`worktree` branch name makes one at `<repo>.worktrees/<branch>`, beside the
-repo, on a new branch from the workdir's `HEAD`, and the session runs at its
-root. Removal is explicit only: `RemoveWorktree` removes it, and is refused
-when the branch or the worktree's `HEAD` is not merged into the main repo's
-`HEAD`, when the worktree is dirty, or when a turn runs or waits in its
-directory, or a shell command does.
+`worktree` branch name makes one at `<repo>.worktrees/<dir>`, beside the
+repo, where `<dir>` is the branch with each `/` as `-` (`feat/x` is
+`feat-x`), on a new branch from the workdir's `HEAD`, and the session runs at
+its root. A branch whose `<dir>` already exists is refused as
+`WorktreeFailed`. Removal is explicit only: `RemoveWorktree` removes it, and
+is refused when the branch or the worktree's `HEAD` is not merged into the
+main repo's `HEAD`, when the worktree is dirty, or when a turn runs or waits
+in its directory, or a shell command does.
 Archiving never removes a worktree. Heads group sessions by repo, from the
 worktree the create logged, so a plain create runs no git. Work for any
 session in a removed worktree's directory is refused until a worktree is made
