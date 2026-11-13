@@ -2527,6 +2527,128 @@ fn a_removed_worktree_is_an_archive_style_row() {
     );
 }
 
+/// A session created in `/srv/app`, or in its git worktree `branch`.
+fn created_session(branch: Option<&str>) -> EventKind {
+    EventKind::SessionCreated {
+        workdir: match branch {
+            Some(branch) => format!("/srv/app.worktrees/{branch}"),
+            None => "/srv/app".into(),
+        },
+        context_name: "start".into(),
+        from: None,
+        worktree: branch.map(|branch| skywave_proto::Worktree {
+            repo: "/srv/app".into(),
+            branch: branch.into(),
+        }),
+    }
+}
+
+#[test]
+fn an_archived_worktree_row_is_removable() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let me = rig.me;
+    let (archived_worktree, archived_plain, active_worktree) =
+        (SessionId::new(), SessionId::new(), SessionId::new());
+    let archive = EventKind::SessionArchived {
+        archived: true,
+        by: me,
+    };
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![
+                event_at(archived_worktree, at, created_session(Some("feat-x"))),
+                event_at(archived_worktree, at, archive.clone()),
+                event_at(archived_plain, at, created_session(None)),
+                event_at(archived_plain, at, archive),
+                event_at(active_worktree, at, created_session(Some("feat-y"))),
+            ],
+        })
+        .unwrap();
+    let flags = |rig: &Rig, id: SessionId| {
+        let row = match rig.list() {
+            ScreenView::SessionList { rows, .. } => rows
+                .into_iter()
+                .find(|r| r.session_id == id.0.to_string())
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        (row.removable, row.worktree_removed)
+    };
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::ArchivedSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(flags(&rig, archived_worktree), (true, false));
+    assert_eq!(flags(&rig, archived_plain), (false, false));
+
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(
+                archived_worktree,
+                at,
+                EventKind::WorktreeRemoved { by: me },
+            )],
+        })
+        .unwrap();
+    rig.view();
+    assert_eq!(flags(&rig, archived_worktree), (false, true));
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(flags(&rig, active_worktree), (false, false));
+}
+
+#[test]
+fn the_remove_worktree_intent_queues_the_command() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let session = SessionId::new();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![
+                event_at(session, at, created_session(Some("feat-x"))),
+                event_at(
+                    session,
+                    at,
+                    EventKind::SessionArchived {
+                        archived: true,
+                        by: rig.me,
+                    },
+                ),
+            ],
+        })
+        .unwrap();
+    rig.view();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::RemoveWorktree {
+            session_id: session.0.to_string(),
+        },
+    });
+    let entry = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.command.kind, CommandKind::RemoveWorktree { .. }))
+        .unwrap();
+    assert!(matches!(
+        entry.command.kind,
+        CommandKind::RemoveWorktree { session_id } if session_id == session
+    ));
+}
+
 impl Rig {
     fn open_session(&self) -> crate::signals::SessionScreen {
         match &self.head.sent.screen.as_ref().unwrap().screen {

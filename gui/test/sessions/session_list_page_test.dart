@@ -35,6 +35,8 @@ SessionRowView sessionRow(
   renameLabel: 'queued',
   deletable: deletable,
   deleteBlockedLabel: blocked,
+  removable: false,
+  worktreeRemoved: false,
   archived: archived,
 );
 
@@ -356,6 +358,8 @@ void main() {
       lastActivityMs: 0,
       importingLabel: 'importing history…',
       deletable: false,
+      removable: false,
+      worktreeRemoved: false,
       archived: false,
     );
     await pump(tester, list(rows: [plain, importing]));
@@ -428,6 +432,8 @@ void main() {
             lastActivityLabel: row.lastActivityLabel,
             lastActivityMs: 0,
             deletable: false,
+            removable: false,
+            worktreeRemoved: false,
             archived: false,
           ),
         ],

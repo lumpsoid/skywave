@@ -286,6 +286,8 @@ fn row_view(row: &SessionRow, archived: bool, group: &str) -> SessionRowView {
         deletable: row.deletable,
         delete_blocked_label: (archived && !row.deletable)
             .then(|| format!("cannot delete {title} yet: answer or cancel first")),
+        removable: archived && row.worktree.is_some() && !row.worktree_removed,
+        worktree_removed: row.worktree_removed,
         archived,
         title,
     }
