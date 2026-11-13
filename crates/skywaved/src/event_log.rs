@@ -1100,6 +1100,18 @@ const WORKTREE_SQL: &str = "SELECT kind FROM events WHERE session_id = ?1
 const WORKTREE_REMOVED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM events
      WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'worktree_removed')";
 
+/// Whether the newest worktree made at `workdir` was removed: the
+/// directory is gone for every session there, until a worktree is made at that
+/// path again.
+const WORKDIR_WORKTREE_REMOVED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM events
+     WHERE session_id = (
+         SELECT c.session_id FROM events c JOIN sessions s ON s.id = c.session_id
+         WHERE s.workdir = ?1
+           AND json_extract(c.kind, '$.type') = 'session_created'
+           AND json_extract(c.kind, '$.worktree') IS NOT NULL
+         ORDER BY c.seq DESC LIMIT 1)
+       AND json_extract(kind, '$.type') = 'worktree_removed')";
+
 /// The context of the session's newest `BackgroundTasksChanged` or
 /// `SchedulesChanged`.
 pub(crate) fn last_work_context_in(
@@ -1294,6 +1306,15 @@ pub(crate) fn worktree_removed_in(conn: &Connection, id: SessionId) -> Result<bo
     let removed = conn
         .prepare_cached(WORKTREE_REMOVED_SQL)?
         .query_row([id.0.to_string()], |r| r.get(0))?;
+    Ok(removed)
+}
+
+/// [`WORKDIR_WORKTREE_REMOVED_SQL`]: whether the newest worktree made at
+/// `workdir` (a session's `workdir`) has a `WorktreeRemoved`.
+pub(crate) fn workdir_worktree_removed_in(conn: &Connection, workdir: &str) -> Result<bool> {
+    let removed = conn
+        .prepare_cached(WORKDIR_WORKTREE_REMOVED_SQL)?
+        .query_row([workdir], |r| r.get(0))?;
     Ok(removed)
 }
 

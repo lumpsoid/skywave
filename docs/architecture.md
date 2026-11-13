@@ -445,10 +445,10 @@ the daemon's appends, which would otherwise stop `serve` (below).
   already has `WorktreeRemoved` skips git, so a resend after a failed
   transaction is accepted.
   `WorktreeRemoved` makes the supervisor stop the agents of every session in
-  that workdir. Afterwards the removed session's work (messages, settings,
-  `ClearContext`, `MoveContext`, `RunShell`) is refused `WorkdirNotFound`,
-  decided from the log. Other sessions in that directory are stopped, not
-  refused (D52).
+  that workdir. Afterwards work (messages, settings, `ClearContext`,
+  `MoveContext`, `RunShell`) is refused `WorkdirNotFound`, decided from the
+  log, for the removed session and for every other session in that
+  directory, until a new worktree is made at that path (D52).
 - **Agent supervisor** (D3, D4, D8): at most one agent process per session,
   started lazily for the context a message or setting request is stamped
   with: resumed from that context's opaque handle, else forked from the
