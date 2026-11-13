@@ -1004,6 +1004,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::WorktreeDirty,
             RejectReason::BranchUnmerged,
             RejectReason::TurnRunning,
+            RejectReason::ShellRunning,
             RejectReason::UnknownSession,
             RejectReason::UnknownApproval,
             RejectReason::ApprovalAlreadyResolved,
@@ -1827,8 +1828,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v32() {
-    assert_eq!(PROTOCOL_VERSION, 32);
+fn protocol_is_v33() {
+    assert_eq!(PROTOCOL_VERSION, 33);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
