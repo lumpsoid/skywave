@@ -540,12 +540,14 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/a".into(),
+            worktree: None,
         })
         .unwrap();
     h.core
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/b".into(),
+            worktree: None,
         })
         .unwrap();
     // The killed server: the engine reports it is backing off.
@@ -570,6 +572,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         .dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/c".into(),
+            worktree: None,
         })
         .unwrap();
     h.sync();
@@ -1192,7 +1195,8 @@ fn create_session_goes_from_queued_to_the_real_row() {
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
             conversation: None,
-            workdir: "/srv/new".into()
+            workdir: "/srv/new".into(),
+            worktree: None,
         })
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
@@ -1363,7 +1367,8 @@ fn tab_fills_in_the_only_directory() {
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
             conversation: None,
-            workdir: "/srv/api/".into()
+            workdir: "/srv/api/".into(),
+            worktree: None,
         })
     );
 }
@@ -1420,6 +1425,7 @@ fn pasting_an_outside_conversation_asks_the_workdir_then_the_id() {
         Some(Action::CreateSession {
             workdir: "/srv/api/".into(),
             conversation: Some("0b6c1a2e-1111-4222-8333-444455556666".into()),
+            worktree: None,
         })
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
@@ -1531,6 +1537,7 @@ fn c_lists_the_servers_conversations_and_enter_continues_one() {
         Some(Action::CreateSession {
             workdir: "/srv/web".into(),
             conversation: Some("c-old".into()),
+            worktree: None,
         })
     );
     assert!(h.app.conversation_picker().is_none(), "the core closes it");
@@ -1805,7 +1812,8 @@ fn stale_rows_cannot_be_chosen_while_a_new_directory_loads() {
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
             conversation: None,
-            workdir: "/srv/api/".into()
+            workdir: "/srv/api/".into(),
+            worktree: None,
         })
     );
 }

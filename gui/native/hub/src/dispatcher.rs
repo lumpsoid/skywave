@@ -157,6 +157,7 @@ mod tests {
                 Action::CreateSession {
                     conversation: None,
                     workdir: workdir.clone(),
+                    worktree: None,
                 },
             );
         }

@@ -183,6 +183,7 @@ async fn commands_survive(n: usize, profile: LinkProfile, limit: Duration) {
             client.dispatch(Action::CreateSession {
                 conversation: None,
                 workdir: daemon.workdir(),
+                worktree: None,
             });
         }
     }
@@ -354,6 +355,7 @@ async fn two_devices_converge_over_different_links() {
     a.dispatch(Action::CreateSession {
         conversation: None,
         workdir: daemon.workdir(),
+        worktree: None,
     });
     b.create_session(&daemon).await;
     a.create_session(&daemon).await;
@@ -432,6 +434,7 @@ async fn an_adopting_create_over_a_lossy_link_settles_once_and_converges() {
     a.dispatch(Action::CreateSession {
         conversation: Some("conv-1".into()),
         workdir: daemon.workdir(),
+        worktree: None,
     });
     daemon
         .wait_log("the import", |events| {
@@ -728,6 +731,7 @@ async fn offline_compose_drains_over_a_lossy_link() {
     client.dispatch(Action::CreateSession {
         conversation: None,
         workdir: daemon.workdir(),
+        worktree: None,
     });
     let queued = client.seam.pending_outbox().unwrap();
     assert_eq!(queued.len(), 6);
@@ -809,6 +813,7 @@ async fn soak_two_devices_random_links() {
                 0..=4 if sessions.len() < 12 => client.dispatch(Action::CreateSession {
                     conversation: None,
                     workdir: daemon.workdir(),
+                    worktree: None,
                 }),
                 5..=7 => proxy.set_profile(LinkProfile::random(&mut rng)),
                 8 => proxy.cut(),

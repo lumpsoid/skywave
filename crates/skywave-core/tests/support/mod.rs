@@ -454,6 +454,7 @@ impl Client {
         self.dispatch(Action::CreateSession {
             conversation: None,
             workdir: daemon.workdir(),
+            worktree: None,
         });
         let command = self.outbox().last().unwrap().command.id;
         self.wait("the session in the replica", |c, _| {

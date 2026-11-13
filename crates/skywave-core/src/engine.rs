@@ -1808,6 +1808,7 @@ mod tests {
             .dispatch(crate::Action::CreateSession {
                 conversation: None,
                 workdir: "/srv".into(),
+                worktree: None,
             })
             .unwrap();
         while links.lock().unwrap().len() == published {
@@ -2571,6 +2572,7 @@ mod tests {
             .dispatch(crate::Action::CreateSession {
                 conversation: None,
                 workdir: workdir.into(),
+                worktree: None,
             })
             .unwrap();
     }
