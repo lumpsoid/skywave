@@ -430,11 +430,48 @@ fn head_of(git: &Git, dir: &Path, deadline: Instant) -> Result<String, RejectRea
     Ok(printed.trim_end().to_owned())
 }
 
+/// Deletes what a killed `git worktree add` leaves at `target` once git has
+/// had its turn: a real directory holding nothing but a `.git` file, or
+/// nothing at all. Git refuses to remove such a directory because it is not a
+/// registered worktree, so the caller cannot leave it to `git worktree remove`.
+/// Any other entry is the user's: the directory is kept with a warning.
+fn remove_half_made(target: &Path, branch: &str) {
+    if !fs::symlink_metadata(target).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
+    let git_file = target.join(".git");
+    let listed = fs::read_dir(target).and_then(|dir| {
+        dir.map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()
+    });
+    let only_git = listed.is_ok_and(|names| names.iter().all(|name| name == OsStr::new(".git")));
+    let git_is_file = match fs::symlink_metadata(&git_file) {
+        Ok(meta) => meta.is_file(),
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+    };
+    if !only_git || !git_is_file {
+        tracing::warn!(branch = %branch, dir = %target.display(), "a failed worktree add left a directory with files; keeping it");
+        return;
+    }
+    let deleted = match fs::remove_file(&git_file) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => fs::remove_dir(target),
+    };
+    if let Err(e) = deleted {
+        tracing::warn!(branch = %branch, dir = %target.display(), error = %e, "cannot delete a failed worktree add's directory");
+    }
+}
+
 /// Undoes a `git worktree add` that did not succeed: git may have made the
 /// branch, the target or both before it failed or was killed. Under
 /// [`CREATING`] neither existed before the add, so what exists now is this
 /// create's, and nothing else is touched. Its own deadline: the create's may
 /// be spent.
+///
+/// A killed add can leave the target as a plain directory that git never
+/// registered, which `git worktree remove` refuses. [`remove_half_made`]
+/// deletes it, but only when it holds nothing but a `.git` file. A lock the
+/// killed add left is why the remove is given `--force` twice.
 fn undo_failed_add(git: &Git, repo: &Path, branch: &str, target: &str) {
     let deadline = Instant::now() + WORKTREE_DEADLINE;
     let target_made = fs::symlink_metadata(target).is_ok();
@@ -443,7 +480,7 @@ fn undo_failed_add(git: &Git, repo: &Path, branch: &str, target: &str) {
         return;
     }
     if target_made {
-        let remove = ["worktree", "remove", "--force", target];
+        let remove = ["worktree", "remove", "--force", "--force", target];
         succeeded(
             git,
             repo,
@@ -462,6 +499,9 @@ fn undo_failed_add(git: &Git, repo: &Path, branch: &str, target: &str) {
         branch,
         "git worktree prune failed",
     );
+    if fs::symlink_metadata(target).is_ok() {
+        remove_half_made(Path::new(target), branch);
+    }
     if branch_made {
         let delete = ["branch", "-D", branch];
         succeeded(git, repo, deadline, &delete, branch, "git branch -D failed");
@@ -831,5 +871,62 @@ mod tests {
         // Positive control: without the hook the same branch is created.
         setup_git(&f.project(), &["config", "--unset", "core.hooksPath"]);
         assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    /// A killed add after its `mkdir` of the target: an empty directory git
+    /// never registered, which `git worktree remove` refuses.
+    #[test]
+    fn a_worktree_add_killed_after_its_mkdir_is_undone() {
+        let f = Fixture::new();
+        setup_git(&f.project(), &["branch", "feat/x"]);
+        let target = f.root.join("project.worktrees/feat/x");
+        fs::create_dir_all(&target).unwrap();
+        undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    /// A killed add after it wrote `.git`: the worktree is registered and
+    /// locked, and the directory holds only the `.git` file.
+    #[test]
+    fn a_worktree_add_killed_after_its_git_file_is_undone() {
+        let f = Fixture::new();
+        let target = f.root.join("project.worktrees/feat/x");
+        setup_git(
+            &f.project(),
+            &["worktree", "add", "-b", "feat/x", text(&target).unwrap()],
+        );
+        let locked = git_in(&f.project(), &["worktree", "lock", text(&target).unwrap()]);
+        assert!(locked.status.success());
+        for entry in fs::read_dir(&target).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name() == Some(OsStr::new(".git")) {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    /// A directory with a user's file in it is never deleted, even when the
+    /// add that made it failed. The branch is still undone.
+    #[test]
+    fn a_failed_add_keeps_a_target_with_files() {
+        let f = Fixture::new();
+        setup_git(&f.project(), &["branch", "feat/x"]);
+        let target = f.root.join("project.worktrees/feat/x");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), "mine").unwrap();
+        undo_failed_add(&git(), &f.project(), "feat/x", text(&target).unwrap());
+        assert!(target.join("keep.txt").exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
     }
 }
