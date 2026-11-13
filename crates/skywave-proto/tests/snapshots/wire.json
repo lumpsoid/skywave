@@ -1,7 +1,7 @@
 {
-  "protocol_version": 32,
+  "protocol_version": 33,
   "hello": {
-    "protocol_version": 32,
+    "protocol_version": 33,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -1771,6 +1771,10 @@
     {
       "result": "rejected",
       "reason": "turn_running"
+    },
+    {
+      "result": "rejected",
+      "reason": "shell_running"
     },
     {
       "result": "rejected",

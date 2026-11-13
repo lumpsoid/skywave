@@ -430,11 +430,14 @@ the daemon's appends, which would otherwise stop `serve` (below).
   mutex (`crates/skywaved/src/worktree.rs`). A worktree whose command is
   refused, or whose transaction does not commit, is discarded
   (`worktree remove --force`, `branch -D`); only a worktree just made is
-  ever discarded. `RemoveWorktree { session_id }` is the only thing that
+  ever discarded. `RemoveWorktree { session_id }` is the only command that
   removes one:
   archiving never does. It answers `WorktreeRemoved { by }` after these
   checks, in order: the session has a worktree (else `NotAWorktree`); no
-  session in the same workdir has a running turn (`TurnRunning`); the branch
+  session in the same workdir has a running turn, a message handed to its
+  agent whose turn has not started, or a message the supervisor has not
+  handled yet (`TurnRunning`), nor a shell command running or waiting
+  (`ShellRunning`); the branch
   and the worktree's `HEAD` are merged into the main repository's `HEAD`
   (`merge-base --is-ancestor`, else `BranchUnmerged`); the worktree is clean
   (`status --porcelain`, untracked files included, else `WorktreeDirty`).
@@ -445,10 +448,17 @@ the daemon's appends, which would otherwise stop `serve` (below).
   already has `WorktreeRemoved` skips git, so a resend after a failed
   transaction is accepted.
   `WorktreeRemoved` makes the supervisor stop the agents of every session in
-  that workdir. Afterwards the removed session's work (messages, settings,
-  `ClearContext`, `MoveContext`, `RunShell`) is refused `WorkdirNotFound`,
-  decided from the log. Other sessions in that directory are stopped, not
-  refused (D52).
+  that workdir. Afterwards work (messages, settings, `ClearContext`,
+  `MoveContext`, `RunShell`) is refused `WorkdirNotFound`, decided from the
+  log, for the removed session and for every other session in that
+  directory, until a new worktree is made at that path (D52).
+  A crash between the `git worktree add` and the session's commit is undone
+  at startup. `create` records the worktree's intent (repo, branch, target,
+  start commit, command) in `worktree_intents` before git runs, and the row is
+  dropped with the commit or the discard. `serve` sweeps the rows after the
+  serve lock and before the API serves: a row whose command was accepted is
+  only dropped; any other goes to `worktree::sweep`, which removes its
+  worktree and branch only while git still matches it.
 - **Agent supervisor** (D3, D4, D8): at most one agent process per session,
   started lazily for the context a message or setting request is stamped
   with: resumed from that context's opaque handle, else forked from the

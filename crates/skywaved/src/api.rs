@@ -620,8 +620,28 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
         )),
         _ => prepare_import(api, &command).await?.map(Preparation::from),
     };
-    api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
-        .await
+    let intent = match &prepared {
+        Some(Preparation::Worktree(prepared)) => prepared.intent(),
+        _ => None,
+    };
+    api.blocking(move |api, db| {
+        let result = api.log.handle_with(db, device, &command, prepared);
+        // Not committed as accepted, so no session: the worktree is discarded
+        // by now, and its intent goes with it. An accepted session's row went
+        // in the same commit as its `SessionCreated`.
+        if let Some(intent) = intent
+            && !matches!(result, Ok(CommandResult::Accepted { .. }))
+        {
+            event_log::forget_worktree_intent_in(
+                db.conn(),
+                &intent.repo,
+                &intent.branch,
+                &intent.attempt,
+            )?;
+        }
+        result
+    })
+    .await
 }
 
 /// The crop of `blob` to `keep`, or `None` when `handle_with` refuses the
@@ -816,31 +836,62 @@ async fn prepare_worktree(
     let deadline = Instant::now() + worktree::WORKTREE_DEADLINE;
     let (git, roots) = (api.git.clone(), api.log.roots().to_vec());
     let (workdir, branch) = (workdir.clone(), branch.clone());
+    // A fresh token per preparation: a resend's attempt never shares it, so
+    // this attempt's late undo cannot delete the row of a newer one.
+    let (shared, id) = (api.clone(), command.id);
+    let attempt = uuid::Uuid::new_v4().to_string();
     let prepared = tokio::task::spawn_blocking(move || {
-        worktree::Prepared::new(
-            git.clone(),
-            worktree::create(&git, &roots, &workdir, &branch, deadline),
-        )
+        let mut intent = None;
+        let created = worktree::create(
+            &git,
+            &roots,
+            &workdir,
+            &branch,
+            deadline,
+            &attempt,
+            |made| {
+                record_intent(&shared, made, id)?;
+                intent = Some(made.clone());
+                Ok(())
+            },
+        );
+        worktree::Prepared::new(git, created, intent)
     })
     .await;
     Ok(Some(match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
             tracing::error!(error = %e, "creating a worktree failed");
-            worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed))
+            worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed), None)
         }
     }))
 }
 
+/// Records `intent` on the API's connection before git adds its worktree, so
+/// a crash after the add leaves a row to undo. A failed write refuses the
+/// create: git never adds a worktree that was not recorded.
+fn record_intent(
+    api: &Api,
+    intent: &worktree::Intent,
+    command: CommandId,
+) -> std::result::Result<(), RejectReason> {
+    let db = lock(&api.db);
+    event_log::record_worktree_intent_in(db.conn(), intent, command).map_err(|e| {
+        tracing::error!(error = %e, "recording a worktree intent failed");
+        RejectReason::WorktreeFailed
+    })
+}
+
 /// The outcome of a `RemoveWorktree` of `session_id`. Its checks run on a
 /// blocking thread off the API's connection, before git: an unknown session, a
-/// session with no worktree, and a turn running in any session of the same
-/// directory are refused there. The directory may be shared with sessions that
-/// name no worktree, or with a worktree made at the same path since. A session
-/// whose worktree was already removed is accepted without git, so nothing
-/// made at that path since is touched. Otherwise [`worktree::remove`] runs,
-/// bounded by its own deadline as git in [`prepare_worktree`] is. A removal
-/// starts no work, so a stopping server or a low disk does not refuse it here.
+/// session with no worktree, and a turn or a shell command running or queued in
+/// any session of the same directory are refused there. The directory may be
+/// shared with sessions that name no worktree, or with a worktree made at the
+/// same path since. A session whose worktree was already removed is accepted
+/// without git, so nothing made at that path since is touched. Otherwise
+/// [`worktree::remove`] runs, bounded by its own deadline as git in
+/// [`prepare_worktree`] is. A removal starts no work, so a stopping server or a
+/// low disk does not refuse it here.
 async fn prepare_removal(
     api: &Arc<Api>,
     session_id: SessionId,
@@ -853,15 +904,16 @@ async fn prepare_removal(
             let Some(recorded) = api.log.worktree_of(db, session_id)? else {
                 return Ok(Err(RejectReason::NotAWorktree));
             };
-            // The session itself is one of these. The turn check comes before
-            // the removed check: an accepted removal logs `WorktreeRemoved`,
-            // which stops every session of the directory.
-            let sessions = api.log.sessions(db)?;
-            if sessions
-                .iter()
-                .any(|s| s.workdir == info.workdir && s.turn_active)
-            {
+            // The session itself is one of these. Queued work counts too: the
+            // supervisor or the shell runner would start it in a directory
+            // that is gone. The turn check comes before the removed check: an
+            // accepted removal logs `WorktreeRemoved`, which stops every
+            // session of the directory.
+            if api.log.workdir_turn_busy(db, &info.workdir)? {
                 return Ok(Err(RejectReason::TurnRunning));
+            }
+            if api.log.workdir_shell_busy(db, &info.workdir)? {
+                return Ok(Err(RejectReason::ShellRunning));
             }
             if api.log.worktree_removed(db, session_id)? {
                 return Ok(Ok(None));

@@ -42,7 +42,8 @@ pub use supervisor::{Activity, Supervisor, SupervisorConfig, SupervisorHandle};
 use blobs::{BlobFile, BlobStore};
 use data_dir::DataDir;
 use db::Db;
-use skywave_proto::{BlobId, BlobRef};
+use skywave_proto::{BlobId, BlobRef, CommandResult};
+use workdir::Git;
 
 /// Locks shared server state, recovering it from a poisoned mutex.
 ///
@@ -103,10 +104,45 @@ impl Storage {
         );
         Ok(())
     }
+
+    /// `serve`'s startup undo of the worktrees a crash left between `git
+    /// worktree add` and a session's commit, one row per intent. A command
+    /// the log accepted committed its session, so its row is only dropped.
+    /// Any other row goes to [`worktree::sweep`], which touches only what git
+    /// still matches. Every row is dropped once handled. The caller must hold
+    /// the data dir's [`ServeLock`](data_dir::ServeLock), and run this before
+    /// the API can create worktrees.
+    pub fn sweep_worktrees(&mut self, git: &Git) -> Result<()> {
+        let conn = self.db.conn();
+        let intents = event_log::worktree_intents_in(conn)?;
+        let swept = intents.len();
+        for (intent, command) in intents {
+            let accepted = matches!(
+                commands::stored_result(conn, command)?,
+                Some(CommandResult::Accepted { .. })
+            );
+            if !accepted {
+                worktree::sweep(git, &intent);
+            }
+            event_log::forget_worktree_intent_in(
+                conn,
+                &intent.repo,
+                &intent.branch,
+                &intent.attempt,
+            )?;
+        }
+        tracing::info!(swept, "swept worktree intents");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use skywave_proto::CommandId;
+
     use super::*;
 
     #[test]
@@ -163,5 +199,84 @@ mod tests {
             .unwrap();
         assert_eq!(content, "tool output");
         assert!(storage.open_blob(BlobId::new()).unwrap().is_none());
+    }
+
+    /// Records a worktree intent for `branch` as `create` would, for `command`.
+    fn record_intent(
+        storage: &Storage,
+        repo: &Path,
+        branch: &str,
+        target: &Path,
+        command: CommandId,
+    ) {
+        let intent = worktree::Intent {
+            repo: repo.to_str().unwrap().to_owned(),
+            branch: branch.to_owned(),
+            target: target.to_str().unwrap().to_owned(),
+            start: "0".repeat(40),
+            attempt: "a".to_owned(),
+        };
+        event_log::record_worktree_intent_in(storage.db.conn(), &intent, command).unwrap();
+    }
+
+    fn intent_rows(storage: &Storage) -> i64 {
+        let count = "SELECT COUNT(*) FROM worktree_intents";
+        storage
+            .db
+            .conn()
+            .query_row(count, [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A command the log accepted committed its session: its half-made
+    /// directory is left alone and its row dropped. The same directory under
+    /// a command with no stored result is undone, which is the control.
+    #[test]
+    fn the_worktree_sweep_skips_git_for_an_accepted_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(tmp.path().join("data")).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let (kept, swept) = (tmp.path().join("kept"), tmp.path().join("swept"));
+        for dir in [&kept, &swept] {
+            fs::create_dir(dir).unwrap();
+            fs::write(dir.join(".git"), "gitdir: nowhere\n").unwrap();
+        }
+        let accepted = CommandId::new();
+        record_intent(&storage, &repo, "feat/kept", &kept, accepted);
+        record_intent(&storage, &repo, "feat/swept", &swept, CommandId::new());
+        let result = r#"{"result":"accepted","seq":1}"#;
+        let sql = "INSERT INTO commands (command_id, device_id, result) VALUES (?1, ?2, ?3)";
+        let params = rusqlite::params![accepted.0.to_string(), "device", result];
+        storage.db.conn().execute(sql, params).unwrap();
+        assert_eq!(intent_rows(&storage), 2);
+        storage.sweep_worktrees(&Git::default()).unwrap();
+        assert_eq!(intent_rows(&storage), 0);
+        assert!(kept.join(".git").exists());
+        assert!(!swept.exists());
+    }
+
+    #[test]
+    fn the_worktree_sweep_forgets_every_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(tmp.path().join("data")).unwrap();
+        let gone = tmp.path().join("gone");
+        record_intent(
+            &storage,
+            &gone.join("a"),
+            "feat/x",
+            &gone.join("x"),
+            CommandId::new(),
+        );
+        record_intent(
+            &storage,
+            &gone.join("b"),
+            "feat/y",
+            &gone.join("y"),
+            CommandId::new(),
+        );
+        assert_eq!(intent_rows(&storage), 2);
+        storage.sweep_worktrees(&Git::default()).unwrap();
+        assert_eq!(intent_rows(&storage), 0);
     }
 }
