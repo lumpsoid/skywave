@@ -1568,6 +1568,7 @@ mod tests {
                     workdir: "/srv".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             }],
         };
@@ -3255,6 +3256,7 @@ mod tests {
                     workdir: "/srv".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 }),
                 event(EventKind::UserMessage {
                     device_id: DeviceId::new(),
@@ -3552,6 +3554,7 @@ mod tests {
                         workdir: "/srv".into(),
                         context_name: "start".into(),
                         from: None,
+                        worktree: None,
                     },
                 }]),
                 grew: Notify::new(),

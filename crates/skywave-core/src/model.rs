@@ -611,6 +611,7 @@ impl Model {
                 self.enqueue(CommandKind::CreateSession {
                     workdir: workdir.to_owned(),
                     conversation,
+                    worktree: None,
                 })
             }
             Action::CreateSessionLike(from) => {
@@ -626,6 +627,7 @@ impl Model {
                 let effects = self.enqueue(CommandKind::CreateSession {
                     workdir,
                     conversation: None,
+                    worktree: None,
                 });
                 if let Some(Effect::Enqueue(command)) = effects.first() {
                     self.opening = Some((command.id, at));
@@ -2642,6 +2644,7 @@ impl Model {
                 CommandKind::CreateSession {
                     workdir,
                     conversation,
+                    ..
                 } => {
                     let outgoing = Outgoing::from(&e.status);
                     (!self.in_replica(outgoing)).then(|| PendingSession {
@@ -4652,6 +4655,7 @@ mod tests {
                     workdir: workdir.into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 }],
             );
             id
@@ -7346,6 +7350,7 @@ mod tests {
             CommandKind::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: None,
+                worktree: None,
             }
         );
         assert_eq!(f.model.unloaded_session(), None);
@@ -7359,6 +7364,7 @@ mod tests {
             workdir: "/srv/a".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         f.log_commands(new, vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(new));
@@ -7379,6 +7385,7 @@ mod tests {
             CommandKind::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: None,
+                worktree: None,
             }
         );
         let new = SessionId::new();
@@ -8039,6 +8046,7 @@ mod tests {
         let kind = |conversation: Option<&str>| CommandKind::CreateSession {
             workdir: "/srv/a".into(),
             conversation: conversation.map(str::to_owned),
+            worktree: None,
         };
         assert_eq!(create(&mut f, Some(" id ")), kind(Some("id")));
         assert_eq!(create(&mut f, Some("  ")), kind(None));
@@ -8091,6 +8099,7 @@ mod tests {
             from: Some(SessionOrigin::Agent {
                 conversation: "conv-1".into(),
             }),
+            worktree: None,
         };
         f.log_stamped(adopted, vec![(None, ContextId::first_of(adopted), created)]);
         f.log(adopted, vec![message("go on")]);
@@ -8124,6 +8133,7 @@ mod tests {
             from: Some(SessionOrigin::Agent {
                 conversation: "conv-1".into(),
             }),
+            worktree: None,
         }
     }
 
@@ -10085,6 +10095,7 @@ mod tests {
                 from: Some(SessionOrigin::Agent {
                     conversation: conversation.into(),
                 }),
+                worktree: None,
             }],
         );
         id
@@ -10925,6 +10936,7 @@ mod tests {
             CommandKind::CreateSession {
                 workdir: workdir.into(),
                 conversation: Some(id.into()),
+                worktree: None,
             }
         );
         assert_eq!(f.list_view().conversations, None);
@@ -11472,6 +11484,7 @@ mod tests {
                 session: from,
                 context,
             })),
+            worktree: None,
         };
         assert!(!created.logged_by_command());
         f.log_stamped(new, vec![(None, ContextId::first_of(new), created)]);
@@ -12899,6 +12912,7 @@ mod tests {
                             workdir: "/srv".into(),
                             context_name: "start".into(),
                             from: None,
+                            worktree: None,
                         },
                     }],
                 })

@@ -335,6 +335,7 @@ fn created(session_id: SessionId, minute: u32, workdir: &str) -> Event {
             workdir: workdir.into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         },
     )
 }
@@ -1574,6 +1575,7 @@ fn a_listed_conversation_already_in_a_session_opens_it() {
                     from: Some(SessionOrigin::Agent {
                         conversation: "c-twice".into(),
                     }),
+                    worktree: None,
                 },
             ),
             event(
@@ -2898,6 +2900,7 @@ fn a_moved_context_is_a_divider_in_both_sessions() {
                         session: id,
                         context: ContextId::first_of(id),
                     })),
+                    worktree: None,
                 },
             ),
             event(
@@ -2943,6 +2946,7 @@ fn an_adopted_session_starts_with_a_divider_naming_the_conversation() {
                 from: Some(SessionOrigin::Agent {
                     conversation: "3f2a-91bc".into(),
                 }),
+                worktree: None,
             },
         )],
     );
@@ -2988,6 +2992,7 @@ fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionI
                     from: Some(SessionOrigin::Agent {
                         conversation: "3f2a".into(),
                     }),
+                    worktree: None,
                 },
             ),
             imported(
@@ -3122,6 +3127,7 @@ fn an_adopted_session_says_it_imports_until_its_history_is_in() {
                 from: Some(SessionOrigin::Agent {
                     conversation: "3f2a".into(),
                 }),
+                worktree: None,
             },
         )],
     );
@@ -3333,6 +3339,7 @@ fn a_moved_context_shows_where_it_went_and_enter_opens_that_session() {
                         session: id,
                         context: ContextId::first_of(id),
                     })),
+                    worktree: None,
                 },
             ),
             event(

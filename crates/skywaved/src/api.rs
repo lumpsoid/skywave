@@ -710,6 +710,7 @@ async fn prepare_import(
     let CommandKind::CreateSession {
         workdir,
         conversation: Some(conversation),
+        ..
     } = &command.kind
     else {
         return Ok(None);

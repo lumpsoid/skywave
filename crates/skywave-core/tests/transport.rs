@@ -205,6 +205,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
         kind: CommandKind::CreateSession {
             workdir: fx.workdir(),
             conversation: None,
+            worktree: None,
         },
     };
     let accepted = transport.send_command(&create).await.unwrap();
@@ -607,6 +608,7 @@ async fn log_of(transport: &HttpsTransport, fx: &Fixture, texts: Vec<String>) ->
         kind: CommandKind::CreateSession {
             workdir: fx.workdir(),
             conversation: None,
+            worktree: None,
         },
     };
     let CommandResult::Accepted { mut seq } = transport.send_command(&create).await.unwrap() else {
@@ -801,6 +803,7 @@ async fn workdir_reads_reach_a_real_server() {
         kind: CommandKind::CreateSession {
             workdir: fx.workdir(),
             conversation: None,
+            worktree: None,
         },
     };
     let accepted = transport.send_command(&create).await.unwrap();

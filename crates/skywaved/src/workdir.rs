@@ -773,6 +773,7 @@ mod tests {
                 kind: CommandKind::CreateSession {
                     workdir: workdir.to_str().unwrap().to_owned(),
                     conversation: None,
+                    worktree: None,
                 },
             };
             log.handle(&mut storage.db, DeviceId::new(), &create)
@@ -884,6 +885,7 @@ mod tests {
                 kind: CommandKind::CreateSession {
                     workdir: self.workdir.to_str().unwrap().to_owned(),
                     conversation: None,
+                    worktree: None,
                 },
             };
             log.handle(&mut self.storage.db, DeviceId::new(), &create)

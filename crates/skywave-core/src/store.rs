@@ -553,6 +553,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
+    v31_to_v32,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -631,6 +632,13 @@ fn v29_to_v30(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// workdir commit log, a new read; no stored workdir answer or event
 /// changes shape. Nothing stored changes.
 fn v30_to_v31(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v31 to v32, as the server's step of the same name. v32 added an optional
+/// `worktree` to `session_created` events, which v31 JSON lacks and reads as
+/// `None`. Nothing stored changes.
+fn v31_to_v32(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
