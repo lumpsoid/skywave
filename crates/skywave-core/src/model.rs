@@ -965,6 +965,15 @@ impl Model {
                     archived,
                 })
             }
+            Action::RemoveWorktree { session_id } => {
+                let has_worktree = self
+                    .summary(session_id)
+                    .is_some_and(|s| s.worktree.is_some());
+                if !has_worktree {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::RemoveWorktree { session_id })
+            }
             Action::SetPermissionMode { session_id, mode } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
@@ -2613,6 +2622,7 @@ impl Model {
                     rename: title.rename,
                     workdir: s.workdir.clone(),
                     worktree: s.worktree.clone(),
+                    worktree_removed: s.worktree_removed,
                     state: session_state(s),
                     pending_approvals: s.pending_approvals.len(),
                     last_activity: s.last_activity,
@@ -6512,6 +6522,40 @@ mod tests {
 
     fn archived_event(archived: bool, by: DeviceId) -> EventKind {
         EventKind::SessionArchived { archived, by }
+    }
+
+    #[test]
+    fn remove_worktree_queues_only_for_a_worktree_session() {
+        let mut f = Fixture::paired();
+        let plain = f.session("/srv/plain");
+        assert!(
+            f.dispatch(Action::RemoveWorktree { session_id: plain })
+                .is_empty(),
+            "a session without a worktree has none to remove"
+        );
+
+        let in_worktree = SessionId::new();
+        f.log(
+            in_worktree,
+            vec![EventKind::SessionCreated {
+                workdir: "/srv/app".into(),
+                context_name: "start".into(),
+                from: None,
+                worktree: Some(skywave_proto::Worktree {
+                    repo: "/srv/app".into(),
+                    branch: "feat/x".into(),
+                }),
+            }],
+        );
+        let command = queued(&f.dispatch(Action::RemoveWorktree {
+            session_id: in_worktree,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::RemoveWorktree {
+                session_id: in_worktree,
+            }
+        );
     }
 
     /// The active and the archived list, each most recently active first.

@@ -290,6 +290,13 @@ pub enum Action {
         session_id: SessionId,
         archived: bool,
     },
+    /// Remove the git worktree the session runs in and delete its branch on the
+    /// server. Refused there while a turn runs, when the worktree has changes or
+    /// when its branch is not merged. Nothing changes here until
+    /// `WorktreeRemoved` is in the replica.
+    RemoveWorktree {
+        session_id: SessionId,
+    },
     /// Ask the session's agent to run in `mode`. The agent is started for
     /// it if it is not running; the session view's
     /// [`agent`](crate::SessionView::agent) shows the switch until the

@@ -68,6 +68,8 @@ pub struct SessionSummary {
     pub adopted: Option<String>,
     /// The git worktree the session runs in, from its `SessionCreated`.
     pub worktree: Option<Worktree>,
+    /// The session's worktree was removed (`WorktreeRemoved`); its work is refused.
+    pub worktree_removed: bool,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -201,6 +203,7 @@ impl SessionSummary {
             importing: false,
             adopted: None,
             worktree: None,
+            worktree_removed: false,
         };
         summary.apply(seq, event);
         summary
@@ -296,6 +299,7 @@ impl SessionSummary {
                 };
                 self.importing = self.adopted.is_some();
             }
+            EventKind::WorktreeRemoved { .. } => self.worktree_removed = true,
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
             EventKind::ApprovalRequested { id, .. } | EventKind::QuestionAsked { id, .. } => {
                 if !self.pending_approvals.contains(id) {
@@ -327,7 +331,6 @@ impl SessionSummary {
             | EventKind::TurnInterrupted
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
-            | EventKind::WorktreeRemoved { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::PermissionModeChanged { .. }
             | EventKind::PermissionModeRefused { .. }
@@ -669,6 +672,35 @@ mod tests {
         assert_eq!(summary.worktree, Some(worktree));
         let plain = SessionSummary::new(Seq(1), &created(None));
         assert_eq!(plain.worktree, None, "a session without one has none");
+    }
+
+    #[test]
+    fn worktree_removed_marks_the_session() {
+        let sid = SessionId::new();
+        let worktree = Worktree {
+            repo: "/srv/app".into(),
+            branch: "feat/x".into(),
+        };
+        let created = event(
+            sid,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/app".into(),
+                context_name: "start".into(),
+                from: None,
+                worktree: Some(worktree.clone()),
+            },
+        );
+        let mut summary = SessionSummary::new(Seq(1), &created);
+        assert!(!summary.worktree_removed);
+        let by = DeviceId::new();
+        summary.apply(Seq(2), &event(sid, 1, EventKind::WorktreeRemoved { by }));
+        assert!(summary.worktree_removed);
+        assert_eq!(
+            summary.worktree,
+            Some(worktree),
+            "heads still group it by repo"
+        );
     }
 
     #[test]

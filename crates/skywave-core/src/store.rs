@@ -494,6 +494,14 @@ UPDATE sessions SET worktree = (SELECT json_extract(event, '$.kind.worktree')
     ORDER BY seq
     LIMIT 1);
 "#),
+    Sql(r#"
+-- `SessionSummary::worktree_removed` (protocol v32): the session's worktree
+-- was removed by `RemoveWorktree`. Backfilled from the stored log.
+ALTER TABLE sessions ADD COLUMN worktree_removed INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET worktree_removed = EXISTS (SELECT 1 FROM events
+    WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'worktree_removed');
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -3021,7 +3029,7 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
     stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted, \
-    last_message_seq, worktree";
+    last_message_seq, worktree, worktree_removed";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -3036,7 +3044,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
         ),
         params![
             summary.id.0.to_string(),
@@ -3058,6 +3066,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.adopted,
             seq_sql(summary.last_message_seq)?,
             summary.worktree.as_ref().map(to_json).transpose()?,
+            summary.worktree_removed,
         ],
     )?;
     Ok(())
@@ -3084,6 +3093,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         adopted: row.get(16)?,
         last_message_seq: seq_col(row, 17)?,
         worktree: opt_json_col(row, 18)?,
+        worktree_removed: row.get(19)?,
     })
 }
 

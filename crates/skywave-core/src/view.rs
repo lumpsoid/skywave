@@ -893,6 +893,8 @@ pub struct SessionRow {
     pub importing: bool,
     /// The git worktree the session runs in; heads group sessions by its repo.
     pub worktree: Option<Worktree>,
+    /// The worktree was removed: work for the session is refused.
+    pub worktree_removed: bool,
 }
 
 /// What the usage screen totals: every turn in the replica that reported
