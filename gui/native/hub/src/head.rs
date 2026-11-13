@@ -20,7 +20,8 @@ use skywave_present::crop::toggle;
 use skywave_present::format;
 use skywave_present::policy::{
     AlertWatcher, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
-    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, shell_stop,
+    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, search_history,
+    shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::storage::Grouping as StorageGrouping;
@@ -40,9 +41,9 @@ use crate::prefs::Prefs;
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
     ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate, GuiIntent,
-    LinkUpdate, PairForm, PlatformEffect, RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow,
-    ShellUpdate, StorageGroupingView, TimelineRow, TimelineUpdate, UsageGroupingView,
-    UsageSpanView,
+    HistoryRowView, HistorySearchView, LinkUpdate, PairForm, PlatformEffect, RenamePrompt,
+    ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView, TimelineRow,
+    TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
 use crate::workdir::{WorkdirText, shown_blob};
@@ -51,6 +52,9 @@ use crate::{intents, link, screen, search, shell, timeline};
 /// How often running clocks on screen (a tool's elapsed time, how long a
 /// message has waited) are brought up to date.
 pub const TICK: Duration = Duration::from_secs(1);
+
+/// The most rows the shell history picker sends, newest first.
+const HISTORY_SEARCH_ROWS: usize = 100;
 
 /// The time a step happens at: monotonic for the policies, wall-clock
 /// (ms since the Unix epoch) for the labels counting against core's
@@ -151,6 +155,8 @@ impl Composer {
                 text: text.clone(),
                 rev,
                 history_label: None,
+                // The picker is the open session's, set when published.
+                history_search: None,
                 to_label: None,
                 // The mode's own fields are the open session's, set when
                 // published.
@@ -196,6 +202,8 @@ struct SessionHead {
     when: RunWhen,
     /// Earlier shell commands being recalled, apart from the prompts.
     shell_history: PromptHistory<(String, usize)>,
+    /// The shell history picker's selected row, while it is open.
+    history_search: Option<usize>,
     marker: ReadMarker,
     /// The newest row is on screen (Dart says so).
     following: bool,
@@ -224,6 +232,7 @@ impl SessionHead {
             mode: view.mode,
             when: when_of(view),
             shell_history: PromptHistory::new(),
+            history_search: None,
             marker: ReadMarker::new(view.id),
             following: false,
             subagent: view.subagent.as_ref().map(|s| s.call),
@@ -694,6 +703,10 @@ impl Head {
                     composer.cursor = cursor;
                     session.saver.edited(clock.now);
                     session.end_history();
+                    // The picker's query changed: back to its newest match.
+                    if session.history_search.is_some() {
+                        session.history_search = Some(0);
+                    }
                 } else if composer.cursor != cursor {
                     // A caret move is not an edit: it keeps history browsing.
                     composer.cursor = cursor;
@@ -705,6 +718,7 @@ impl Head {
                     return Ok(());
                 };
                 session.end_history();
+                session.history_search = None;
                 let id = session.id;
                 let text = session.composer.text.clone();
                 let action = if session.shell() {
@@ -742,11 +756,28 @@ impl Head {
             }
             GuiIntent::HistoryOlder => self.recall(true, clock),
             GuiIntent::HistoryNewer => self.recall(false, clock),
+            GuiIntent::HistorySearchOpen => {
+                if let Some(session) = self.session.as_mut().filter(|s| s.shell()) {
+                    session.end_history();
+                    session.history_search = Some(0);
+                }
+            }
+            GuiIntent::HistorySearchMove { older } => self.move_history_search(older),
+            GuiIntent::HistorySearchAccept => self.accept_history_search(None, clock),
+            GuiIntent::HistorySearchPick { index } => {
+                self.accept_history_search(Some(index), clock);
+            }
+            GuiIntent::HistorySearchClose => {
+                if let Some(session) = self.session.as_mut() {
+                    session.history_search = None;
+                }
+            }
             GuiIntent::ToggleShellMode { session_id } => {
                 let Some(session) = self.open_head(&session_id) else {
                     return Ok(());
                 };
                 let (id, shell) = (session.id, session.shell());
+                session.history_search = None;
                 // Into shell mode only while the server runs shell
                 // commands; back out always, should it have stopped since.
                 let enabled = open_session(&self.view).is_some_and(|v| v.shell.enabled);
@@ -1515,6 +1546,9 @@ impl Head {
             let shell = open.filter(|_| s.shell());
             ComposerView {
                 history_label: history.position().map(|(at, of)| format!("{at} of {of}")),
+                history_search: s.history_search.map(|selected| {
+                    history_search_view(&view.shell_history, &s.composer.text, selected)
+                }),
                 mode: match s.mode {
                     ComposerMode::Agent => ComposerModeView::Agent,
                     ComposerMode::Shell => ComposerModeView::Shell,
@@ -1782,6 +1816,54 @@ impl Head {
         session.saver.edited(clock.now);
     }
 
+    /// Moves the open picker's selection to the next row (`older`, a row
+    /// further down the matches) or the previous one, clamped at both ends.
+    fn move_history_search(&mut self, older: bool) {
+        let (Some(view), Some(session)) = (&self.view, self.session.as_mut()) else {
+            return;
+        };
+        let Some(selected) = session.history_search else {
+            return;
+        };
+        let matching = search_history(
+            &view.shell_history,
+            &session.composer.text,
+            HISTORY_SEARCH_ROWS,
+        )
+        .len();
+        session.history_search = Some(if older {
+            (selected + 1).min(matching.saturating_sub(1))
+        } else {
+            selected.saturating_sub(1)
+        });
+    }
+
+    /// Puts row `index` of the open picker (its selected row when `None`)
+    /// into the composer, without running it, and closes the picker. Ignored
+    /// while the picker is closed; a row with no match just closes it.
+    fn accept_history_search(&mut self, index: Option<u32>, clock: Clock) {
+        let (Some(view), Some(session)) = (&self.view, self.session.as_mut()) else {
+            return;
+        };
+        if session.history_search.is_none() {
+            return;
+        }
+        let row = match index {
+            Some(index) => usize::try_from(index).ok(),
+            None => session.history_search,
+        };
+        let command =
+            row.and_then(|row| history_row(&view.shell_history, &session.composer.text, row));
+        session.history_search = None;
+        let Some(command) = command else {
+            return;
+        };
+        let cursor = command.chars().count();
+        self.revs += 1;
+        session.composer = Composer::new(command, cursor, self.revs);
+        session.saver.edited(clock.now);
+    }
+
     /// The open session's logged entry at `seq`.
     fn entry(&self, seq: Seq) -> Option<&Entry> {
         open_session(&self.view)?
@@ -1874,6 +1956,63 @@ fn logged(key: ItemKey) -> Option<Seq> {
         ItemKey::Logged(seq) => Some(seq),
         ItemKey::Pending(_) => None,
     }
+}
+
+/// The command of row `row` of the picker's matches of `query` over
+/// `commands`, if there is such a row.
+fn history_row(commands: &[String], query: &str, row: usize) -> Option<String> {
+    search_history(commands, query, HISTORY_SEARCH_ROWS)
+        .get(row)
+        .map(|found| found.command.to_owned())
+}
+
+/// The picker as shown for `query` over `commands` (newest first), with
+/// `selected` highlighted, clamped to the rows sent.
+fn history_search_view(commands: &[String], query: &str, selected: usize) -> HistorySearchView {
+    let matches = search_history(commands, query, usize::MAX);
+    let matching = matches.len();
+    let rows: Vec<HistoryRowView> = matches
+        .iter()
+        .take(HISTORY_SEARCH_ROWS)
+        .map(|found| HistoryRowView {
+            command: found.command.to_owned(),
+            matched: utf16_ranges(found.command, &found.matched),
+        })
+        .collect();
+    let selected =
+        (!rows.is_empty()).then(|| u32::try_from(selected.min(rows.len() - 1)).unwrap_or(u32::MAX));
+    let empty_label = if commands.is_empty() {
+        Some("No shell commands yet".to_owned())
+    } else if rows.is_empty() {
+        Some("No match".to_owned())
+    } else {
+        None
+    };
+    HistorySearchView {
+        rows,
+        selected,
+        count_label: format!("{matching}/{}", commands.len()),
+        empty_label,
+    }
+}
+
+/// The UTF-16 ranges of the chars at `chars` (char indices, ascending) of
+/// `text`; adjacent chars make one range.
+fn utf16_ranges(text: &str, chars: &[usize]) -> Vec<Utf16Range> {
+    let mut ranges: Vec<Utf16Range> = Vec::new();
+    let mut offset = 0;
+    for (index, c) in text.chars().enumerate() {
+        let start = offset;
+        offset += u32::try_from(c.len_utf16()).unwrap_or(u32::MAX);
+        if !chars.contains(&index) {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(last) if last.end == start => last.end = offset,
+            _ => ranges.push(Utf16Range { start, end: offset }),
+        }
+    }
+    ranges
 }
 
 #[cfg(test)]
