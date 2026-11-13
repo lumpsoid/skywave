@@ -31,8 +31,9 @@ class StateBadge extends StatelessWidget {
 }
 
 /// One session on the list. A tap opens it; its menu starts a new session
-/// in its workdir, renames, archives or unarchives, and deletes an archived
-/// one from this device after asking.
+/// in its workdir, renames, archives or unarchives, removes an archived
+/// session's worktree, and deletes an archived one from this device after
+/// asking.
 /// On a phone the state is a dot, the title takes two lines, the workdir
 /// is its last component and the menu is a sheet.
 class SessionRow extends StatelessWidget {
@@ -144,6 +145,14 @@ class SessionRow extends StatelessWidget {
                       semanticLabel: _draftLabel,
                       color: colors.onSurfaceVariant,
                     ),
+                  if (row.worktreeRemoved)
+                    _Marker(
+                      key: const Key('row-worktree-removed'),
+                      icon: Icons.folder_off,
+                      text: 'worktree removed',
+                      semanticLabel: _worktreeRemovedLabel,
+                      color: colors.onSurfaceVariant,
+                    ),
                   Text(
                     [?row.costLabel, row.lastActivityLabel].join(' · '),
                     style: muted,
@@ -166,6 +175,7 @@ String _unreadLabel(int unread) => '$unread unread';
 String _approvalsLabel(String approvals) => 'needs approval, $approvals';
 String _errorLabel(String error) => 'agent error: $error';
 const _draftLabel = 'draft saved';
+const _worktreeRemovedLabel = 'worktree removed';
 
 /// What a screen reader says for [row]: its title, a rename on its way,
 /// its state (unless a marker says it), the markers, where it works, and
@@ -185,6 +195,7 @@ String rowSemanticsLabel(SessionRowView row) {
     if (row.approvalsLabel case final approvals?) _approvalsLabel(approvals),
     if (row.error case final error?) _errorLabel(error),
     if (row.hasDraft) _draftLabel,
+    if (row.worktreeRemoved) _worktreeRemovedLabel,
     ?row.workdir,
     ?row.costLabel,
     'last active ${row.lastActivityLabel}',
@@ -285,6 +296,13 @@ class _RowMenu extends StatelessWidget {
         _RowAction(icon: Icons.unarchive, title: 'Unarchive', onTap: archive)
       else
         _RowAction(icon: Icons.archive, title: 'Archive', onTap: archive),
+      if (row.removable)
+        _RowAction(
+          icon: Icons.folder_delete,
+          title: 'Remove worktree',
+          destructive: true,
+          onTap: () => _removeWorktree(context),
+        ),
       if (row.deletable || row.deleteBlockedLabel != null)
         _RowAction(
           icon: Icons.delete_forever,
@@ -423,6 +441,44 @@ class _RowMenu extends StatelessWidget {
     ).then((confirmed) {
       if (confirmed ?? false) {
         send.act(ActionIntentDeleteSessionLocally(sessionId: row.sessionId));
+      }
+    });
+  }
+
+  /// Asks before removing the worktree and its branch. The server decides
+  /// whether the branch is merged and the worktree clean; it refuses if not.
+  void _removeWorktree(BuildContext context) {
+    final branch = switch (row.branch) {
+      final b? => ' $b',
+      null => '',
+    };
+    showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Remove worktree?'),
+        content: Text(
+          'Remove the worktree of ${row.title} and delete its branch$branch? '
+          'The server refuses if the branch is not merged or the worktree '
+          'has changes.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Keep'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+              foregroundColor: Theme.of(context).colorScheme.onError,
+            ),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    ).then((confirmed) {
+      if (confirmed ?? false) {
+        send.act(ActionIntentRemoveWorktree(sessionId: row.sessionId));
       }
     });
   }
