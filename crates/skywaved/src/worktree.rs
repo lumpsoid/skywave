@@ -4,8 +4,12 @@
 //! The repository is found from the workdir with `--git-common-dir`, so a
 //! subdirectory resolves to the repository's root and a worktree resolves to
 //! the main repository. A bare repository is refused. The main working tree's
-//! parent must lie under a configured root (D14). Outcomes come from git's
-//! exit statuses; a timeout is a failure.
+//! parent must lie under a configured root (D14), and so must every directory
+//! between `<repo>.worktrees` and the new worktree that already exists: a
+//! symlink there would send git's writes outside the roots. A new branch starts
+//! at the workdir's `HEAD`, which is the main tree's only when the workdir is
+//! the main tree. [`create`] runs one at a time. Outcomes come from git's exit
+//! statuses; a timeout is a failure.
 //!
 //! [`discard`] is rollback only: the caller uses it for a worktree [`create`]
 //! made for a session that was not committed ([`Prepared`]). `--force` is
@@ -13,7 +17,9 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use skywave_proto::RejectReason;
@@ -35,8 +41,16 @@ pub struct Created {
 /// How long git may take to create or discard a worktree; git is killed past it.
 pub const WORKTREE_DEADLINE: Duration = Duration::from_secs(20);
 
+/// Serialises [`create`]. Its checks and its `git worktree add` are one step:
+/// two creates naming one branch would both pass [`branch_exists`] and the
+/// target check, and the loser would fail as `WorktreeFailed` instead of
+/// `BranchExists`. It also keeps a failed add's cleanup to what this create
+/// made: the branch and target did not exist before its add, and no other
+/// create can have made them since.
+static CREATING: Mutex<()> = Mutex::new(());
+
 /// Creates a worktree of `workdir`'s repository on a new `branch`, starting
-/// at the repository's current `HEAD`. Refusals: `WorkdirNotAllowed` or
+/// at the workdir's `HEAD`. Refusals: `WorkdirNotAllowed` or
 /// `WorkdirNotFound` from the roots check, `NotARepository`, `BranchExists`;
 /// anything else that stops the create is `WorktreeFailed`.
 pub fn create(
@@ -46,6 +60,7 @@ pub fn create(
     branch: &str,
     deadline: Instant,
 ) -> Result<Created, RejectReason> {
+    let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     check_name(branch)?;
     let workdir = dirs::canonical_under_roots(roots, workdir)?;
     let main = main_working_tree(git, Path::new(&workdir), deadline)?;
@@ -56,10 +71,18 @@ pub fn create(
     if branch_exists(git, &repo, branch, deadline)? {
         return Err(RejectReason::BranchExists);
     }
-    if fs::symlink_metadata(&target).is_ok() {
+    if fs::symlink_metadata(&target).is_ok() || !real_dirs_below(&worktrees, &target) {
         return Err(RejectReason::WorktreeFailed);
     }
-    let add = ["worktree", "add", "-b", branch, target_text.as_str()];
+    let head = head_of(git, Path::new(&workdir), deadline)?;
+    let add = [
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        target_text.as_str(),
+        head.as_str(),
+    ];
     if !succeeded(
         git,
         &repo,
@@ -68,6 +91,7 @@ pub fn create(
         branch,
         "git worktree add failed",
     ) {
+        undo_failed_add(git, &repo, branch, &target_text);
         return Err(RejectReason::WorktreeFailed);
     }
     let made = Created {
@@ -75,7 +99,7 @@ pub fn create(
         repo: repo_text,
         branch: branch.to_owned(),
     };
-    finish(git, made, &target, deadline)
+    finish(git, made, &target)
 }
 
 /// Rolls back a worktree [`create`] made: removes it with `--force` and
@@ -233,14 +257,80 @@ fn branch_exists(
     Ok(run(git, repo, deadline, &args)?.status.success())
 }
 
+/// Whether every directory from `worktrees` down to `target`, the target
+/// itself excluded, that exists is a real directory. `symlink_metadata` does
+/// not follow a link, so a symlink or a file in the way is refused: git would
+/// otherwise write through the link, outside the roots, or fail after it has
+/// made the branch.
+fn real_dirs_below(worktrees: &Path, target: &Path) -> bool {
+    target
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(worktrees))
+        .all(|dir| match fs::symlink_metadata(dir) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) => e.kind() == io::ErrorKind::NotFound,
+        })
+}
+
+/// The commit the workdir's `HEAD` names, where the new branch starts. A
+/// repository with no commit has none, so it cannot have a worktree branch.
+fn head_of(git: &Git, dir: &Path, deadline: Instant) -> Result<String, RejectReason> {
+    let done = run(
+        git,
+        dir,
+        deadline,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+    )?;
+    if !done.status.success() {
+        return Err(RejectReason::WorktreeFailed);
+    }
+    let printed = String::from_utf8_lossy(&done.out);
+    Ok(printed.trim_end().to_owned())
+}
+
+/// Undoes a `git worktree add` that did not succeed: git may have made the
+/// branch, the target or both before it failed or was killed. Under
+/// [`CREATING`] neither existed before the add, so what exists now is this
+/// create's, and nothing else is touched. Its own deadline: the create's may
+/// be spent.
+fn undo_failed_add(git: &Git, repo: &Path, branch: &str, target: &str) {
+    let deadline = Instant::now() + WORKTREE_DEADLINE;
+    let target_made = fs::symlink_metadata(target).is_ok();
+    let branch_made = matches!(branch_exists(git, repo, branch, deadline), Ok(true));
+    if !target_made && !branch_made {
+        return;
+    }
+    if target_made {
+        let remove = ["worktree", "remove", "--force", target];
+        succeeded(
+            git,
+            repo,
+            deadline,
+            &remove,
+            branch,
+            "git worktree remove failed",
+        );
+    }
+    let prune = ["worktree", "prune"];
+    succeeded(
+        git,
+        repo,
+        deadline,
+        &prune,
+        branch,
+        "git worktree prune failed",
+    );
+    if branch_made {
+        let delete = ["branch", "-D", branch];
+        succeeded(git, repo, deadline, &delete, branch, "git branch -D failed");
+    }
+}
+
 /// The created worktree with its path canonical. If that cannot be done the
-/// worktree is discarded, so a failed create leaves nothing unreported.
-fn finish(
-    git: &Git,
-    made: Created,
-    target: &Path,
-    deadline: Instant,
-) -> Result<Created, RejectReason> {
+/// worktree is discarded, so a failed create leaves nothing unreported. The
+/// discard gets its own deadline: the create's may be spent.
+fn finish(git: &Git, made: Created, target: &Path) -> Result<Created, RejectReason> {
     let canonical = fs::canonicalize(target)
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok());
@@ -248,7 +338,7 @@ fn finish(
         Some(path) => Ok(Created { path, ..made }),
         None => {
             tracing::warn!(branch = %made.branch, "cannot canonicalise the new worktree");
-            discard(git, &made, deadline);
+            discard(git, &made, Instant::now() + WORKTREE_DEADLINE);
             Err(RejectReason::WorktreeFailed)
         }
     }
@@ -493,5 +583,112 @@ mod tests {
         discard(&git(), &created, deadline());
         assert!(!path.exists());
         assert!(!git_in(&f.project(), &verify).status.success());
+    }
+
+    /// The commit `dir`'s `HEAD` names.
+    fn head_at(dir: &Path) -> String {
+        let out = git_in(dir, &["rev-parse", "HEAD"]);
+        String::from_utf8_lossy(&out.stdout).trim_end().to_owned()
+    }
+
+    fn has_branch(repo: &Path, branch: &str) -> bool {
+        let full = format!("refs/heads/{branch}");
+        git_in(repo, &["rev-parse", "--verify", "--quiet", &full])
+            .status
+            .success()
+    }
+
+    #[test]
+    fn a_worktree_starts_at_the_workdirs_head() {
+        let f = Fixture::new();
+        let a = f.create(&f.project(), "a").unwrap();
+        let a_path = PathBuf::from(&a.path);
+        setup_git(&a_path, &["commit", "-q", "--allow-empty", "-m", "on a"]);
+        let b = f.create(&a_path, "b").unwrap();
+        let b_head = head_at(Path::new(&b.path));
+        assert_eq!(b_head, head_at(&a_path));
+        assert_ne!(b_head, head_at(&f.project()));
+    }
+
+    #[test]
+    fn a_symlinked_worktrees_directory_is_refused() {
+        let f = Fixture::new();
+        let outside = f.root.parent().unwrap().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let link = f.root.join("project.worktrees");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_eq!(
+            f.create(&f.project(), "feat/x"),
+            Err(RejectReason::WorktreeFailed)
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!has_branch(&f.project(), "feat/x"));
+        // Positive control: without the link the same branch is created.
+        fs::remove_file(&link).unwrap();
+        assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    #[test]
+    fn a_symlink_for_a_branch_component_is_refused() {
+        let f = Fixture::new();
+        let outside = f.root.parent().unwrap().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let worktrees = f.root.join("project.worktrees");
+        fs::create_dir(&worktrees).unwrap();
+        let link = worktrees.join("feat");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_eq!(
+            f.create(&f.project(), "feat/x"),
+            Err(RejectReason::WorktreeFailed)
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!has_branch(&f.project(), "feat/x"));
+        // Positive control: without the link the same branch is created.
+        fs::remove_file(&link).unwrap();
+        assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    #[test]
+    fn a_failed_add_leaves_no_branch() {
+        let f = Fixture::new();
+        let worktrees = f.root.join("project.worktrees");
+        fs::write(&worktrees, "not a directory").unwrap();
+        assert_eq!(
+            f.create(&f.project(), "feat/x"),
+            Err(RejectReason::WorktreeFailed)
+        );
+        assert!(!has_branch(&f.project(), "feat/x"));
+        // Positive control: without the file the same branch is created.
+        fs::remove_file(&worktrees).unwrap();
+        assert!(f.create(&f.project(), "feat/x").is_ok());
+    }
+
+    /// A failing `post-checkout` hook makes `git worktree add -b` exit non-zero
+    /// after it has made the branch and the worktree. The cleanup removes both,
+    /// so a retry is not refused `BranchExists`.
+    #[test]
+    fn a_worktree_add_failing_after_its_branch_leaves_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new();
+        let hooks = f.root.parent().unwrap().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        setup_git(
+            &f.project(),
+            &["config", "core.hooksPath", text(&hooks).unwrap()],
+        );
+        let target = f.root.join("project.worktrees/feat/x");
+        assert_eq!(
+            f.create(&f.project(), "feat/x"),
+            Err(RejectReason::WorktreeFailed)
+        );
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        // Positive control: without the hook the same branch is created.
+        setup_git(&f.project(), &["config", "--unset", "core.hooksPath"]);
+        assert!(f.create(&f.project(), "feat/x").is_ok());
     }
 }
