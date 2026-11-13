@@ -13,13 +13,15 @@ SessionRowView sessionRow(
   String? blocked,
   String? title,
   bool hasWorkdir = true,
+  String? group,
 }) => SessionRowView(
   sessionId: id,
   title: title ?? 'title $id',
   workdir: hasWorkdir ? '/srv/proj-$id' : null,
   workdirName: hasWorkdir ? 'proj-$id' : null,
-  group: hasWorkdir ? '/srv/proj-$id' : '',
-  groupName: hasWorkdir ? 'proj-$id' : 'no directory',
+  group: group ?? (hasWorkdir ? '/srv/proj-$id' : ''),
+  groupName:
+      group?.split('/').last ?? (hasWorkdir ? 'proj-$id' : 'no directory'),
   branch: null,
   state: AgentState.awaitingApproval,
   badgeLabel: 'approval',
@@ -53,6 +55,10 @@ ScreenViewSessionList list({
   create: create,
   rename: rename,
 );
+
+/// Text inside a session row, not a group header with the same words.
+Finder rowText(String text) =>
+    find.descendant(of: find.byType(SessionRow), matching: find.text(text));
 
 void main() {
   late List<GuiIntent> sent;
@@ -88,6 +94,34 @@ void main() {
     expect(sent, [
       const GuiIntentAct(action: ActionIntentOpenSession(sessionId: 'a')),
     ]);
+  });
+
+  testWidgets('rows are grouped under a header per repo', (tester) async {
+    await pump(
+      tester,
+      list(
+        rows: [
+          sessionRow('a', group: '/srv/app'),
+          sessionRow('b', group: '/srv/app'),
+          sessionRow('c', group: '/srv/other'),
+        ],
+      ),
+    );
+    final appHeader = find.byKey(const ValueKey('group:/srv/app'));
+    final otherHeader = find.byKey(const ValueKey('group:/srv/other'));
+    expect(appHeader, findsOneWidget);
+    expect(otherHeader, findsOneWidget);
+    expect(find.text('app'), findsOneWidget);
+    expect(find.text('other'), findsOneWidget);
+
+    double top(Finder finder) => tester.getTopLeft(finder).dy;
+    final a = find.byKey(const ValueKey('a'));
+    final b = find.byKey(const ValueKey('b'));
+    final c = find.byKey(const ValueKey('c'));
+    expect(top(appHeader), lessThan(top(a)));
+    expect(top(a), lessThan(top(b)));
+    expect(top(b), lessThan(top(otherHeader)));
+    expect(top(otherHeader), lessThan(top(c)));
   });
 
   testWidgets('the menu archives and unarchives', (tester) async {
@@ -415,7 +449,8 @@ void main() {
     expect(find.byType(StateBadge), findsOneWidget);
     expect(find.byKey(const Key('row-state-a')), findsNothing);
     expect(find.text('/srv/proj-a'), findsOneWidget);
-    expect(find.text('proj-a'), findsNothing);
+    // The group header says `proj-a` too; only the row must not.
+    expect(rowText('proj-a'), findsNothing);
     expect(tester.widget<Text>(find.textContaining('title a')).maxLines, 1);
   });
 
@@ -457,7 +492,7 @@ void main() {
       expect(find.byKey(const Key('row-state-a')), findsOneWidget);
       expect(find.byType(StateBadge), findsNothing);
       expect(find.text('approval'), findsNothing);
-      expect(find.text('proj-a'), findsOneWidget);
+      expect(rowText('proj-a'), findsOneWidget);
       expect(find.text('/srv/proj-a'), findsNothing);
       for (final text in [
         '3',
