@@ -2122,6 +2122,41 @@ fn set_user_version(dir: &Path, version: i64) {
     conn.pragma_update(None, "user_version", version).unwrap();
 }
 
+/// Pins the `SCHEMA_VERSION - 6` threshold in `set_user_version` to the
+/// `last_message_seq` migration: a rewind below it drops the column, and the
+/// reopen must rerun the migration that adds it back.
+#[test]
+fn set_user_version_drops_the_list_order_column_exactly_below_its_migration() {
+    let has_column = |dir: &Path, column: &str| -> bool {
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+            [column],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    };
+    for (version, present) in [
+        (skywave_core::store::SCHEMA_VERSION - 7, false),
+        (skywave_core::store::SCHEMA_VERSION - 6, true),
+    ] {
+        let (_tmp, dir) = data_dir();
+        drop(Store::open(&dir).unwrap());
+        set_user_version(&dir, version);
+        assert_eq!(
+            has_column(&dir, "last_message_seq"),
+            present,
+            "rewound to user_version {version}"
+        );
+        drop(Store::open(&dir).unwrap());
+        assert!(
+            has_column(&dir, "last_message_seq"),
+            "reopen from user_version {version} did not restore last_message_seq"
+        );
+    }
+}
+
 /// The schema before `server_facts` kept each fact of the server's `hello`
 /// as a `settings` row of its own; the migration moves them into the one
 /// row, and a replica that never took a `hello` gets none.
