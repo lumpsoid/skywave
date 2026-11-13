@@ -4363,6 +4363,157 @@ fn shell_history_recalls_commands_not_prompts() {
     assert_eq!(rig.composer().text, "half");
 }
 
+/// A shell command `command` requested by this device, as the log has it.
+fn requested(rig: &Rig, command: &str) -> EventKind {
+    EventKind::ShellRequested {
+        command: command.into(),
+        when: RunWhen::Always,
+        by: rig.me,
+    }
+}
+
+/// The shell history picker as the head last sent Dart; `None` while closed.
+fn picker(rig: &Rig) -> Option<HistorySearchView> {
+    rig.composer().history_search
+}
+
+#[test]
+fn history_search_spans_sessions() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    let mine = requested(&rig, "git status");
+    rig.log(vec![mine]);
+    let other = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/work".into(),
+        context_name: "start".into(),
+        from: None,
+        worktree: None,
+    };
+    let theirs = requested(&rig, "git stash");
+    rig.log_in(other, vec![created, theirs]);
+
+    rig.intent(GuiIntent::HistorySearchOpen);
+    let open = picker(&rig).expect("the picker is open");
+    let commands: Vec<&str> = open.rows.iter().map(|row| row.command.as_str()).collect();
+    assert_eq!(commands, ["git stash", "git status"]);
+    assert_eq!(open.selected, Some(0));
+    assert_eq!(open.count_label, "2/2");
+    assert!(
+        open.rows.iter().all(|row| row.matched.is_empty()),
+        "{:?}",
+        open.rows
+    );
+
+    rig.edit("gsh");
+    let open = picker(&rig).expect("the picker is open");
+    assert_eq!(open.rows.len(), 1, "{:?}", open.rows);
+    assert_eq!(open.rows[0].command, "git stash");
+    assert_eq!(open.count_label, "1/2");
+    assert_eq!(
+        open.rows[0].matched,
+        [
+            Utf16Range { start: 0, end: 1 },
+            Utf16Range { start: 4, end: 5 },
+            Utf16Range { start: 8, end: 9 },
+        ]
+    );
+
+    rig.edit("git");
+    let open = picker(&rig).expect("the picker is open");
+    assert_eq!(open.rows.len(), 2, "{:?}", open.rows);
+    for row in &open.rows {
+        assert_eq!(row.matched, [Utf16Range { start: 0, end: 3 }]);
+    }
+}
+
+#[test]
+fn history_search_accepts_without_running() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    rig.log(vec![requested(&rig, "ls -la")]);
+    rig.log(vec![requested(&rig, "make test")]);
+    rig.actions.clear();
+
+    rig.intent(GuiIntent::HistorySearchOpen);
+    rig.intent(GuiIntent::HistorySearchMove { older: true });
+    assert_eq!(picker(&rig).and_then(|p| p.selected), Some(1));
+    rig.intent(GuiIntent::HistorySearchMove { older: true });
+    assert_eq!(picker(&rig).and_then(|p| p.selected), Some(1), "clamped");
+    rig.intent(GuiIntent::HistorySearchAccept);
+
+    assert_eq!(rig.composer().text, "ls -la");
+    assert!(picker(&rig).is_none());
+    assert!(
+        !rig.actions
+            .iter()
+            .any(|a| matches!(a, Action::RunShell { .. })),
+        "{:?}",
+        rig.actions
+    );
+    // Positive control: the same field, sent, does run.
+    rig.submit();
+    assert!(
+        rig.actions
+            .iter()
+            .any(|a| matches!(a, Action::RunShell { command, .. } if command == "ls -la")),
+        "{:?}",
+        rig.actions
+    );
+}
+
+#[test]
+fn history_search_pick_and_close() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    rig.log(vec![requested(&rig, "ls -la")]);
+    rig.log(vec![requested(&rig, "make test")]);
+
+    rig.intent(GuiIntent::HistorySearchOpen);
+    rig.intent(GuiIntent::HistorySearchPick { index: 1 });
+    assert_eq!(rig.composer().text, "ls -la");
+    assert!(picker(&rig).is_none());
+
+    rig.edit("half");
+    rig.intent(GuiIntent::HistorySearchOpen);
+    assert!(picker(&rig).is_some());
+    rig.intent(GuiIntent::HistorySearchClose);
+    assert!(picker(&rig).is_none());
+    // Dart's field keeps its text until a `rev`; the typed text is the hub's.
+    assert_eq!(rig.text(), "half");
+}
+
+#[test]
+fn history_search_needs_shell_mode() {
+    let mut rig = Rig::new();
+    rig.log(vec![requested(&rig, "ls")]);
+    rig.intent(GuiIntent::HistorySearchOpen);
+    assert!(picker(&rig).is_none(), "no picker in agent mode");
+
+    rig.switch_to_shell();
+    rig.intent(GuiIntent::HistorySearchOpen);
+    assert!(picker(&rig).is_some());
+    let id = rig.session.0.to_string();
+    rig.intent(GuiIntent::ToggleShellMode { session_id: id });
+    rig.results();
+    rig.view();
+    assert!(picker(&rig).is_none());
+}
+
+#[test]
+fn history_search_typing_resets_the_selection() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    rig.log(vec![requested(&rig, "git status")]);
+    rig.log(vec![requested(&rig, "git stash")]);
+
+    rig.intent(GuiIntent::HistorySearchOpen);
+    rig.intent(GuiIntent::HistorySearchMove { older: true });
+    assert_eq!(picker(&rig).and_then(|p| p.selected), Some(1));
+    rig.edit("git");
+    assert_eq!(picker(&rig).and_then(|p| p.selected), Some(0));
+}
+
 #[test]
 fn the_stops_take_back_a_pending_run_and_stop_a_running_one() {
     let mut rig = Rig::new();

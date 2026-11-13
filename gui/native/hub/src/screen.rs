@@ -522,6 +522,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             cursor_utf16: 0,
             rev: 0,
             history_label: None,
+            history_search: None,
             to_label: None,
             mode: ComposerModeView::Agent,
             shell_enabled: false,
