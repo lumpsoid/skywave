@@ -181,6 +181,10 @@ pub enum GuiIntent {
     CreateConversationTyped {
         conversation: String,
     },
+    /// The new-worktree branch field changed.
+    CreateWorktreeTyped {
+        worktree: String,
+    },
     /// Tab: open the highlighted row, else fill or list again.
     CompletionComplete,
     /// Move the highlight: ↓ from none highlights the first row, ↑ from

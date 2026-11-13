@@ -3254,13 +3254,46 @@ fn accepting_with_a_conversation_id_adopts_it() {
         Some(&Action::CreateSession {
             workdir: "/srv/app".into(),
             conversation: Some("  abc-123 ".into()),
-            worktree: None,
+            worktree: Some(String::new()),
         })
     );
     assert_eq!(
         queued_creations(&rig),
         [("/srv/app".to_owned(), Some("abc-123".to_owned()))]
     );
+}
+
+#[test]
+fn accepting_with_a_worktree_branch_asks_for_it() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateWorktreeTyped {
+        worktree: "  feat/x\u{7}".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::CreateSession {
+            workdir: "/srv/app".into(),
+            conversation: Some(String::new()),
+            worktree: Some("  feat/x".into()),
+        })
+    );
+    // The core trims the branch; queued_creations ignores it, so read it here.
+    let worktrees: Vec<Option<String>> = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { worktree, .. } => Some(worktree),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(worktrees, [Some("feat/x".to_owned())]);
 }
 
 #[test]
