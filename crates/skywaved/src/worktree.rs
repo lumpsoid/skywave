@@ -8,13 +8,13 @@
 //! exit statuses; a timeout is a failure.
 //!
 //! [`discard`] is rollback only: the caller uses it for a worktree [`create`]
-//! made when the session's database transaction then failed. `--force` is
+//! made for a session that was not committed ([`Prepared`]). `--force` is
 //! safe there because only a worktree just made is ever discarded.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use skywave_proto::RejectReason;
 
@@ -31,6 +31,9 @@ pub struct Created {
     pub repo: String,
     pub branch: String,
 }
+
+/// How long git may take to create or discard a worktree; git is killed past it.
+pub const WORKTREE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Creates a worktree of `workdir`'s repository on a new `branch`, starting
 /// at the repository's current `HEAD`. Refusals: `WorkdirNotAllowed` or
@@ -98,6 +101,62 @@ pub fn discard(git: &Git, created: &Created, deadline: Instant) {
         &created.branch,
         "git branch -D failed",
     );
+}
+
+/// A worktree [`create`] made for a session, or the refusal it came to, held
+/// until the command's transaction is known, as
+/// [`crate::agent::import::Prepared`] holds its blobs. `handle_with` calls
+/// [`Prepared::kept`] for a rejected command too, so a worktree is kept only
+/// when apply logged its session ([`Prepared::logged`]). Dropped otherwise,
+/// it is discarded.
+#[derive(Debug)]
+pub struct Prepared {
+    git: Git,
+    result: Result<Created, RejectReason>,
+    /// Set once apply has checked the worktree and logs its session.
+    logged: bool,
+    /// Set by [`Prepared::kept`] when `logged`.
+    kept: bool,
+}
+
+impl Prepared {
+    pub(crate) fn new(git: Git, result: Result<Created, RejectReason>) -> Prepared {
+        Prepared {
+            git,
+            result,
+            logged: false,
+            kept: false,
+        }
+    }
+
+    /// The worktree, or the refusal it came to.
+    pub(crate) fn created(&self) -> Result<Created, RejectReason> {
+        self.result.clone()
+    }
+
+    /// Marks the worktree as one apply logs a session for.
+    pub(crate) fn logged(&mut self) {
+        self.logged = true;
+    }
+
+    /// Called once the command's transaction is committed: a logged worktree
+    /// is the session's from now on. One never logged is still discarded.
+    pub(crate) fn kept(mut self) {
+        if self.logged {
+            self.kept = true;
+        }
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        if let Ok(created) = &self.result {
+            discard(&self.git, created, Instant::now() + WORKTREE_DEADLINE);
+        }
+    }
 }
 
 /// Refuses, before git runs, a name that would read as an option or climb

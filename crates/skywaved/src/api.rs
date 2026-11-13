@@ -100,8 +100,9 @@
 //! work returns: stuck threads hold theirs, so at most [`FS_PERMITS`] can
 //! pile up. Hello, commands, events, blobs and attachments never take one.
 //!
-//! **Prepared commands** (an adopting create and a crop) are prepared off
-//! the API's connection, then handed to [`EventLog::handle_with`]. A
+//! **Prepared commands** (an adopting create, a create naming a worktree, and
+//! a crop) are prepared off the API's connection, then handed to
+//! [`EventLog::handle_with`]. A
 //! command already handled is answered from its stored result without
 //! preparing anything; a resend that arrives while the first request is
 //! still preparing waits for that request's reply.
@@ -146,8 +147,8 @@ use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContentHash,
     ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery,
     HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult, LoginStartResult,
-    PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, UploadResult, UsageLimit, UsageLimitsResult,
-    WorkdirQuery, check_conversation_id, limits, path,
+    PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, UploadResult, UsageLimit,
+    UsageLimitsResult, WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -172,7 +173,8 @@ use crate::event_log::{self, DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
 use crate::login::LoginFlows;
 use crate::server::{JoinedHook, ServerOptions};
 use crate::storage::{self, StorageReader};
-use crate::workdir::{self, Snapshot, WorkdirReader};
+use crate::workdir::{self, Git, Snapshot, WorkdirReader};
+use crate::worktree;
 use crate::{EventLog, lock};
 
 /// Longest a `GET /v1/events` waits, whatever `wait` asks for.
@@ -233,6 +235,9 @@ pub(crate) struct Api {
     /// Workdir reads, on a second connection of their own (behind its own
     /// mutex), so file I/O never holds `db`.
     workdir: WorkdirReader,
+    /// How the git a `CreateSession` naming a worktree runs, as workdir
+    /// reads do.
+    git: Git,
     /// Storage reports, on a third connection of their own.
     storage: StorageReader,
     log: EventLog,
@@ -290,6 +295,7 @@ impl Api {
         );
         Ok(Api {
             db: Mutex::new(Db::open(&dir.db_path())?),
+            git: options.git.clone(),
             workdir: WorkdirReader::new(
                 Db::open(&dir.db_path())?,
                 blobs.clone(),
@@ -509,6 +515,9 @@ async fn commands(
         CommandKind::CreateSession {
             conversation: Some(_),
             ..
+        } | CommandKind::CreateSession {
+            worktree: Some(_),
+            ..
         } | CommandKind::CropBlob { .. }
     ) || matches!(
         &command.kind,
@@ -599,6 +608,11 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
         CommandKind::SendMessage { attachments, .. } => {
             Some(prepare_attachments(api, attachments.clone()).await?)
         }
+        CommandKind::CreateSession {
+            worktree: Some(_), ..
+        } => prepare_worktree(api, &command)
+            .await?
+            .map(Preparation::from),
         _ => prepare_import(api, &command).await?.map(Preparation::from),
     };
     api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
@@ -764,6 +778,41 @@ async fn prepare_import(
             }
         },
     ))
+}
+
+/// The worktree a `CreateSession` naming one asks for, created on a blocking
+/// thread off the API's connection: git is slow and changes the disk, so it
+/// never runs inside the transaction, and once per command, since a resend
+/// is answered from the log. Git is bounded by its own deadline
+/// ([`worktree::WORKTREE_DEADLINE`]), not by a timeout here: a timeout would
+/// answer while git still ran, and the worktree it made would have no one to
+/// discard it.
+async fn prepare_worktree(
+    api: &Arc<Api>,
+    command: &Command,
+) -> std::result::Result<Option<worktree::Prepared>, StatusCode> {
+    let CommandKind::CreateSession {
+        workdir,
+        conversation: None,
+        worktree: Some(branch),
+    } = &command.kind
+    else {
+        return Ok(None);
+    };
+    let deadline = Instant::now() + worktree::WORKTREE_DEADLINE;
+    let (git, roots) = (api.git.clone(), api.log.roots().to_vec());
+    let (workdir, branch) = (workdir.clone(), branch.clone());
+    let created = tokio::task::spawn_blocking(move || {
+        worktree::create(&git, &roots, &workdir, &branch, deadline)
+    })
+    .await;
+    Ok(Some(match created {
+        Ok(result) => worktree::Prepared::new(api.git.clone(), result),
+        Err(e) => {
+            tracing::error!(error = %e, "creating a worktree failed");
+            worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed))
+        }
+    }))
 }
 
 async fn events(

@@ -24,7 +24,7 @@ use skywave_proto::{
     FileResult, HelloResponse, ImageType, ImportOutcome, LimitSeverity, LimitWindow, LineSpan,
     ListResult, LogResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason,
     RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage, StorageReport,
-    ToolResult, UploadResult, UsageLimit, UsageLimitsResult, limits, path,
+    ToolResult, UploadResult, UsageLimit, UsageLimitsResult, Worktree, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -842,6 +842,187 @@ async fn create_session_adopts_a_conversation_by_its_id() {
             conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
         })
     );
+}
+
+/// Makes `dir` a repository with one commit on `main`: a worktree starts
+/// from the commit.
+fn make_repo(dir: &std::path::Path) {
+    setup_git(dir, &["init", "-q"]);
+    setup_git(dir, &["commit", "-q", "--allow-empty", "-m", "first"]);
+}
+
+/// Whether the repository at `dir` has the local branch `branch`.
+fn has_branch(dir: &std::path::Path, branch: &str) -> bool {
+    let full = format!("refs/heads/{branch}");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--verify", "--quiet", full.as_str()])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("this test needs `git` on PATH: {e}"))
+        .status
+        .success()
+}
+
+/// A `CreateSession` of the fixture's `project` on a new worktree `branch`.
+fn worktree_command(f: &Fixture, branch: &str) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: f.root.join("project").display().to_string(),
+            conversation: None,
+            worktree: Some(branch.into()),
+        },
+    }
+}
+
+/// A `CreateSession` naming a worktree makes it next to the repository and
+/// starts the session there. Resending it answers the same and logs nothing
+/// more.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_makes_a_worktree_and_runs_there() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let command = worktree_command(&f, "feat/x");
+
+    let accepted = device.command(&command).await;
+    assert_eq!(accepted, CommandResult::Accepted { seq: Seq(1) });
+    assert_eq!(device.command(&command).await, accepted);
+    assert_eq!(f.log.head(), Seq(1));
+    let batch = device.events(Seq::ZERO, 0).await;
+    assert_eq!(batch.events.len(), 1);
+    let event = &batch.events[0];
+    assert_eq!(event.command_id, Some(command.id));
+    let EventKind::SessionCreated {
+        workdir,
+        from,
+        worktree,
+        ..
+    } = &event.kind
+    else {
+        panic!("{batch:?}");
+    };
+    let made = f.root.join("project.worktrees/feat/x");
+    assert!(made.is_dir());
+    assert_eq!(from, &None);
+    assert_eq!(
+        workdir,
+        &std::fs::canonicalize(&made).unwrap().display().to_string()
+    );
+    assert_eq!(
+        worktree,
+        &Some(Worktree {
+            repo: std::fs::canonicalize(&project)
+                .unwrap()
+                .display()
+                .to_string(),
+            branch: "feat/x".into(),
+        })
+    );
+}
+
+/// A worktree on a branch that already exists is refused and makes no
+/// directory. The same create on a free branch then goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_refuses_an_existing_branch() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    make_repo(&f.root.join("project"));
+
+    assert_eq!(
+        device.command(&worktree_command(&f, "main")).await,
+        rejected(RejectReason::BranchExists)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees").exists());
+    // Positive control: a free branch from the same fixture is created.
+    let free = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&free), Seq(1));
+    assert!(f.root.join("project.worktrees/feat/x").is_dir());
+}
+
+/// A worktree needs a repository: a plain directory is refused and nothing
+/// is created.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_refuses_a_worktree_outside_a_repository() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+
+    assert_eq!(
+        device.command(&worktree_command(&f, "feat/x")).await,
+        rejected(RejectReason::NotARepository)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees").exists());
+    // Positive control: once the directory is a repository, the same command
+    // is accepted.
+    make_repo(&f.root.join("project"));
+    let made = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&made), Seq(1));
+}
+
+/// D30: a worktree with a conversation is refused before anything is
+/// created, the branch included.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_refuses_a_worktree_with_a_conversation() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let adopting = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: project.display().to_string(),
+            conversation: Some("9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into()),
+            worktree: Some("feat/x".into()),
+        },
+    };
+
+    assert_eq!(
+        device.command(&adopting).await,
+        rejected(RejectReason::BadConversation)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees").exists());
+    assert!(!has_branch(&project, "feat/x"));
+    // Positive control: the same branch without the conversation is created.
+    let made = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&made), Seq(1));
+    assert!(has_branch(&project, "feat/x"));
+}
+
+/// A worktree made for a session the log then refuses is discarded with its
+/// branch. Were the branch left behind, creating it again would be refused
+/// with `BranchExists`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_whose_session_is_rejected_is_discarded() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+
+    // A stopping server refuses new work after the worktree is made.
+    f.log.set_stopping(true);
+    assert_eq!(
+        device.command(&worktree_command(&f, "feat/x")).await,
+        rejected(RejectReason::ServerStopping)
+    );
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(!f.root.join("project.worktrees/feat/x").exists());
+    assert!(!has_branch(&project, "feat/x"));
+    // Positive control: running again, the same branch is created.
+    f.log.set_stopping(false);
+    let made = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&made), Seq(1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
