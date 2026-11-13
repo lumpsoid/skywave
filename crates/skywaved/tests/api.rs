@@ -1026,6 +1026,29 @@ async fn a_worktree_whose_session_is_rejected_is_discarded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn removing_the_worktree_of_an_unknown_session_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+
+    let remove = |session_id| Command {
+        id: CommandId::new(),
+        kind: CommandKind::RemoveWorktree { session_id },
+    };
+    assert_eq!(
+        device.command(&remove(SessionId::new())).await,
+        rejected(RejectReason::UnknownSession)
+    );
+    // Positive control: the same command for a known session is not refused
+    // as unknown, so the refusal above is about the session id.
+    assert_ne!(
+        device.command(&remove(session)).await,
+        rejected(RejectReason::UnknownSession)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn events_page_with_limit_and_reject_a_bad_query() {
     let mut f = Fixture::start().await;
     let creds = f.pair().await;

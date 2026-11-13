@@ -681,6 +681,16 @@
       {
         "session_id": "01920000-0000-7000-8000-000000000001",
         "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "worktree_removed",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
         "command_id": null,
         "context": "01920000-0000-7000-8000-000000000008",
         "kind": {
@@ -1603,6 +1613,13 @@
     {
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
+        "type": "remove_worktree",
+        "session_id": "01920000-0000-7000-8000-000000000001"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
         "type": "set_permission_mode",
         "session_id": "01920000-0000-7000-8000-000000000001",
         "mode": "accept_edits"
@@ -1738,6 +1755,22 @@
     {
       "result": "rejected",
       "reason": "worktree_failed"
+    },
+    {
+      "result": "rejected",
+      "reason": "not_a_worktree"
+    },
+    {
+      "result": "rejected",
+      "reason": "worktree_dirty"
+    },
+    {
+      "result": "rejected",
+      "reason": "branch_unmerged"
+    },
+    {
+      "result": "rejected",
+      "reason": "turn_running"
     },
     {
       "result": "rejected",

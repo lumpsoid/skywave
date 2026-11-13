@@ -552,7 +552,9 @@ fn v30_to_v31(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 }
 
 /// v31 to v32. v32 added an optional `worktree` to `CreateSession` and
-/// `SessionCreated`; JSON without it reads as `None`. Nothing stored changes.
+/// `SessionCreated`; JSON without it reads as `None`. v32 also added
+/// `RemoveWorktree` and `WorktreeRemoved`, which v31 data cannot hold, so
+/// nothing stored changes.
 fn v31_to_v32(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }

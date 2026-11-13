@@ -15,6 +15,7 @@
 //! - `StopSession` → `SessionStopped`;
 //! - `RenameSession` → `SessionRenamed` with the normalised name;
 //! - `SetSessionArchived` → `SessionArchived`;
+//! - `RemoveWorktree` → `WorktreeRemoved`;
 //! - `SetPermissionMode` → `PermissionModeRequested`;
 //! - `SetModel` → `ModelRequested` with the normalised model;
 //! - `SetEffort` → `EffortRequested`;
@@ -715,6 +716,13 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
+            CommandKind::RemoveWorktree { session_id } => {
+                if known(*session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                // The git work lands in the next step.
+                return Ok(Err(RejectReason::NotAWorktree));
+            }
             CommandKind::SetPermissionMode { session_id, mode } => {
                 if *mode == PermissionMode::Bypass && !self.bypass_allowed() {
                     return Ok(Err(RejectReason::BypassDisabled));
@@ -909,6 +917,7 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::StopShell { .. }
         | CommandKind::RenameSession { .. }
         | CommandKind::SetSessionArchived { .. }
+        | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         // Freeing space is what a low disk needs.
         | CommandKind::DeleteBlob { .. }

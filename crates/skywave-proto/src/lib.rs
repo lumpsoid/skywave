@@ -182,7 +182,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v32: git worktree sessions: `worktree` on `CommandKind::CreateSession`
 /// and on `EventKind::SessionCreated` ([`Worktree`]), and the `RejectReason`s
-/// `NotARepository`, `BranchExists` and `WorktreeFailed`.
+/// `NotARepository`, `BranchExists` and `WorktreeFailed`. Also
+/// `CommandKind::RemoveWorktree` and `EventKind::WorktreeRemoved`, with the
+/// `RejectReason`s `NotAWorktree`, `WorktreeDirty`, `BranchUnmerged` and
+/// `TurnRunning`.
 pub const PROTOCOL_VERSION: u32 = 32;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
@@ -574,6 +577,12 @@ pub enum EventKind {
         archived: bool,
         by: DeviceId,
     },
+    /// The session's git worktree and its branch were removed by a
+    /// `RemoveWorktree` command. The agent is stopped and the session cannot
+    /// run again.
+    WorktreeRemoved {
+        by: DeviceId,
+    },
     SessionStateChanged(SessionState),
     /// What the turn that is ending took, as the agent reported it; logged
     /// just before the turn's closing `SessionStateChanged`, at most once a
@@ -885,6 +894,7 @@ impl EventKind {
             | EventKind::QuestionAnswered { by, .. }
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
+            | EventKind::WorktreeRemoved { by }
             | EventKind::PermissionModeRequested { by, .. }
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
@@ -948,6 +958,7 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
@@ -1008,6 +1019,7 @@ impl EventKind {
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
             | EventKind::SubagentUsage(_)
@@ -1091,6 +1103,7 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::WorktreeRemoved { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
             | EventKind::SubagentUsage(_)
@@ -2021,6 +2034,11 @@ pub enum CommandKind {
         session_id: SessionId,
         archived: bool,
     },
+    /// Remove the git worktree the session runs in and delete its branch, then
+    /// stop the session's agent. Refused while a turn runs, when the worktree
+    /// has uncommitted changes, or when the branch is not merged into the
+    /// repo's HEAD. Idempotent: a resend after it was removed is accepted.
+    RemoveWorktree { session_id: SessionId },
     /// Ask the session's agent to run in `mode`, starting the agent if it
     /// is not running. Accepted for any known session; the agent's answer
     /// comes as a `PermissionModeChanged` or `PermissionModeRefused` naming
@@ -2276,6 +2294,15 @@ pub enum RejectReason {
     BranchExists,
     /// git could not create the worktree; the server log has its stderr.
     WorktreeFailed,
+    /// `RemoveWorktree` for a session that was not created in a git worktree.
+    NotAWorktree,
+    /// `RemoveWorktree` while the worktree has uncommitted or untracked changes.
+    WorktreeDirty,
+    /// `RemoveWorktree` while the worktree's branch is not merged into the
+    /// repo's HEAD.
+    BranchUnmerged,
+    /// `RemoveWorktree` while the session's agent is running a turn.
+    TurnRunning,
     UnknownSession,
     UnknownApproval,
     /// Another answer already won (D5).

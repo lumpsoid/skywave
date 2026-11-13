@@ -650,7 +650,8 @@ fn v30_to_v31(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 
 /// v31 to v32, as the server's step of the same name. v32 added an optional
 /// `worktree` to `session_created` events, which v31 JSON lacks and reads as
-/// `None`. Nothing stored changes.
+/// `None`. v32 also added `RemoveWorktree` and `WorktreeRemoved`, which v31
+/// data cannot hold, so nothing stored changes.
 fn v31_to_v32(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
