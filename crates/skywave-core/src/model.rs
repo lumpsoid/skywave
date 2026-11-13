@@ -3677,8 +3677,9 @@ impl Model {
                     archived: *archived,
                     by: self.device_ref(*by),
                 }),
-                // No timeline entry yet.
-                EventKind::WorktreeRemoved { .. } => None,
+                EventKind::WorktreeRemoved { by } => Some(Entry::WorktreeRemoved {
+                    by: self.device_ref(*by),
+                }),
                 // Calls a turn leaves open stay running until the server
                 // logs them unanswered.
                 EventKind::SessionStateChanged(state) => match state {
@@ -6621,6 +6622,25 @@ mod tests {
         assert!(
             f.dispatch(archive(SessionId::new(), true)).is_empty(),
             "unknown here"
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_has_a_timeline_entry() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        let by = f.me;
+        f.log(old, vec![EventKind::WorktreeRemoved { by }]);
+        f.open(old);
+        assert_eq!(
+            entries(&f),
+            vec![Entry::WorktreeRemoved {
+                by: DeviceRef {
+                    id: f.me,
+                    name: None,
+                    me: true,
+                },
+            }]
         );
     }
 

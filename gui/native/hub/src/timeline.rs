@@ -355,6 +355,11 @@ fn row(
                 format!("brought back from the archive by {}", who(by))
             },
         ),
+        Entry::WorktreeRemoved { by } => set(
+            &mut row,
+            RowKind::Archived,
+            format!("worktree removed by {}", who(by)),
+        ),
         Entry::AgentSetting {
             setting,
             by,

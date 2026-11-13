@@ -1708,6 +1708,8 @@ pub enum Entry {
     /// The session was archived (`true`) or brought back from the archive.
     /// A message brings it back too, without an entry of its own.
     Archived { archived: bool, by: DeviceRef },
+    /// The session's git worktree and its branch were removed; its work is refused from here on.
+    WorktreeRemoved { by: DeviceRef },
     /// The agent reported an error.
     AgentErrored { message: String },
     /// The agent started as `version`, not `confirmed`, the version the
