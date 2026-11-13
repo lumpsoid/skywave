@@ -834,13 +834,14 @@ async fn prepare_worktree(
 
 /// The outcome of a `RemoveWorktree` of `session_id`. Its checks run on a
 /// blocking thread off the API's connection, before git: an unknown session, a
-/// session with no worktree, and a turn running in any session of the same
-/// directory are refused there. The directory may be shared with sessions that
-/// name no worktree, or with a worktree made at the same path since. A session
-/// whose worktree was already removed is accepted without git, so nothing
-/// made at that path since is touched. Otherwise [`worktree::remove`] runs,
-/// bounded by its own deadline as git in [`prepare_worktree`] is. A removal
-/// starts no work, so a stopping server or a low disk does not refuse it here.
+/// session with no worktree, and a turn or a shell command running or queued in
+/// any session of the same directory are refused there. The directory may be
+/// shared with sessions that name no worktree, or with a worktree made at the
+/// same path since. A session whose worktree was already removed is accepted
+/// without git, so nothing made at that path since is touched. Otherwise
+/// [`worktree::remove`] runs, bounded by its own deadline as git in
+/// [`prepare_worktree`] is. A removal starts no work, so a stopping server or a
+/// low disk does not refuse it here.
 async fn prepare_removal(
     api: &Arc<Api>,
     session_id: SessionId,
@@ -853,15 +854,16 @@ async fn prepare_removal(
             let Some(recorded) = api.log.worktree_of(db, session_id)? else {
                 return Ok(Err(RejectReason::NotAWorktree));
             };
-            // The session itself is one of these. The turn check comes before
-            // the removed check: an accepted removal logs `WorktreeRemoved`,
-            // which stops every session of the directory.
-            let sessions = api.log.sessions(db)?;
-            if sessions
-                .iter()
-                .any(|s| s.workdir == info.workdir && s.turn_active)
-            {
+            // The session itself is one of these. Queued work counts too: the
+            // supervisor or the shell runner would start it in a directory
+            // that is gone. The turn check comes before the removed check: an
+            // accepted removal logs `WorktreeRemoved`, which stops every
+            // session of the directory.
+            if api.log.workdir_turn_busy(db, &info.workdir)? {
                 return Ok(Err(RejectReason::TurnRunning));
+            }
+            if api.log.workdir_shell_busy(db, &info.workdir)? {
+                return Ok(Err(RejectReason::ShellRunning));
             }
             if api.log.worktree_removed(db, session_id)? {
                 return Ok(Ok(None));

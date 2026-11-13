@@ -434,7 +434,10 @@ the daemon's appends, which would otherwise stop `serve` (below).
   removes one:
   archiving never does. It answers `WorktreeRemoved { by }` after these
   checks, in order: the session has a worktree (else `NotAWorktree`); no
-  session in the same workdir has a running turn (`TurnRunning`); the branch
+  session in the same workdir has a running turn, a message handed to its
+  agent whose turn has not started, or a message the supervisor has not
+  handled yet (`TurnRunning`), nor a shell command running or waiting
+  (`ShellRunning`); the branch
   and the worktree's `HEAD` are merged into the main repository's `HEAD`
   (`merge-base --is-ancestor`, else `BranchUnmerged`); the worktree is clean
   (`status --porcelain`, untracked files included, else `WorktreeDirty`).

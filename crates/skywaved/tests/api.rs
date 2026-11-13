@@ -1058,6 +1058,20 @@ fn remove_command(session: SessionId) -> Command {
     }
 }
 
+/// Stands for a supervisor that has handled every event logged so far:
+/// this fixture runs none, so its cursor stays at 0.
+fn supervisor_caught_up(f: &Fixture) {
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE supervisor_cursor SET seq = \
+             (SELECT COALESCE(MAX(seq), 0) FROM events) WHERE id = 1",
+            [],
+        )
+        .unwrap();
+}
+
 /// A merged, clean worktree is removed with its branch, and the removal is
 /// logged. Resending the same command answers the same. A new command for the
 /// same session is accepted too: the removal is already done.
@@ -1109,6 +1123,7 @@ async fn work_for_a_removed_worktree_session_is_refused() {
             .command(&message_command(session, context, "hello", Vec::new()))
             .await,
     );
+    supervisor_caught_up(&f);
     accepted_seq(&device.command(&remove_command(session)).await);
 
     assert_eq!(
@@ -1168,6 +1183,7 @@ async fn work_for_a_session_sharing_a_removed_worktree_is_refused() {
             .command(&message_command(other, context, "hello", Vec::new()))
             .await,
     );
+    supervisor_caught_up(&f);
     accepted_seq(&device.command(&remove_command(owner)).await);
 
     assert_eq!(
@@ -1327,6 +1343,169 @@ async fn a_worktree_is_not_removed_while_a_turn_runs() {
     let idle = EventKind::SessionStateChanged(SessionState::Idle);
     f.log
         .append(&mut f.storage.db, session, context, idle)
+        .unwrap();
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+}
+
+/// A message the supervisor has not handled yet keeps the worktree: the
+/// refusal comes before git runs. Once the supervisor has handled it, the
+/// removal goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_is_not_removed_while_a_message_waits_for_the_supervisor() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let context = ContextId::first_of(session);
+    let dir = f.root.join("project.worktrees/feat/x");
+    accepted_seq(
+        &device
+            .command(&message_command(session, context, "hello", Vec::new()))
+            .await,
+    );
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    assert!(dir.is_dir());
+    // Positive control: once the supervisor has handled the message, the
+    // same worktree is removed.
+    supervisor_caught_up(&f);
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+}
+
+/// A message handed to its agent, whose turn has not started, keeps the
+/// worktree. Once the handed row is gone, the removal goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_is_not_removed_while_a_handed_message_waits_for_its_turn() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let context = ContextId::first_of(session);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let message = accepted_seq(
+        &device
+            .command(&message_command(session, context, "hello", Vec::new()))
+            .await,
+    );
+    supervisor_caught_up(&f);
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO supervisor_owed (seq, session_id, context, state) \
+             SELECT seq, session_id, context, 'waiting' FROM events WHERE seq = ?1",
+            [i64::try_from(message.0).unwrap()],
+        )
+        .unwrap();
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    assert!(dir.is_dir());
+    // Positive control: once nothing is owed, the same worktree is removed.
+    f.storage
+        .db
+        .conn()
+        .execute("DELETE FROM supervisor_owed", [])
+        .unwrap();
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+}
+
+/// A held session's events after its held seq are not handled yet, though the
+/// cursor is past them, so a message there keeps the worktree. Once the held
+/// row is gone, the removal goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_is_not_removed_while_a_held_message_waits() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let context = ContextId::first_of(session);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let message = accepted_seq(
+        &device
+            .command(&message_command(session, context, "hello", Vec::new()))
+            .await,
+    );
+    supervisor_caught_up(&f);
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO supervisor_held (session_id, seq) VALUES (?1, ?2)",
+            rusqlite::params![session.0.to_string(), i64::try_from(message.0 - 1).unwrap()],
+        )
+        .unwrap();
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    assert!(dir.is_dir());
+    // Positive control: once the session is no longer held, the same worktree
+    // is removed.
+    f.storage
+        .db
+        .conn()
+        .execute("DELETE FROM supervisor_held", [])
+        .unwrap();
+    accepted_seq(&device.command(&remove_command(session)).await);
+    assert!(!dir.exists());
+}
+
+/// A shell command queued or running in the worktree keeps it: the refusal
+/// comes before git runs. Once the run has finished, the removal goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_is_not_removed_while_a_shell_command_waits() {
+    let f = Fixture::start_with_shell(true).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let run = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RunShell {
+            session_id: session,
+            command: "true".into(),
+            when: Default::default(),
+        },
+    };
+    accepted_seq(&device.command(&run).await);
+
+    assert_eq!(
+        device.command(&remove_command(session)).await,
+        rejected(RejectReason::ShellRunning)
+    );
+    assert!(dir.is_dir());
+    assert!(has_branch(&project, "feat/x"));
+    // Positive control: once the run has finished, the same worktree is
+    // removed. Nothing runs the command here, so the finish is stored by hand.
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE shell_runs SET finished_seq = (SELECT MAX(seq) FROM events)",
+            [],
+        )
         .unwrap();
     accepted_seq(&device.command(&remove_command(session)).await);
     assert!(!dir.exists());

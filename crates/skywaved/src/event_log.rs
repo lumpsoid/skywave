@@ -692,6 +692,19 @@ impl EventLog {
         worktree_removed_in(db.conn(), id)
     }
 
+    /// Whether a session in `workdir` has work the supervisor has not seen
+    /// through: a running turn, a message handed to its agent whose turn has
+    /// not started, or a message the supervisor has not handled yet.
+    pub fn workdir_turn_busy(&self, db: &Db, workdir: &str) -> Result<bool> {
+        workdir_turn_busy_in(db.conn(), workdir)
+    }
+
+    /// Whether a session in `workdir` has a shell command queued or running
+    /// (a `RunShell` with no `ShellFinished` yet).
+    pub fn workdir_shell_busy(&self, db: &Db, workdir: &str) -> Result<bool> {
+        workdir_shell_busy_in(db.conn(), workdir)
+    }
+
     /// Every session, oldest first.
     pub fn sessions(&self, db: &Db) -> Result<Vec<SessionInfo>> {
         let mut stmt = db.conn().prepare_cached(
@@ -1112,6 +1125,25 @@ const WORKDIR_WORKTREE_REMOVED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM events
          ORDER BY c.seq DESC LIMIT 1)
        AND json_extract(kind, '$.type') = 'worktree_removed')";
 
+/// [`EventLog::workdir_turn_busy`]: a session in the directory that runs a
+/// turn, has a message handed to its agent (`supervisor_owed`), or has a
+/// `UserMessage` past its supervisor's position: the held seq if the session
+/// is held, else the cursor.
+const WORKDIR_TURN_BUSY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM sessions s
+     WHERE s.workdir = ?1 AND (s.turn_active = 1
+       OR EXISTS (SELECT 1 FROM supervisor_owed o WHERE o.session_id = s.id)
+       OR EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.id
+             AND json_extract(e.kind, '$.type') = 'user_message'
+             AND e.seq > COALESCE(
+                 (SELECT h.seq FROM supervisor_held h WHERE h.session_id = s.id),
+                 (SELECT c.seq FROM supervisor_cursor c WHERE c.id = 1)))))";
+
+/// [`EventLog::workdir_shell_busy`]: a shell run of a session in the
+/// directory with no `ShellFinished`, queued or running.
+const WORKDIR_SHELL_BUSY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM shell_runs r
+     JOIN sessions s ON s.id = r.session_id
+     WHERE s.workdir = ?1 AND r.finished_seq IS NULL)";
+
 /// The context of the session's newest `BackgroundTasksChanged` or
 /// `SchedulesChanged`.
 pub(crate) fn last_work_context_in(
@@ -1316,6 +1348,24 @@ pub(crate) fn workdir_worktree_removed_in(conn: &Connection, workdir: &str) -> R
         .prepare_cached(WORKDIR_WORKTREE_REMOVED_SQL)?
         .query_row([workdir], |r| r.get(0))?;
     Ok(removed)
+}
+
+/// [`EventLog::workdir_turn_busy`]: whether any session in `workdir` has
+/// [`WORKDIR_TURN_BUSY_SQL`]'s work queued or running.
+pub(crate) fn workdir_turn_busy_in(conn: &Connection, workdir: &str) -> Result<bool> {
+    let busy = conn
+        .prepare_cached(WORKDIR_TURN_BUSY_SQL)?
+        .query_row([workdir], |r| r.get(0))?;
+    Ok(busy)
+}
+
+/// [`EventLog::workdir_shell_busy`]: whether any session in `workdir` has a
+/// shell run with no `ShellFinished`.
+pub(crate) fn workdir_shell_busy_in(conn: &Connection, workdir: &str) -> Result<bool> {
+    let busy = conn
+        .prepare_cached(WORKDIR_SHELL_BUSY_SQL)?
+        .query_row([workdir], |r| r.get(0))?;
+    Ok(busy)
 }
 
 /// The session's newest `SessionStateChanged` or `TurnInterrupted`, with
