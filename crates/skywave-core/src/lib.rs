@@ -46,6 +46,7 @@ pub mod pairing;
 pub mod projection;
 pub mod seam;
 pub mod search;
+mod shell_history;
 mod snippets;
 mod storage;
 pub mod store;

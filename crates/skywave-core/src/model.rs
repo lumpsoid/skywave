@@ -30,6 +30,7 @@ use crate::projection::{
     BlobFate, FIRST_PROMPT_MAX_CHARS, SessionSummary, TurnRecord, blob_refs, first_line, is_notable,
 };
 use crate::seam::Request;
+use crate::shell_history::ShellHistory;
 use crate::snippets::Snippets;
 use crate::storage::Storage;
 use crate::store::WorkdirStored;
@@ -314,6 +315,8 @@ pub(crate) struct Model {
     read_marks: HashMap<SessionId, ReadMark>,
     /// This device's saved prompts, as stored.
     snippets: Snippets,
+    /// Shell commands from every session, newest first, as logged.
+    shell_history: ShellHistory,
     /// Sessions deleted from this device, as stored: their events are
     /// skipped for good.
     deleted: HashSet<SessionId>,
@@ -411,6 +414,7 @@ impl Model {
             draft_rev: 0,
             read_marks: HashMap::new(),
             snippets: Snippets::default(),
+            shell_history: ShellHistory::default(),
             deleted: HashSet::new(),
             alerted: HashSet::new(),
             alerts: 0,
@@ -451,6 +455,7 @@ impl Model {
         self.composer_modes = snapshot.composer_modes;
         self.read_marks = snapshot.read_marks;
         self.snippets = Snippets::new(snapshot.snippets);
+        self.shell_history = ShellHistory::new(snapshot.shell_history);
         self.deleted = snapshot.deleted;
         self.devices = snapshot.devices;
         self.models = snapshot.models;
@@ -1826,6 +1831,9 @@ impl Model {
             if self.deleted.contains(&event.session_id) {
                 continue;
             }
+            if let EventKind::ShellRequested { command, .. } = &event.kind {
+                self.shell_history.record(command);
+            }
             match self.sessions.iter_mut().find(|s| s.id == event.session_id) {
                 Some(summary) => summary.apply(seq, event),
                 None => self.sessions.push(SessionSummary::new(seq, event)),
@@ -2370,6 +2378,7 @@ impl Model {
             screen: self.screen(),
             can_go_back: self.shown_subagent().is_some() || self.back().is_some(),
             snippets: self.snippets.list().to_vec(),
+            shell_history: self.shell_history.list(),
             login_expires: self.settings.server.login_expires,
             agent_login_offered: self.settings.server.agent_login_offered,
             agent_logged_out: self.settings.server.agent_logged_out,
@@ -4741,6 +4750,7 @@ mod tests {
             devices: HashMap::new(),
             models: Vec::new(),
             snippets: Vec::new(),
+            shell_history: Vec::new(),
             turns: Vec::new(),
             workdirs: HashMap::new(),
             usage_limits: None,
@@ -9647,6 +9657,7 @@ mod tests {
             devices: model.devices.clone(),
             models: model.models.clone(),
             snippets: model.snippets.list().to_vec(),
+            shell_history: model.shell_history.list().to_vec(),
             turns: model.turns.clone(),
             workdirs: model.workdirs.stored.clone(),
             usage_limits: model.usage_limits.stored.clone(),

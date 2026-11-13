@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::address::{ServerAddress, ServerAddresses};
 use crate::attachment::{self, AttachedImage};
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
+use crate::shell_history::SHELL_HISTORY_MAX;
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
@@ -1125,6 +1126,8 @@ pub struct Snapshot {
     pub models: Vec<ModelChoice>,
     /// This device's saved prompts, in no order ([`Store::set_snippet`]).
     pub snippets: Vec<Snippet>,
+    /// Shell commands from every session, newest first, each once ([`Store::shell_history`]).
+    pub shell_history: Vec<String>,
     /// Every stored turn's usage, in log order ([`Store::turns`]).
     pub turns: Vec<TurnRecord>,
     /// The latest stored answer to each workdir read
@@ -1226,6 +1229,7 @@ impl Store {
             devices: self.devices()?,
             models: self.offered_models()?,
             snippets: self.snippets()?,
+            shell_history: self.shell_history(SHELL_HISTORY_MAX)?,
             turns: self.turns()?,
             workdirs: self.workdirs()?,
             usage_limits: self.usage_limits()?,
@@ -2392,6 +2396,19 @@ impl Store {
             )?,
         };
         Ok(())
+    }
+
+    /// Every shell command logged in any session, newest first, each once (its
+    /// newest run), at most `limit`.
+    pub fn shell_history(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT json_extract(event, '$.kind.command') AS command, MAX(seq) AS last
+             FROM events WHERE json_extract(event, '$.kind.type') = 'shell_requested'
+             GROUP BY command ORDER BY last DESC LIMIT ?1",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map([limit], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     // ---- snippets -----------------------------------------------------------
