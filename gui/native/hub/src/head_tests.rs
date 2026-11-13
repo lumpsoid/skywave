@@ -618,6 +618,64 @@ fn an_adopted_session_row_says_its_history_is_importing() {
     assert_eq!(label(&rig, new), None);
 }
 
+#[test]
+fn the_list_groups_worktree_sessions_by_repo() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let (in_worktree, plain) = (SessionId::new(), SessionId::new());
+    let created =
+        |workdir: &str, worktree: Option<skywave_proto::Worktree>| EventKind::SessionCreated {
+            workdir: workdir.into(),
+            context_name: "start".into(),
+            from: None,
+            worktree,
+        };
+    let feature = skywave_proto::Worktree {
+        repo: "/srv/app".into(),
+        branch: "feat-x".into(),
+    };
+    for (session, kind) in [
+        (
+            in_worktree,
+            created("/srv/app.worktrees/feat-x", Some(feature)),
+        ),
+        (plain, created("/srv/app", None)),
+    ] {
+        rig.seam
+            .apply_events(&EventBatch {
+                from: Seq(rig.seam.cursor().unwrap().0 + 1),
+                events: vec![event_at(session, at, kind)],
+            })
+            .unwrap();
+    }
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    let rows = match rig.list() {
+        ScreenView::SessionList { rows, .. } => rows,
+        _ => unreachable!(),
+    };
+    let position = |id: SessionId| {
+        rows.iter()
+            .position(|r| r.session_id == id.0.to_string())
+            .unwrap()
+    };
+    let grouping = |id: SessionId| {
+        let row = &rows[position(id)];
+        (
+            row.group.as_str(),
+            row.group_name.as_str(),
+            row.branch.as_deref(),
+        )
+    };
+    assert_eq!(grouping(in_worktree), ("/srv/app", "app", Some("feat-x")));
+    assert_eq!(grouping(plain), ("/srv/app", "app", None));
+    assert_eq!(grouping(rig.session), ("/srv/work", "work", None));
+    assert_eq!(position(in_worktree).abs_diff(position(plain)), 1);
+}
+
 impl Rig {
     fn new() -> Rig {
         Rig::on(Head::new(Prefs::default()))
