@@ -1138,6 +1138,87 @@ async fn work_for_a_removed_worktree_session_is_refused() {
     accepted_seq(&device.command(&rename).await);
 }
 
+/// A plain session in a removed worktree's directory is refused
+/// `WorkdirNotFound` too: the directory is gone for it as well. Control for it,
+/// before the removal, is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_for_a_session_sharing_a_removed_worktree_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let owner = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let plain = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: dir.display().to_string(),
+            conversation: None,
+            worktree: None,
+        },
+    };
+    let made = device.command(&plain).await;
+    let other = session_of(&made, &device.events(Seq::ZERO, 0).await);
+    let context = ContextId::first_of(other);
+    // Positive control: before the removal, the other session's message is accepted.
+    accepted_seq(
+        &device
+            .command(&message_command(other, context, "hello", Vec::new()))
+            .await,
+    );
+    accepted_seq(&device.command(&remove_command(owner)).await);
+
+    assert_eq!(
+        device
+            .command(&message_command(other, context, "again", Vec::new()))
+            .await,
+        rejected(RejectReason::WorkdirNotFound)
+    );
+}
+
+/// A worktree made at a removed worktree's path again makes the directory
+/// usable again, so a session sharing it works once more. Until then it is
+/// refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recreated_worktree_lets_a_sharing_session_work_again() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let owner = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let dir = f.root.join("project.worktrees/feat/x");
+    let plain = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: dir.display().to_string(),
+            conversation: None,
+            worktree: None,
+        },
+    };
+    let made = device.command(&plain).await;
+    let other = session_of(&made, &device.events(Seq::ZERO, 0).await);
+    let context = ContextId::first_of(other);
+    accepted_seq(&device.command(&remove_command(owner)).await);
+    assert_eq!(
+        device
+            .command(&message_command(other, context, "refused", Vec::new()))
+            .await,
+        rejected(RejectReason::WorkdirNotFound)
+    );
+
+    accepted_seq(&device.command(&worktree_command(&f, "feat/x")).await);
+    assert!(dir.is_dir());
+    accepted_seq(
+        &device
+            .command(&message_command(other, context, "again", Vec::new()))
+            .await,
+    );
+}
+
 /// Uncommitted work keeps the worktree and its branch. Once the file is gone,
 /// the same session's removal goes through.
 #[tokio::test(flavor = "multi_thread")]

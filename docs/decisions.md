@@ -1382,7 +1382,9 @@ root. Removal is explicit only: `RemoveWorktree` removes it, and is refused
 when the branch or the worktree's `HEAD` is not merged into the main repo's
 `HEAD`, when the worktree is dirty, or when a turn runs in its directory.
 Archiving never removes a worktree. Heads group sessions by repo, from the
-worktree the create logged, so a plain create runs no git.
+worktree the create logged, so a plain create runs no git. Work for any
+session in a removed worktree's directory is refused until a worktree is made
+there again.
 **Why:** several sessions on one repo can run in parallel without stepping on
 each other (user decision, 2026-11-13). The layout and archiving never
 removing a worktree are user decisions too. **Rejected:** removing on
@@ -1392,5 +1394,3 @@ picking an existing worktree (out of scope for now).
 **Deferred:** a crash between `git worktree add` and the commit leaves an
 orphan worktree, and a retry then gets `BranchExists`. Removal counts a
 queued but unstarted turn as idle and does not check a running `RunShell`.
-Other sessions sharing a removed worktree's directory are stopped, not
-refused.

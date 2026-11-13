@@ -408,9 +408,15 @@ impl EventLog {
                 return Ok(Err(RejectReason::DiskLow));
             }
             // A session whose worktree was removed has no directory to run
-            // in: the log says so, where the disk would only say it now.
+            // in, and neither has a session sharing its directory until a
+            // worktree is made there again: the log says so, where the disk
+            // would only say it now.
             if let Some(id) = work_session(&command.kind)
-                && event_log::worktree_removed_in(tx, id)?
+                && (event_log::worktree_removed_in(tx, id)?
+                    || match event_log::session_in(tx, id)? {
+                        Some(info) => event_log::workdir_worktree_removed_in(tx, &info.workdir)?,
+                        None => false,
+                    })
             {
                 return Ok(Err(RejectReason::WorkdirNotFound));
             }
