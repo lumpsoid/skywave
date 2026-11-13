@@ -878,6 +878,15 @@ fn worktree_command(f: &Fixture, branch: &str) -> Command {
     }
 }
 
+/// How many worktree intents the database holds.
+fn intents(f: &Fixture) -> i64 {
+    f.storage
+        .db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM worktree_intents", [], |r| r.get(0))
+        .unwrap()
+}
+
 /// A `CreateSession` naming a worktree makes it next to the repository and
 /// starts the session there. Resending it answers the same and logs nothing
 /// more.
@@ -894,6 +903,7 @@ async fn create_session_makes_a_worktree_and_runs_there() {
     assert_eq!(accepted, CommandResult::Accepted { seq: Seq(1) });
     assert_eq!(device.command(&command).await, accepted);
     assert_eq!(f.log.head(), Seq(1));
+    assert_eq!(intents(&f), 0);
     let batch = device.events(Seq::ZERO, 0).await;
     assert_eq!(batch.events.len(), 1);
     let event = &batch.events[0];
@@ -941,6 +951,8 @@ async fn create_session_refuses_an_existing_branch() {
     );
     assert_eq!(f.log.head(), Seq::ZERO);
     assert!(!f.root.join("project.worktrees").exists());
+    // The check comes before the record: a pre-existing branch is never recorded.
+    assert_eq!(intents(&f), 0);
     // Positive control: a free branch from the same fixture is created.
     let free = device.command(&worktree_command(&f, "feat/x")).await;
     assert_eq!(accepted_seq(&free), Seq(1));
@@ -1023,6 +1035,41 @@ async fn a_worktree_whose_session_is_rejected_is_discarded() {
     f.log.set_stopping(false);
     let made = device.command(&worktree_command(&f, "feat/x")).await;
     assert_eq!(accepted_seq(&made), Seq(1));
+}
+
+/// A worktree add that fails after it recorded its intent (a failing
+/// `post-checkout` hook) is refused and undoes the add. Its intent row goes
+/// with the refusal, so no row is left for a branch that is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_worktree_add_leaves_no_intent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let hooks = f.root.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    setup_git(
+        &project,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+
+    assert_eq!(
+        device.command(&worktree_command(&f, "feat/x")).await,
+        rejected(RejectReason::WorktreeFailed)
+    );
+    assert_eq!(intents(&f), 0);
+    assert!(!has_branch(&project, "feat/x"));
+    // Positive control: without the hook the same branch is created.
+    setup_git(&project, &["config", "--unset", "core.hooksPath"]);
+    let made = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted_seq(&made), Seq(1));
+    assert_eq!(intents(&f), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

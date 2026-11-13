@@ -56,6 +56,7 @@ use crate::db::Db;
 use crate::disk::Disk;
 use crate::error::{Error, Result};
 use crate::storage;
+use crate::worktree;
 
 /// Batch size used when `GET /v1/events` names no `limit`.
 pub const DEFAULT_BATCH_LIMIT: u32 = 500;
@@ -1368,6 +1369,46 @@ pub(crate) fn workdir_shell_busy_in(conn: &Connection, workdir: &str) -> Result<
     Ok(busy)
 }
 
+/// Records `intent`, a worktree [`worktree::create`] is about to add, for
+/// `command`. The create holds [`worktree`]'s lock, so a row with the same
+/// repository and branch is one whose branch is gone: replaced, and its
+/// attempt's later [`forget_worktree_intent_in`] then matches nothing.
+pub(crate) fn record_worktree_intent_in(
+    conn: &Connection,
+    intent: &worktree::Intent,
+    command: CommandId,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO worktree_intents
+             (repo, branch, target, start, command, attempt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            intent.repo,
+            intent.branch,
+            intent.target,
+            intent.start,
+            command.0.to_string(),
+            intent.attempt,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Deletes the intent row of `branch` in `repo` if `attempt` wrote it. A row
+/// a later attempt has replaced is that attempt's, and is kept.
+pub(crate) fn forget_worktree_intent_in(
+    conn: &Connection,
+    repo: &str,
+    branch: &str,
+    attempt: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM worktree_intents WHERE repo = ?1 AND branch = ?2 AND attempt = ?3",
+        params![repo, branch, attempt],
+    )?;
+    Ok(())
+}
+
 /// The session's newest `SessionStateChanged` or `TurnInterrupted`, with
 /// the context it is stamped with.
 pub(crate) fn last_state_event_in(
@@ -1848,5 +1889,38 @@ mod tests {
         let (s_steps, _) = steps(&short, old, &[s_session.0.to_string()]);
         let (l_steps, _) = steps(&long, old, &[l_session.0.to_string()]);
         assert!(l_steps > s_steps * 100, "{s_steps} then {l_steps}");
+    }
+
+    /// A row another attempt replaced is that attempt's: forgetting with the
+    /// first attempt's token keeps it, and only the replacing attempt's removes
+    /// it. Both attempts are one command's (a resend's), so the command cannot
+    /// tell them apart.
+    #[test]
+    fn a_replaced_worktree_intent_is_forgotten_only_by_its_own_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        let conn = db.conn();
+        let intent = |attempt: &str| worktree::Intent {
+            repo: "/r".into(),
+            branch: "feat/x".into(),
+            target: "/r.worktrees/feat/x".into(),
+            start: "abc".into(),
+            attempt: attempt.into(),
+        };
+        let rows = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM worktree_intents", [], |r| r.get(0))
+                .unwrap()
+        };
+        let command = CommandId::new();
+        let (a, b) = (intent("a"), intent("b"));
+        record_worktree_intent_in(conn, &a, command).unwrap();
+        // Positive control: A's row is there to be forgotten.
+        assert_eq!(rows(), 1);
+        // The resend's attempt records the same repository and branch, replacing A's row.
+        record_worktree_intent_in(conn, &b, command).unwrap();
+        forget_worktree_intent_in(conn, &a.repo, &a.branch, &a.attempt).unwrap();
+        assert_eq!(rows(), 1, "A's late forget removed B's row");
+        forget_worktree_intent_in(conn, &b.repo, &b.branch, &b.attempt).unwrap();
+        assert_eq!(rows(), 0);
     }
 }
