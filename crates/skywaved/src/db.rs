@@ -460,6 +460,21 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE event_blobs_v23 RENAME TO event_blobs;
     CREATE INDEX event_blobs_seq ON event_blobs (seq);
     "#,
+    // v24: a worktree a create is about to add, until its session is logged or
+    // the create is undone; a row left at startup is a crash's orphan. `command`
+    // is the creating command, kept for the sweep; `attempt` is one preparation's
+    // own token: an undo deletes only the row its own attempt wrote.
+    r#"
+    CREATE TABLE worktree_intents (
+        repo    TEXT NOT NULL,
+        branch  TEXT NOT NULL,
+        target  TEXT NOT NULL,
+        start   TEXT NOT NULL,
+        command TEXT NOT NULL,
+        attempt TEXT NOT NULL,
+        PRIMARY KEY (repo, branch)
+    ) STRICT;
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -797,7 +812,7 @@ mod tests {
     use super::*;
     use crate::event_log::parse_id;
 
-    const TABLES: [&str; 15] = [
+    const TABLES: [&str; 16] = [
         "approvals",
         "blobs",
         "commands",
@@ -813,6 +828,7 @@ mod tests {
         "supervisor_held",
         "supervisor_owed",
         "workdir_blobs",
+        "worktree_intents",
     ];
 
     fn schema(db: &Db) -> Vec<(String, String)> {
@@ -1218,6 +1234,57 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    /// v24 adds an empty `worktree_intents`, one row per repository and
+    /// branch: a row with no `start`, `command` or `attempt` is refused, a second row
+    /// for the same pair is refused, and the same branch in another repository
+    /// is its own.
+    #[test]
+    fn v24_adds_an_empty_worktree_intents_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..23] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 23).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, ?1)",
+                [PROTOCOL_VERSION],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = db.conn();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM worktree_intents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        // Each of `start`, `command` and `attempt` is required.
+        for missing in [
+            "INSERT INTO worktree_intents (repo, branch, target, command, attempt)
+             VALUES ('r', 'b', 't', 'c', 'a')",
+            "INSERT INTO worktree_intents (repo, branch, target, start, attempt)
+             VALUES ('r', 'b', 't', 's', 'a')",
+            "INSERT INTO worktree_intents (repo, branch, target, start, command)
+             VALUES ('r', 'b', 't', 's', 'c')",
+        ] {
+            assert!(conn.execute(missing, []).is_err(), "{missing}");
+        }
+        let insert = |repo: &str, branch: &str| {
+            conn.execute(
+                "INSERT INTO worktree_intents (repo, branch, target, start, command, attempt)
+                 VALUES (?1, ?2, 't', 's', 'c', 'a')",
+                rusqlite::params![repo, branch],
+            )
+        };
+        // Positive control, then the same repository and branch again.
+        assert!(insert("r", "b").is_ok());
+        assert!(insert("r", "b").is_err());
+        assert!(insert("r2", "b").is_ok());
     }
 
     /// The turn usage v24 wrote (its wire snapshot's) reads once v25's

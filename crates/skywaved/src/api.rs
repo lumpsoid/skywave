@@ -620,8 +620,28 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
         )),
         _ => prepare_import(api, &command).await?.map(Preparation::from),
     };
-    api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
-        .await
+    let intent = match &prepared {
+        Some(Preparation::Worktree(prepared)) => prepared.intent(),
+        _ => None,
+    };
+    api.blocking(move |api, db| {
+        let result = api.log.handle_with(db, device, &command, prepared);
+        // Not committed as accepted, so no session: the worktree is discarded
+        // by now, and its intent goes with it. An accepted session's row went
+        // in the same commit as its `SessionCreated`.
+        if let Some(intent) = intent
+            && !matches!(result, Ok(CommandResult::Accepted { .. }))
+        {
+            event_log::forget_worktree_intent_in(
+                db.conn(),
+                &intent.repo,
+                &intent.branch,
+                &intent.attempt,
+            )?;
+        }
+        result
+    })
+    .await
 }
 
 /// The crop of `blob` to `keep`, or `None` when `handle_with` refuses the
@@ -816,20 +836,50 @@ async fn prepare_worktree(
     let deadline = Instant::now() + worktree::WORKTREE_DEADLINE;
     let (git, roots) = (api.git.clone(), api.log.roots().to_vec());
     let (workdir, branch) = (workdir.clone(), branch.clone());
+    // A fresh token per preparation: a resend's attempt never shares it, so
+    // this attempt's late undo cannot delete the row of a newer one.
+    let (shared, id) = (api.clone(), command.id);
+    let attempt = uuid::Uuid::new_v4().to_string();
     let prepared = tokio::task::spawn_blocking(move || {
-        worktree::Prepared::new(
-            git.clone(),
-            worktree::create(&git, &roots, &workdir, &branch, deadline),
-        )
+        let mut intent = None;
+        let created = worktree::create(
+            &git,
+            &roots,
+            &workdir,
+            &branch,
+            deadline,
+            &attempt,
+            |made| {
+                record_intent(&shared, made, id)?;
+                intent = Some(made.clone());
+                Ok(())
+            },
+        );
+        worktree::Prepared::new(git, created, intent)
     })
     .await;
     Ok(Some(match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
             tracing::error!(error = %e, "creating a worktree failed");
-            worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed))
+            worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed), None)
         }
     }))
+}
+
+/// Records `intent` on the API's connection before git adds its worktree, so
+/// a crash after the add leaves a row to undo. A failed write refuses the
+/// create: git never adds a worktree that was not recorded.
+fn record_intent(
+    api: &Api,
+    intent: &worktree::Intent,
+    command: CommandId,
+) -> std::result::Result<(), RejectReason> {
+    let db = lock(&api.db);
+    event_log::record_worktree_intent_in(db.conn(), intent, command).map_err(|e| {
+        tracing::error!(error = %e, "recording a worktree intent failed");
+        RejectReason::WorktreeFailed
+    })
 }
 
 /// The outcome of a `RemoveWorktree` of `session_id`. Its checks run on a

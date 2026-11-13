@@ -433,10 +433,18 @@ impl EventLog {
             CommandKind::CreateSession {
                 worktree: Some(_), ..
             } => {
-                let created = match prepared_worktree(self.roots(), prepared) {
-                    Ok(created) => created,
+                let (created, intent) = match prepared_worktree(self.roots(), prepared) {
+                    Ok(made) => made,
                     Err(reason) => return Ok(Err(reason)),
                 };
+                // Its intent goes in the commit that logs the session, so a
+                // committed session never has a row.
+                event_log::forget_worktree_intent_in(
+                    tx,
+                    &intent.repo,
+                    &intent.branch,
+                    &intent.attempt,
+                )?;
                 let session = SessionId::new();
                 let context = ContextId::first_of(session);
                 let kind = EventKind::SessionCreated {
@@ -901,21 +909,24 @@ impl EventLog {
     }
 }
 
-/// The worktree `prepare_worktree` made for a `CreateSession` naming one,
-/// its path checked under the roots again. It is marked logged only once
-/// that passes: a refusal after that would keep a worktree whose session
-/// was never logged.
+/// The worktree `prepare_worktree` made for a `CreateSession` naming one, with
+/// the intent it recorded, its path checked under the roots again. It is marked
+/// logged only once that passes: a refusal after that would keep a worktree
+/// whose session was never logged.
 fn prepared_worktree(
     roots: &[PathBuf],
     prepared: Option<&mut Preparation>,
-) -> std::result::Result<worktree::Created, RejectReason> {
+) -> std::result::Result<(worktree::Created, worktree::Intent), RejectReason> {
     let Some(Preparation::Worktree(prepared)) = prepared else {
         return Err(RejectReason::WorktreeFailed);
     };
     let created = prepared.created()?;
+    // A worktree created is always recorded first: create writes its intent
+    // before git adds anything.
+    let intent = prepared.intent().ok_or(RejectReason::WorktreeFailed)?;
     dirs::canonical_under_roots(roots, &created.path)?;
     prepared.logged();
-    Ok(created)
+    Ok((created, intent))
 }
 
 /// Whether a command of this kind starts new work, which a low disk refuses

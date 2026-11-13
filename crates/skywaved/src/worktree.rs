@@ -42,6 +42,20 @@ pub struct Created {
     pub branch: String,
 }
 
+/// A worktree `create` is about to add, recorded before git runs so a
+/// crash before its session is logged leaves a trace to undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Intent {
+    pub repo: String,
+    pub branch: String,
+    pub target: String,
+    /// The commit the new branch starts at.
+    pub start: String,
+    /// The token of the preparation that made this intent: a resend's
+    /// preparation has its own, so one attempt's undo never drops another's row.
+    pub attempt: String,
+}
+
 /// How long git may take to create or discard a worktree; git is killed past it.
 pub const WORKTREE_DEADLINE: Duration = Duration::from_secs(20);
 
@@ -58,12 +72,20 @@ static CREATING: Mutex<()> = Mutex::new(());
 /// at the workdir's `HEAD`. Refusals: `WorkdirNotAllowed` or
 /// `WorkdirNotFound` from the roots check, `NotARepository`, `BranchExists`;
 /// anything else that stops the create is `WorktreeFailed`.
+///
+/// `record` gets the [`Intent`] once the checks pass and before git adds
+/// anything; its refusal is the create's, and git does not run. A branch
+/// that already exists is refused before `record`, so an intent never names
+/// a branch or target this create did not make. `attempt` is the caller's
+/// token for this preparation, carried into the intent.
 pub fn create(
     git: &Git,
     roots: &[PathBuf],
     workdir: &str,
     branch: &str,
     deadline: Instant,
+    attempt: &str,
+    record: impl FnOnce(&Intent) -> Result<(), RejectReason>,
 ) -> Result<Created, RejectReason> {
     let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     check_name(branch)?;
@@ -80,6 +102,13 @@ pub fn create(
         return Err(RejectReason::WorktreeFailed);
     }
     let head = head_of(git, Path::new(&workdir), deadline)?;
+    record(&Intent {
+        repo: repo_text.clone(),
+        branch: branch.to_owned(),
+        target: target_text.clone(),
+        start: head.clone(),
+        attempt: attempt.to_owned(),
+    })?;
     let add = [
         "worktree",
         "add",
@@ -278,6 +307,9 @@ fn check_clean(git: &Git, path: &Path, deadline: Instant) -> Result<(), RejectRe
 pub struct Prepared {
     git: Git,
     result: Result<Created, RejectReason>,
+    /// The intent [`create`] recorded, if it got that far. Its row is the
+    /// caller's to delete once the command is not committed.
+    intent: Option<Intent>,
     /// Set once apply has checked the worktree and logs its session.
     logged: bool,
     /// Set by [`Prepared::kept`] when `logged`.
@@ -285,10 +317,15 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    pub(crate) fn new(git: Git, result: Result<Created, RejectReason>) -> Prepared {
+    pub(crate) fn new(
+        git: Git,
+        result: Result<Created, RejectReason>,
+        intent: Option<Intent>,
+    ) -> Prepared {
         Prepared {
             git,
             result,
+            intent,
             logged: false,
             kept: false,
         }
@@ -297,6 +334,11 @@ impl Prepared {
     /// The worktree, or the refusal it came to.
     pub(crate) fn created(&self) -> Result<Created, RejectReason> {
         self.result.clone()
+    }
+
+    /// The intent [`create`] recorded for this worktree, if any.
+    pub(crate) fn intent(&self) -> Option<Intent> {
+        self.intent.clone()
     }
 
     /// Marks the worktree as one apply logs a session for.
@@ -652,6 +694,8 @@ mod tests {
                 text(workdir).unwrap(),
                 branch,
                 deadline(),
+                "attempt",
+                |_| Ok(()),
             )
         }
     }
@@ -727,7 +771,9 @@ mod tests {
                 &roots,
                 text(&project).unwrap(),
                 "feat/x",
-                deadline()
+                deadline(),
+                "attempt",
+                |_| Ok(()),
             ),
             Err(RejectReason::WorkdirNotAllowed)
         );
@@ -789,6 +835,64 @@ mod tests {
         let b_head = head_at(Path::new(&b.path));
         assert_eq!(b_head, head_at(&a_path));
         assert_ne!(b_head, head_at(&f.project()));
+    }
+
+    /// The intent is recorded before git adds anything: the target and the
+    /// branch are absent when it is, and it names what the create made.
+    #[test]
+    fn create_records_its_intent_before_git_adds() {
+        let f = Fixture::new();
+        let target = f.root.join("project.worktrees/feat/x");
+        let mut recorded = None;
+        let record = |intent: &Intent| {
+            assert!(!target.exists(), "the target exists before git adds it");
+            assert!(!has_branch(&f.project(), "feat/x"));
+            recorded = Some(intent.clone());
+            Ok(())
+        };
+        let created = create(
+            &git(),
+            &f.roots(),
+            text(&f.project()).unwrap(),
+            "feat/x",
+            deadline(),
+            "a1",
+            record,
+        )
+        .unwrap();
+        assert_eq!(
+            recorded,
+            Some(Intent {
+                repo: created.repo,
+                branch: "feat/x".to_owned(),
+                target: text(&target).unwrap().to_owned(),
+                start: head_at(&f.project()),
+                attempt: "a1".to_owned(),
+            })
+        );
+        assert!(target.is_dir());
+        assert!(has_branch(&f.project(), "feat/x"));
+    }
+
+    /// A refused record ends the create before git runs: nothing is added.
+    #[test]
+    fn a_refused_record_adds_nothing() {
+        let f = Fixture::new();
+        let target = f.root.join("project.worktrees/feat/x");
+        let refused = create(
+            &git(),
+            &f.roots(),
+            text(&f.project()).unwrap(),
+            "feat/x",
+            deadline(),
+            "a1",
+            |_| Err(RejectReason::WorktreeFailed),
+        );
+        assert_eq!(refused, Err(RejectReason::WorktreeFailed));
+        assert!(!target.exists());
+        assert!(!has_branch(&f.project(), "feat/x"));
+        // Positive control: a record that accepts lets the same branch be made.
+        assert!(f.create(&f.project(), "feat/x").is_ok());
     }
 
     #[test]
