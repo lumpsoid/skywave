@@ -1192,7 +1192,7 @@ logs) an event that no longer decodes rather than failing.
   deleted here, already pulled). Only the latest request's answer is kept;
   offline (or with the server unreachable) it is `Unavailable(Offline)`,
   at once when the link is down, and nothing is asked later. Continuing is
-  `CreateSession { workdir, conversation }`, which ends the picker, as do `EndConversations` and leaving the list.
+  `CreateSession { workdir, conversation, worktree }` (no worktree), which ends the picker, as do `EndConversations` and leaving the list.
   Nothing is stored: the listing goes stale at once.
 - **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
   changes; `ShowWorkdir` switches between the changes, one file's diff (a

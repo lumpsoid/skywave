@@ -42,9 +42,13 @@ pub enum Action {
     /// outside Skywave, which the session continues; blank is `None`.
     /// Whether it is usable is the server's and the agent's call. Ends the
     /// conversation picker and the workdir completion.
+    ///
+    /// `worktree` is a new branch to create a git worktree on; the session
+    /// runs in that worktree. `None` or blank: run in `workdir`.
     CreateSession {
         workdir: String,
         conversation: Option<String>,
+        worktree: Option<String>,
     },
     /// Start a session in the session's workdir, from its page or from a
     /// session list, and open it once its `SessionCreated` reaches the

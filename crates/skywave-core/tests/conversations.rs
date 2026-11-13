@@ -71,6 +71,7 @@ async fn a_conversation_picked_and_continued_shows_as_continued() {
     client.dispatch(Action::CreateSession {
         workdir: pick.workdir.clone(),
         conversation: Some(pick.id.clone()),
+        worktree: None,
     });
     let view = client
         .wait("the adopted session", |client, view| {

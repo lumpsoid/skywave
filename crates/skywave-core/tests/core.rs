@@ -199,6 +199,7 @@ fn a_new_server_address_reconnects_keeps_the_pairing_and_survives_restart() {
     core.dispatch(Action::CreateSession {
         workdir: "/srv/a".into(),
         conversation: None,
+        worktree: None,
     })
     .unwrap();
     drain(&requests);

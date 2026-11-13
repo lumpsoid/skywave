@@ -592,6 +592,7 @@ impl Model {
             Action::CreateSession {
                 workdir,
                 conversation,
+                worktree,
             } => {
                 let workdir = workdir.trim();
                 if workdir.is_empty() {
@@ -608,10 +609,15 @@ impl Model {
                     .map(str::trim)
                     .filter(|c| !c.is_empty())
                     .map(str::to_owned);
+                let worktree = worktree
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_owned);
                 self.enqueue(CommandKind::CreateSession {
                     workdir: workdir.to_owned(),
                     conversation,
-                    worktree: None,
+                    worktree,
                 })
             }
             Action::CreateSessionLike(from) => {
@@ -4757,7 +4763,8 @@ mod tests {
             model
                 .dispatch(Action::CreateSession {
                     conversation: None,
-                    workdir: "/srv/x".into()
+                    workdir: "/srv/x".into(),
+                    worktree: None,
                 })
                 .is_empty()
         );
@@ -7297,13 +7304,15 @@ mod tests {
         assert!(
             f.dispatch(Action::CreateSession {
                 conversation: None,
-                workdir: "   ".into()
+                workdir: "   ".into(),
+                worktree: None,
             })
             .is_empty()
         );
         let command = queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: " /srv/new ".into(),
+            worktree: None,
         }));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
@@ -8040,6 +8049,7 @@ mod tests {
             queued(&f.dispatch(Action::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: conversation.map(str::to_owned),
+                worktree: None,
             }))
             .kind
         };
@@ -8056,11 +8066,32 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_session_asks_for_a_trimmed_worktree() {
+        let mut f = Fixture::paired();
+        let create = |f: &mut Fixture, worktree: Option<&str>| {
+            queued(&f.dispatch(Action::CreateSession {
+                workdir: "/srv/app".into(),
+                conversation: None,
+                worktree: worktree.map(str::to_owned),
+            }))
+            .kind
+        };
+        let kind = |worktree: Option<&str>| CommandKind::CreateSession {
+            workdir: "/srv/app".into(),
+            conversation: None,
+            worktree: worktree.map(str::to_owned),
+        };
+        assert_eq!(create(&mut f, Some("  feat/x ")), kind(Some("feat/x")));
+        assert_eq!(create(&mut f, Some("   ")), kind(None));
+    }
+
+    #[test]
     fn a_refused_conversation_is_a_discardable_failed_creation() {
         let mut f = Fixture::paired();
         let command = queued(&f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("nope".into()),
+            worktree: None,
         }));
         f.model.command_sending(command.id, Utc::now());
         f.model.command_result(
@@ -8514,6 +8545,7 @@ mod tests {
         let command = queued(&f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("conv-1".into()),
+            worktree: None,
         }));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
@@ -8583,10 +8615,12 @@ mod tests {
         let refused = queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/etc".into(),
+            worktree: None,
         }));
         let waiting = queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/new".into(),
+            worktree: None,
         }));
         f.model.command_sending(refused.id, Utc::now());
         f.model.command_sending(waiting.id, Utc::now());
@@ -10028,6 +10062,7 @@ mod tests {
         queued(&f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/x".into(),
+            worktree: None,
         }));
         assert_eq!(f.list_view().completion, None);
 
@@ -10930,6 +10965,7 @@ mod tests {
         let command = queued(&f.dispatch(Action::CreateSession {
             workdir: pick.workdir,
             conversation: Some(pick.id),
+            worktree: None,
         }));
         assert_eq!(
             command.kind,

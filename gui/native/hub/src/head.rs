@@ -1123,6 +1123,7 @@ impl Head {
                     let action = Action::CreateSession {
                         conversation: Some(create.conversation.clone()),
                         workdir: create.input.clone(),
+                        worktree: None,
                     };
                     let tag = self.dispatch_user(action, Purpose::Create, clock, out);
                     self.create_tag = Some(tag);
@@ -1171,6 +1172,7 @@ impl Head {
                 let action = Action::CreateSession {
                     workdir,
                     conversation: Some(conversation_id),
+                    worktree: None,
                 };
                 let tag = self.dispatch_user(action, Purpose::Create, clock, out);
                 self.create_tag = Some(tag);

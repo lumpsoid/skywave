@@ -403,6 +403,7 @@ fn the_conversation_picker_lists_and_continues_one() {
         Some(&Action::CreateSession {
             workdir: "/home/me/personal/skywave".into(),
             conversation: Some("bbb".into()),
+            worktree: None,
         })
     );
     rig.results();
@@ -3253,6 +3254,7 @@ fn accepting_with_a_conversation_id_adopts_it() {
         Some(&Action::CreateSession {
             workdir: "/srv/app".into(),
             conversation: Some("  abc-123 ".into()),
+            worktree: None,
         })
     );
     assert_eq!(
