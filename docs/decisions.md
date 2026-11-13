@@ -1399,3 +1399,34 @@ leftover row's worktree and branch, but only while git still matches the row
 (registered by the add, or a half-made directory; the branch's tip still at
 its start). It keeps a branch it cannot prove it made, and a branch someone
 committed on.
+
+## D53. Shell history: every session's commands, picked like fzf
+A device keeps one shell history across all its sessions: every command
+logged in any session (`ShellRequested`), newest first, each command once
+at its newest run, at most 1000. Core derives it from the event log, so
+nothing is stored of its own: no table, no migration, no wire change, and
+every device with the same log has the same list. Only logged commands
+count; a command still in the outbox is not in it.
+
+In the GUI's shell mode, Ctrl-R opens a picker, and closes it again (the
+input menu's "Search history" opens it too). In the shell composer Ctrl-R
+opens the picker instead of retrying the link (the composer's key handler
+takes it first); everywhere else, and in the agent composer, Ctrl-R still
+retries while offline. The picker is an inline list above the composer
+field, not a modal, so the field keeps focus, and the composer text is its
+query. The query matches as an fzf-like subsequence with smart
+case (an upper-case letter makes it case-sensitive). Every match is listed
+in recency order with no scoring, so the same query always lists the same
+rows in the same order. Up and Down (or Ctrl-P and Ctrl-N) move, Enter or
+Tab fills the field with the selected command and never runs it, a tap
+picks a row, and Esc closes and keeps the text. Up and Ctrl-P recall while
+the picker is closed is unchanged and stays per session. The TUI has no
+picker yet; the GUI is the primary head.
+**Why:** the user wanted shell history that is global rather than per
+folder, with an explicit trigger and a list of every match like fzf, not a
+modal dialog (user decision). Subsequence matching, smart case and recency
+order are the simple-over-smart choice: predictable rows, no ranking to
+explain. Deriving the history from the replicated log keeps it device-local,
+like prompt history, and needs no protocol change. Ctrl-R is the bash, zsh
+and fzf history key, and retry stays a press away (focus outside the field,
+or the banner). **Rejected:** a modal dialog, and scored matching.
