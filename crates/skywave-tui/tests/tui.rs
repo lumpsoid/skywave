@@ -7469,6 +7469,20 @@ fn a_message_brings_an_archived_session_back() {
 }
 
 #[test]
+fn a_removed_worktree_shows_on_the_timeline() {
+    let (mut h, id, _) = open_session();
+    let phone = DeviceId::new();
+    pull(
+        &mut h,
+        vec![event(id, 1, EventKind::WorktreeRemoved { by: phone })],
+    );
+    assert_contains(
+        &h.screen(),
+        &format!("worktree removed by device …{}", tail(phone)),
+    );
+}
+
+#[test]
 fn an_approval_in_an_archived_session_still_shows() {
     let mut h = Harness::paired();
     h.seam.set_link(PairedLink::Online { latency_ms: 5 });
