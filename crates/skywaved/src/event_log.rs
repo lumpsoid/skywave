@@ -1409,6 +1409,30 @@ pub(crate) fn forget_worktree_intent_in(
     Ok(())
 }
 
+/// Every worktree intent row, with the command that recorded it, for the
+/// startup sweep.
+pub(crate) fn worktree_intents_in(conn: &Connection) -> Result<Vec<(worktree::Intent, CommandId)>> {
+    let mut stmt = conn.prepare(
+        "SELECT repo, branch, target, start, command, attempt FROM worktree_intents
+         ORDER BY repo, branch",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let intent = worktree::Intent {
+            repo: r.get(0)?,
+            branch: r.get(1)?,
+            target: r.get(2)?,
+            start: r.get(3)?,
+            attempt: r.get(5)?,
+        };
+        Ok((intent, r.get::<_, String>(4)?))
+    })?;
+    rows.map(|row| {
+        let (intent, command) = row?;
+        Ok((intent, parse_id(&command)?))
+    })
+    .collect()
+}
+
 /// The session's newest `SessionStateChanged` or `TurnInterrupted`, with
 /// the context it is stamped with.
 pub(crate) fn last_state_event_in(

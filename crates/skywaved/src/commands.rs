@@ -994,7 +994,7 @@ fn work_session(kind: &CommandKind) -> Option<SessionId> {
     }
 }
 
-fn stored_result(conn: &Connection, id: CommandId) -> Result<Option<CommandResult>> {
+pub(crate) fn stored_result(conn: &Connection, id: CommandId) -> Result<Option<CommandResult>> {
     let json: Option<String> = conn
         .query_row(
             "SELECT result FROM commands WHERE command_id = ?1",

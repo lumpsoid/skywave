@@ -1392,5 +1392,10 @@ removing a worktree are user decisions too. **Rejected:** removing on
 archive (it loses work silently); a server-side repo column, or git reads on
 every create for grouping (the first event already carries the repo);
 picking an existing worktree (out of scope for now).
-**Deferred:** a crash between `git worktree add` and the commit leaves an
-orphan worktree, and a retry then gets `BranchExists`.
+A crash between `git worktree add` and the session's commit no longer leaves
+an orphan. The intent row (`worktree_intents`) is recorded before git runs and
+dropped with the commit or the discard. At startup skywaved undoes each
+leftover row's worktree and branch, but only while git still matches the row
+(registered by the add, or a half-made directory; the branch's tip still at
+its start). It keeps a branch it cannot prove it made, and a branch someone
+committed on.
