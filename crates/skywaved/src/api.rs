@@ -786,7 +786,13 @@ async fn prepare_import(
 /// is answered from the log. Git is bounded by its own deadline
 /// ([`worktree::WORKTREE_DEADLINE`]), not by a timeout here: a timeout would
 /// answer while git still ran, and the worktree it made would have no one to
-/// discard it.
+/// discard it. The [`worktree::Prepared`] is built on that thread, so a request
+/// dropped while git runs leaves its worktree with an owner: the task's output,
+/// dropped with its handle, discards it.
+///
+/// A server stopping or a low disk is refused `ServerStopping` or `DiskLow` by
+/// `apply`, before the session, so nothing is prepared for it, as
+/// `prepare_import` does.
 async fn prepare_worktree(
     api: &Arc<Api>,
     command: &Command,
@@ -799,15 +805,21 @@ async fn prepare_worktree(
     else {
         return Ok(None);
     };
+    if api.log.stopping() || api.log.disk().refresh() {
+        return Ok(None);
+    }
     let deadline = Instant::now() + worktree::WORKTREE_DEADLINE;
     let (git, roots) = (api.git.clone(), api.log.roots().to_vec());
     let (workdir, branch) = (workdir.clone(), branch.clone());
-    let created = tokio::task::spawn_blocking(move || {
-        worktree::create(&git, &roots, &workdir, &branch, deadline)
+    let prepared = tokio::task::spawn_blocking(move || {
+        worktree::Prepared::new(
+            git.clone(),
+            worktree::create(&git, &roots, &workdir, &branch, deadline),
+        )
     })
     .await;
-    Ok(Some(match created {
-        Ok(result) => worktree::Prepared::new(api.git.clone(), result),
+    Ok(Some(match prepared {
+        Ok(prepared) => prepared,
         Err(e) => {
             tracing::error!(error = %e, "creating a worktree failed");
             worktree::Prepared::new(api.git.clone(), Err(RejectReason::WorktreeFailed))
