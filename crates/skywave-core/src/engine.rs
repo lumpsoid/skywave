@@ -2147,7 +2147,9 @@ mod tests {
             [],
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 3)
+        db.execute_batch("ALTER TABLE sessions DROP COLUMN worktree;")
+            .unwrap();
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 4)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(

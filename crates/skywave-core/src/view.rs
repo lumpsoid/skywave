@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use skywave_proto::{Fingerprint, ImageType};
+use skywave_proto::{Fingerprint, ImageType, Worktree};
 use uuid::Uuid;
 
 pub use skywave_proto::{
@@ -891,6 +891,8 @@ pub struct SessionRow {
     /// pulled): a long import arrives over several pulls. Its
     /// [`PendingSession`] may show beside it until then.
     pub importing: bool,
+    /// The git worktree the session runs in; heads group sessions by its repo.
+    pub worktree: Option<Worktree>,
 }
 
 /// What the usage screen totals: every turn in the replica that reported

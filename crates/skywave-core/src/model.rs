@@ -2612,6 +2612,7 @@ impl Model {
                     named: title.named,
                     rename: title.rename,
                     workdir: s.workdir.clone(),
+                    worktree: s.worktree.clone(),
                     state: session_state(s),
                     pending_approvals: s.pending_approvals.len(),
                     last_activity: s.last_activity,
