@@ -159,6 +159,7 @@ impl Fixture {
             kind: CommandKind::CreateSession {
                 workdir: workdir.to_owned(),
                 conversation: conversation.map(str::to_owned),
+                worktree: None,
             },
         }
     }

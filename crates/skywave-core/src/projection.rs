@@ -529,6 +529,7 @@ mod tests {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
         );
@@ -578,6 +579,7 @@ mod tests {
             workdir: "/srv/x".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let turn = |tokens: Option<u64>| {
@@ -644,6 +646,7 @@ mod tests {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         );
         let mut summary = SessionSummary::new(Seq(1), &created);
@@ -720,6 +723,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.title(), "app");
@@ -770,6 +774,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let renamed = EventKind::SessionRenamed {
@@ -794,6 +799,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let deleted = EventKind::BlobDeleted {
@@ -846,6 +852,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let first = ContextId::first_of(sid);
@@ -896,6 +903,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert!(!summary.archived);
@@ -930,6 +938,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.usage, None);
@@ -999,6 +1008,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         summary.apply(Seq(2), &event(sid, 1, unanswered));
@@ -1044,6 +1054,7 @@ mod tests {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let archive = EventKind::SessionArchived { archived: true, by };

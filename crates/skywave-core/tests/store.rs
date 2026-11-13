@@ -59,6 +59,7 @@ impl Log {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(
@@ -73,6 +74,7 @@ impl Log {
                     workdir: "/srv/b".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(
@@ -708,6 +710,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             turn(
@@ -783,6 +786,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -878,6 +882,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
             workdir: "/srv/x".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         },
     );
     let mut store = Store::open(&dir).unwrap();
@@ -979,6 +984,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -1053,6 +1059,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -1146,6 +1153,7 @@ fn notable_count_is_projected_and_backfilled() {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -1510,6 +1518,7 @@ fn v25_reads_the_turn_usage_a_v24_replica_holds() {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(id, 1, EventKind::TurnUsage(usage.clone())),
@@ -1586,6 +1595,7 @@ fn v26_reads_the_pending_approval_a_v25_replica_holds() {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(id, 1, requested.clone()),
@@ -1622,6 +1632,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
         workdir: "/srv/x".into(),
         context_name: "start".into(),
         from: None,
+        worktree: None,
     };
     let batch = EventBatch {
         from: Seq(1),
@@ -1665,6 +1676,7 @@ fn v28_opens_a_v27_replica_without_a_login_expiry() {
         workdir: "/srv/x".into(),
         context_name: "start".into(),
         from: None,
+        worktree: None,
     };
     let batch = EventBatch {
         from: Seq(1),
@@ -1707,6 +1719,7 @@ fn v29_opens_a_v28_replica_without_the_agent_login_flags() {
         workdir: "/srv/x".into(),
         context_name: "start".into(),
         from: None,
+        worktree: None,
     };
     let batch = EventBatch {
         from: Seq(1),
@@ -1755,6 +1768,7 @@ fn v30_opens_a_v29_replica_with_its_user_messages() {
         workdir: "/srv/x".into(),
         context_name: "start".into(),
         from: None,
+        worktree: None,
     };
     let message = EventKind::UserMessage {
         device_id: DeviceId::new(),
@@ -1795,6 +1809,7 @@ fn v31_opens_a_v30_replica_unchanged() {
         workdir: "/srv/x".into(),
         context_name: "start".into(),
         from: None,
+        worktree: None,
     };
     let message = EventKind::UserMessage {
         device_id: DeviceId::new(),
@@ -1811,6 +1826,48 @@ fn v31_opens_a_v30_replica_unchanged() {
     // What v30 left: stamped 30.
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute("UPDATE protocol_stamp SET version = 30", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events, [created, message]);
+}
+
+/// A v31 replica opens as v32 with its stored events read back unchanged:
+/// v32 added an optional `worktree` that a v31 event lacks, so it reads as
+/// `None`.
+#[test]
+fn v32_opens_a_v31_replica_unchanged() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/x".into(),
+        context_name: "start".into(),
+        from: None,
+        worktree: None,
+    };
+    let message = EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "look".into(),
+        attachments: Vec::new(),
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![event(id, 0, created.clone()), event(id, 1, message.clone())],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+    // What v31 left: stamped 31.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 31", [])
         .unwrap();
     drop(conn);
 
@@ -1904,6 +1961,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -1977,6 +2035,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         )
     };
@@ -2479,6 +2538,7 @@ fn withdraw_anything_not_accepted() {
         kind: CommandKind::CreateSession {
             workdir: "/etc".into(),
             conversation: None,
+            worktree: None,
         },
     };
     let interrupt = Command {
@@ -3083,6 +3143,7 @@ fn created(session_id: SessionId, minute: u32) -> Event {
             workdir: "/srv/x".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         },
     )
 }
@@ -3279,6 +3340,7 @@ fn a_v8_replica_moves_into_first_contexts() {
                     workdir: "/srv".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             )
         };
@@ -3528,6 +3590,7 @@ fn agent_settings_and_offered_models_are_kept() {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(
@@ -3543,6 +3606,7 @@ fn agent_settings_and_offered_models_are_kept() {
                     workdir: "/srv/b".into(),
                     context_name: "start".into(),
                     from: None,
+                    worktree: None,
                 },
             ),
             event(
@@ -3583,6 +3647,7 @@ fn an_agents_effort_is_kept() {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             }),
             event(EventKind::EffortChanged {
                 effort: Some(Effort::XHigh),
@@ -4519,6 +4584,7 @@ fn adopted_log(session: SessionId, output: &BlobRef) -> Vec<Event> {
                 from: Some(SessionOrigin::Agent {
                     conversation: "conv-1".into(),
                 }),
+                worktree: None,
             },
         )
     };

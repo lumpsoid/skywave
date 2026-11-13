@@ -1604,6 +1604,7 @@ fn create_on_server(daemon: &mut Daemon, device: skywave_core::DeviceId) {
         kind: CommandKind::CreateSession {
             workdir: daemon.workdir(),
             conversation: None,
+            worktree: None,
         },
     };
     let result = daemon

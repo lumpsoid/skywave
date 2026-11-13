@@ -1555,6 +1555,7 @@ mod tests {
                 workdir: "/w".into(),
                 context_name: "start".into(),
                 from: None,
+                worktree: None,
             },
         );
         log(

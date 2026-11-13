@@ -47,6 +47,7 @@ fn an_adopted_session_starts_with_a_divider_row() {
             from: Some(skywave_proto::SessionOrigin::Agent {
                 conversation: "3f2a-91bc".into(),
             }),
+            worktree: None,
         },
     }];
     rig.seam
@@ -96,6 +97,7 @@ fn adopted_created(conversation: &str) -> EventKind {
         from: Some(skywave_proto::SessionOrigin::Agent {
             conversation: conversation.into(),
         }),
+        worktree: None,
     }
 }
 
@@ -652,6 +654,7 @@ impl Rig {
             workdir: "/srv/work".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         };
         seam.apply_events(&EventBatch {
             from: Seq(seam.cursor().unwrap().0 + 1),
@@ -1746,6 +1749,7 @@ fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
             workdir: "/srv/other".into(),
             context_name: "start".into(),
             from: None,
+            worktree: None,
         }],
     );
     let approval = |id| EventKind::ApprovalRequested {
@@ -2198,6 +2202,7 @@ fn a_tapped_candidate_fills_the_create_prompt() {
         workdir: "/srv/other".into(),
         context_name: "start".into(),
         from: None,
+        worktree: None,
     };
     rig.seam
         .apply_events(&EventBatch {
@@ -2383,6 +2388,7 @@ fn a_moved_context_is_a_divider_row() {
                         context: start,
                     },
                 )),
+                worktree: None,
             },
         },
         Event {
@@ -2618,6 +2624,7 @@ fn a_moved_context_row_names_where_it_went() {
                                 context: start,
                             },
                         )),
+                        worktree: None,
                     },
                 },
                 Event {

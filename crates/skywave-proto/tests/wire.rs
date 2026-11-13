@@ -59,6 +59,7 @@ fn all_event_kinds() -> Vec<EventKind> {
             workdir: "/srv/code/skywave".into(),
             context_name: "velvet walrus".into(),
             from: None,
+            worktree: None,
         },
         EventKind::SessionCreated {
             workdir: "/srv/code/skywave".into(),
@@ -67,12 +68,23 @@ fn all_event_kinds() -> Vec<EventKind> {
                 session: session(),
                 context: context(),
             })),
+            worktree: None,
         },
         EventKind::SessionCreated {
             workdir: "/srv/code/skywave".into(),
             context_name: "copper heron".into(),
             from: Some(SessionOrigin::Agent {
                 conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
+            }),
+            worktree: None,
+        },
+        EventKind::SessionCreated {
+            workdir: "/srv/code/skywave".into(),
+            context_name: "quiet fern".into(),
+            from: None,
+            worktree: Some(Worktree {
+                repo: "/srv/code/skywave".into(),
+                branch: "feat/login".into(),
             }),
         },
         EventKind::ContextStarted {
@@ -847,10 +859,17 @@ fn all_command_kinds() -> Vec<CommandKind> {
         CommandKind::CreateSession {
             workdir: "/srv/code/skywave".into(),
             conversation: None,
+            worktree: None,
         },
         CommandKind::CreateSession {
             workdir: "/srv/code/skywave".into(),
             conversation: Some("9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into()),
+            worktree: None,
+        },
+        CommandKind::CreateSession {
+            workdir: "/srv/code/skywave".into(),
+            conversation: None,
+            worktree: Some("feat/login".into()),
         },
         CommandKind::SendMessage {
             session_id: session(),
@@ -974,6 +993,9 @@ fn all_command_results() -> Vec<CommandResult> {
         [
             RejectReason::WorkdirNotAllowed,
             RejectReason::WorkdirNotFound,
+            RejectReason::NotARepository,
+            RejectReason::BranchExists,
+            RejectReason::WorktreeFailed,
             RejectReason::UnknownSession,
             RejectReason::UnknownApproval,
             RejectReason::ApprovalAlreadyResolved,
@@ -1423,6 +1445,7 @@ fn v9_session_created_decodes_without_from() {
             workdir: "/w".into(),
             context_name: "velvet walrus".into(),
             from: None,
+            worktree: None,
         }
     );
     assert!(kind.logged_by_command());
@@ -1486,6 +1509,7 @@ fn session_created_is_logged_by_command_only_when_fresh() {
         workdir: "/w".into(),
         context_name: "start".into(),
         from,
+        worktree: None,
     };
     assert!(created(None).logged_by_command());
     assert!(
@@ -1795,8 +1819,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v31() {
-    assert_eq!(PROTOCOL_VERSION, 31);
+fn protocol_is_v32() {
+    assert_eq!(PROTOCOL_VERSION, 32);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

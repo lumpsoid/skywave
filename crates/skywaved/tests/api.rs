@@ -211,6 +211,7 @@ impl Fixture {
             kind: CommandKind::CreateSession {
                 workdir: self.root.join("project").display().to_string(),
                 conversation: None,
+                worktree: None,
             },
         }
     }
@@ -805,6 +806,7 @@ async fn create_session_adopts_a_conversation_by_its_id() {
         kind: CommandKind::CreateSession {
             workdir: f.root.join("project").display().to_string(),
             conversation: Some(conversation.to_owned()),
+            worktree: None,
         },
     };
 

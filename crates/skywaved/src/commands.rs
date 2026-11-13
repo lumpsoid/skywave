@@ -395,7 +395,13 @@ impl EventLog {
             CommandKind::CreateSession {
                 workdir,
                 conversation,
+                worktree,
             } => {
+                if worktree.is_some() {
+                    // Worktree creation lands with the git step; until then
+                    // nothing can satisfy it.
+                    return Ok(Err(RejectReason::WorktreeFailed));
+                }
                 let workdir = match dirs::canonical_under_roots(self.roots(), workdir) {
                     Ok(workdir) => workdir,
                     Err(reason) => return Ok(Err(reason)),
@@ -414,6 +420,7 @@ impl EventLog {
                     workdir: workdir.clone(),
                     context_name: context_name::random(),
                     from,
+                    worktree: None,
                 };
                 if !adopting {
                     (session, context, kind)
@@ -627,6 +634,7 @@ impl EventLog {
                             session: *session_id,
                             context: *context,
                         })),
+                        worktree: None,
                     },
                 )?;
                 (

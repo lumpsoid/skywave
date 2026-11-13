@@ -329,6 +329,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
     match reason {
         RejectReason::WorkdirNotAllowed => "not under a configured root on the server",
         RejectReason::WorkdirNotFound => "no such directory on the server",
+        RejectReason::NotARepository => "not a git repository on the server",
+        RejectReason::BranchExists => "that branch already exists",
+        RejectReason::WorktreeFailed => "git could not create the worktree",
         RejectReason::UnknownSession => "the server does not know this session",
         RejectReason::UnknownApproval => "the server does not know this approval",
         RejectReason::ApprovalAlreadyResolved => "already answered on another device",
