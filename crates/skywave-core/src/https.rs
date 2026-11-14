@@ -1095,6 +1095,13 @@ impl Transport for HttpsTransport {
         Box::pin(self.workdir(path::WORKDIR_FILE, query))
     }
 
+    fn workdir_download<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
+        Box::pin(self.workdir(path::WORKDIR_DOWNLOAD, query))
+    }
+
     fn attachment_staged(
         &self,
         sha256: ContentHash,

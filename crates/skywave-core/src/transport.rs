@@ -174,6 +174,17 @@ pub trait Transport: Send + Sync {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 
+    /// `GET /v1/workdir/download?session=&path=`: one file of the session's
+    /// workdir to save, text or binary, its content as a blob. Defaults to
+    /// [`TransportError::NotFound`] like [`workdir_file`](Transport::workdir_file).
+    fn workdir_download<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
+        let _ = query;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
     /// `HEAD /v1/attachments/{sha256}`: whether the server holds a staged
     /// upload with this hash. Defaults to [`TransportError::NotFound`] like
     /// [`list_dirs`](Transport::list_dirs).

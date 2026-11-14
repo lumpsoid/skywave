@@ -37,6 +37,9 @@ pub enum WorkdirAsk {
     List { session: SessionId, path: String },
     /// One file; `path` as requested, relative to the workdir.
     File { session: SessionId, path: String },
+    /// One file to save on the device, text or binary
+    /// (`GET /v1/workdir/download`); answered by [`WorkdirAnswer::File`].
+    Download { session: SessionId, path: String },
     /// The newest commits on `HEAD`.
     Log { session: SessionId },
 }
@@ -47,7 +50,8 @@ impl WorkdirAsk {
             WorkdirAsk::Changes { session }
             | WorkdirAsk::Log { session }
             | WorkdirAsk::List { session, .. }
-            | WorkdirAsk::File { session, .. } => *session,
+            | WorkdirAsk::File { session, .. }
+            | WorkdirAsk::Download { session, .. } => *session,
         }
     }
 
@@ -56,17 +60,21 @@ impl WorkdirAsk {
     pub fn path(&self) -> &str {
         match self {
             WorkdirAsk::Changes { .. } | WorkdirAsk::Log { .. } => "",
-            WorkdirAsk::List { path, .. } | WorkdirAsk::File { path, .. } => path,
+            WorkdirAsk::List { path, .. }
+            | WorkdirAsk::File { path, .. }
+            | WorkdirAsk::Download { path, .. } => path,
         }
     }
 
-    /// `changes`, `list`, `file` or `log`: the replica's `kind` column.
+    /// `changes`, `list`, `file`, `log` or `download`: the replica's `kind`
+    /// column.
     pub fn kind(&self) -> &'static str {
         match self {
             WorkdirAsk::Changes { .. } => "changes",
             WorkdirAsk::List { .. } => "list",
             WorkdirAsk::File { .. } => "file",
             WorkdirAsk::Log { .. } => "log",
+            WorkdirAsk::Download { .. } => "download",
         }
     }
 
@@ -78,6 +86,7 @@ impl WorkdirAsk {
             "list" => Some(WorkdirAsk::List { session, path }),
             "file" => Some(WorkdirAsk::File { session, path }),
             "log" => Some(WorkdirAsk::Log { session }),
+            "download" => Some(WorkdirAsk::Download { session, path }),
             _ => None,
         }
     }
@@ -130,6 +139,7 @@ impl WorkdirAnswer {
             (WorkdirAnswer::Changes(_), WorkdirAsk::Changes { .. })
                 | (WorkdirAnswer::List(_), WorkdirAsk::List { .. })
                 | (WorkdirAnswer::File(_), WorkdirAsk::File { .. })
+                | (WorkdirAnswer::File(_), WorkdirAsk::Download { .. })
                 | (WorkdirAnswer::Log(_), WorkdirAsk::Log { .. })
         )
     }

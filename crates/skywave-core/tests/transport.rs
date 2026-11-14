@@ -783,6 +783,10 @@ async fn workdir_reads_default_to_not_found() {
         Old.workdir_file(&query).await,
         Err(TransportError::NotFound)
     );
+    assert_eq!(
+        Old.workdir_download(&query).await,
+        Err(TransportError::NotFound)
+    );
 }
 
 /// A transport that cannot read the worktree list answers `NotFound`, as a
@@ -914,6 +918,67 @@ async fn worktrees_reach_a_real_server() {
 
     let list = transport.worktrees().await.unwrap();
     assert!(list.repos.is_empty());
+}
+
+/// The download read against a real server: a binary file comes back as a
+/// blob of its own bytes, where the file read refuses it as binary.
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_download_reaches_a_real_server() {
+    let fx = Fixture::start().await;
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let identity = paired.credentials;
+    let transport =
+        HttpsTransport::new(&paired.address, &identity, config(), ExpectedRun::default()).unwrap();
+
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: fx.workdir(),
+            conversation: None,
+            worktree: None,
+        },
+    };
+    let accepted = transport.send_command(&create).await.unwrap();
+    assert!(matches!(accepted, CommandResult::Accepted { .. }));
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    let session = batch.events[0].session_id;
+    let bytes = b"\x89PNG\0\x01\x02";
+    std::fs::write(std::path::Path::new(&fx.workdir()).join("logo.bin"), bytes).unwrap();
+    let query = WorkdirQuery {
+        session,
+        path: "logo.bin".into(),
+    };
+
+    let FileResult::File {
+        size,
+        content: FileBody::Blob(blob),
+        ..
+    } = transport.workdir_download(&query).await.unwrap()
+    else {
+        panic!("expected the file as a blob");
+    };
+    assert_eq!(size, 7);
+    let content = transport.blob(blob.id, 0).await.unwrap();
+    assert_eq!(read_all(content).await, bytes);
+
+    // The file read of the same path is the control: binary, no blob.
+    assert!(matches!(
+        transport.workdir_file(&query).await.unwrap(),
+        FileResult::File {
+            content: FileBody::Binary,
+            ..
+        }
+    ));
 }
 
 /// A wrong fingerprint fails the TLS handshake, so the code never reaches
