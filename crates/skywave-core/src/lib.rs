@@ -54,6 +54,7 @@ mod tls;
 pub mod transport;
 pub mod view;
 pub mod workdir;
+mod worktrees;
 
 pub use action::{Action, Route};
 pub use address::{AddressError, DEFAULT_PORT, ServerAddress, ServerAddresses};
@@ -62,8 +63,8 @@ pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
     CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, LOGIN_TIMEOUT,
-    MAX_SERVER_ERRORS, STORAGE_TIMEOUT, USAGE_LIMITS_TIMEOUT, WALL_CHECK, WallClock,
-    default_device_name,
+    MAX_SERVER_ERRORS, STORAGE_TIMEOUT, USAGE_LIMITS_TIMEOUT, WALL_CHECK, WORKTREES_TIMEOUT,
+    WallClock, default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, Identity, IdentityError, PairedCredentials, Pairing};

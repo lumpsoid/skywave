@@ -16,6 +16,7 @@ use chrono::Utc;
 use skywave_proto::{
     ChangesResult, CommandResult, ContentHash, ConversationsResult, DirsResult, EventBatch,
     HelloResponse, LogResult, LoginFinish, LoginFinishResult, LoginStartResult, StorageReport,
+    WorktreeList,
 };
 
 use crate::address::ServerAddress;
@@ -91,6 +92,12 @@ pub enum Request {
     /// within [`STORAGE_TIMEOUT`](crate::STORAGE_TIMEOUT). Answer with
     /// [`Seam::storage_reported`], naming `req`.
     Storage {
+        req: u64,
+    },
+    /// Ask the server for its worktree list, for the worktrees screen,
+    /// within [`WORKTREES_TIMEOUT`](crate::WORKTREES_TIMEOUT). Answer with
+    /// [`Seam::worktrees_listed`], naming `req`.
+    Worktrees {
         req: u64,
     },
     /// Read the session's workdir as `ask` says, within
@@ -585,6 +592,18 @@ impl Seam {
             .shared
             .update::<(), Infallible>(|state, _| {
                 state.model.storage_reported(req, result);
+                Ok(())
+            })
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::Worktrees`] `req`. Kept in memory only; an
+    /// answer to an older request than the latest is ignored.
+    pub fn worktrees_listed(&self, req: u64, result: Result<WorktreeList, TransportError>) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state, _| {
+                state.model.worktrees_listed(req, result);
                 Ok(())
             })
             .unwrap_or_else(|never| match never {});
