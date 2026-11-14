@@ -3851,6 +3851,47 @@ async fn workdir_list_and_file_answer_every_outcome_with_200() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_download_serves_a_binary_file_as_a_blob() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let bytes = b"\x89PNG\0\x01\x02";
+    std::fs::write(workdir.join("logo.bin"), bytes).unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+
+    let reply = device
+        .get(&workdir_uri(path::WORKDIR_DOWNLOAD, session, "logo.bin"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let FileResult::File {
+        size: 7,
+        content: FileBody::Blob(blob),
+        ..
+    } = reply.json::<FileResult>()
+    else {
+        panic!("expected a binary blob: {:?}", reply.body);
+    };
+    let content = device.get(&path::blob(blob.id)).await;
+    assert_eq!(content.status, StatusCode::OK);
+    assert_eq!(&content.body[..], bytes);
+
+    // The same path through the file route is still refused as binary.
+    let reply = device
+        .get(&workdir_uri(path::WORKDIR_FILE, session, "logo.bin"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let FileResult::File {
+        content: FileBody::Binary,
+        ..
+    } = reply.json::<FileResult>()
+    else {
+        panic!("expected binary, got {:?}", reply.body);
+    };
+}
+
 /// The content blob of the answer to reading file `name`.
 async fn file_blob(device: &mut Client, session: SessionId, name: &str) -> BlobRef {
     let reply = device

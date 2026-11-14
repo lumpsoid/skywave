@@ -75,8 +75,9 @@
 //! logged or stored. Each `hello` drops a flow left open too long.
 //!
 //! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/log`,
-//! `/v1/workdir/list` and `/v1/workdir/file`, D36): reads of a session's
-//! workdir, every outcome a 200 [`ChangesResult`](skywave_proto::ChangesResult),
+//! `/v1/workdir/list`, `/v1/workdir/file` and `/v1/workdir/download`, D36):
+//! reads of a session's workdir, every outcome a 200
+//! [`ChangesResult`](skywave_proto::ChangesResult),
 //! [`LogResult`](skywave_proto::LogResult),
 //! [`ListResult`](skywave_proto::ListResult) or
 //! [`FileResult`](skywave_proto::FileResult). They run on a blocking thread
@@ -84,7 +85,7 @@
 //! and one snapshot at a time. Each request takes its deadline
 //! ([`workdir::SNAPSHOT_DEADLINE`]) when the handler starts; a snapshot that
 //! gets the lock only after it does nothing and the reply is a 503. One that
-//! reaches it while running stops: a 503 for list and file, and the 200
+//! reaches it while running stops: a 503 for list, file and download, and the 200
 //! `Failed { "timed out" }` for changes, whose git children are killed then.
 //! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
 //! future, and the deadline is what stops the abandoned work.
@@ -383,6 +384,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::WORKTREES, get(worktrees))
+        .route(path::WORKDIR_DOWNLOAD, get(workdir_download))
         .route(path::BLOB_ROUTE, get(blob))
         .route(
             path::ATTACHMENT_ROUTE,
@@ -1233,6 +1235,17 @@ async fn workdir_file(
         return StatusCode::BAD_REQUEST.into_response();
     };
     workdir_snapshot(&api, deadline, move |s| s.file(&query)).await
+}
+
+async fn workdir_download(
+    State(api): State<Arc<Api>>,
+    query: std::result::Result<Query<WorkdirQuery>, QueryRejection>,
+) -> Response {
+    let deadline = Instant::now() + workdir::SNAPSHOT_DEADLINE;
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    workdir_snapshot(&api, deadline, move |s| s.download(&query)).await
 }
 
 /// Runs `f` as one workdir snapshot on a blocking thread (module docs,

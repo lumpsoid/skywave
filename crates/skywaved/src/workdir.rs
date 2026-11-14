@@ -1,7 +1,7 @@
 //! Read-only views of a session's workdir (`GET /v1/workdir/changes`,
-//! `/v1/workdir/log`, `/v1/workdir/list` and `/v1/workdir/file`, D36): git
-//! changes, the commit log, listings, file contents, and the
-//! content-deduplicated store their blobs go to.
+//! `/v1/workdir/log`, `/v1/workdir/list`, `/v1/workdir/file` and
+//! `/v1/workdir/download`, D36): git changes, the commit log, listings, file
+//! contents, and the content-deduplicated store their blobs go to.
 //!
 //! **One snapshot at a time.** [`WorkdirReader`] owns its own database
 //! connection behind a mutex, apart from the API's, and a whole snapshot
@@ -61,6 +61,10 @@
 //! `TooLarge` too, never an unbounded read. A NUL in the first
 //! [`BINARY_SNIFF_BYTES`] is `Binary` (git's heuristic). Neither gets a blob.
 //! Open failures answer `NotFound`; a read failing midway is a server fault.
+//! **Downloads** (`download`, v36) resolve and read the same way, but serve
+//! binary content too, and their cap is the reader's download cap
+//! ([`WorkdirReader::with_download_max`]), not `WORKDIR_FILE_MAX_BYTES`.
+//! Their blob is recorded under [`AnswerKind::Download`], not `File`.
 //!
 //! The checks and the open are not atomic: whoever can write the workdir can
 //! swap a symlink between them. That is the agent, which can read the target
@@ -188,10 +192,10 @@
 //!
 //! **Garbage.** A workdir blob is live while the latest answer to some
 //! read names it, whatever the session: `workdir_answer_blobs` keeps, per
-//! read (session, `changes` or `file`, the path as requested, `''` for
-//! changes), the blobs its latest answer named, the key and the rule the
-//! core keeps its stored answers by. A changes or file answer replaces
-//! the read's rows, except `ChangesResult::Failed`, which the core never
+//! read (session, `changes`, `file` or `download`, the path as requested,
+//! `''` for changes), the blobs its latest answer named, the key and the rule the
+//! core keeps its stored answers by. A changes, file or download answer
+//! replaces the read's rows, except `ChangesResult::Failed`, which the core never
 //! stores either; a list names no blob. In the same transaction, every
 //! `workdir_blobs` row no answer names goes with its `blobs` row; the
 //! files are removed after the commit. So a refresh deletes the content
@@ -243,6 +247,8 @@ pub const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(15);
 pub const SCAN_CAP: usize = dirs::SCAN_CAP;
 /// Content with a NUL in its first this many bytes is binary.
 pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// Largest file `GET /v1/workdir/download` serves unless configured otherwise, in bytes.
+pub const DEFAULT_DOWNLOAD_MAX: u64 = 64 * 1024 * 1024;
 /// Read size for file contents; the deadline is checked between reads.
 const READ_CHUNK: usize = 64 * 1024;
 /// How often a snapshot waiting for the lock tries it again.
@@ -255,6 +261,7 @@ pub struct WorkdirReader {
     blobs: BlobStore,
     roots: Vec<PathBuf>,
     git: Git,
+    download_max: u64,
 }
 
 impl WorkdirReader {
@@ -266,12 +273,19 @@ impl WorkdirReader {
             blobs,
             roots,
             git: Git::default(),
+            download_max: DEFAULT_DOWNLOAD_MAX,
         }
     }
 
     /// This reader running git as `git` says.
     pub fn with_git(mut self, git: Git) -> WorkdirReader {
         self.git = git;
+        self
+    }
+
+    /// This reader serving downloads up to `max` bytes.
+    pub fn with_download_max(mut self, max: u64) -> WorkdirReader {
+        self.download_max = max;
         self
     }
 
@@ -301,6 +315,7 @@ impl WorkdirReader {
             blobs: &self.blobs,
             roots: &self.roots,
             git: &self.git,
+            download_max: self.download_max,
             deadline,
         };
         snapshot.check_deadline()?;
@@ -315,6 +330,7 @@ pub struct Snapshot<'a> {
     blobs: &'a BlobStore,
     roots: &'a [PathBuf],
     git: &'a Git,
+    download_max: u64,
     deadline: Instant,
 }
 
@@ -432,7 +448,26 @@ impl Snapshot<'_> {
     /// `GET /v1/workdir/file` (module docs, "Files"), recorded as the read's
     /// latest answer (module docs, "Garbage").
     pub fn file(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
-        let answer = self.read_file(query)?;
+        let answer = self.read_file(query, limits::WORKDIR_FILE_MAX_BYTES, true)?;
+        self.answer_file(query, AnswerKind::File, answer)
+    }
+
+    /// `GET /v1/workdir/download` (module docs, "Files"): any file as a blob up
+    /// to the download cap, recorded apart from `file` so neither answer frees
+    /// the other's blob.
+    pub fn download(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
+        let answer = self.read_file(query, self.download_max, false)?;
+        self.answer_file(query, AnswerKind::Download, answer)
+    }
+
+    /// Records `answer`'s blob, if it names one, as the latest answer of `kind`
+    /// to the read, then returns it.
+    fn answer_file(
+        &mut self,
+        query: &WorkdirQuery,
+        kind: AnswerKind,
+        answer: FileResult,
+    ) -> Result<FileResult> {
         let blobs = match &answer {
             FileResult::File {
                 content: FileBody::Blob(blob),
@@ -440,11 +475,13 @@ impl Snapshot<'_> {
             } => vec![blob.id],
             _ => Vec::new(),
         };
-        self.answered(query.session, AnswerKind::File, &query.path, &blobs)?;
+        self.answered(query.session, kind, &query.path, &blobs)?;
         Ok(answer)
     }
 
-    fn read_file(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
+    /// The read behind `file` and `download`: `cap` is the largest content
+    /// served, and `text_only` refuses binary content (`Binary`).
+    fn read_file(&mut self, query: &WorkdirQuery, cap: u64, text_only: bool) -> Result<FileResult> {
         let (target, path) = match self.locate(query)? {
             Located::Found { target, path, .. } => (target, path),
             Located::UnknownSession => return Ok(FileResult::UnknownSession),
@@ -467,7 +504,7 @@ impl Snapshot<'_> {
             size,
             content,
         };
-        if meta.len() > limits::WORKDIR_FILE_MAX_BYTES {
+        if meta.len() > cap {
             return Ok(file_answer(meta.len(), FileBody::TooLarge));
         }
         let Ok(mut file) = open_nonblocking(&target) else {
@@ -476,8 +513,8 @@ impl Snapshot<'_> {
         if !file.metadata().is_ok_and(|m| m.is_file()) {
             return Ok(FileResult::NotAFile);
         }
-        let content = self.read_capped(&mut file, &target, limits::WORKDIR_FILE_MAX_BYTES)?;
-        if content.len() as u64 > limits::WORKDIR_FILE_MAX_BYTES {
+        let content = self.read_capped(&mut file, &target, cap)?;
+        if content.len() as u64 > cap {
             let size = file
                 .metadata()
                 .map_or(content.len() as u64, |m| m.len())
@@ -485,7 +522,7 @@ impl Snapshot<'_> {
             return Ok(file_answer(size, FileBody::TooLarge));
         }
         let size = content.len() as u64;
-        if looks_binary(&content) {
+        if text_only && looks_binary(&content) {
             return Ok(file_answer(size, FileBody::Binary));
         }
         let blob = self.store(&content)?;
@@ -616,6 +653,7 @@ impl Snapshot<'_> {
 pub(crate) enum AnswerKind {
     Changes,
     File,
+    Download,
 }
 
 impl AnswerKind {
@@ -623,6 +661,7 @@ impl AnswerKind {
         match self {
             AnswerKind::Changes => "changes",
             AnswerKind::File => "file",
+            AnswerKind::Download => "download",
         }
     }
 }
@@ -818,6 +857,13 @@ mod tests {
             let query = self.query(path);
             self.reader
                 .snapshot(Tree::later(), |s| s.file(&query))
+                .unwrap()
+        }
+
+        fn download(&self, path: &str) -> FileResult {
+            let query = self.query(path);
+            self.reader
+                .snapshot(Tree::later(), |s| s.download(&query))
                 .unwrap()
         }
 
@@ -1046,6 +1092,47 @@ mod tests {
         // served.
         assert!(matches!(t.read("edge").2, FileBody::Blob(b) if b.size == max));
         assert!(matches!(t.read("late-nul").2, FileBody::Blob(_)));
+    }
+
+    #[test]
+    fn downloads_serve_any_file_up_to_the_download_cap() {
+        let mut t = Tree::new();
+        t.reader.download_max = 16;
+        std::fs::write(t.workdir.join("bin"), b"ab\0cd").unwrap();
+        std::fs::write(t.workdir.join("edge"), vec![b'a'; 16]).unwrap();
+        std::fs::write(t.workdir.join("big"), vec![b'a'; 17]).unwrap();
+        // Binary content is a blob to a download, where `file` refuses it.
+        let FileResult::File {
+            size: 5,
+            content: FileBody::Blob(bin),
+            ..
+        } = t.download("bin")
+        else {
+            panic!("expected a binary blob");
+        };
+        assert_eq!(t.blob_content(&bin), b"ab\0cd");
+        assert_eq!(t.read("bin"), ("bin".into(), 5, FileBody::Binary));
+        // Positive control: exactly the cap is served, one byte past it is not.
+        assert!(matches!(
+            t.download("edge"),
+            FileResult::File {
+                size: 16,
+                content: FileBody::Blob(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            t.download("big"),
+            FileResult::File {
+                content: FileBody::TooLarge,
+                ..
+            }
+        ));
+        assert_eq!(t.download("src"), FileResult::IsADirectory);
+        // A file answer to the same path does not free the download's blob:
+        // the two answers are recorded under their own kinds.
+        t.file("bin");
+        assert!(t.stored(bin.id));
     }
 
     #[test]
