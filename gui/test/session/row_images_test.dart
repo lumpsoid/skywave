@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/session/images.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';

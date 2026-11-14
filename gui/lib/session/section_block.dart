@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/session/highlight.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/markdown_body.dart';

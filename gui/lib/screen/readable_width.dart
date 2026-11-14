@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// Keeps a page's content to a readable width on wide windows, centred;
 /// on a phone it is the whole width.

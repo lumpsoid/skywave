@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// Rust's boot failure with a Retry (worded [retryLabel]: "Restart" after
 /// the hub crashed), and "Reset local data" when [onReset] is given (the

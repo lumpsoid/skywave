@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// Shown while Rust boots and until its first screen arrives. It never
 /// animates: for a wait under a second a calm page reads better than a
