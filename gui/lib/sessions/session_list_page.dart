@@ -57,6 +57,13 @@ class SessionListPage extends StatelessWidget {
                 ),
               ),
               IconButton(
+                tooltip: 'Worktrees',
+                icon: const Icon(Icons.account_tree_outlined),
+                onPressed: () => send.act(
+                  const ActionIntentNavigate(route: RouteView.worktrees),
+                ),
+              ),
+              IconButton(
                 tooltip: 'Settings',
                 icon: const Icon(Icons.settings),
                 onPressed: () => send.act(
