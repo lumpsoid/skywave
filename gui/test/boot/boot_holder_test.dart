@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/app.dart';
 import 'package:skywave_gui/boot/boot_failure_page.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
+import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -82,7 +83,7 @@ void main() {
     expect(holder.status, isA<BootReady>());
   });
 
-  testWidgets('shows a spinner, then the failure, then the app', (
+  testWidgets('shows the startup page, then the failure, then the app', (
     tester,
   ) async {
     final holder = BootHolder();
@@ -90,7 +91,8 @@ void main() {
     await tester.pumpWidget(
       SkywaveApp(boot: holder, holders: fakeHolders(), send: sent.add),
     );
-    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    expect(find.byType(StartupPage), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
 
     holder.fail('Cannot open the data: disk full');
     await tester.pump();
@@ -135,10 +137,11 @@ void main() {
     expect(find.text('Retry'), findsNothing);
     expect(find.text('Reset local data'), findsNothing);
 
-    // Restart sends Boot again: the spinner until Rust answers.
+    // Restart sends Boot again: the startup page until Rust answers.
     await tester.tap(find.text('Restart'));
     await tester.pump();
-    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    expect(find.byType(StartupPage), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
   });
 
   testWidgets('leaving and returning to the screen is reported once each', (
