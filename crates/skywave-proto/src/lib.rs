@@ -3141,9 +3141,10 @@ pub enum FileResult {
 pub enum FileBody {
     /// The bytes, fetched as a blob.
     Blob(BlobRef),
-    /// Not text; not served.
+    /// Not text; `GET /v1/workdir/file` does not serve it (download does).
     Binary,
-    /// Past [`limits::WORKDIR_FILE_MAX_BYTES`].
+    /// Past the route's cap: [`limits::WORKDIR_FILE_MAX_BYTES`] for `file`, the
+    /// server's download cap for `download`.
     TooLarge,
 }
 

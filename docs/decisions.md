@@ -1437,3 +1437,19 @@ explain. Deriving the history from the replicated log keeps it device-local,
 like prompt history, and needs no protocol change. Ctrl-R is the bash, zsh
 and fzf history key, and retry stays a press away (focus outside the field,
 or the banner). **Rejected:** a modal dialog, and scored matching.
+
+## D54. Repository files download as workdir blobs
+A head saves any workdir file through `GET /v1/workdir/download` (v36). It
+answers a `FileResult` like `file`, but serves binary content too and has
+its own cap (64 MiB by default, server config). The bytes travel as a
+workdir blob over `GET /v1/blobs/{id}`, so a download resumes, is
+hash-checked and compressed like every blob, and no second transport
+exists. A download is not fetched on open; the head asks for it. Its
+answer is recorded under its own kind (`download`) for GC, so a file-view
+answer and a download answer for the same path never replace each other's
+blobs; schema v25 widens the CHECK on `workdir_answer_blobs` to allow it.
+**Why:** the user wanted repository files, binary ones included, saved to
+the device without a second transport. Reusing the workdir read and the
+blob route gives resume, hashing and compression for free. **Rejected:** a
+raw streaming route (no hash up front, and the file can change between
+resumed ranges).

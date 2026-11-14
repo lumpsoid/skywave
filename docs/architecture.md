@@ -174,6 +174,7 @@ every version.
 | `GET /v1/worktrees` | The git worktrees of every repository a session's worktree was made from (D52, read from `SessionCreated`), as a `WorktreeList` read when asked: per repo a `RepoListing`, `Worktrees { worktrees, more }` with the main working tree first and at most `limits::WORKTREES_MAX` entries (`more` past them), each with its branch (`None` when detached), head, `main`, `missing`, `dirty` (`None` when its status was not read: missing, or outside the roots) and `merged`; `Gone` when the repo's directory is gone or is not its own top level, `Failed { reason }` when git fails for that repo alone. Always 200. Since v34. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
+| `GET /v1/workdir/download?session=&path=` | One file of a session's workdir to save on the device (D54), text or binary, as a `FileResult` whose content is a blob up to the server's download cap (64 MiB by default), else `TooLarge`. Recorded apart from `file`, so neither frees the other's blob. Since v36. |
 
 - **Seqs** are global and contiguous: the first event is 1, 0 is "before
   everything". Events carry no seq on the wire; the batch carries `from`.
@@ -724,12 +725,13 @@ the daemon's appends, which would otherwise stop `serve` (below).
   children killed). The outer timeout is 20 s. Content blobs are
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
   keeps its blob across refreshes; event blobs are never reused for them,
-  nor deduplicated among themselves (D44).
+  nor deduplicated among themselves (D44). `download` shares `file`'s path
+  rules and differs only in serving binary content and in its cap.
   **Blob GC**: a workdir blob lives while the latest answer to some read
   names it, any session: `workdir_answer_blobs` keeps the blobs of each
   read's latest answer, keyed as the core keys its stored answers
-  (session, `changes` or `file`, the path as requested), and every
-  changes or file answer but `ChangesResult::Failed` replaces its read's
+  (session, `changes`, `file` or `download`, the path as requested), and every
+  changes, file or download answer but `ChangesResult::Failed` replaces its read's
   rows. In that transaction every workdir blob no answer names loses its
   rows; its file goes after the commit. All of it runs on the workdir
   connection under the snapshot mutex, so no pass falls between a store

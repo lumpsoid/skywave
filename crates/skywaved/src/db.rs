@@ -475,6 +475,22 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo, branch)
     ) STRICT;
     "#,
+    // v25: a download answer (protocol v36, `GET /v1/workdir/download`) names its blob too.
+    // Made again as in v23: SQLite cannot change a CHECK in place.
+    r#"
+    CREATE TABLE workdir_answer_blobs_v25 (
+        session_id TEXT NOT NULL,
+        kind       TEXT NOT NULL CHECK (kind IN ('changes', 'file', 'download')),
+        path       TEXT NOT NULL,
+        blob_id    TEXT NOT NULL REFERENCES blobs (id),
+        PRIMARY KEY (session_id, kind, path, blob_id)
+    ) STRICT;
+    INSERT INTO workdir_answer_blobs_v25 (session_id, kind, path, blob_id)
+        SELECT session_id, kind, path, blob_id FROM workdir_answer_blobs;
+    DROP TABLE workdir_answer_blobs;
+    ALTER TABLE workdir_answer_blobs_v25 RENAME TO workdir_answer_blobs;
+    CREATE INDEX workdir_answer_blobs_by_blob ON workdir_answer_blobs (blob_id);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -1304,6 +1320,82 @@ mod tests {
         assert!(insert("r", "b").is_ok());
         assert!(insert("r", "b").is_err());
         assert!(insert("r2", "b").is_ok());
+    }
+
+    /// v25 lets a download answer name its blob: the table made again keeps
+    /// v24's `file` row and its `workdir_answer_blobs_by_blob` index.
+    #[test]
+    fn v25_schema_lets_a_download_answer_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..24] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 24).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, ?1)",
+                [PROTOCOL_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs (id, size, sha256) VALUES ('b1', 1, 'h')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workdir_answer_blobs (session_id, kind, path, blob_id)
+                 VALUES ('s', 'file', 'a.txt', 'b1')",
+                [],
+            )
+            .unwrap();
+            // v24 refuses a download's answer.
+            assert!(
+                conn.execute(
+                    "INSERT INTO workdir_answer_blobs (session_id, kind, path, blob_id)
+                     VALUES ('s', 'download', 'a.txt', 'b1')",
+                    [],
+                )
+                .is_err()
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows: Vec<(String, String, String, String)> = db
+            .conn()
+            .prepare("SELECT session_id, kind, path, blob_id FROM workdir_answer_blobs")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "s".to_owned(),
+                "file".to_owned(),
+                "a.txt".to_owned(),
+                "b1".to_owned()
+            )]
+        );
+        let index: String = db
+            .conn()
+            .query_row(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'workdir_answer_blobs_by_blob'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, "workdir_answer_blobs_by_blob");
+        db.conn()
+            .execute(
+                "INSERT INTO workdir_answer_blobs (session_id, kind, path, blob_id)
+                 VALUES ('s', 'download', 'a.txt', 'b1')",
+                [],
+            )
+            .unwrap();
     }
 
     /// The turn usage v24 wrote (its wire snapshot's) reads once v25's
