@@ -143,6 +143,9 @@ output_max = "64MiB"    # output kept per command; the rest is dropped
 min_free = "1GiB"       # below this free on the data dir's disk, agents
                         # pause and new work is refused until space is
                         # freed; 0 turns it off
+
+[files]
+download_max = "64MiB"  # largest repository file a device can download
 ```
 
 ```sh
