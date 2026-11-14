@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
 import 'package:skywave_gui/screen/screen_holder.dart';
 import 'package:skywave_gui/screen/repair_page.dart';
@@ -28,7 +29,8 @@ void main() {
         home: ScreenNavigator(holders: holders, send: sent.add),
       ),
     );
-    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    expect(find.byType(StartupPage), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
 
     holders.screen.apply(pairingScreen());
     await tester.pumpAndSettle();

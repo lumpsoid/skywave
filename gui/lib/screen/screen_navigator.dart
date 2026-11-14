@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/crop/crop_page.dart';
 import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
@@ -47,9 +48,7 @@ class ScreenNavigator extends StatelessWidget {
                 final update = holders.screen.screen;
                 final kind = holders.screen.kind;
                 if (update == null || kind == null) {
-                  return const Scaffold(
-                    body: Center(child: CircularProgressIndicator()),
-                  );
+                  return const StartupPage();
                 }
                 final repair = update.repair;
                 final covered = repair != null;
