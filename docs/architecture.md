@@ -161,8 +161,8 @@ every version.
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
-| `HEAD /v1/attachments/{sha256}` | 204 if an image with that sha256 is staged, else 404; lets a device skip a re-upload across reconnects. Since v30. |
-| `PUT /v1/attachments/{sha256}` | Stages an image (raw bytes, at most `limits::ATTACHMENT_MAX_BYTES`) for a later `SendMessage` to name, answering an `UploadResult` with 200: `Stored { size, media_type }`, `TooLarge`, `NotAnImage`, `HashMismatch` or `DiskLow`. The file is `attachments/<sha256 hex>`, with no table; staging is a cache, capped at 256 MiB (the oldest evicted on each upload) and swept of files older than 7 days at startup. A lost upload surfaces as `UnknownAttachment`. Since v30. |
+| `HEAD /v1/attachments/{sha256}` | 204 if a file with that sha256 is staged, else 404; lets a device skip a re-upload across reconnects. Since v30. |
+| `PUT /v1/attachments/{sha256}` | Stages a file of any type (raw bytes, at most `limits::ATTACHMENT_MAX_BYTES`) for a later `SendMessage` to name, answering an `UploadResult` with 200: `Stored { size }`, `TooLarge`, `HashMismatch` or `DiskLow`. The file is `attachments/<sha256 hex>`, with no table, kept only while it hashes to its name; staging is a cache, capped at 256 MiB (the oldest evicted on each upload) and swept of files older than 7 days at startup. A lost upload surfaces as `UnknownAttachment`. Since v30. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
@@ -375,8 +375,9 @@ the daemon's appends, which would otherwise stop `serve` (below).
   `UnknownSession`, `ContextChanged`, `MessageTooLong`, then
   `TooManyAttachments` (more than `ATTACHMENTS_MAX` names), then
   `AttachmentsTooLarge` (the images total over `ATTACHMENTS_MAX_TOTAL_BYTES`),
-  then `UnknownAttachment` (a name not staged, or no longer an image or the
-  hash it names). A refused command's linked files go as a crop's do. A
+  then `UnknownAttachment` (a name not staged, a staged file that is not an
+  image, or one no longer the hash it names; the image check is here, not at
+  staging). A refused command's linked files go as a crop's do. A
   crash between a link and the commit leaves blob files without rows, which
   the startup sweep removes; one between the commit and the staged file's
   removal leaves that file, which eviction removes. `DeleteBlob` takes an
@@ -1021,8 +1022,10 @@ logs) an event that no longer decodes rather than failing.
   HEAD on every attempt and PUT from its local file when the server does not
   hold it, since the server unlinks the staged files a message used, so
   nothing is cached. A missing or too-large local file, or an upload the
-  server refuses as too large, not an image or a hash mismatch, fails the
-  message as `AttachmentRefused`: final, discardable, never posted. A low disk
+  server refuses as too large or a hash mismatch, fails the message as
+  `AttachmentRefused`: final, discardable, never posted. (An outbox entry
+  stored before v36 may carry `NotAnImage`, which the server no longer
+  answers.) A low disk
   stops the uploads and posts the message anyway, so the server's stored
   `DiskLow` refusal shows it and the outbox keeps moving. A HEAD or PUT that
   fails in transport backs off like the command's own request. A third loop,

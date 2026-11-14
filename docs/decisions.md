@@ -1327,8 +1327,9 @@ is what the log keeps.
   upload is not posted: the outbox checks before each image and again right
   before posting.
 - **Device refusals settle the message.** A refusal on the device (`TooLarge`,
-  `NotAnImage`, `HashMismatch`, or a missing local file) settles the message
-  `AttachmentRefused`: never posted, discardable.
+  `HashMismatch`, or a missing local file) settles the message
+  `AttachmentRefused`: never posted, discardable. An outbox entry stored before
+  v36 may carry `NotAnImage`, which the server no longer answers (D55).
 - **A low disk refuses, never waits.** A low disk refuses an image message with
   `DiskLow`, as it does text (D40). The outbox posts it anyway instead of
   waiting, so control commands keep moving.
@@ -1453,3 +1454,15 @@ the device without a second transport. Reusing the workdir read and the
 blob route gives resume, hashing and compression for free. **Rejected:** a
 raw streaming route (no hash up front, and the file can change between
 resumed ranges).
+
+## D55. Staging takes any file (v36)
+`PUT /v1/attachments/{sha256}` stages any file, not only an image. Staging no
+longer sniffs: image-ness is decided where a staged file is used as an image,
+a message's attachment, which is refused `UnknownAttachment` when the file is
+not one. One staging then serves a message's images and the files a workdir
+write names. An existing staged file is trusted only while it still hashes to
+its name. Nothing stored changes: `UploadResult` is an HTTP answer, not stored
+on either side.
+**Why:** the check that matters is where the bytes are used as an image, not
+where they arrive, and one cache of uploads is simpler to evict and sweep than
+one per kind of file.

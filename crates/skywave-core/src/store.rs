@@ -707,7 +707,8 @@ fn v34_to_v35(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 }
 
 /// v35 to v36, as the server's step of the same name. v36 added the route
-/// `GET /v1/workdir/download` and nothing stored, so nothing stored changes.
+/// `GET /v1/workdir/download` and staging answers that are not stored either;
+/// no stored event or command result changes.
 fn v35_to_v36(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
@@ -923,7 +924,8 @@ pub enum LogCheck {
 pub enum AttachmentRefusal {
     /// The server refused the upload as larger than it takes.
     TooLarge,
-    /// The server did not read the upload as an image.
+    /// The server did not read the upload as an image. Since protocol v36 the
+    /// server no longer answers this; kept for outbox entries stored before.
     NotAnImage,
     /// The server's hash of the upload differs from the one asked for.
     HashMismatch,

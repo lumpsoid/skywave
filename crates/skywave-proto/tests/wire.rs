@@ -807,12 +807,8 @@ fn all_login_finish_results() -> Vec<LoginFinishResult> {
 
 fn all_upload_results() -> Vec<UploadResult> {
     vec![
-        UploadResult::Stored {
-            size: 340_000,
-            media_type: ImageType::Png,
-        },
+        UploadResult::Stored { size: 340_000 },
         UploadResult::TooLarge,
-        UploadResult::NotAnImage,
         UploadResult::HashMismatch,
         UploadResult::DiskLow,
     ]

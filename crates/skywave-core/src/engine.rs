@@ -1192,7 +1192,6 @@ async fn stage_one(
         UploadResult::Stored { .. } => ImageStaging::Staged,
         UploadResult::DiskLow => ImageStaging::DiskLow,
         UploadResult::TooLarge => ImageStaging::Refused(AttachmentRefusal::TooLarge),
-        UploadResult::NotAnImage => ImageStaging::Refused(AttachmentRefusal::NotAnImage),
         UploadResult::HashMismatch => ImageStaging::Refused(AttachmentRefusal::HashMismatch),
     })
 }
@@ -2981,7 +2980,6 @@ mod tests {
                         self.staged.lock().unwrap().insert(sha256);
                         Ok(UploadResult::Stored {
                             size: bytes.len() as u64,
-                            media_type: ImageType::Png,
                         })
                     }
                 }
@@ -3134,7 +3132,7 @@ mod tests {
         let seam = paired_seam(dir.path());
         let a = put_file(dir.path(), b"not really a picture");
         let mut server = StagingServer::new();
-        server.put_answer = Some(UploadResult::NotAnImage);
+        server.put_answer = Some(UploadResult::HashMismatch);
         enqueue_with(&seam, "one", vec![a]);
         enqueue(&seam, "two");
 
@@ -3147,7 +3145,7 @@ mod tests {
         assert_eq!(
             entries.iter().map(|e| e.status.clone()).collect::<Vec<_>>(),
             [
-                OutboxStatus::AttachmentRefused(AttachmentRefusal::NotAnImage),
+                OutboxStatus::AttachmentRefused(AttachmentRefusal::HashMismatch),
                 OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
             ]
         );
@@ -3468,7 +3466,7 @@ mod tests {
         let seam = paired_seam(dir.path());
         let a = put_file(dir.path(), b"not really a picture");
         let mut server = StagingServer::new();
-        server.put_answer = Some(UploadResult::NotAnImage);
+        server.put_answer = Some(UploadResult::HashMismatch);
         attach_draft_image(&seam, SessionId::new(), b"not really a picture");
 
         stage_for_a_minute(&sender_ctx(&seam), &server).await;

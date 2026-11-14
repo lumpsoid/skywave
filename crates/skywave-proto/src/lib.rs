@@ -197,6 +197,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v36: repository file download: `GET` [`path::WORKDIR_DOWNLOAD`] answering a
 /// [`FileResult`] whose content is any file, text or binary, as a blob.
+/// Staging (`PUT` [`path::ATTACHMENT_ROUTE`]) takes any file:
+/// [`UploadResult::Stored`] lost `media_type` and `NotAnImage` is gone; a
+/// message's image is checked when the message names it.
 pub const PROTOCOL_VERSION: u32 = 36;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
@@ -2413,7 +2416,8 @@ pub enum RejectReason {
     /// span past the blob's last line, or every line kept.
     BadCrop,
     /// A `SendMessage` names an image hash the server has no staged upload
-    /// for (never uploaded, or evicted); upload it and send again.
+    /// for (never uploaded, or evicted), or whose staged upload is not an
+    /// image; upload it and send again.
     UnknownAttachment,
     /// A `SendMessage` with more than [`limits::ATTACHMENTS_MAX`] attachments.
     TooManyAttachments,
@@ -2792,13 +2796,10 @@ pub enum LoginFinishResult {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum UploadResult {
-    /// The image is staged, or already was. `size` is in bytes and
-    /// `media_type` is the sniffed type.
-    Stored { size: u64, media_type: ImageType },
+    /// The file is staged, or already was. `size` is in bytes.
+    Stored { size: u64 },
     /// Over [`limits::ATTACHMENT_MAX_BYTES`]; nothing stored.
     TooLarge,
-    /// Not PNG, JPEG, GIF or WEBP.
-    NotAnImage,
     /// The body does not hash to the path's sha256.
     HashMismatch,
     /// The server's disk is low; nothing stored.

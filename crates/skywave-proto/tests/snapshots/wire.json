@@ -2462,14 +2462,10 @@
   "upload_results": [
     {
       "result": "stored",
-      "size": 340000,
-      "media_type": "png"
+      "size": 340000
     },
     {
       "result": "too_large"
-    },
-    {
-      "result": "not_an_image"
     },
     {
       "result": "hash_mismatch"
