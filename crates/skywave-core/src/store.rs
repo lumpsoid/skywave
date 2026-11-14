@@ -503,6 +503,22 @@ UPDATE sessions SET worktree_removed = EXISTS (SELECT 1 FROM events
     WHERE session_id = sessions.id
         AND json_extract(event, '$.kind.type') = 'worktree_removed');
 "#),
+    // A saved download's answer (protocol v36) is a fifth read kind. As for
+    // 'log', `workdir_snapshots` is rebuilt (create, copy, drop, rename) to
+    // allow 'download' in its CHECK; its rows keep their kind and path.
+    Sql(r#"
+CREATE TABLE workdir_snapshots_with_download (
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('changes', 'list', 'file', 'log', 'download')),
+    path TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (json_valid(result)),
+    PRIMARY KEY (session_id, kind, path)
+);
+INSERT INTO workdir_snapshots_with_download (session_id, kind, path, result)
+    SELECT session_id, kind, path, result FROM workdir_snapshots;
+DROP TABLE workdir_snapshots;
+ALTER TABLE workdir_snapshots_with_download RENAME TO workdir_snapshots;
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -2173,7 +2189,9 @@ impl Store {
             let answer = match ask {
                 WorkdirAsk::Changes { .. } => WorkdirAnswer::Changes(json_col(row, 3)?),
                 WorkdirAsk::List { .. } => WorkdirAnswer::List(json_col(row, 3)?),
-                WorkdirAsk::File { .. } => WorkdirAnswer::File(json_col(row, 3)?),
+                WorkdirAsk::File { .. } | WorkdirAsk::Download { .. } => {
+                    WorkdirAnswer::File(json_col(row, 3)?)
+                }
                 WorkdirAsk::Log { .. } => WorkdirAnswer::Log(json_col(row, 3)?),
             };
             Ok((ask, answer))

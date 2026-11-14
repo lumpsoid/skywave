@@ -665,6 +665,10 @@ async fn read_workdir(
             .workdir_file(&query)
             .await
             .map(WorkdirAnswer::File),
+        WorkdirAsk::Download { .. } => transport
+            .workdir_download(&query)
+            .await
+            .map(WorkdirAnswer::File),
     }
 }
 
@@ -2170,7 +2174,7 @@ mod tests {
              ALTER TABLE sessions DROP COLUMN worktree;",
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 5)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 6)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(
