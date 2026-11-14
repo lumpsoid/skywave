@@ -5,6 +5,7 @@ import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
+import 'package:skywave_gui/workdir/saving.dart';
 
 /// A session's workdir, read-only: its git changes and a changed file's
 /// diff (Changes), its newest commits (Commits), or its files and one
@@ -68,6 +69,17 @@ class WorkdirPage extends StatelessWidget {
         ),
         actions: [
           ApprovalsButton(send: send),
+          if (screen.pane == WorkdirPaneKind.file)
+            IconButton(
+              tooltip: 'Download file',
+              icon: const Icon(Icons.download_outlined),
+              onPressed: () => send.act(
+                ActionIntentDownloadWorkdirFile(
+                  sessionId: screen.sessionId,
+                  path: screen.path,
+                ),
+              ),
+            ),
           IconButton(
             tooltip: 'Refresh',
             icon: const Icon(Icons.refresh),
@@ -151,6 +163,14 @@ class WorkdirPage extends StatelessWidget {
                 WorkdirPaneKind.file => _TextPane(screen: screen, send: send),
               },
             ),
+            if (screen.downloads.isNotEmpty) ...[
+              const Divider(height: 1),
+              _DownloadsPanel(
+                sessionId: screen.sessionId,
+                downloads: screen.downloads,
+                send: send,
+              ),
+            ],
           ],
         ),
       ),
@@ -193,9 +213,24 @@ class _ListPane extends StatelessWidget {
                   : Icons.description_outlined,
             ),
             title: Text(entry.name),
-            trailing: entry.detail == null
-                ? null
-                : Text(entry.detail!, style: muted),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (entry.detail != null) Text(entry.detail!, style: muted),
+                if (entry.opens == WorkdirPaneKind.file)
+                  IconButton(
+                    key: ValueKey('workdir-download-${entry.path}'),
+                    tooltip: 'Download',
+                    icon: const Icon(Icons.download_outlined),
+                    onPressed: () => send.act(
+                      ActionIntentDownloadWorkdirFile(
+                        sessionId: screen.sessionId,
+                        path: entry.path,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
             onTap: () => send.act(
               ActionIntentShowWorkdir(
                 pane: entry.opens,
@@ -216,6 +251,84 @@ class _ListPane extends StatelessWidget {
           ),
       ],
     );
+  }
+}
+
+/// The downloads this session started, one row each in the core's order: the
+/// path, its one line of progress or outcome, then Save… once the file is on
+/// this device, or Retry when the download failed.
+class _DownloadsPanel extends StatelessWidget {
+  const _DownloadsPanel({
+    required this.sessionId,
+    required this.downloads,
+    required this.send,
+  });
+
+  final String sessionId;
+  final List<WorkdirDownloadRow> downloads;
+  final SendIntent send;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = SkyColors.of(context);
+    final muted = Theme.of(context).textTheme.bodySmall
+        ?.copyWith(color: colors.muted);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 160),
+      child: ListView(
+        shrinkWrap: true,
+        children: [
+          for (final row in downloads)
+            ListTile(
+              dense: true,
+              title: Text(row.path),
+              subtitle: Text(row.label, style: muted),
+              trailing: _action(context, row),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget? _action(BuildContext context, WorkdirDownloadRow row) {
+    final localPath = row.localPath;
+    if (localPath != null) {
+      return TextButton(
+        onPressed: () => _save(context, localPath, row.path),
+        child: const Text('Save…'),
+      );
+    }
+    if (row.failed) {
+      return TextButton(
+        onPressed: () => send.act(
+          ActionIntentDownloadWorkdirFile(sessionId: sessionId, path: row.path),
+        ),
+        child: const Text('Retry'),
+      );
+    }
+    return null;
+  }
+
+  Future<void> _save(
+    BuildContext context,
+    String localPath,
+    String path,
+  ) async {
+    final name = path.split('/').last;
+    try {
+      final saved = await saveWorkdirFile(source: localPath, name: name);
+      if (saved != null && context.mounted) {
+        _say(context, 'Saved $path');
+      }
+    } catch (error) {
+      if (context.mounted) {
+        _say(context, 'Could not save $path: $error');
+      }
+    }
+  }
+
+  void _say(BuildContext context, String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 }
 
