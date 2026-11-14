@@ -234,6 +234,28 @@ impl Workdirs {
             WorkdirFetch::Idle
         }
     }
+
+    /// The paths of `session`'s download asks that are stored, in flight or
+    /// failed: each once, sorted.
+    pub(crate) fn download_paths(&self, session: SessionId) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .stored
+            .keys()
+            .chain(self.pending.keys())
+            .chain(self.failed.keys())
+            .filter(|ask| ask.session() == session)
+            .filter_map(|ask| match ask {
+                WorkdirAsk::Download { path, .. } => Some(path.clone()),
+                WorkdirAsk::Changes { .. }
+                | WorkdirAsk::List { .. }
+                | WorkdirAsk::File { .. }
+                | WorkdirAsk::Log { .. } => None,
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
 }
 
 /// The parent of a workdir path; empty for a top-level one.

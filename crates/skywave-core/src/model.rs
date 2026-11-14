@@ -54,8 +54,8 @@ use crate::view::{
     SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
     ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
     SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
-    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
-    WorkdirView, WorktreeSession, WorktreesView,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload,
+    WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -1091,6 +1091,24 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::DownloadWorkdirFile { session_id, path } => {
+                if self.device().is_none() || self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                let ask = WorkdirAsk::Download {
+                    session: session_id,
+                    path,
+                };
+                if self.workdirs.fetch(&ask) == WorkdirFetch::Loading {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.workdirs
+                    .ask(ask, online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
             Action::DownloadBlob(id) => match self.blobs.get(&id).map(|b| &b.status) {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
@@ -1392,6 +1410,12 @@ impl Model {
     /// after a failure is [`Action::DownloadBlob`]'s).
     fn want_shown_blob(&mut self) -> Option<Request> {
         let id = self.shown_blob()?.id;
+        self.want_blob(id)
+    }
+
+    /// Asks for blob `id`, once: if it is not downloaded and not asked for
+    /// yet. Whether it is on screen does not matter here.
+    fn want_blob(&mut self, id: BlobId) -> Option<Request> {
         let record = self.blobs.get(&id)?;
         let not_here = matches!(
             record.status,
@@ -2247,8 +2271,9 @@ impl Model {
     /// Mirrors [`Store::put_workdir`](crate::Store::put_workdir), which
     /// stored the awaited `answer` to `ask`: the answer replaces the last
     /// one, the blobs it registered join the blob map and those it purged
-    /// leave it. Returns the download of the blob the pane on screen now
-    /// shows, if it is wanted.
+    /// leave it. Returns the downloads of the blobs wanted now: a download
+    /// ask's content, whatever is on screen, then the blob the pane on
+    /// screen shows.
     pub(crate) fn workdir_stored(
         &mut self,
         ask: WorkdirAsk,
@@ -2272,8 +2297,22 @@ impl Model {
         for blob in &stored.purged {
             self.forget_blob(*blob);
         }
+        let download = match (&ask, &answer) {
+            (
+                WorkdirAsk::Download { .. },
+                WorkdirAnswer::File(FileResult::File {
+                    content: FileBody::Blob(blob),
+                    ..
+                }),
+            ) => Some(blob.id),
+            _ => None,
+        };
         self.workdirs.answered(ask, answer);
-        self.want_shown_blob().into_iter().collect()
+        let downloaded = download.and_then(|id| self.want_blob(id));
+        downloaded
+            .into_iter()
+            .chain(self.want_shown_blob())
+            .collect()
     }
 
     /// Mirrors [`Store::reset_for_server`](crate::Store::reset_for_server),
@@ -2638,7 +2677,42 @@ impl Model {
             last_dir: last_dir.to_owned(),
             fetch: self.workdirs.fetch(&ask),
             body,
+            downloads: self.workdir_downloads(id),
         })
+    }
+
+    /// The downloads of session `id`'s files, one per path, sorted: each
+    /// one's read, its stored answer and, if the answer carries a blob, the
+    /// blob's view.
+    fn workdir_downloads(&self, id: SessionId) -> Vec<WorkdirDownload> {
+        self.workdirs
+            .download_paths(id)
+            .into_iter()
+            .map(|path| {
+                let ask = WorkdirAsk::Download {
+                    session: id,
+                    path: path.clone(),
+                };
+                let fetch = self.workdirs.fetch(&ask);
+                let result = match self.workdirs.stored.get(&ask) {
+                    Some(WorkdirAnswer::File(result)) => Some(result.clone()),
+                    _ => None,
+                };
+                let blob = match &result {
+                    Some(FileResult::File {
+                        content: FileBody::Blob(blob),
+                        ..
+                    }) => Some(self.blob_view(blob)),
+                    _ => None,
+                };
+                WorkdirDownload {
+                    path,
+                    fetch,
+                    result,
+                    blob,
+                }
+            })
+            .collect()
     }
 
     fn pairing_view(&self) -> PairingView {
@@ -13016,6 +13090,127 @@ mod tests {
             f.model.set_link(ONLINE);
             asked(f.dispatch(Action::RefreshWorkdir));
             assert_eq!(view(&f).fetch, WorkdirFetch::Loading);
+        }
+
+        #[test]
+        fn workdir_download_asks_afresh_and_wants_its_blob_off_screen() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let other = f.session("/srv/b");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let download = |path: &str| WorkdirAsk::Download {
+                session: id,
+                path: path.into(),
+            };
+
+            // Asked for, and in flight: a second dispatch asks nothing.
+            let (req, ask) = asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "big.bin".into(),
+            }));
+            assert_eq!(ask, download("big.bin"));
+            assert!(
+                f.dispatch(Action::DownloadWorkdirFile {
+                    session_id: id,
+                    path: "big.bin".into(),
+                })
+                .is_empty(),
+                "in flight"
+            );
+            let shown = view(&f);
+            assert_eq!(shown.downloads.len(), 1);
+            assert_eq!(shown.downloads[0].path, "big.bin");
+            assert_eq!(shown.downloads[0].fetch, WorkdirFetch::Loading);
+            assert_eq!(shown.downloads[0].result, None);
+
+            // The content is wanted though the Changes pane is on screen.
+            let big = blob(4);
+            assert_eq!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("big.bin", FileBody::Blob(big.clone()))
+                ),
+                vec![Request::DownloadBlob(big.id)]
+            );
+            let shown = view(&f);
+            assert_eq!(shown.downloads[0].fetch, WorkdirFetch::Idle);
+            assert_eq!(
+                shown.downloads[0].blob.as_ref().map(|b| &b.state),
+                Some(&BlobState::Requested { size: 4 })
+            );
+
+            // Asked afresh once more; the blob is wanted already, so nothing.
+            let (req, ask) = asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "big.bin".into(),
+            }));
+            assert_eq!(ask, download("big.bin"));
+            assert!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("big.bin", FileBody::Blob(big.clone()))
+                )
+                .is_empty(),
+                "already wanted"
+            );
+
+            // Over the cap: no blob is wanted, and the entry says so. Listed
+            // by path, not by when it was asked for.
+            let (req, ask) = asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "a.bin".into(),
+            }));
+            assert!(answer(&mut f, req, ask, file("a.bin", FileBody::TooLarge)).is_empty());
+            let shown = view(&f);
+            let paths: Vec<&str> = shown.downloads.iter().map(|d| d.path.as_str()).collect();
+            assert_eq!(paths, ["a.bin", "big.bin"]);
+            assert!(matches!(
+                shown.downloads[0].result,
+                Some(FileResult::File {
+                    content: FileBody::TooLarge,
+                    ..
+                })
+            ));
+            assert_eq!(shown.downloads[0].blob, None);
+
+            // Another session's download is not this session's.
+            asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: other,
+                path: "other.bin".into(),
+            }));
+            assert_eq!(view(&f).downloads.len(), 2);
+
+            // An unknown session: nothing.
+            assert!(
+                f.dispatch(Action::DownloadWorkdirFile {
+                    session_id: SessionId::new(),
+                    path: "big.bin".into(),
+                })
+                .is_empty()
+            );
+
+            // Offline: asked for nothing, and the entry fails at once.
+            f.model.set_link(offline());
+            assert!(
+                f.dispatch(Action::DownloadWorkdirFile {
+                    session_id: id,
+                    path: "offline.bin".into(),
+                })
+                .is_empty()
+            );
+            let shown = view(&f);
+            let entry = shown
+                .downloads
+                .iter()
+                .find(|d| d.path == "offline.bin")
+                .expect("listed");
+            assert_eq!(entry.fetch, WorkdirFetch::Failed(not_connected()));
+            assert_eq!(entry.result, None);
         }
 
         #[test]

@@ -5240,6 +5240,7 @@ mod workdir {
             last_dir: "src".into(),
             fetch,
             body,
+            downloads: Vec::new(),
         });
         let outs = rig.head.on_view(view, rig.clock);
         rig.apply(outs);
