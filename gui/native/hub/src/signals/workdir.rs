@@ -55,6 +55,27 @@ pub struct WorkdirScreen {
     pub entries: Vec<WorkdirEntryRow>,
     /// The diff or file shown, on those panes only, when it has a blob.
     pub content: Option<WorkdirContent>,
+    /// The files asked for download, sorted by path, on every pane: the save
+    /// flow reads them, not the pane shown.
+    pub downloads: Vec<WorkdirDownloadRow>,
+}
+
+/// A file of the workdir asked for download, for the save flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct WorkdirDownloadRow {
+    /// The path in the workdir, as asked.
+    pub path: String,
+    /// One line on where the download is: asking, failed, too large, or
+    /// the blob's own label (with progress while downloading).
+    pub label: String,
+    /// The ask failed or the answer cannot be downloaded: the head offers
+    /// to try again.
+    pub failed: bool,
+    /// The content's blob, when the answer carries one.
+    pub blob: Option<BlobFacts>,
+    /// The file on this device once the blob is available: the head
+    /// copies it to where the user saves it.
+    pub local_path: Option<String>,
 }
 
 /// How a changed file changed.

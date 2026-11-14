@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use skywave_core::{
-    BlobId, BlobState, BlobView, ChangedFile, ChangesResult, EntryKind, FileChange, FileResult,
-    LinkTarget, ListResult, WorkdirBody, WorkdirFetch, WorkdirPane, WorkdirView, read_head,
+    BlobId, BlobState, BlobView, ChangedFile, ChangesResult, EntryKind, FileBody, FileChange,
+    FileResult, LinkTarget, ListResult, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane,
+    WorkdirView, read_head,
 };
 use skywave_present::format::bytes;
 use skywave_present::workdir::{
@@ -23,7 +24,8 @@ use skywave_proto::LogResult;
 
 use crate::signals::{
     ScreenView, WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent,
-    WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
+    WorkdirDownloadRow, WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind,
+    WorkdirScreen,
 };
 use skywave_present::text::clean_line;
 
@@ -236,6 +238,7 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
             commits,
             entries,
             content,
+            downloads: view.downloads.iter().map(download_row).collect(),
         },
     }
 }
@@ -313,6 +316,64 @@ fn change_row(file: &ChangedFile) -> WorkdirChangeRow {
         from: file.from.as_deref().map(clean_line),
         counts_label: counts_label(file),
         untracked: file.change == FileChange::Untracked,
+    }
+}
+
+/// A download as the save flow reads it: where its ask stands, else where
+/// its content's download stands, with the file once it is on the device.
+fn download_row(download: &WorkdirDownload) -> WorkdirDownloadRow {
+    let (label, failed, blob, local_path) =
+        match (&download.fetch, &download.result, &download.blob) {
+            (WorkdirFetch::Loading, _, _) => {
+                ("Asking the server\u{2026}".to_owned(), false, None, None)
+            }
+            (WorkdirFetch::Failed(reason), _, _) => {
+                (format!("Download failed: {reason}"), true, None, None)
+            }
+            (
+                WorkdirFetch::Idle,
+                Some(FileResult::File {
+                    content: FileBody::Blob(_),
+                    ..
+                }),
+                Some(view),
+            ) => {
+                let local_path = match &view.state {
+                    BlobState::Available { path } => Some(path.display().to_string()),
+                    _ => None,
+                };
+                let facts = blob_facts(view);
+                let failed = matches!(view.state, BlobState::Failed { .. });
+                (facts.label.clone(), failed, Some(facts), local_path)
+            }
+            (
+                WorkdirFetch::Idle,
+                Some(FileResult::File {
+                    content: FileBody::TooLarge,
+                    size,
+                    ..
+                }),
+                _,
+            ) => (
+                format!("Too large to download: {}", bytes(*size)),
+                true,
+                None,
+                None,
+            ),
+            (WorkdirFetch::Idle, Some(other), _) => (
+                file_wording(other).unwrap_or_else(|| "Cannot download.".to_owned()),
+                true,
+                None,
+                None,
+            ),
+            (WorkdirFetch::Idle, None, _) => ("Not asked yet.".to_owned(), false, None, None),
+        };
+    WorkdirDownloadRow {
+        path: download.path.clone(),
+        label: clean_line(&label),
+        failed,
+        blob,
+        local_path,
     }
 }
 

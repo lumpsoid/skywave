@@ -438,6 +438,12 @@ pub enum ActionIntent {
     DownloadBlob {
         blob_id: String,
     },
+    /// Ask the server for a file of the session's workdir, and download its
+    /// content: the file's state is the screen's `downloads`.
+    DownloadWorkdirFile {
+        session_id: String,
+        path: String,
+    },
     /// Delete a blob (a target's `blob_id`) from the server and every
     /// device. Sent only once its `delete_question` was confirmed.
     DeleteBlob {
