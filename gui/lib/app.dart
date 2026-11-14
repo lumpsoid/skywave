@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:rinf/rinf.dart';
 import 'package:skywave_gui/boot/boot_failure_page.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
+import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_banner.dart';
@@ -12,7 +13,7 @@ import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The app: a spinner until Rust has booted, its failure with a Retry (a
+/// The app: the startup page until Rust has booted, its failure with a Retry (a
 /// Restart after the hub crashed), or the app itself. Holders are created in `main` and passed down from here.
 /// Each time Rust answers `Booted`, [AppReady] asks it to send everything
 /// again, so a rebuilt widget tree starts whole.
@@ -116,9 +117,7 @@ class _SkywaveAppState extends State<SkywaveApp> {
       home: ListenableBuilder(
         listenable: widget.boot,
         builder: (context, _) => switch (widget.boot.status) {
-          BootPending() => const Scaffold(
-            body: Center(child: CircularProgressIndicator()),
-          ),
+          BootPending() => const StartupPage(),
           BootError(:final message, :final unreadable, :final crashed) =>
             BootFailurePage(
               message: message,
