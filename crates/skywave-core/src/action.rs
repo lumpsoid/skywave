@@ -78,6 +78,10 @@ pub enum Action {
     /// (paired only). The report shown stays until the answer; offline the
     /// screen is `Unavailable` at once and nothing is asked later.
     RefreshStorage,
+    /// Ask the server for its worktree list again, on the worktrees screen
+    /// (paired only). The list shown stays until the answer; offline the
+    /// screen is `Unavailable` at once and nothing is asked later.
+    RefreshWorktrees,
     /// Ask the server for its agent's usage limits again, on the usage
     /// limits page or a session's info page (paired only). The stored answer stays shown until the
     /// new one; offline the page is `Unavailable` at once and nothing is
@@ -455,6 +459,10 @@ pub enum Route {
     /// What the server's data takes on its disk: opening it asks the
     /// server for its report.
     Storage,
+    /// Every git worktree of the repositories sessions' worktrees came
+    /// from, with the sessions in each: opening it asks the server for the
+    /// list.
+    Worktrees,
     /// The usage limits of the account the server's agent runs as: the
     /// stored answer, asked for on opening only when none is stored. Back
     /// returns to the session it was opened from, if any.

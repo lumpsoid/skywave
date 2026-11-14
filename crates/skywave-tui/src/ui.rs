@@ -99,6 +99,11 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             Screen::ServerAddresses(view) => render_server_addresses(frame, body, view),
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
             Screen::Storage(view) => storage::render(frame, body, app, view),
+            Screen::Worktrees(_) => frame.render_widget(
+                Paragraph::new("The worktrees page is in the GUI only.")
+                    .block(Block::bordered().title(" Worktrees ")),
+                body,
+            ),
             Screen::UsageLimits(view) => limits::render(frame, body, view, DateTime::from(wall)),
             Screen::SessionInfo(view) => info::render(frame, body, app, view, DateTime::from(wall)),
             Screen::Workdir(workdir) => workdir::render(frame, body, app, workdir, wall),
@@ -1007,6 +1012,7 @@ fn footer_keys(app: &App) -> &'static str {
         Screen::Storage(_) => {
             "↑↓ select · D delete · K crop · r refresh · Tab list · Esc back · ? help · q quit"
         }
+        Screen::Worktrees(_) => "Esc back · ? help · q quit",
         Screen::Workdir(view) => match view.pane {
             WorkdirPane::Changes | WorkdirPane::Commits | WorkdirPane::Dir { .. } => {
                 "↑↓ select · Enter open · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
@@ -1391,6 +1397,9 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  Read from the server when the screen opens, so only online."),
             Line::from("  A session's size is its events in the log and their blobs."),
         ]),
+        Screen::Worktrees(_) => {
+            lines.extend([section("Worktrees"), key("Esc", "back to sessions")])
+        }
         Screen::Workdir(_) => lines.extend([
             section("Workdir (w on a session's timeline)"),
             key("Tab", "switch between changes and files"),

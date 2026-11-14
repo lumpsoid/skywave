@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/rendering.dart';
@@ -257,6 +257,25 @@ void main() {
     // The menu is open: its archive entry is there.
     expect(find.text('Unarchive'), findsOneWidget);
     expect(find.text('Remove worktree'), findsNothing);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    // An active row that is removable offers it too.
+    await pump(tester, list(rows: [sessionRow('b', removable: true)]));
+    await tester.tap(find.byKey(const Key('row-menu-b')));
+    await tester.pumpAndSettle();
+    expect(find.text('Archive'), findsOneWidget);
+    expect(find.text('Remove worktree'), findsOneWidget);
+  });
+
+  testWidgets('the app bar opens the worktrees page', (tester) async {
+    await pump(tester, list());
+    await tester.tap(find.byTooltip('Worktrees'));
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentNavigate(route: RouteView.worktrees),
+      ),
+    ]);
   });
 
   testWidgets('a removed worktree shows a marker', (tester) async {

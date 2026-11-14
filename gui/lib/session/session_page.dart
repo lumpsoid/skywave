@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';

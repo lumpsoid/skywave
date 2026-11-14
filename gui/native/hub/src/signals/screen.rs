@@ -133,6 +133,17 @@ pub enum ScreenView {
         /// no report.
         empty_label: Option<String>,
     },
+    /// Every git worktree of the repositories sessions' worktrees came
+    /// from, asked for on opening; `RefreshWorktrees` asks again.
+    Worktrees {
+        /// Asking, offline or failed; `None` once the list is fresh.
+        status_label: Option<String>,
+        /// One per repository, sorted by path.
+        repos: Vec<WorktreeRepoView>,
+        /// What an empty list says; `None` when it has repos or there is no
+        /// list.
+        empty_label: Option<String>,
+    },
     /// The paired server's addresses: the one in use, then the others to
     /// switch to (`SetServerAddress`, also for a new one) or forget
     /// (`ForgetServerAddress`), in the order they were left.
@@ -259,6 +270,43 @@ pub struct StorageRowView {
     /// The blob a blob or shell run row stands for, and what may be done
     /// to it; `None` for a session row and a run kept as no blob.
     pub target: Option<BlobTargetView>,
+}
+
+/// One repository of the worktrees screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct WorktreeRepoView {
+    /// The repository's main working tree's path.
+    pub repo: String,
+    /// Why the list is short or missing (more, gone, git failed).
+    pub note: Option<String>,
+    /// The main working tree first.
+    pub worktrees: Vec<WorktreeView>,
+}
+
+/// One git worktree of a repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct WorktreeView {
+    pub path: String,
+    /// The branch, `detached at <sha>` when none is checked out.
+    pub branch: String,
+    /// `main`, `missing`, `uncommitted changes`, `merged`, `not merged`….
+    pub tags: Vec<String>,
+    /// The sessions running in it, latest message first, as the session
+    /// list orders them.
+    pub sessions: Vec<WorktreeSessionView>,
+}
+
+/// A session running in a listed worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct WorktreeSessionView {
+    pub session_id: String,
+    pub title: String,
+    pub archived: bool,
+    /// `RemoveWorktree` may be sent: a skywave worktree, not removed.
+    pub removable: bool,
+    pub worktree_removed: bool,
+    /// A removal on its way or failed; `None` when none or settled.
+    pub removal_label: Option<String>,
 }
 
 /// The usage limits as listed, on their page and a session's info page.
@@ -404,8 +452,8 @@ pub struct SessionRowView {
     /// Why it cannot be deleted yet, for an archived row that is not
     /// deletable.
     pub delete_blocked_label: Option<String>,
-    /// `RemoveWorktree` is offered: the row is archived and runs in a git
-    /// worktree that is not removed yet.
+    /// `RemoveWorktree` is offered: the row runs in a git worktree that is
+    /// not removed yet, archived or not.
     pub removable: bool,
     /// The session's worktree was removed; its work is refused.
     pub worktree_removed: bool,

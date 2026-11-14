@@ -785,6 +785,13 @@ async fn workdir_reads_default_to_not_found() {
     );
 }
 
+/// A transport that cannot read the worktree list answers `NotFound`, as a
+/// server without `GET /v1/worktrees` would.
+#[tokio::test]
+async fn worktrees_defaults_to_not_found() {
+    assert_eq!(Old.worktrees().await, Err(TransportError::NotFound));
+}
+
 /// The three workdir reads against a real server with a paired device,
 /// paths that need escaping in the query included.
 #[tokio::test(flavor = "multi_thread")]
@@ -890,6 +897,23 @@ async fn workdir_reads_reach_a_real_server() {
         transport.workdir_file(&unknown).await.unwrap(),
         FileResult::UnknownSession
     );
+}
+
+/// `GET /v1/worktrees` against a real server with a paired device and no
+/// worktree session: the list names no repository.
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrees_reach_a_real_server() {
+    let fx = Fixture::start().await;
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let identity = paired.credentials;
+    let transport =
+        HttpsTransport::new(&paired.address, &identity, config(), ExpectedRun::default()).unwrap();
+
+    let list = transport.worktrees().await.unwrap();
+    assert!(list.repos.is_empty());
 }
 
 /// A wrong fingerprint fails the TLS handshake, so the code never reaches

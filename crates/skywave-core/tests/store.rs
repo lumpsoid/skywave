@@ -1980,6 +1980,47 @@ fn v33_opens_a_v32_replica_unchanged() {
     assert_eq!(events, [created, message]);
 }
 
+/// A v33 replica opens as v34 with its stored events read back unchanged:
+/// v34 added the worktree list, which stores nothing.
+#[test]
+fn v34_opens_a_v33_replica_unchanged() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/x".into(),
+        context_name: "start".into(),
+        from: None,
+        worktree: None,
+    };
+    let message = EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "look".into(),
+        attachments: Vec::new(),
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![event(id, 0, created.clone()), event(id, 1, message.clone())],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+    // What v33 left: stamped 33.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 33", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events, [created, message]);
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),

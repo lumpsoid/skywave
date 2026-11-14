@@ -14,7 +14,7 @@ use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
     EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
     LoginFinishResult, LoginStartResult, RunId, StorageReport, UploadResult, UsageLimitsResult,
-    WorkdirQuery,
+    WorkdirQuery, WorktreeList,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -93,6 +93,13 @@ pub trait Transport: Send + Sync {
     /// the storage screen. Defaults to [`TransportError::NotFound`] like
     /// [`list_dirs`](Transport::list_dirs).
     fn storage_report(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/worktrees`: every worktree of the repositories sessions'
+    /// worktrees came from, for the worktrees screen. Defaults to
+    /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
+    fn worktrees(&self) -> BoxFuture<'_, Result<WorktreeList, TransportError>> {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 

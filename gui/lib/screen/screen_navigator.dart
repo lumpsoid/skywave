@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/crop/crop_page.dart';
 import 'package:skywave_gui/holders.dart';
@@ -17,6 +17,7 @@ import 'package:skywave_gui/storage/storage_page.dart';
 import 'package:skywave_gui/usage/limits_page.dart';
 import 'package:skywave_gui/usage/usage_page.dart';
 import 'package:skywave_gui/workdir/workdir_page.dart';
+import 'package:skywave_gui/worktrees/worktrees_page.dart';
 
 /// The booted app: the banner over a navigator whose one page is the
 /// screen Rust sent (D18), but in a subagent's view, which is a second
@@ -137,6 +138,11 @@ class ScreenNavigator extends StatelessWidget {
           send: send,
         ),
         final ScreenViewStorage screen => StoragePage(
+          screen: screen,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        final ScreenViewWorktrees screen => WorktreesPage(
           screen: screen,
           canGoBack: update.canGoBack,
           send: send,

@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
@@ -13,6 +13,7 @@ import 'package:skywave_gui/session/timeline_holder.dart';
 import 'package:skywave_gui/session/timeline_view.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
+import '../finders.dart';
 import '../fakes.dart';
 import 'rows.dart';
 
@@ -586,7 +587,7 @@ void main() {
     expect(find.text('run the tests'), findsOneWidget);
     expect(find.text('Save the message as a snippet'), findsNothing);
 
-    await tester.tap(find.byTooltip('Edit snippet').first);
+    await tester.tap(byTooltip('Edit snippet').first);
     await tester.pumpAndSettle();
     await tester.enterText(find.byKey(const Key('snippet-edit-name')), '');
     await tester.enterText(find.byKey(const Key('snippet-edit-text')), ' ');
@@ -616,7 +617,7 @@ void main() {
       ),
     );
 
-    await tester.tap(find.byTooltip('Delete snippet').last);
+    await tester.tap(byTooltip('Delete snippet').last);
     await tester.pumpAndSettle();
     expect(
       sent.whereType<GuiIntentAct>().last,
@@ -1367,13 +1368,13 @@ void main() {
       await tester.enterText(composer(), ' \n\t ');
       await tester.pump();
       expect(send().onPressed, isNull, reason: 'whitespace is blank');
-      await tester.tap(find.byTooltip('Send'));
+      await tester.tap(byTooltip('Send'));
       expect(sent.whereType<GuiIntentComposerSubmit>(), isEmpty);
 
       await tester.enterText(composer(), 'hi');
       await tester.pump();
       expect(send().onPressed, isNotNull);
-      await tester.tap(find.byTooltip('Send'));
+      await tester.tap(byTooltip('Send'));
       expect(sent.last, const GuiIntentComposerSubmit(sessionId: 's1'));
 
       // The hub clears the sent message: off again.
@@ -1554,7 +1555,7 @@ void main() {
     await tester.drag(find.byType(ListView), const Offset(0, 400));
     await tester.pumpAndSettle();
     expect(sent.last, const GuiIntentFollowingChanged(following: false));
-    expect(find.byTooltip('Jump to newest'), findsOneWidget);
+    expect(byTooltip('Jump to newest'), findsOneWidget);
 
     // New rows do not move a view scrolled back: the rows in view stay put.
     final newest = tester
@@ -1695,7 +1696,7 @@ void main() {
 
     await show(screenWith(canInterrupt: false));
     await tester.tap(find.text('a'));
-    await tester.tap(find.byTooltip('Interrupt (Ctrl+X)'));
+    await tester.tap(byTooltip('Interrupt (Ctrl+X)'));
     await ctrlX();
     expect(sent.whereType<GuiIntentAct>(), isEmpty, reason: 'agent idle');
 
@@ -1703,13 +1704,13 @@ void main() {
     // Still, not a spinner: offline it can wait as long as the link is down.
     expect(find.byIcon(Icons.hourglass_top), findsOneWidget);
     expect(find.byType(CircularProgressIndicator), findsNothing);
-    await tester.tap(find.byTooltip('Interrupting…'));
+    await tester.tap(byTooltip('Interrupting…'));
     await ctrlX();
     expect(sent.whereType<GuiIntentAct>(), isEmpty, reason: 'on its way');
 
     await show(screenWith(interruptRefusal: 'the server could not take it'));
     expect(
-      find.byTooltip('Interrupt failed: the server could not take it'),
+      byTooltip('Interrupt failed: the server could not take it'),
       findsOneWidget,
     );
     expect(find.textContaining('interrupt'), findsNothing);
@@ -1759,7 +1760,7 @@ void main() {
     expect(find.byType(SnackBar), findsNothing);
     // It stays on the button.
     expect(
-      find.byTooltip('Interrupt failed: the server could not take it'),
+      byTooltip('Interrupt failed: the server could not take it'),
       findsOneWidget,
     );
 
@@ -1780,7 +1781,7 @@ void main() {
     expect(snack('bogus refused: unknown model'), findsOneWidget);
     expect(snack('bypass refused: not launched for it'), findsNothing);
     await dismiss();
-    expect(find.byTooltip('bogus refused: unknown model'), findsOneWidget);
+    expect(byTooltip('bogus refused: unknown model'), findsOneWidget);
   });
 
   testWidgets('no progress bar runs while the agent works', (tester) async {
@@ -1804,7 +1805,7 @@ void main() {
         timeline: holding([]),
         sent: sent,
       );
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
     }
 
@@ -1859,7 +1860,7 @@ void main() {
         timeline: holding([]),
         sent: sent,
       );
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
     }
 
@@ -2047,7 +2048,7 @@ void main() {
       ]);
 
       sent.clear();
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Contexts…'));
       await tester.pumpAndSettle();
@@ -2099,7 +2100,7 @@ void main() {
     const on = 'Conversation only is on: show tool calls';
     IconButton button(String tooltip) => tester.widget<IconButton>(
       find.ancestor(
-        of: find.byTooltip(tooltip),
+        of: byTooltip(tooltip),
         matching: find.byType(IconButton),
       ),
     );
@@ -2112,7 +2113,7 @@ void main() {
     );
     expect(button(off).isSelected, isFalse);
     expect(button(off).style, isNull);
-    await tester.tap(find.byTooltip(off));
+    await tester.tap(byTooltip(off));
     expect(sent.last, const GuiIntentToggleConversationOnly());
 
     await pumpSession(
@@ -2124,7 +2125,7 @@ void main() {
     expect(button(on).isSelected, isTrue);
     expect(button(on).style, isNotNull, reason: 'filled while on');
     expect(find.byIcon(Icons.forum), findsOneWidget);
-    await tester.tap(find.byTooltip(on));
+    await tester.tap(byTooltip(on));
     expect(sent.last, const GuiIntentToggleConversationOnly());
   });
 
@@ -2146,7 +2147,7 @@ void main() {
     await tester.tap(find.byKey(const Key('status-usage')));
     expect(sent.last, info);
     sent.clear();
-    await tester.tap(find.byTooltip('More'));
+    await tester.tap(byTooltip('More'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Session info'));
     await tester.pumpAndSettle();
@@ -2166,7 +2167,7 @@ void main() {
         timeline: holding([]),
         sent: sent,
       );
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text(title));
       await tester.pumpAndSettle();
@@ -2196,17 +2197,17 @@ void main() {
     );
     expect(find.text('archived · a message brings it back'), findsOneWidget);
     expect(find.textContaining(r'$0.04'), findsOneWidget);
-    await tester.tap(find.byTooltip('Interrupt (Ctrl+X)'));
+    await tester.tap(byTooltip('Interrupt (Ctrl+X)'));
     expect(
       sent.last,
       const GuiIntentAct(action: ActionIntentInterrupt(sessionId: 's1')),
     );
-    await tester.tap(find.byTooltip('Workdir'));
+    await tester.tap(byTooltip('Workdir'));
     expect(
       sent.last,
       const GuiIntentAct(action: ActionIntentOpenWorkdir(sessionId: 's1')),
     );
-    await tester.tap(find.byTooltip('More'));
+    await tester.tap(byTooltip('More'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Rename'));
     await tester.pumpAndSettle();
@@ -2250,14 +2251,14 @@ void main() {
       expect(find.text('work'), findsOneWidget);
       expect(find.text('skywave'), findsOneWidget);
       expect(find.text('/home/me/skywave'), findsNothing);
-      expect(find.byTooltip('Interrupt (Ctrl+X)'), findsOneWidget);
-      expect(find.byTooltip('More'), findsOneWidget);
+      expect(byTooltip('Interrupt (Ctrl+X)'), findsOneWidget);
+      expect(byTooltip('More'), findsOneWidget);
       for (final tooltip in [
         'Workdir',
         'Search (Ctrl+F)',
         'Conversation only: hide tool calls',
       ]) {
-        expect(find.byTooltip(tooltip), findsNothing, reason: tooltip);
+        expect(byTooltip(tooltip), findsNothing, reason: tooltip);
       }
     });
 
@@ -2266,7 +2267,7 @@ void main() {
       final sent = <GuiIntent>[];
       await phone(tester, screenWith(), sent);
       Future<void> more() async {
-        await tester.tap(find.byTooltip('More'));
+        await tester.tap(byTooltip('More'));
         await tester.pumpAndSettle();
       }
 
@@ -2294,7 +2295,7 @@ void main() {
         ('Conversation only', const GuiIntentToggleConversationOnly()),
         ('Search', const GuiIntentSearchTyped(query: '')),
       ]) {
-        await tester.tap(find.byTooltip(label));
+        await tester.tap(byTooltip(label));
         await tester.pumpAndSettle();
         expect(sent.last, intent, reason: label);
         expect(find.byType(BottomSheet), findsNothing, reason: label);
@@ -2312,7 +2313,7 @@ void main() {
 
     testWidgets('the sheet shows conversation only as on', (tester) async {
       await phone(tester, screenWith(conversationOnly: true), <GuiIntent>[]);
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       final toggle = tester.widget<IconButton>(
         find.widgetWithIcon(IconButton, Icons.forum),
@@ -2330,7 +2331,7 @@ void main() {
         timeline: holding([]),
         sent: sent,
       );
-      await tester.tap(find.byTooltip('Permission mode'));
+      await tester.tap(byTooltip('Permission mode'));
       await tester.pumpAndSettle();
       expect(find.text('accept edits detail'), findsOneWidget);
       await tester.tap(find.text('plan'));
@@ -2346,7 +2347,7 @@ void main() {
       );
 
       sent.clear();
-      await tester.tap(find.byTooltip('Permission mode'));
+      await tester.tap(byTooltip('Permission mode'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('bypass'));
       await tester.pumpAndSettle();
@@ -2355,7 +2356,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(sent, isEmpty);
 
-      await tester.tap(find.byTooltip('Permission mode'));
+      await tester.tap(byTooltip('Permission mode'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('bypass'));
       await tester.pumpAndSettle();
@@ -2379,7 +2380,7 @@ void main() {
         timeline: holding([]),
         sent: sent,
       );
-      await tester.tap(find.byTooltip('Model'));
+      await tester.tap(byTooltip('Model'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Opus'));
       await tester.pumpAndSettle();
@@ -2390,7 +2391,7 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byTooltip('Model'));
+      await tester.tap(byTooltip('Model'));
       await tester.pumpAndSettle();
       await tester.enterText(
         find.descendant(
@@ -2419,7 +2420,7 @@ void main() {
         sent: sent,
       );
       expect(find.text('effort medium'), findsOneWidget);
-      await tester.tap(find.byTooltip('Effort'));
+      await tester.tap(byTooltip('Effort'));
       await tester.pumpAndSettle();
       expect(find.byType(AlertDialog), findsOneWidget);
       await tester.tap(find.text('high'));
@@ -2438,7 +2439,7 @@ void main() {
 
       // The level it runs at sends nothing.
       sent.clear();
-      await tester.tap(find.byTooltip('Effort'));
+      await tester.tap(byTooltip('Effort'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('medium'));
       await tester.pumpAndSettle();
@@ -2465,7 +2466,7 @@ void main() {
         sent: sent,
       );
       expect(find.text('no effort'), findsOneWidget);
-      await tester.tap(find.byTooltip('Effort'));
+      await tester.tap(byTooltip('Effort'));
       await tester.pumpAndSettle();
       expect(find.text('This model takes no effort level.'), findsOneWidget);
       expect(
@@ -2498,7 +2499,7 @@ void main() {
         sent: [],
       );
       expect(
-        find.byTooltip('effort max refused: not for this model'),
+        byTooltip('effort max refused: not for this model'),
         findsOne,
       );
       await tester.tap(find.text('effort medium'));
@@ -2532,9 +2533,9 @@ void main() {
         timeline: holding([]),
         sent: [],
       );
-      expect(find.byTooltip('Effort'), findsNothing, reason: 'folded');
+      expect(byTooltip('Effort'), findsNothing, reason: 'folded');
       expect(
-        find.byTooltip('effort max refused: not for this model'),
+        byTooltip('effort max refused: not for this model'),
         findsOne,
       );
     });
@@ -2562,7 +2563,7 @@ void main() {
       // No model named yet: the chip still opens the name field.
       expect(find.text('model unknown'), findsOneWidget);
       expect(find.bySemanticsLabel('Model: model unknown'), findsOneWidget);
-      expect(find.byTooltip('bypass refused: not launched for it'), findsOne);
+      expect(byTooltip('bypass refused: not launched for it'), findsOne);
       await tester.tap(find.text('ask'));
       await tester.pumpAndSettle();
       expect(find.text('bypass refused: not launched for it'), findsOneWidget);
@@ -2632,8 +2633,8 @@ void main() {
       );
       expect(tester.takeException(), isNull);
       // Too narrow for both labels: one chip lists them in full.
-      expect(find.byTooltip('Permission mode'), findsNothing);
-      await tester.tap(find.byTooltip('Agent settings'));
+      expect(byTooltip('Permission mode'), findsNothing);
+      await tester.tap(byTooltip('Agent settings'));
       await tester.pumpAndSettle();
       expect(find.text("accept edits → don't ask"), findsOneWidget);
       final sheet = find.byType(BottomSheet);
@@ -2679,7 +2680,7 @@ void main() {
       // The folded chip shows only the model; the sheet lists the rest.
       expect(find.text('unknown → claude-opus-5-5'), findsOneWidget);
       expect(find.text('mode unknown'), findsNothing);
-      await tester.tap(find.byTooltip('Agent settings'));
+      await tester.tap(byTooltip('Agent settings'));
       await tester.pumpAndSettle();
       final sheet = find.byType(BottomSheet);
       for (final label in [
@@ -2708,7 +2709,7 @@ void main() {
       );
       await tester.pump();
       expect(find.textContaining('working', findRichText: true), findsOne);
-      expect(find.byTooltip('agent working'), findsOneWidget);
+      expect(byTooltip('agent working'), findsOneWidget);
       expect(find.text('/home/me/skywave'), findsOneWidget);
     });
 
@@ -2728,7 +2729,7 @@ void main() {
       const left = (1600 - timelineMaxWidth) / 2;
       const right = left + timelineMaxWidth;
       final back = tester.getRect(find.byType(BackButton));
-      final more = tester.getRect(find.byTooltip('More'));
+      final more = tester.getRect(byTooltip('More'));
       final status = tester.getRect(find.byType(StatusLine));
       final composer = tester.getRect(find.byType(Composer));
       expect(back.left, greaterThanOrEqualTo(left));
@@ -2749,7 +2750,7 @@ void main() {
       for (final tooltip in ['Permission mode', 'Model', 'Effort']) {
         final size = tester.getSize(
           find.descendant(
-            of: find.byTooltip(tooltip),
+            of: byTooltip(tooltip),
             matching: find.byType(InkWell),
           ),
         );
@@ -2813,7 +2814,7 @@ void main() {
         ('More', true),
       ]) {
         expect(
-          tester.getSemantics(find.byTooltip(tooltip)),
+          tester.getSemantics(byTooltip(tooltip)),
           matchesSemantics(
             tooltip: tooltip,
             isButton: true,
@@ -2878,7 +2879,7 @@ void main() {
         timeline: holding([]),
         sent: sent,
       );
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       return sent;
     }
@@ -2904,7 +2905,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(sent.whereType<GuiIntentAct>(), isEmpty);
 
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Stop agent'));
       await tester.pumpAndSettle();
@@ -2915,7 +2916,7 @@ void main() {
       ]);
 
       sent.clear();
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('New context'));
       await tester.pumpAndSettle();
@@ -3037,7 +3038,7 @@ void main() {
       ]);
 
       sent.clear();
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Contexts…'));
       await tester.pumpAndSettle();
@@ -3165,7 +3166,7 @@ void main() {
         timeline: holding([]),
         sent: sent,
       );
-      await tester.tap(find.byTooltip('More'));
+      await tester.tap(byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Background work'));
       await tester.pumpAndSettle();
@@ -3214,7 +3215,7 @@ void main() {
       expect(find.text('to the main agent'), findsOneWidget);
 
       sent.clear();
-      await tester.tap(find.byTooltip('Stop this subagent'));
+      await tester.tap(byTooltip('Stop this subagent'));
       await tester.pumpAndSettle();
       expect(find.text('Stop this subagent?'), findsOneWidget);
       expect(sent, isEmpty);
@@ -3235,7 +3236,7 @@ void main() {
         sent: [],
       );
       expect(find.text('Explore sync'), findsOneWidget);
-      expect(find.byTooltip('Stop this subagent'), findsNothing);
+      expect(byTooltip('Stop this subagent'), findsNothing);
     });
   });
 }
