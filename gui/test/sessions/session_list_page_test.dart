@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/rendering.dart';
+import 'package:skywave_gui/session/look.dart' show agentIcon;
 import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/sessions/session_row.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -552,14 +553,17 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('a row shows a state dot, two title lines and the folder '
+    testWidgets('a row shows a state icon, two title lines and the folder '
         'name, with nothing clipped', (tester) async {
       final semantics = tester.ensureSemantics();
       // Wider than the title's room on a phone, not twice as wide.
       const long = 'too long for one';
       await phone(tester, list(rows: [sessionRow('a', title: long)]));
       expect(tester.takeException(), isNull);
-      expect(find.byKey(const Key('row-state-a')), findsOneWidget);
+      expect(
+        tester.widget<Icon>(find.byKey(const Key('row-state-a'))).icon,
+        agentIcon(AgentState.awaitingApproval),
+      );
       expect(find.byType(StateBadge), findsNothing);
       expect(find.text('approval'), findsNothing);
       expect(rowText('proj-a'), findsOneWidget);
