@@ -986,11 +986,13 @@ logs) an event that no longer decodes rather than failing.
   schema migration backfills them from the stored events. The worktree stays
   recorded after removal, so grouping holds. `Action::CreateSession` takes a
   `worktree`; `Action::RemoveWorktree` enqueues only for a session that has
-  one. The timeline shows `WorktreeRemoved`. Heads group the list by repo
+  one; heads offer it for any such session that is not removed, archived or
+  not. The timeline shows `WorktreeRemoved`. Heads group the list by repo
   (`skywave_present::session_list::by_repo`) with this key: the session's
   own worktree's repo; else the repo of a worktree session in the same
   workdir (a plain session started in a worktree joins its repo); else the
-  workdir. A plain create makes no git call. The TUI has no worktree UI yet.
+  workdir. A plain create makes no git call. The worktrees screen (below)
+  lists them; the TUI has no worktree UI yet.
 - **Sync engine** (D7): the pull loop long-polls from the cursor and applies
   each batch and the new cursor in one transaction. The outbox sends oldest
   first, one command in flight, so the server sees commands in the order
@@ -1355,6 +1357,20 @@ logs) an event that no longer decodes rather than failing.
   device's delete pulled while the screen is open, or this device's own
   settled in the log before the refresh it asked for answers. The fate
   decides the row; nothing asks the server again for it.
+- **Worktrees screen** (`Route::Worktrees`, D52): opening it asks
+  `GET /v1/worktrees` within `WORKTREES_TIMEOUT` (20 s), and
+  `RefreshWorktrees` asks again, as does this device's own `RemoveWorktree`
+  settling accepted while the screen is open (by its reply or, the reply
+  lost, by the log). Offline nothing is asked. `WorktreesView.status` is
+  `Loading`, `Ready` or `Unavailable(Offline | Failed)`. The list stays
+  during a refresh and after a failed one; `list` is the latest answer.
+  `sessions` maps each listed worktree's path to the sessions whose workdir
+  is that path, latest message first, each with its title, `archived`,
+  `worktree` (made in a skywave worktree), `worktree_removed` and the
+  delivery state of its latest `RemoveWorktree` (`removal`). A listed
+  worktree no session runs in has no key. Nothing is stored: opening the
+  screen drops the last list and asks again. `skywave_present::worktrees`
+  words it for both heads.
 - **Server addresses page** (`Route::ServerAddresses`,
   `Screen::ServerAddresses(ServerAddressesView)`): the address in use and
   the server's other addresses (see Pairing), from the replica's settings.

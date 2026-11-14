@@ -81,8 +81,10 @@ stays on the device, so you can still read it offline.
 ### 🌿 Parallel sessions on one repo
 Give a new session a branch name and it runs in its own git worktree on that
 branch, so several sessions can work one repo at once. The list groups them
-under their repo. Once an archived session's branch is merged, remove its
-worktree from the session's menu in the GUI.
+under their repo. The GUI's Worktrees page lists every worktree of those
+repos, with its branch, uncommitted changes and merge state. Once a session's
+branch is merged, remove its worktree from the session's menu or from that
+page.
 
 ### 📡 You always know where you stand
 The link's state is always one glance away: `Connecting…`, `Syncing · 4/9`
