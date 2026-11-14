@@ -302,7 +302,8 @@ impl Api {
                 blobs.clone(),
                 log.roots().to_vec(),
             )
-            .with_git(options.git),
+            .with_git(options.git)
+            .with_download_max(options.download_max),
             storage: StorageReader::new(Db::open(&dir.db_path())?, dir.clone(), options.log_file),
             // A `DeleteBlob` removes the file from the store served here
             // (a `CropBlob` its own preparation's, the same store).

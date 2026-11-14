@@ -64,7 +64,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::identity::ServerIdentity;
 use crate::login::LOGIN_FLOW_MAX;
 use crate::pairing::{self, PairService, RateLimit, SystemClock};
-use crate::workdir::Git;
+use crate::workdir::{DEFAULT_DOWNLOAD_MAX, Git};
 
 mod limits;
 
@@ -124,6 +124,8 @@ pub struct ServerOptions {
     /// login start waits for another's; tests know a resend joined from
     /// it. `None` in the daemon.
     pub joined_hook: Option<JoinedHook>,
+    /// Largest workdir file a download serves (`[files] download_max`).
+    pub download_max: u64,
 }
 
 /// [`ServerOptions::joined_hook`].
@@ -146,6 +148,7 @@ impl Default for ServerOptions {
             crop_deadline: CROP_DEADLINE,
             crop_hook: None,
             joined_hook: None,
+            download_max: DEFAULT_DOWNLOAD_MAX,
         }
     }
 }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer};
 use crate::disk::DEFAULT_MIN_FREE;
 use crate::error::{Error, IoContext, Result};
 use crate::shell::{DEFAULT_OUTPUT_MAX, DEFAULT_PROGRAM, ShellConfig};
+use crate::workdir::DEFAULT_DOWNLOAD_MAX;
 
 /// Default `listen` address.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
@@ -38,6 +39,8 @@ pub struct Config {
     pub shell: ShellConfig,
     /// The data dir's disk (`[disk]`).
     pub disk: DiskConfig,
+    /// Files moving between devices and the server (`[files]`).
+    pub files: FilesConfig,
 }
 
 /// How much of the data dir's disk the daemon keeps free ([`crate::disk`]).
@@ -53,6 +56,21 @@ impl Default for DiskConfig {
     fn default() -> Self {
         DiskConfig {
             min_free: DEFAULT_MIN_FREE,
+        }
+    }
+}
+
+/// Files moving between devices and the server (`[files]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilesConfig {
+    /// Largest workdir file `GET /v1/workdir/download` serves, in bytes (D54).
+    pub download_max: u64,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        FilesConfig {
+            download_max: DEFAULT_DOWNLOAD_MAX,
         }
     }
 }
@@ -85,6 +103,8 @@ struct RawConfig {
     shell: RawShell,
     #[serde(default)]
     disk: RawDisk,
+    #[serde(default)]
+    files: RawFiles,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -92,6 +112,13 @@ struct RawConfig {
 struct RawDisk {
     #[serde(default, deserialize_with = "size")]
     min_free: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFiles {
+    #[serde(default, deserialize_with = "size")]
+    download_max: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -285,6 +312,9 @@ impl Config {
             disk: DiskConfig {
                 min_free: raw.disk.min_free.unwrap_or(DEFAULT_MIN_FREE),
             },
+            files: FilesConfig {
+                download_max: raw.files.download_max.unwrap_or(DEFAULT_DOWNLOAD_MAX),
+            },
         })
     }
 }
@@ -402,6 +432,31 @@ mod tests {
             512 << 20
         );
         for bad in ["[disk]\nmin_free = \"1GB\"", "[disk]\nfloor = 1"] {
+            assert!(
+                matches!(parse(bad), Err(Error::ConfigParse { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_download_cap_takes_a_size() {
+        let parse = |text: &str| Config::parse(text, Path::new("/c.toml"), &env(&[("HOME", "/h")]));
+        assert_eq!(
+            parse("[files]\ndownload_max = \"256 MiB\"")
+                .unwrap()
+                .files
+                .download_max,
+            256 << 20
+        );
+        assert_eq!(
+            parse("[files]\ndownload_max = 1000")
+                .unwrap()
+                .files
+                .download_max,
+            1000
+        );
+        for bad in ["[files]\ndownload_max = \"1GB\"", "[files]\nupload = 1"] {
             assert!(
                 matches!(parse(bad), Err(Error::ConfigParse { .. })),
                 "{bad}"
@@ -538,6 +593,7 @@ mod tests {
         assert_eq!(c.shell.rc, None);
         assert_eq!(c.shell.output_max, 64 << 20);
         assert_eq!(c.disk.min_free, 1 << 30);
+        assert_eq!(c.files.download_max, 64 << 20);
     }
 
     #[test]

@@ -1441,7 +1441,7 @@ or the banner). **Rejected:** a modal dialog, and scored matching.
 ## D54. Repository files download as workdir blobs
 A head saves any workdir file through `GET /v1/workdir/download` (v36). It
 answers a `FileResult` like `file`, but serves binary content too and has
-its own cap (64 MiB by default, server config). The bytes travel as a
+its own cap (`[files] download_max`, 64 MiB by default). The bytes travel as a
 workdir blob over `GET /v1/blobs/{id}`, so a download resumes, is
 hash-checked and compressed like every blob, and no second transport
 exists. A download is not fetched on open; the head asks for it. Its
