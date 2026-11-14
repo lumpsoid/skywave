@@ -112,6 +112,11 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         },
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
+        // No GUI worktrees screen yet: nothing navigates to it.
+        Screen::Worktrees(_) => ScreenView::ServerAddresses {
+            current: String::new(),
+            others: Vec::new(),
+        },
         Screen::UsageLimits(view) => ScreenView::UsageLimits {
             limits: limits_view(view, ui.wall_ms),
         },

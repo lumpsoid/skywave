@@ -14,7 +14,7 @@ use skywave_proto::limits::{ATTACHMENTS_MAX, ATTACHMENTS_MAX_TOTAL_BYTES};
 use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ContentHash, ConversationsResult,
     DeviceInfo, DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem,
-    LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RuleSuggestion,
+    LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RepoListing, RuleSuggestion,
     SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, WorktreeList,
     answers_fit,
 };
@@ -55,7 +55,7 @@ use crate::view::{
     ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
     SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
     UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
-    WorkdirView,
+    WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -121,6 +121,7 @@ enum Place {
     Pairing,
     Usage,
     Storage,
+    Worktrees,
     /// The usage limits page, opened from the session on screen, if any:
     /// back returns there.
     UsageLimits(Option<SessionId>),
@@ -235,6 +236,7 @@ impl From<Route> for Place {
             Route::Pairing => Place::Pairing,
             Route::Usage => Place::Usage,
             Route::Storage => Place::Storage,
+            Route::Worktrees => Place::Worktrees,
             Route::UsageLimits => Place::UsageLimits(None),
         }
     }
@@ -697,6 +699,17 @@ impl Model {
                 }
                 let online = self.online();
                 self.storage
+                    .refresh(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::RefreshWorktrees => {
+                if self.device().is_none() || self.place != Place::Worktrees {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.worktrees
                     .refresh(online)
                     .map(Effect::Request)
                     .into_iter()
@@ -1187,6 +1200,7 @@ impl Model {
                 let online = self.online();
                 let asked = match self.place {
                     Place::Storage => self.storage.open(online),
+                    Place::Worktrees => self.worktrees.open(online),
                     Place::UsageLimits(_) => self.usage_limits.open(online),
                     _ => None,
                 };
@@ -1253,9 +1267,12 @@ impl Model {
         self.device()?;
         let route = match &self.place {
             Place::SessionList(_) => return None,
-            Place::Archived | Place::Settings | Place::Pairing | Place::Usage | Place::Storage => {
-                Route::SessionList
-            }
+            Place::Archived
+            | Place::Settings
+            | Place::Pairing
+            | Place::Usage
+            | Place::Storage
+            | Place::Worktrees => Route::SessionList,
             Place::ServerAddresses => Route::Settings,
             Place::UsageLimits(from) => {
                 return Some(match from.filter(|id| self.summary(*id).is_some()) {
@@ -2070,7 +2087,9 @@ impl Model {
     ///
     /// A delete or crop of a blob this settles as accepted changed what the
     /// server stores, so an open storage screen asks for its report again;
-    /// that holds whether the reply or the log settled it.
+    /// a `RemoveWorktree` settled as accepted changes the worktree list, so
+    /// an open worktrees screen asks for it again. That holds whether the
+    /// reply or the log settled it.
     pub(crate) fn command_result(
         &mut self,
         id: CommandId,
@@ -2078,17 +2097,22 @@ impl Model {
         now: DateTime<Utc>,
     ) -> Option<Request> {
         let entry = self.outbox_entry(id).filter(|e| !e.status.is_settled())?;
-        let frees = matches!(
-            entry.command.kind,
-            CommandKind::DeleteBlob { .. } | CommandKind::CropBlob { .. }
-        ) && matches!(result, CommandResult::Accepted { .. });
+        let accepted = matches!(result, CommandResult::Accepted { .. });
+        let frees = accepted
+            && matches!(
+                entry.command.kind,
+                CommandKind::DeleteBlob { .. } | CommandKind::CropBlob { .. }
+            );
+        let removes = accepted && matches!(entry.command.kind, CommandKind::RemoveWorktree { .. });
         entry.status = OutboxStatus::Done(result);
         entry.answered_at = Some(now);
-        if !frees || self.place != Place::Storage || self.device().is_none() {
-            return None;
-        }
         let online = self.online();
-        self.storage.refresh(online)
+        let paired = self.device().is_some();
+        match self.place {
+            Place::Storage if frees && paired => self.storage.refresh(online),
+            Place::Worktrees if removes && paired => self.worktrees.refresh(online),
+            _ => None,
+        }
     }
 
     /// Mirrors [`Store::record_undeliverable`](crate::Store::record_undeliverable).
@@ -2462,6 +2486,7 @@ impl Model {
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived, None)),
             Place::Usage => Screen::Usage(self.usage_view()),
             Place::Storage => Screen::Storage(self.storage_view()),
+            Place::Worktrees => Screen::Worktrees(self.worktrees_view()),
             Place::UsageLimits(_) => Screen::UsageLimits(self.usage_limits.view()),
             Place::Session { id, open, scope } => {
                 match self.session_view(*id, open.as_ref(), *scope) {
@@ -2784,6 +2809,44 @@ impl Model {
             titles,
             pending: self.blob_pendings(),
             gone,
+        }
+    }
+
+    fn worktrees_view(&self) -> WorktreesView {
+        let (status, list) = self.worktrees.shown();
+        let paths = list
+            .iter()
+            .flat_map(|list| &list.repos)
+            .filter_map(|repo| match &repo.listing {
+                RepoListing::Worktrees { worktrees, .. } => Some(worktrees),
+                RepoListing::Gone | RepoListing::Failed { .. } => None,
+            })
+            .flatten()
+            .map(|entry| entry.path.as_str());
+        let sessions: HashMap<String, Vec<WorktreeSession>> = paths
+            .filter_map(|path| {
+                let running: Vec<WorktreeSession> = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.workdir.as_deref() == Some(path))
+                    .map(|s| WorktreeSession {
+                        id: s.id,
+                        title: self.title(s).text,
+                        archived: self.archived(s),
+                        worktree: s.worktree.is_some(),
+                        worktree_removed: s.worktree_removed,
+                        removal: self.latest_outgoing(|kind| {
+                            matches!(kind, CommandKind::RemoveWorktree { session_id } if *session_id == s.id)
+                        }),
+                    })
+                    .collect();
+                (!running.is_empty()).then(|| (path.to_owned(), running))
+            })
+            .collect();
+        WorktreesView {
+            status,
+            list,
+            sessions,
         }
     }
 
@@ -4587,6 +4650,7 @@ mod tests {
     use super::*;
     use crate::view::{
         CandidateSource, Completion, CompletionStatus, FailReason, LinkRejection, Refusal,
+        WorktreesStatus, WorktreesUnavailable,
     };
 
     /// Paired as `device` at `srv:7443` with a server CA whose DER is
@@ -10412,6 +10476,184 @@ mod tests {
         assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
     }
 
+    fn worktrees_view(f: &Fixture) -> WorktreesView {
+        match f.model.view().screen {
+            Screen::Worktrees(view) => view,
+            other => panic!("expected the worktrees screen, got {other:?}"),
+        }
+    }
+
+    fn worktrees_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::Worktrees { req })] => Some(*req),
+            other => panic!("expected a worktrees request, got {other:?}"),
+        }
+    }
+
+    /// One repository, `/srv/app`, whose worktrees are at `paths`.
+    fn worktree_list(paths: &[&str]) -> skywave_proto::WorktreeList {
+        skywave_proto::WorktreeList {
+            at: Utc::now(),
+            repos: vec![skywave_proto::RepoWorktrees {
+                repo: "/srv/app".into(),
+                listing: skywave_proto::RepoListing::Worktrees {
+                    worktrees: paths
+                        .iter()
+                        .map(|path| skywave_proto::WorktreeEntry {
+                            path: (*path).into(),
+                            branch: Some("feat/x".into()),
+                            head: None,
+                            main: false,
+                            missing: false,
+                            dirty: Some(false),
+                            merged: true,
+                        })
+                        .collect(),
+                    more: false,
+                },
+            }],
+        }
+    }
+
+    /// A session created in a skywave worktree of `/srv/app`, in `workdir`.
+    fn created_in_worktree(workdir: &str) -> EventKind {
+        EventKind::SessionCreated {
+            workdir: workdir.into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: Some(skywave_proto::Worktree {
+                repo: "/srv/app".into(),
+                branch: "feat/x".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_worktrees_screen_asks_on_opening_and_on_refresh() {
+        let mut f = Fixture::paired();
+        assert_eq!(worktrees_req(&f.dispatch(Action::RefreshWorktrees)), None);
+
+        let first = worktrees_req(&f.dispatch(Action::Navigate(Route::Worktrees))).unwrap();
+        let view = worktrees_view(&f);
+        assert_eq!(view.status, WorktreesStatus::Loading);
+        assert_eq!(view.list, None);
+        let list = worktree_list(&["/srv/app-a"]);
+        f.model.worktrees_listed(first, Ok(list.clone()));
+        let view = worktrees_view(&f);
+        assert_eq!(view.status, WorktreesStatus::Ready);
+        assert_eq!(view.list, Some(list.clone()));
+
+        // A refresh keeps the list until its answer, and a failure keeps it.
+        let second = worktrees_req(&f.dispatch(Action::RefreshWorktrees)).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(worktrees_view(&f).status, WorktreesStatus::Loading);
+        assert_eq!(worktrees_view(&f).list, Some(list.clone()));
+        f.model
+            .worktrees_listed(second, Err(TransportError::BadStatus(503)));
+        let view = worktrees_view(&f);
+        assert_eq!(
+            view.status,
+            WorktreesStatus::Unavailable(WorktreesUnavailable::Failed(
+                TransportError::BadStatus(503).to_string()
+            ))
+        );
+        assert_eq!(view.list, Some(list));
+
+        // Offline nothing is asked.
+        f.model.set_link(PairedLink::Reconnecting {
+            attempt: 1,
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
+        });
+        assert_eq!(worktrees_req(&f.dispatch(Action::RefreshWorktrees)), None);
+        assert_eq!(
+            worktrees_view(&f).status,
+            WorktreesStatus::Unavailable(WorktreesUnavailable::Offline)
+        );
+
+        // Elsewhere a refresh asks nothing.
+        f.model.set_link(PairedLink::Online { latency_ms: 5 });
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(worktrees_req(&f.dispatch(Action::RefreshWorktrees)), None);
+    }
+
+    #[test]
+    fn the_worktrees_screen_names_the_sessions_in_each_worktree() {
+        let mut f = Fixture::paired();
+        let (p, q) = ("/srv/app-a", "/srv/app-b");
+        let a = SessionId::new();
+        f.log(a, vec![created_in_worktree(p)]);
+        let b = SessionId::new();
+        f.log(b, vec![created_in_worktree(p)]);
+        queued(&f.dispatch(archive(b, true)));
+        let c = f.session("/srv/other");
+
+        let first = worktrees_req(&f.dispatch(Action::Navigate(Route::Worktrees))).unwrap();
+        f.model.worktrees_listed(first, Ok(worktree_list(&[p, q])));
+        let view = worktrees_view(&f);
+        // The replica's order: most recently active first, so B (logged
+        // after A) leads.
+        let running = &view.sessions[p];
+        let ids: Vec<SessionId> = running.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![b, a]);
+        assert!(running[0].archived);
+        assert!(!running[1].archived && running[1].worktree && !running[1].worktree_removed);
+        assert!(!view.sessions.contains_key(q));
+        assert!(view.sessions.values().flatten().all(|s| s.id != c));
+
+        // Removing it shows as queued on its row, and nowhere else.
+        let remove = queued(&f.dispatch(Action::RemoveWorktree { session_id: a }));
+        assert_eq!(remove.kind, CommandKind::RemoveWorktree { session_id: a });
+        let view = worktrees_view(&f);
+        assert_eq!(view.sessions[p][0].removal, None);
+        assert_eq!(view.sessions[p][1].removal, Some(Outgoing::Queued));
+
+        // Its title is the one the session list shows.
+        let title = view.sessions[p][1].title.clone();
+        f.dispatch(Action::Back);
+        let row = f
+            .list_view()
+            .sessions
+            .into_iter()
+            .find(|r| r.id == a)
+            .unwrap();
+        assert_eq!(title, row.title);
+    }
+
+    #[test]
+    fn an_accepted_remove_worktree_refreshes_an_open_worktrees_screen() {
+        let mut f = Fixture::paired();
+        let a = SessionId::new();
+        f.log(a, vec![created_in_worktree("/srv/app-a")]);
+        let first = worktrees_req(&f.dispatch(Action::Navigate(Route::Worktrees))).unwrap();
+
+        // A refusal changed nothing on the server.
+        let refused = queued(&f.dispatch(Action::RemoveWorktree { session_id: a }));
+        let rejected = CommandResult::Rejected {
+            reason: RejectReason::ShellRunning,
+        };
+        assert_eq!(
+            f.model.command_result(refused.id, rejected, Utc::now()),
+            None
+        );
+
+        let removed = queued(&f.dispatch(Action::RemoveWorktree { session_id: a }));
+        let Some(Request::Worktrees { req }) = accept(&mut f, removed.id, 5) else {
+            panic!("expected a worktrees request");
+        };
+        assert_ne!(req, first);
+        assert_eq!(worktrees_view(&f).status, WorktreesStatus::Loading);
+        // Only the first answer counts.
+        assert_eq!(accept(&mut f, removed.id, 5), None);
+
+        // Closed, nothing is asked.
+        f.dispatch(Action::Navigate(Route::Settings));
+        let closed = queued(&f.dispatch(Action::RemoveWorktree { session_id: a }));
+        assert_eq!(accept(&mut f, closed.id, 6), None);
+    }
+
     fn usage_limits_view(f: &Fixture) -> crate::view::UsageLimitsView {
         match f.model.view().screen {
             Screen::UsageLimits(view) => view,
@@ -11078,6 +11320,7 @@ mod tests {
             Screen::ServerAddresses(_) => "server addresses",
             Screen::Usage(_) => "usage",
             Screen::Storage(_) => "storage",
+            Screen::Worktrees(_) => "worktrees",
             Screen::UsageLimits(_) => "usage limits",
             Screen::SessionInfo(_) => "session info",
             Screen::Workdir(_) => "workdir",
@@ -11129,6 +11372,7 @@ mod tests {
         );
         assert_back(&mut f, nav(Route::Usage), "usage", "active list");
         assert_back(&mut f, nav(Route::Storage), "storage", "active list");
+        assert_back(&mut f, nav(Route::Worktrees), "worktrees", "active list");
         // Re-pairing a paired device can be cancelled.
         assert_back(&mut f, nav(Route::Pairing), "pairing", "active list");
         // A session goes back to the list it is on.
