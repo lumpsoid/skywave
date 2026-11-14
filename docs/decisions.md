@@ -1402,6 +1402,8 @@ leftover row's worktree and branch, but only while git still matches the row
 its start). It keeps a branch it cannot prove it made, and a branch someone
 committed on.
 
+**Update (D52, 2026-11-15):** a worktrees page lists every worktree of the repos that sessions' worktrees came from (`GET /v1/worktrees`, read when asked, recorded nowhere; still no repo column) with the sessions in each, and Remove worktree is offered for any session in a skywave worktree, archived or not (user decision, 2026-11-14); the server's refusals are unchanged and archiving still never removes. **Rejected:** removing a worktree no session runs in (`RemoveWorktree` is per session; such worktrees are listed read-only).
+
 ## D53. Shell history: every session's commands, picked like fzf
 A device keeps one shell history across all its sessions: every command
 logged in any session (`ShellRequested`), newest first, each command once

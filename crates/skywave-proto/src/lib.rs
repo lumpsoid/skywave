@@ -3017,7 +3017,8 @@ pub enum RepoListing {
         /// More worktrees exist past `worktrees`.
         more: bool,
     },
-    /// The repository's directory no longer exists.
+    /// The repository's directory no longer exists, or is not its own top level
+    /// (its `.git` is gone).
     Gone,
     /// git is missing or exited unexpectedly; `reason` is bounded text.
     Failed { reason: String },
