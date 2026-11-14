@@ -635,6 +635,23 @@ pub struct WorkdirView {
     /// This pane's read (a diff's is the changes').
     pub fetch: WorkdirFetch,
     pub body: WorkdirBody,
+    /// The files of the session asked for download
+    /// ([`Action::DownloadWorkdirFile`](crate::Action::DownloadWorkdirFile))
+    /// that are stored, in flight or failed, sorted by path.
+    pub downloads: Vec<WorkdirDownload>,
+}
+
+/// A file of the workdir asked for download ([`Action::DownloadWorkdirFile`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkdirDownload {
+    pub path: String,
+    /// The read of the download ask: loading, failed, or idle.
+    pub fetch: WorkdirFetch,
+    /// The server's answer, once stored (`FileBody::TooLarge` = over the cap).
+    pub result: Option<FileResult>,
+    /// The content, when the answer carries a blob: its progress, and
+    /// `BlobState::Available { path }` once it is on the device.
+    pub blob: Option<BlobView>,
 }
 
 /// The state of the read a workdir pane shows.

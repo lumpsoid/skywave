@@ -99,8 +99,8 @@ pub use view::{
     SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellEnd,
     ShellRun, ShellRunState, ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
     SubagentUsage, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView,
-    TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirFetch, WorkdirPane,
-    WorkdirView,
+    TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload, WorkdirFetch,
+    WorkdirPane, WorkdirView,
 };
 pub use view::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,

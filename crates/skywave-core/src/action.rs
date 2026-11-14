@@ -383,6 +383,15 @@ pub enum Action {
     /// Read again what the workdir pane on screen shows (a diff: the
     /// changes). Offline it fails at once, and is not queued.
     RefreshWorkdir,
+    /// Download a file of the session's workdir, whatever pane is on screen:
+    /// the server is asked for the file as it is now, unless that download is
+    /// already in flight (then nothing is asked). Once the answer carries the
+    /// content as a blob, the blob is downloaded whatever is on screen. A no-op
+    /// for an unknown session. Its state is [`WorkdirView::downloads`](crate::WorkdirView::downloads).
+    DownloadWorkdirFile {
+        session_id: SessionId,
+        path: String,
+    },
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
     /// Delete a blob from the server and from every device. Queued in the
