@@ -4031,10 +4031,43 @@ async fn worktrees_lists_a_sessions_worktree_with_its_status() {
     let [main, linked] = worktrees.as_slice() else {
         panic!("{worktrees:?}");
     };
-    assert!(main.main && main.merged && !main.dirty, "{main:?}");
-    assert!(!linked.main && linked.merged && !linked.dirty, "{linked:?}");
+    assert!(
+        main.main && main.merged && main.dirty == Some(false),
+        "{main:?}"
+    );
+    assert!(
+        !linked.main && linked.merged && linked.dirty == Some(false),
+        "{linked:?}"
+    );
     assert_eq!(linked.branch.as_deref(), Some("feat/x"));
     assert!(!linked.missing, "{linked:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrees_answers_gone_for_a_deleted_repo() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    make_repo(&f.root.join("project"));
+    let accepted = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted, CommandResult::Accepted { seq: Seq(1) });
+
+    // Positive control: listed while the repository is there.
+    let reply = device.get(path::WORKTREES).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let list = reply.json::<WorktreeList>();
+    assert!(
+        matches!(list.repos[0].listing, RepoListing::Worktrees { .. }),
+        "{list:?}"
+    );
+
+    std::fs::remove_dir_all(f.root.join("project.worktrees/feat-x")).unwrap();
+    std::fs::remove_dir_all(f.root.join("project")).unwrap();
+    let reply = device.get(path::WORKTREES).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let list = reply.json::<WorktreeList>();
+    assert_eq!(list.repos.len(), 1, "{list:?}");
+    assert_eq!(list.repos[0].listing, RepoListing::Gone, "{list:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

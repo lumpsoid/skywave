@@ -1192,7 +1192,7 @@ fn all_worktree_lists() -> Vec<WorktreeList> {
         head: Some("e3c8849a1f0b2c7d6e5f4a3b2c1d0e9f8a7b6c5d".into()),
         main: true,
         missing: false,
-        dirty: false,
+        dirty: Some(false),
         merged: true,
     };
     let linked = WorktreeEntry {
@@ -1201,7 +1201,7 @@ fn all_worktree_lists() -> Vec<WorktreeList> {
         head: Some("1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c".into()),
         main: false,
         missing: false,
-        dirty: true,
+        dirty: Some(true),
         merged: false,
     };
     let detached = WorktreeEntry {
@@ -1210,7 +1210,7 @@ fn all_worktree_lists() -> Vec<WorktreeList> {
         head: None,
         main: false,
         missing: true,
-        dirty: false,
+        dirty: None,
         merged: false,
     };
     vec![
