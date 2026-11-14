@@ -2230,6 +2230,11 @@ impl App {
                 KeyCode::Esc => Some(Action::Back),
                 _ => None,
             },
+            Screen::Worktrees(_) => match key.code {
+                KeyCode::Char('q') => self.quit(),
+                KeyCode::Esc => Some(Action::Back),
+                _ => None,
+            },
             Screen::SessionInfo(_) => {
                 let info = &mut self.ui.info;
                 match key.code {

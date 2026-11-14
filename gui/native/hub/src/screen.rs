@@ -9,7 +9,8 @@ use skywave_core::{
     LoginFlowView, LoginOutcome, LoginView, Outgoing, PairingStatus, PairingView, PendingSession,
     PermissionMode, QuestionPrompt, RuleSuggestion, Screen, SessionId, SessionInfoView,
     SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet, StorageView,
-    SubagentHeader, TimelineItem, UsageLimitsView, UsageView, ViewState,
+    SubagentHeader, TimelineItem, UsageLimitsView, UsageView, ViewState, WorktreeSession,
+    WorktreesView,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -33,6 +34,8 @@ use skywave_present::session_info;
 use skywave_present::session_list::by_repo;
 use skywave_present::storage::{self, Grouping as StorageGrouping};
 use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
+use skywave_present::worktrees;
+use skywave_proto::{RepoListing, RepoWorktrees, WorktreeEntry};
 
 use crate::link::count;
 use crate::signals::{
@@ -44,7 +47,8 @@ use crate::signals::{
     QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
     SessionRowView, SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
     StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView,
-    UsageGroupingView, UsageRowView, UsageSpanView,
+    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRepoView, WorktreeSessionView,
+    WorktreeView,
 };
 use skywave_present::text::{clean, clean_line};
 
@@ -112,6 +116,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         },
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
+        Screen::Worktrees(view) => worktrees_view(view),
         Screen::UsageLimits(view) => ScreenView::UsageLimits {
             limits: limits_view(view, ui.wall_ms),
         },
@@ -286,7 +291,7 @@ fn row_view(row: &SessionRow, archived: bool, group: &str) -> SessionRowView {
         deletable: row.deletable,
         delete_blocked_label: (archived && !row.deletable)
             .then(|| format!("cannot delete {title} yet: answer or cancel first")),
-        removable: archived && row.worktree.is_some() && !row.worktree_removed,
+        removable: row.worktree.is_some() && !row.worktree_removed,
         worktree_removed: row.worktree_removed,
         archived,
         title,
@@ -1042,6 +1047,64 @@ fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
         empty_label: (rows.is_empty() && view.report.is_some())
             .then(|| grouping.empty_label().to_owned()),
         rows,
+    }
+}
+
+/// The worktrees screen: each repository's worktrees, with the sessions
+/// running in each.
+fn worktrees_view(view: &WorktreesView) -> ScreenView {
+    ScreenView::Worktrees {
+        status_label: worktrees::status_line(view),
+        repos: view
+            .list
+            .iter()
+            .flat_map(|list| &list.repos)
+            .map(|repo| worktree_repo_view(view, repo))
+            .collect(),
+        empty_label: worktrees::empty_label(view),
+    }
+}
+
+fn worktree_repo_view(view: &WorktreesView, repo: &RepoWorktrees) -> WorktreeRepoView {
+    let entries = match &repo.listing {
+        RepoListing::Worktrees {
+            worktrees: listed, ..
+        } => listed
+            .iter()
+            .map(|entry| worktree_view(view, entry))
+            .collect(),
+        RepoListing::Gone | RepoListing::Failed { .. } => Vec::new(),
+    };
+    WorktreeRepoView {
+        repo: clean_line(&repo.repo),
+        note: worktrees::listing_note(&repo.listing).map(|note| clean_line(&note)),
+        worktrees: entries,
+    }
+}
+
+fn worktree_view(view: &WorktreesView, entry: &WorktreeEntry) -> WorktreeView {
+    WorktreeView {
+        path: clean_line(&entry.path),
+        branch: clean_line(&worktrees::branch_label(entry)),
+        tags: worktrees::tags(entry),
+        sessions: view
+            .sessions
+            .get(&entry.path)
+            .into_iter()
+            .flatten()
+            .map(worktree_session_view)
+            .collect(),
+    }
+}
+
+fn worktree_session_view(session: &WorktreeSession) -> WorktreeSessionView {
+    WorktreeSessionView {
+        session_id: session.id.0.to_string(),
+        title: clean_line(&session.title),
+        archived: session.archived,
+        removable: session.worktree && !session.worktree_removed,
+        worktree_removed: session.worktree_removed,
+        removal_label: worktrees::removal_label(session.removal.as_ref()),
     }
 }
 

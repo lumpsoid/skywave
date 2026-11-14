@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/approval_panel.dart' show approvalDockWidth;
 import 'package:skywave_gui/session/look.dart';

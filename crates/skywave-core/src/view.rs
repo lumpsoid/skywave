@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use skywave_proto::{Fingerprint, ImageType, Worktree};
+use skywave_proto::{Fingerprint, ImageType, Worktree, WorktreeList};
 use uuid::Uuid;
 
 pub use skywave_proto::{
@@ -552,6 +552,7 @@ pub enum Screen {
     ServerAddresses(ServerAddressesView),
     Usage(UsageView),
     Storage(StorageView),
+    Worktrees(WorktreesView),
     UsageLimits(UsageLimitsView),
     SessionInfo(Box<SessionInfoView>),
     Workdir(WorkdirView),
@@ -958,6 +959,50 @@ pub enum StorageUnavailable {
     Offline,
     /// The request failed, worded by the transport.
     Failed(String),
+}
+
+/// Where the worktrees screen's list stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreesStatus {
+    /// Asked; the list shown, if any, is the one before.
+    Loading,
+    /// The list is the server's latest answer.
+    Ready,
+    /// The last ask failed; the list shown, if any, is older.
+    Unavailable(WorktreesUnavailable),
+}
+
+/// Why the worktrees screen has no fresh list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreesUnavailable {
+    /// Not connected: nothing was asked.
+    Offline,
+    /// The request failed, worded by the transport.
+    Failed(String),
+}
+
+/// The worktrees screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorktreesView {
+    pub status: WorktreesStatus,
+    /// The latest list; kept while a refresh is asked or fails.
+    pub list: Option<WorktreeList>,
+    /// The sessions running in each listed worktree, by its path, in the
+    /// replica's session order; a worktree no session runs in has no key.
+    pub sessions: std::collections::HashMap<String, Vec<WorktreeSession>>,
+}
+
+/// A session running in a listed worktree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorktreeSession {
+    pub id: SessionId,
+    pub title: String,
+    pub archived: bool,
+    /// Created in a skywave worktree, so `RemoveWorktree` applies.
+    pub worktree: bool,
+    pub worktree_removed: bool,
+    /// The latest `RemoveWorktree` for this session, until its effect is in the replica.
+    pub removal: Option<Outgoing>,
 }
 
 /// The usage limits of the account the server's agent runs as

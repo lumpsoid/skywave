@@ -189,7 +189,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v33: the `RejectReason` `ShellRunning`, for a `RemoveWorktree` while a
 /// shell command runs or waits in the worktree.
-pub const PROTOCOL_VERSION: u32 = 33;
+///
+/// v34: the worktree list: `GET` [`path::WORKTREES`] answering [`WorktreeList`]
+/// ([`RepoWorktrees`], [`RepoListing`], [`WorktreeEntry`]) and [`limits::WORKTREES_MAX`].
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -1334,6 +1337,9 @@ pub mod limits {
     /// [`ListResult::Listed`](crate::ListResult::Listed); past it the
     /// listing is `truncated`.
     pub const WORKDIR_LIST_MAX: usize = 1000;
+    /// Most [`WorktreeEntry`](crate::WorktreeEntry)s per repository in a
+    /// [`WorktreeList`](crate::WorktreeList).
+    pub const WORKTREES_MAX: usize = 200;
     /// Most [`OutsideConversation`](crate::OutsideConversation)s in one
     /// [`ConversationsResult::Listed`](crate::ConversationsResult::Listed);
     /// past it the listing is `truncated`.
@@ -2982,6 +2988,64 @@ pub struct Commit {
     pub subject: String,
 }
 
+/// Response to `GET /v1/worktrees`, always 200: the git worktrees of every
+/// repository a session's worktree was made from (`Worktree::repo`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WorktreeList {
+    /// Server clock when the list was read.
+    pub at: DateTime<Utc>,
+    /// One per repository, sorted by `repo`.
+    pub repos: Vec<RepoWorktrees>,
+}
+
+/// One repository's worktrees, or why they could not be read.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RepoWorktrees {
+    /// The canonical path of the repository's main working tree, as in
+    /// [`Worktree::repo`].
+    pub repo: String,
+    pub listing: RepoListing,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum RepoListing {
+    /// `git worktree list`, the main working tree first.
+    Worktrees {
+        /// At most [`limits::WORKTREES_MAX`].
+        worktrees: Vec<WorktreeEntry>,
+        /// More worktrees exist past `worktrees`.
+        more: bool,
+    },
+    /// The repository's directory no longer exists, or is not its own top level
+    /// (its `.git` is gone).
+    Gone,
+    /// git is missing or exited unexpectedly; `reason` is bounded text.
+    Failed { reason: String },
+}
+
+/// One worktree of a repository.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// Its directory, absolute.
+    pub path: String,
+    /// The checked-out branch; `None` when `HEAD` is detached.
+    pub branch: Option<String>,
+    /// The full sha of its `HEAD`; `None` on an unborn branch.
+    pub head: Option<String>,
+    /// It is the repository's main working tree.
+    pub main: bool,
+    /// Its directory is gone: git calls it prunable, or it no longer exists.
+    pub missing: bool,
+    /// It has uncommitted or untracked changes (a submodule's own dirty
+    /// content not counted); `None` when its status was not read: its
+    /// directory is missing or outside the server's roots.
+    pub dirty: Option<bool>,
+    /// Its `HEAD` is merged into the main working tree's `HEAD`; `true` for
+    /// the main working tree itself.
+    pub merged: bool,
+}
+
 /// Response to `GET /v1/workdir/list`, always 200: every outcome is a domain
 /// answer.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -3100,6 +3164,9 @@ pub mod path {
     pub const WORKDIR_LIST: &str = "/v1/workdir/list";
     /// One file of a session's workdir: [`crate::FileResult`].
     pub const WORKDIR_FILE: &str = "/v1/workdir/file";
+    /// Every worktree of the repositories sessions' worktrees came from:
+    /// [`crate::WorktreeList`].
+    pub const WORKTREES: &str = "/v1/worktrees";
     /// Route template for blob downloads; `{id}` is a [`BlobId`].
     pub const BLOB_ROUTE: &str = "/v1/blobs/{id}";
 

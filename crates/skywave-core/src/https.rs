@@ -43,7 +43,7 @@ use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
     EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
     LoginFinishResult, LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport,
-    UploadResult, UsageLimitsResult, WorkdirQuery, path,
+    UploadResult, UsageLimitsResult, WorkdirQuery, WorktreeList, path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -52,6 +52,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::address::ServerAddress;
 use crate::encoding::{self, ZstdBody};
+use crate::engine::WORKTREES_TIMEOUT;
 use crate::identity::Identity;
 use crate::tls;
 use crate::transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
@@ -811,6 +812,23 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `GET /v1/worktrees`, which takes no query. Bounded by
+    /// [`WORKTREES_TIMEOUT`] rather than the request timeout: the server
+    /// runs git in every worktree.
+    async fn worktrees(&self) -> Result<WorktreeList, TransportError> {
+        let reply = self
+            .http
+            .request(
+                Method::GET,
+                path::WORKTREES,
+                &self.run_header(),
+                Bytes::new(),
+                WORKTREES_TIMEOUT,
+            )
+            .await?;
+        ok_json(reply)
+    }
+
     /// `GET /v1/usage-limits`, which takes no query.
     async fn usage_limits(&self) -> Result<UsageLimitsResult, TransportError> {
         let reply = self
@@ -1028,6 +1046,10 @@ impl Transport for HttpsTransport {
 
     fn storage_report(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
         Box::pin(HttpsTransport::storage_report(self))
+    }
+
+    fn worktrees(&self) -> BoxFuture<'_, Result<WorktreeList, TransportError>> {
+        Box::pin(HttpsTransport::worktrees(self))
     }
 
     fn usage_limits(&self) -> BoxFuture<'_, Result<UsageLimitsResult, TransportError>> {

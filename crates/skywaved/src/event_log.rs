@@ -1333,6 +1333,21 @@ pub(crate) fn worktree_in(conn: &Connection, id: SessionId) -> Result<Option<Wor
     Ok(worktree)
 }
 
+/// The repository of every session's git worktree, as its `SessionCreated`
+/// names it: distinct, sorted.
+pub(crate) fn worktree_repos(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT json_extract(kind, '$.worktree.repo') FROM events
+         WHERE json_extract(kind, '$.type') = 'session_created'
+           AND json_extract(kind, '$.worktree.repo') IS NOT NULL
+         ORDER BY 1",
+    )?;
+    let repos = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(repos)
+}
+
 /// [`EventLog::worktree_removed`]: whether the session's events include a
 /// `WorktreeRemoved`.
 pub(crate) fn worktree_removed_in(conn: &Connection, id: SessionId) -> Result<bool> {

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
@@ -54,6 +54,13 @@ class SessionListPage extends StatelessWidget {
                 icon: const Icon(Icons.storage),
                 onPressed: () => send.act(
                   const ActionIntentNavigate(route: RouteView.storage),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Worktrees',
+                icon: const Icon(Icons.account_tree_outlined),
+                onPressed: () => send.act(
+                  const ActionIntentNavigate(route: RouteView.worktrees),
                 ),
               ),
               IconButton(

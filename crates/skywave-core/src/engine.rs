@@ -24,6 +24,8 @@
 //!   [`Seam::conversations_listed`].
 //! - `Storage` asks for the server's storage report the same way, within
 //!   [`STORAGE_TIMEOUT`], and answers with [`Seam::storage_reported`].
+//! - `Worktrees` asks for the server's worktree list the same way, within
+//!   [`WORKTREES_TIMEOUT`], and answers with [`Seam::worktrees_listed`].
 //! - `UsageLimits` asks for the agent's usage limits the same way, within
 //!   [`USAGE_LIMITS_TIMEOUT`], and answers with
 //!   [`Seam::usage_limits_answered`].
@@ -156,6 +158,9 @@ pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(12);
 /// Longest a storage report may take, connecting included: above the
 /// server's own 10 s, so its `503` arrives before this gives up.
 pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long the worktrees screen waits for the list: the server runs git in
+/// every worktree.
+pub const WORKTREES_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest a usage limits read may take, connecting included: above the
 /// server's own 20 s, so its `503` arrives before this gives up.
 pub const USAGE_LIMITS_TIMEOUT: Duration = Duration::from_secs(25);
@@ -471,6 +476,19 @@ impl Engine {
                         .await
                         .unwrap_or(Err(TransportError::Timeout));
                     seam.storage_reported(req, result);
+                });
+            }
+            Request::Worktrees { req } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    seam.worktrees_listed(req, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a worktree list", async move {
+                    let result = tokio::time::timeout(WORKTREES_TIMEOUT, transport.worktrees())
+                        .await
+                        .unwrap_or(Err(TransportError::Timeout));
+                    seam.worktrees_listed(req, result);
                 });
             }
             Request::UsageLimits { req } => {

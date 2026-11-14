@@ -1,6 +1,7 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart' hide StateBadge;
+import 'package:skywave_gui/sessions/remove_worktree_dialog.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// An agent state's badge with Rust's label.
@@ -31,7 +32,7 @@ class StateBadge extends StatelessWidget {
 }
 
 /// One session on the list. A tap opens it; its menu starts a new session
-/// in its workdir, renames, archives or unarchives, removes an archived
+/// in its workdir, renames, archives or unarchives, removes a removable
 /// session's worktree, and deletes an archived one from this device after
 /// asking.
 /// On a phone the state is an icon whose shape says it without colour,
@@ -446,39 +447,11 @@ class _RowMenu extends StatelessWidget {
     });
   }
 
-  /// Asks before removing the worktree and its branch. The server decides
-  /// whether the branch is merged and the worktree clean; it refuses if not.
   void _removeWorktree(BuildContext context) {
-    final branch = switch (row.branch) {
-      final b? => ' $b',
-      null => '',
-    };
-    showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Remove worktree?'),
-        content: Text(
-          'Remove the worktree of ${row.title} and delete its branch$branch? '
-          'The server refuses if the branch is not merged or the worktree '
-          'has changes.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Keep'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(context).colorScheme.error,
-              foregroundColor: Theme.of(context).colorScheme.onError,
-            ),
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Remove'),
-          ),
-        ],
-      ),
-    ).then((confirmed) {
-      if (confirmed ?? false) {
+    confirmRemoveWorktree(context, title: row.title, branch: row.branch).then((
+      confirmed,
+    ) {
+      if (confirmed) {
         send.act(ActionIntentRemoveWorktree(sessionId: row.sessionId));
       }
     });

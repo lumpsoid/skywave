@@ -41,6 +41,8 @@
 //! - [`workdir`]: a session's workdir: diff line kinds, change marks and
 //!   counts, entry order and labels, and every empty or failed read's
 //!   wording.
+//! - [`worktrees`]: the worktrees screen: each repository's list, each
+//!   worktree's tags and branch, and the removal and failure wording.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -63,3 +65,4 @@ pub mod text;
 pub mod usage;
 pub mod utf16;
 pub mod workdir;
+pub mod worktrees;
