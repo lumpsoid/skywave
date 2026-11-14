@@ -960,6 +960,26 @@ pub enum StorageUnavailable {
     Failed(String),
 }
 
+/// Where the worktrees screen's list stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreesStatus {
+    /// Asked; the list shown, if any, is the one before.
+    Loading,
+    /// The list is the server's latest answer.
+    Ready,
+    /// The last ask failed; the list shown, if any, is older.
+    Unavailable(WorktreesUnavailable),
+}
+
+/// Why the worktrees screen has no fresh list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreesUnavailable {
+    /// Not connected: nothing was asked.
+    Offline,
+    /// The request failed, worded by the transport.
+    Failed(String),
+}
+
 /// The usage limits of the account the server's agent runs as
 /// ([`Route::UsageLimits`](crate::Route::UsageLimits)): the latest answer
 /// the replica keeps, shown offline too, and where a read of a fresh one

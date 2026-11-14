@@ -15,7 +15,8 @@ use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ContentHash, ConversationsResult,
     DeviceInfo, DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem,
     LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RuleSuggestion,
-    SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, answers_fit,
+    SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, WorktreeList,
+    answers_fit,
 };
 
 use crate::action::{Action, Route};
@@ -57,6 +58,7 @@ use crate::view::{
     WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
+use crate::worktrees::Worktrees;
 
 /// Work the core must do for an action, in order. Persistence effects come
 /// before the requests that make the action visible to the network.
@@ -342,6 +344,8 @@ pub(crate) struct Model {
     conversations_req: u64,
     /// The storage screen's report; in memory only.
     storage: Storage,
+    /// The worktrees screen's list; in memory only.
+    worktrees: Worktrees,
     /// The usage limits page: the stored answer, and the read in flight
     /// or failed (in memory only).
     usage_limits: UsageLimits,
@@ -424,6 +428,7 @@ impl Model {
             dirs_req: 0,
             conversations_req: 0,
             storage: Storage::default(),
+            worktrees: Worktrees::default(),
             usage_limits: UsageLimits::default(),
             login: AgentLogin::default(),
             opening: None,
@@ -2188,6 +2193,14 @@ impl Model {
         result: Result<StorageReport, TransportError>,
     ) {
         self.storage.reported(req, result);
+    }
+
+    pub(crate) fn worktrees_listed(
+        &mut self,
+        req: u64,
+        result: Result<WorktreeList, TransportError>,
+    ) {
+        self.worktrees.listed(req, result);
     }
 
     /// Whether `req` is the request `ask` still waits on: anything else is
