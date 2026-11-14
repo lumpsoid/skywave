@@ -64,7 +64,12 @@
 //! **Downloads** (`download`, v36) resolve and read the same way, but serve
 //! binary content too, and their cap is the reader's download cap
 //! ([`WorkdirReader::with_download_max`]), not `WORKDIR_FILE_MAX_BYTES`.
-//! Their blob is recorded under [`AnswerKind::Download`], not `File`.
+//! Their blob is recorded under [`AnswerKind::Download`], not `File`. The
+//! copy runs outside the workdir lock: phases 1 and 3 (resolve and check the
+//! metadata; dedupe, record and answer) are snapshots, and phase 2 streams the
+//! open file into the blob store with no lock, in chunks, checking the
+//! deadline between reads, so a slow copy never holds up other reads. One
+//! deadline, [`DOWNLOAD_DEADLINE`], covers all three phases.
 //!
 //! The checks and the open are not atomic: whoever can write the workdir can
 //! swap a symlink between them. That is the agent, which can read the target
@@ -243,6 +248,10 @@ pub use git::Git;
 /// `WORKDIR_TIMEOUT`, so a snapshot normally stops before its client is
 /// told 503.
 pub const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(15);
+/// How long one download may run, counted from when its handler started,
+/// across its three phases (module docs, "Downloads"): long enough for the
+/// default 64 MiB at about 0.5 MB/s.
+pub const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(120);
 /// Directory entries read at most per listing, as for `GET /v1/dirs`.
 pub const SCAN_CAP: usize = dirs::SCAN_CAP;
 /// Content with a NUL in its first this many bytes is binary.
@@ -320,6 +329,18 @@ impl WorkdirReader {
         };
         snapshot.check_deadline()?;
         f(&mut snapshot)
+    }
+
+    /// `GET /v1/workdir/download` (module docs, "Downloads"): any file as a
+    /// blob up to the download cap. The copy runs outside the workdir lock;
+    /// `deadline` covers all three phases.
+    pub fn download(&self, query: &WorkdirQuery, deadline: Instant) -> Result<FileResult> {
+        let (target, path) = match self.snapshot(deadline, |s| s.download_source(query))? {
+            Ok(source) => source,
+            Err(answer) => return Ok(answer),
+        };
+        let copied = copy_download(&self.blobs, &target, &path, self.download_max, deadline)?;
+        self.snapshot(deadline, move |s| s.finish_download(query, &path, copied))
     }
 }
 
@@ -448,15 +469,44 @@ impl Snapshot<'_> {
     /// `GET /v1/workdir/file` (module docs, "Files"), recorded as the read's
     /// latest answer (module docs, "Garbage").
     pub fn file(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
-        let answer = self.read_file(query, limits::WORKDIR_FILE_MAX_BYTES, true)?;
+        let answer = self.read_file(query)?;
         self.answer_file(query, AnswerKind::File, answer)
     }
 
-    /// `GET /v1/workdir/download` (module docs, "Files"): any file as a blob up
-    /// to the download cap, recorded apart from `file` so neither answer frees
-    /// the other's blob.
-    pub fn download(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
-        let answer = self.read_file(query, self.download_max, false)?;
+    /// Phase 1 of a download (module docs, "Downloads"): the file to copy, as
+    /// `Ok`, or the answer, which names no blob and is recorded here.
+    fn download_source(
+        &mut self,
+        query: &WorkdirQuery,
+    ) -> Result<std::result::Result<(PathBuf, String), FileResult>> {
+        match self.file_target(query, self.download_max)? {
+            Ok(source) => Ok(Ok(source)),
+            Err(answer) => self
+                .answer_file(query, AnswerKind::Download, answer)
+                .map(Err),
+        }
+    }
+
+    /// Phase 3 of a download (module docs, "Downloads"): keeps the copied
+    /// blob unless its content is stored already (D36, that blob is named
+    /// instead), records it and answers. A new file that is not recorded is
+    /// removed, on a failure too.
+    fn finish_download(
+        &mut self,
+        query: &WorkdirQuery,
+        path: &str,
+        copied: std::result::Result<BlobMeta, FileResult>,
+    ) -> Result<FileResult> {
+        let meta = match copied {
+            Ok(meta) => meta,
+            Err(answer) => return self.answer_file(query, AnswerKind::Download, answer),
+        };
+        let blob = self.check_deadline().and_then(|()| self.adopt_blob(&meta));
+        if !matches!(&blob, Ok(blob) if blob.id == meta.id) {
+            self.blobs.discard(meta.id);
+        }
+        let blob = blob?;
+        let answer = file_answer(path, blob.size, FileBody::Blob(blob));
         self.answer_file(query, AnswerKind::Download, answer)
     }
 
@@ -479,34 +529,44 @@ impl Snapshot<'_> {
         Ok(answer)
     }
 
-    /// The read behind `file` and `download`: `cap` is the largest content
-    /// served, and `text_only` refuses binary content (`Binary`).
-    fn read_file(&mut self, query: &WorkdirQuery, cap: u64, text_only: bool) -> Result<FileResult> {
+    /// The checks a file read makes before it opens the file (module docs,
+    /// "Files"), with `cap` the largest file it may serve: `Ok` is the
+    /// canonical target and its path, `Err` the answer, which names no blob.
+    fn file_target(
+        &self,
+        query: &WorkdirQuery,
+        cap: u64,
+    ) -> Result<std::result::Result<(PathBuf, String), FileResult>> {
         let (target, path) = match self.locate(query)? {
             Located::Found { target, path, .. } => (target, path),
-            Located::UnknownSession => return Ok(FileResult::UnknownSession),
-            Located::WorkdirGone => return Ok(FileResult::WorkdirGone),
-            Located::NotAllowed => return Ok(FileResult::NotAllowed),
-            Located::NotFound => return Ok(FileResult::NotFound),
+            Located::UnknownSession => return Ok(Err(FileResult::UnknownSession)),
+            Located::WorkdirGone => return Ok(Err(FileResult::WorkdirGone)),
+            Located::NotAllowed => return Ok(Err(FileResult::NotAllowed)),
+            Located::NotFound => return Ok(Err(FileResult::NotFound)),
         };
         let Ok(meta) = std::fs::metadata(&target) else {
-            return Ok(FileResult::NotFound);
+            return Ok(Err(FileResult::NotFound));
         };
         if meta.is_dir() {
-            return Ok(FileResult::IsADirectory);
+            return Ok(Err(FileResult::IsADirectory));
         }
         if !meta.is_file() {
-            return Ok(FileResult::NotAFile);
+            return Ok(Err(FileResult::NotAFile));
         }
-        let file_answer = |size, content| FileResult::File {
-            at: Utc::now(),
-            path: path.clone(),
-            size,
-            content,
-        };
         if meta.len() > cap {
-            return Ok(file_answer(meta.len(), FileBody::TooLarge));
+            return Ok(Err(file_answer(&path, meta.len(), FileBody::TooLarge)));
         }
+        Ok(Ok((target, path)))
+    }
+
+    /// The read behind `file`: a file up to `WORKDIR_FILE_MAX_BYTES`, whose
+    /// binary content is refused (`Binary`).
+    fn read_file(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
+        let cap = limits::WORKDIR_FILE_MAX_BYTES;
+        let (target, path) = match self.file_target(query, cap)? {
+            Ok(source) => source,
+            Err(answer) => return Ok(answer),
+        };
         let Ok(mut file) = open_nonblocking(&target) else {
             return Ok(FileResult::NotFound);
         };
@@ -519,20 +579,20 @@ impl Snapshot<'_> {
                 .metadata()
                 .map_or(content.len() as u64, |m| m.len())
                 .max(content.len() as u64);
-            return Ok(file_answer(size, FileBody::TooLarge));
+            return Ok(file_answer(&path, size, FileBody::TooLarge));
         }
         let size = content.len() as u64;
-        if text_only && looks_binary(&content) {
-            return Ok(file_answer(size, FileBody::Binary));
+        if looks_binary(&content) {
+            return Ok(file_answer(&path, size, FileBody::Binary));
         }
         let blob = self.store(&content)?;
-        Ok(file_answer(size, FileBody::Blob(blob)))
+        Ok(file_answer(&path, size, FileBody::Blob(blob)))
     }
 
     /// At most `cap + 1` bytes of `file`, checking the deadline between
     /// chunks.
     fn read_capped(&self, file: &mut File, path: &Path, cap: u64) -> Result<Vec<u8>> {
-        let mut capped = file.take(cap + 1);
+        let mut capped = file.take(cap.saturating_add(1));
         let mut content = Vec::new();
         let mut chunk = vec![0u8; READ_CHUNK];
         loop {
@@ -555,26 +615,12 @@ impl Snapshot<'_> {
     pub fn store(&mut self, content: &[u8]) -> Result<BlobRef> {
         let sha256 = ContentHash::of(content);
         let size = content.len() as u64;
-        let sql_size = i64::try_from(size).unwrap_or(i64::MAX);
         // A plain read, no write lock. Only this connection writes
         // `workdir_blobs`, and every workdir request is serialised by the
         // snapshot mutex, so no other store can insert this content between
         // this lookup and the insert below.
-        let known: Option<String> = self
-            .db
-            .conn()
-            .query_row(
-                "SELECT blob_id FROM workdir_blobs WHERE sha256 = ?1 AND size = ?2",
-                params![sha256.to_hex(), sql_size],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = known {
-            return Ok(BlobRef {
-                id: parse_id(&id)?,
-                size,
-                sha256,
-            });
+        if let Some(known) = self.known_blob(sha256, size)? {
+            return Ok(known);
         }
         // The file (up to the cap, plus its fsyncs) is written before the
         // write lock is taken, so other connections wait only for the two
@@ -585,6 +631,38 @@ impl Snapshot<'_> {
             self.blobs.discard(meta.id);
             return Err(e);
         }
+        Ok(meta.blob_ref())
+    }
+
+    /// The stored blob of workdir content of `sha256` and `size`, if there is
+    /// one (module docs, "Blobs").
+    fn known_blob(&self, sha256: ContentHash, size: u64) -> Result<Option<BlobRef>> {
+        let known: Option<String> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT blob_id FROM workdir_blobs WHERE sha256 = ?1 AND size = ?2",
+                params![sha256.to_hex(), i64::try_from(size).unwrap_or(i64::MAX)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match known {
+            Some(id) => Ok(Some(BlobRef {
+                id: parse_id(&id)?,
+                size,
+                sha256,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// The blob of a copied `meta` (D36): the stored blob of the same content
+    /// if there is one, else `meta`, recorded.
+    fn adopt_blob(&mut self, meta: &BlobMeta) -> Result<BlobRef> {
+        if let Some(known) = self.known_blob(meta.sha256, meta.size)? {
+            return Ok(known);
+        }
+        self.record(meta)?;
         Ok(meta.blob_ref())
     }
 
@@ -767,6 +845,73 @@ fn open_nonblocking(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+/// The answer to a read of the workdir file `path`, `size` bytes long.
+fn file_answer(path: &str, size: u64, content: FileBody) -> FileResult {
+    FileResult::File {
+        at: Utc::now(),
+        path: path.to_owned(),
+        size,
+        content,
+    }
+}
+
+/// Phase 2 of a download (module docs, "Downloads"): streams `target`, the
+/// file `path` names, into a new blob of its first `cap + 1` bytes. It takes
+/// no lock and touches no database. `Ok(Err)` is an answer that names no blob
+/// (not a regular file, or more than `cap` bytes, whose blob is removed); a
+/// copy that fails is `Err`, [`Error::WorkdirDeadline`] past `deadline`.
+fn copy_download(
+    blobs: &BlobStore,
+    target: &Path,
+    path: &str,
+    cap: u64,
+    deadline: Instant,
+) -> Result<std::result::Result<BlobMeta, FileResult>> {
+    let Ok(file) = open_nonblocking(target) else {
+        return Ok(Err(FileResult::NotFound));
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Ok(Err(FileResult::NotAFile));
+    }
+    let mut reader = DeadlineReader {
+        inner: file.take(cap.saturating_add(1)),
+        deadline,
+    };
+    let meta = match blobs.write(&mut reader) {
+        Ok(meta) => meta,
+        Err(_) if Instant::now() >= deadline => return Err(Error::WorkdirDeadline),
+        Err(e) => return Err(e),
+    };
+    if meta.size <= cap {
+        return Ok(Ok(meta));
+    }
+    blobs.discard(meta.id);
+    // As `read_file`: the size the file has now, if that is more.
+    let size = reader
+        .inner
+        .get_ref()
+        .metadata()
+        .map_or(meta.size, |m| m.len())
+        .max(meta.size);
+    Ok(Err(file_answer(path, size, FileBody::TooLarge)))
+}
+
+/// A reader that fails with `TimedOut` once `deadline` has passed, checked
+/// before each read, so a copy stops at the deadline.
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Instant,
+}
+
+impl<R: Read> Read for DeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// git's heuristic: a NUL in the first [`BINARY_SNIFF_BYTES`].
 pub fn looks_binary(content: &[u8]) -> bool {
     content[..content.len().min(BINARY_SNIFF_BYTES)].contains(&0)
@@ -863,7 +1008,7 @@ mod tests {
         fn download(&self, path: &str) -> FileResult {
             let query = self.query(path);
             self.reader
-                .snapshot(Tree::later(), |s| s.download(&query))
+                .download(&query, Instant::now() + DOWNLOAD_DEADLINE)
                 .unwrap()
         }
 
@@ -898,6 +1043,13 @@ mod tests {
                 .conn()
                 .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
                 .unwrap()
+        }
+
+        /// The files in the blob store, recorded or not.
+        fn blob_files(&self) -> usize {
+            std::fs::read_dir(self.storage.dir.blobs_dir())
+                .unwrap()
+                .count()
         }
 
         /// Whether blob `id` is still stored: its row, checked against its
@@ -1133,6 +1285,93 @@ mod tests {
         // the two answers are recorded under their own kinds.
         t.file("bin");
         assert!(t.stored(bin.id));
+    }
+
+    #[test]
+    fn a_download_past_its_cap_check_or_at_no_cap_is_served_whole() {
+        let mut t = Tree::new();
+        // The cap plus one used to wrap at `u64::MAX`: the copy read nothing
+        // (release) or panicked (debug).
+        t.reader.download_max = u64::MAX;
+        std::fs::write(t.workdir.join("bin"), b"ab\0cd").unwrap();
+        let FileResult::File {
+            size: 5,
+            content: FileBody::Blob(bin),
+            ..
+        } = t.download("bin")
+        else {
+            panic!("expected the whole file as a blob");
+        };
+        assert_eq!(t.blob_content(&bin), b"ab\0cd");
+    }
+
+    #[test]
+    fn a_second_download_of_the_same_content_reuses_its_blob() {
+        let t = Tree::new();
+        std::fs::write(t.workdir.join("f"), "same bytes").unwrap();
+        let FileResult::File {
+            content: FileBody::Blob(first),
+            ..
+        } = t.download("f")
+        else {
+            panic!("expected a blob");
+        };
+        let (rows, files) = (t.blob_rows(), t.blob_files());
+        let FileResult::File {
+            content: FileBody::Blob(second),
+            ..
+        } = t.download("f")
+        else {
+            panic!("expected a blob");
+        };
+        assert_eq!(second, first, "a hit names the stored blob");
+        assert_eq!(t.blob_rows(), rows, "a hit adds no blob row");
+        assert_eq!(t.blob_files(), files, "the copy not kept leaves no file");
+        // Positive control: changed content is a new blob, and the answer it
+        // replaces frees the old one, so the counts stay the same.
+        std::fs::write(t.workdir.join("f"), "other bytes").unwrap();
+        let FileResult::File {
+            content: FileBody::Blob(changed),
+            ..
+        } = t.download("f")
+        else {
+            panic!("expected a blob");
+        };
+        assert_ne!(changed.id, first.id);
+        assert!(!t.stored(first.id), "the replaced answer's blob is gone");
+        assert!(t.stored(changed.id));
+        assert_eq!(t.blob_rows(), rows);
+        assert_eq!(t.blob_files(), files);
+    }
+
+    #[test]
+    fn a_download_past_its_deadline_keeps_nothing() {
+        let t = Tree::new();
+        std::fs::write(t.workdir.join("f"), "x").unwrap();
+        let query = t.query("f");
+        let (rows, files) = (t.blob_rows(), t.blob_files());
+        // Past the deadline when the lock is taken: nothing is read or stored.
+        let answer = t.reader.download(&query, Instant::now());
+        assert!(matches!(answer, Err(Error::WorkdirDeadline)));
+        assert_eq!((t.blob_rows(), t.blob_files()), (rows, files));
+        // The lock-free copy, past its deadline, leaves no file behind.
+        let copy = copy_download(
+            &t.reader.blobs,
+            &t.workdir.join("f"),
+            "f",
+            16,
+            Instant::now(),
+        );
+        assert!(matches!(copy, Err(Error::WorkdirDeadline)));
+        assert_eq!(t.blob_files(), files, "the unfinished copy's file is gone");
+        // Positive control: in time, the same file is served.
+        assert!(matches!(
+            t.download("f"),
+            FileResult::File {
+                content: FileBody::Blob(_),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -726,7 +726,11 @@ the daemon's appends, which would otherwise stop `serve` (below).
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
   keeps its blob across refreshes; event blobs are never reused for them,
   nor deduplicated among themselves (D44). `download` shares `file`'s path
-  rules and differs only in serving binary content and in its cap.
+  rules and differs only in serving binary content and in its cap. Its copy
+  runs outside the workdir lock under its own 120 s deadline
+  (`DOWNLOAD_DEADLINE`; its outer timeout is 125 s): the file is streamed into
+  the blob store with no lock held, so a large file neither blocks other
+  reads nor outlasts the 15 s snapshot deadline.
   **Blob GC**: a workdir blob lives while the latest answer to some read
   names it, any session: `workdir_answer_blobs` keeps the blobs of each
   read's latest answer, keyed as the core keys its stored answers

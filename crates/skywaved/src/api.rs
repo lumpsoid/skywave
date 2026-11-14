@@ -88,7 +88,9 @@
 //! reaches it while running stops: a 503 for list, file and download, and the 200
 //! `Failed { "timed out" }` for changes, whose git children are killed then.
 //! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
-//! future, and the deadline is what stops the abandoned work.
+//! future, and the deadline is what stops the abandoned work. A download
+//! takes [`workdir::DOWNLOAD_DEADLINE`] instead, with its outer bound 5 s
+//! longer, and its copy runs outside the lock (module docs of `workdir`).
 //!
 //! **Blocking file-system work** (dirs, the conversations scan, workdir
 //! reads and storage reports) first takes one of [`FS_PERMITS`] permits,
@@ -1242,11 +1244,16 @@ async fn workdir_download(
     State(api): State<Arc<Api>>,
     query: std::result::Result<Query<WorkdirQuery>, QueryRejection>,
 ) -> Response {
-    let deadline = Instant::now() + workdir::SNAPSHOT_DEADLINE;
+    let deadline = Instant::now() + workdir::DOWNLOAD_DEADLINE;
     let Ok(Query(query)) = query else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    workdir_snapshot(&api, deadline, move |s| s.download(&query)).await
+    workdir_blocking(
+        &api,
+        workdir::DOWNLOAD_DEADLINE + Duration::from_secs(5),
+        move |w| w.download(&query, deadline),
+    )
+    .await
 }
 
 /// Runs `f` as one workdir snapshot on a blocking thread (module docs,
@@ -1257,6 +1264,17 @@ async fn workdir_snapshot<T: serde::Serialize + Send + 'static>(
     deadline: Instant,
     f: impl FnOnce(&mut Snapshot<'_>) -> Result<T> + Send + 'static,
 ) -> Response {
+    workdir_blocking(api, WORKDIR_TIMEOUT, move |w| w.snapshot(deadline, f)).await
+}
+
+/// Runs `f` with the workdir reader on a blocking thread, under a
+/// file-system permit: its answer is a 200, a passed deadline, `timeout` or
+/// no permit a 503, any other error a 500.
+async fn workdir_blocking<T: serde::Serialize + Send + 'static>(
+    api: &Arc<Api>,
+    timeout: Duration,
+    f: impl FnOnce(&WorkdirReader) -> Result<T> + Send + 'static,
+) -> Response {
     let permit = match api.fs_permit().await {
         Ok(permit) => permit,
         Err(status) => return status.into_response(),
@@ -1264,9 +1282,9 @@ async fn workdir_snapshot<T: serde::Serialize + Send + 'static>(
     let api = api.clone();
     let work = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        api.workdir.snapshot(deadline, f)
+        f(&api.workdir)
     });
-    match tokio::time::timeout(WORKDIR_TIMEOUT, work).await {
+    match tokio::time::timeout(timeout, work).await {
         Ok(Ok(Ok(answer))) => Json(answer).into_response(),
         Ok(Ok(Err(Error::WorkdirDeadline))) => {
             tracing::warn!("workdir snapshot passed its deadline");
