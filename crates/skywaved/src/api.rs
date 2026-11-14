@@ -382,6 +382,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::WORKDIR_LOG, get(workdir_log))
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
+        .route(path::WORKTREES, get(worktrees))
         .route(path::BLOB_ROUTE, get(blob))
         .route(
             path::ATTACHMENT_ROUTE,
@@ -1205,6 +1206,11 @@ async fn workdir_log(
         return StatusCode::BAD_REQUEST.into_response();
     };
     workdir_snapshot(&api, deadline, move |s| s.log(&query)).await
+}
+
+async fn worktrees(State(api): State<Arc<Api>>) -> Response {
+    let deadline = Instant::now() + workdir::SNAPSHOT_DEADLINE;
+    workdir_snapshot(&api, deadline, move |s| s.worktrees()).await
 }
 
 async fn workdir_list(

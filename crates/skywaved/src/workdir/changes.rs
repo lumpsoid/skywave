@@ -259,14 +259,7 @@ impl<'a> Snapshot<'a> {
             return Ok(ChangesResult::NotGit);
         }
 
-        // Exit 1: no filter is configured at all.
-        let config =
-            repo.output(&["config", "--show-scope", "-z", "--get-regexp", r"^filter\."])?;
-        match config.status.code() {
-            Some(0) => repo.neutralise(repo_filters(&config.out)),
-            Some(1) if config.out.is_empty() => {}
-            _ => return Err(GitError::Failed(config.reason())),
-        }
+        neutralise_filters(&mut repo)?;
 
         let branch = branch(&repo)?;
         let target = head_ref(&repo)?;
@@ -658,6 +651,19 @@ fn split(out: &mut dyn Read, sink: &mut impl Sections) -> io::Result<()> {
             sink.header(&line);
         }
         sink.bytes(&line);
+    }
+    Ok(())
+}
+
+/// Neutralises the repo's own filter drivers before a read that may stream
+/// file content (module docs, "Changes", step 2).
+pub(super) fn neutralise_filters(repo: &mut Repo<'_>) -> Result<(), GitError> {
+    // Exit 1: no filter is configured at all.
+    let config = repo.output(&["config", "--show-scope", "-z", "--get-regexp", r"^filter\."])?;
+    match config.status.code() {
+        Some(0) => repo.neutralise(repo_filters(&config.out)),
+        Some(1) if config.out.is_empty() => {}
+        _ => return Err(GitError::Failed(config.reason())),
     }
     Ok(())
 }
