@@ -40,6 +40,16 @@ IconData toolIcon(ToolKindView kind) => switch (kind) {
   ToolKindView.other => Icons.build_outlined,
 };
 
+/// An agent state's icon, for a phone's session row: each state has its
+/// own shape, so the row reads without its colour.
+IconData agentIcon(AgentState state) => switch (state) {
+  AgentState.idle => Icons.radio_button_unchecked,
+  AgentState.working => Icons.autorenew,
+  AgentState.awaitingApproval => Icons.notification_important,
+  AgentState.errored => Icons.error_outline,
+  AgentState.stopped => Icons.stop_circle_outlined,
+};
+
 /// Colours that are not in the Material scheme: success, the TUI's
 /// magenta for a denial, the agent working, the link banner's, picked
 /// for the theme's brightness. Each text colour meets WCAG AA (4.5:1) on
@@ -96,7 +106,7 @@ class SkyColors {
     ShellRunKind.skipped => muted,
   };
 
-  /// The agent's state, for the header's dot.
+  /// The agent's state: its label, badge and icon.
   Color agent(AgentState state) => switch (state) {
     AgentState.idle => muted,
     AgentState.working => working,

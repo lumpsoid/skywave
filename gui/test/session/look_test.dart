@@ -34,6 +34,11 @@ Future<SkyColors> colorsIn(WidgetTester tester, Brightness brightness) async {
 }
 
 void main() {
+  test('each agent state has its own icon', () {
+    final icons = AgentState.values.map(agentIcon).toSet();
+    expect(icons, hasLength(AgentState.values.length));
+  });
+
   for (final brightness in Brightness.values) {
     testWidgets('$brightness state colours meet AA on every surface', (
       tester,
