@@ -5207,7 +5207,7 @@ mod workdir {
     use skywave_core::{
         BlobId, BlobState, BlobView, ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry,
         EntryKind, FileBody, FileChange, FileResult, LinkTarget, ListResult, Screen, WorkdirBody,
-        WorkdirFetch, WorkdirPane, WorkdirView,
+        WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView,
     };
     use skywave_present::workdir::NOT_FETCHED;
     use skywave_proto::{BlobRef, Commit, CommitLog, LogResult};
@@ -5230,6 +5230,17 @@ mod workdir {
         fetch: WorkdirFetch,
         body: WorkdirBody,
     ) -> WorkdirScreen {
+        shown_with(rig, pane, fetch, body, Vec::new())
+    }
+
+    /// [`shown`] with the files asked for download, `downloads`.
+    fn shown_with(
+        rig: &mut Rig,
+        pane: WorkdirPane,
+        fetch: WorkdirFetch,
+        body: WorkdirBody,
+        downloads: Vec<WorkdirDownload>,
+    ) -> WorkdirScreen {
         rig.clock.wall_ms = (taken() + chrono::Duration::hours(1)).timestamp_millis();
         let mut view = rig.core.view();
         view.screen = Screen::Workdir(WorkdirView {
@@ -5240,7 +5251,7 @@ mod workdir {
             last_dir: "src".into(),
             fetch,
             body,
-            downloads: Vec::new(),
+            downloads,
         });
         let outs = rig.head.on_view(view, rig.clock);
         rig.apply(outs);
@@ -5732,13 +5743,22 @@ mod workdir {
         rig.intent(GuiIntent::Act {
             action: ActionIntent::RefreshWorkdir,
         });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::DownloadWorkdirFile {
+                session_id: rig.session.0.to_string(),
+                path: "bin/app".into(),
+            },
+        });
         let workdir: Vec<_> = rig
             .actions
             .iter()
             .filter(|a| {
                 matches!(
                     a,
-                    Action::OpenWorkdir { .. } | Action::ShowWorkdir(_) | Action::RefreshWorkdir
+                    Action::OpenWorkdir { .. }
+                        | Action::ShowWorkdir(_)
+                        | Action::RefreshWorkdir
+                        | Action::DownloadWorkdirFile { .. }
                 )
             })
             .cloned()
@@ -5756,6 +5776,130 @@ mod workdir {
                 }),
                 Action::ShowWorkdir(WorkdirPane::Dir { path: "src".into() }),
                 Action::RefreshWorkdir,
+                Action::DownloadWorkdirFile {
+                    session_id: rig.session,
+                    path: "bin/app".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_workdir_screen_lists_each_download_with_its_state() {
+        let mut rig = Rig::new();
+        let ready = available(&rig, "x");
+        let BlobState::Available { path } = &ready.state else {
+            panic!("the blob is not available: {:?}", ready.state)
+        };
+        let ready_path = path.display().to_string();
+        let downloading = BlobId::new();
+        let sha256 = skywave_proto::ContentHash::of(b"");
+        let downloads = vec![
+            WorkdirDownload {
+                path: "a.log".into(),
+                fetch: WorkdirFetch::Loading,
+                result: None,
+                blob: None,
+            },
+            WorkdirDownload {
+                path: "b.bin".into(),
+                fetch: WorkdirFetch::Failed("timed out".into()),
+                result: None,
+                blob: None,
+            },
+            WorkdirDownload {
+                path: "c.iso".into(),
+                fetch: WorkdirFetch::Idle,
+                result: Some(FileResult::File {
+                    at: taken(),
+                    path: "c.iso".into(),
+                    size: 200 * 1024 * 1024,
+                    content: FileBody::TooLarge,
+                }),
+                blob: None,
+            },
+            WorkdirDownload {
+                path: "d.mp4".into(),
+                fetch: WorkdirFetch::Idle,
+                result: Some(FileResult::File {
+                    at: taken(),
+                    path: "d.mp4".into(),
+                    size: 4096,
+                    content: FileBody::Blob(BlobRef {
+                        id: downloading,
+                        size: 4096,
+                        sha256,
+                    }),
+                }),
+                blob: Some(BlobView {
+                    id: downloading,
+                    state: BlobState::Downloading {
+                        got: 1024,
+                        size: 4096,
+                        paused: None,
+                    },
+                    change: None,
+                    pending: None,
+                }),
+            },
+            WorkdirDownload {
+                path: "e.txt".into(),
+                fetch: WorkdirFetch::Idle,
+                result: Some(FileResult::File {
+                    at: taken(),
+                    path: "e.txt".into(),
+                    size: 1,
+                    content: FileBody::Blob(BlobRef {
+                        id: ready.id,
+                        size: 1,
+                        sha256,
+                    }),
+                }),
+                blob: Some(ready.clone()),
+            },
+        ];
+        let screen = shown_with(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Idle,
+            WorkdirBody::Nothing,
+            downloads,
+        );
+        let rows = &screen.downloads;
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            ["a.log", "b.bin", "c.iso", "d.mp4", "e.txt"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Asking the server\u{2026}",
+                "Download failed: timed out",
+                "Too large to download: 200.0 MiB",
+                "downloading \u{b7} 1.0 KiB of 4.0 KiB (25%)",
+                "downloaded",
+            ]
+        );
+        let flags: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.failed,
+                    row.blob.as_ref().map(|blob| blob.state),
+                    row.local_path.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (false, None, None),
+                (true, None, None),
+                (true, None, None),
+                (false, Some(BlobStateKind::Downloading), None),
+                (false, Some(BlobStateKind::Available), Some(ready_path)),
             ]
         );
     }

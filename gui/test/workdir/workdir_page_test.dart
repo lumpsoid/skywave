@@ -37,6 +37,7 @@ void main() {
     canGoUp: canGoUp,
     entries: entries,
     content: content,
+    downloads: const [],
   );
 
   Future<List<GuiIntent>> pump(WidgetTester tester, WorkdirScreen s) async {

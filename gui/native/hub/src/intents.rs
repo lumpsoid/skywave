@@ -162,6 +162,10 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::RefreshWorkdir => Action::RefreshWorkdir,
         ActionIntent::OpenNextApproval => Action::OpenNextApproval,
         ActionIntent::DownloadBlob { blob_id } => Action::DownloadBlob(id("blob", &blob_id)?),
+        ActionIntent::DownloadWorkdirFile { session_id, path } => Action::DownloadWorkdirFile {
+            session_id: id("session", &session_id)?,
+            path,
+        },
         ActionIntent::DeleteBlob { blob_id } => Action::DeleteBlob(id("blob", &blob_id)?),
         ActionIntent::CropBlob { blob_id, keep } => Action::CropBlob {
             blob: id("blob", &blob_id)?,
