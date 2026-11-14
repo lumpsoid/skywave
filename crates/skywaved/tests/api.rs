@@ -23,8 +23,9 @@ use skywave_proto::{
     DiffBody, DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange,
     FileResult, HelloResponse, ImageType, ImportOutcome, LimitSeverity, LimitWindow, LineSpan,
     ListResult, LogResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason,
-    RunId, RunsSince, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, ShellRunStorage,
-    StorageReport, ToolResult, UploadResult, UsageLimit, UsageLimitsResult, Worktree, limits, path,
+    RepoListing, RunId, RunsSince, Seq, SessionId, SessionOrigin, SessionState, ShellEnd,
+    ShellRunStorage, StorageReport, ToolResult, UploadResult, UsageLimit, UsageLimitsResult,
+    Worktree, WorktreeList, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -588,6 +589,7 @@ async fn a_request_for_another_run_is_refused_untouched() {
         path::WORKDIR_LOG.to_owned(),
         path::WORKDIR_LIST.to_owned(),
         path::WORKDIR_FILE.to_owned(),
+        path::WORKTREES.to_owned(),
     ] {
         let reply = client
             .send(Method::GET, &uri, &named(&other), Bytes::new())
@@ -3998,6 +4000,60 @@ async fn workdir_log_answers_with_200_and_the_commits() {
         anon.get(&log(session)).await.status,
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrees_lists_a_sessions_worktree_with_its_status() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    make_repo(&f.root.join("project"));
+    let accepted = device.command(&worktree_command(&f, "feat/x")).await;
+    assert_eq!(accepted, CommandResult::Accepted { seq: Seq(1) });
+    let batch = device.events(Seq::ZERO, 0).await;
+    let EventKind::SessionCreated {
+        worktree: Some(worktree),
+        ..
+    } = &batch.events[0].kind
+    else {
+        panic!("{batch:?}");
+    };
+
+    let reply = device.get(path::WORKTREES).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let list = reply.json::<WorktreeList>();
+    assert_eq!(list.repos.len(), 1, "{list:?}");
+    assert_eq!(list.repos[0].repo, worktree.repo);
+    let RepoListing::Worktrees { worktrees, more } = &list.repos[0].listing else {
+        panic!("{:?}", list.repos[0]);
+    };
+    assert!(!more);
+    let [main, linked] = worktrees.as_slice() else {
+        panic!("{worktrees:?}");
+    };
+    assert!(main.main && main.merged && !main.dirty, "{main:?}");
+    assert!(!linked.main && linked.merged && !linked.dirty, "{linked:?}");
+    assert_eq!(linked.branch.as_deref(), Some("feat/x"));
+    assert!(!linked.missing, "{linked:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrees_is_empty_without_worktree_sessions() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    make_repo(&f.root.join("project"));
+    device.command(&f.create_session_command()).await;
+
+    let reply = device.get(path::WORKTREES).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let list = reply.json::<WorktreeList>();
+    assert!(list.repos.is_empty(), "{list:?}");
+
+    // Positive control: a worktree session makes its repository listed.
+    device.command(&worktree_command(&f, "feat/x")).await;
+    let list = device.get(path::WORKTREES).await.json::<WorktreeList>();
+    assert_eq!(list.repos.len(), 1, "{list:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

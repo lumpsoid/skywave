@@ -230,6 +230,7 @@ use crate::event_log::{self, parse_id};
 mod changes;
 pub(crate) mod git;
 mod log;
+mod worktrees;
 
 pub use git::Git;
 
