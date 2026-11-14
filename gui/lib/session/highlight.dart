@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// How search matches are marked in a row's strings.

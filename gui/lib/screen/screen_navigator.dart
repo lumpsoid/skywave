@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/crop/crop_page.dart';
 import 'package:skywave_gui/holders.dart';

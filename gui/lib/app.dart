@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:ui' show AppExitResponse;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:rinf/rinf.dart';
 import 'package:skywave_gui/boot/boot_failure_page.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
