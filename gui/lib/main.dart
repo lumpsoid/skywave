@@ -12,7 +12,7 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Starts Rust, subscribes the holders, then boots the core. The GUI shows
-/// a spinner until Rust answers [Booted].
+/// the startup page until Rust answers [Booted].
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeRust(assignRustSignal);

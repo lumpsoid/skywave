@@ -82,7 +82,7 @@ class BootHolder extends ChangeNotifier {
   /// Rust answered [Booted].
   void booted() => _set(const BootReady());
 
-  /// Shows [message] instead of the spinner.
+  /// Shows [message] instead of the startup page.
   void fail(String message, {bool unreadable = false}) =>
       _set(BootError(message, unreadable: unreadable));
 

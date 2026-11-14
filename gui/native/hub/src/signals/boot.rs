@@ -20,10 +20,10 @@ pub struct Boot {
 #[derive(Serialize, RustSignal)]
 pub struct Booted;
 
-/// The core could not be opened. Dart shows `message` instead of the
-/// spinner and may send [`Boot`] again to retry. `unreadable`: the local
-/// data is from another build or damaged, so retrying alone fails again;
-/// Dart offers a [`Boot`] with `reset_replica` too.
+/// The core could not be opened. Dart shows `message` instead of the startup
+/// page and may send [`Boot`] again to retry. `unreadable`: the local data is
+/// from another build or damaged, so retrying alone fails again; Dart offers a
+/// [`Boot`] with `reset_replica` too.
 #[derive(Debug, Serialize, RustSignal)]
 pub struct BootFailed {
     pub message: String,
