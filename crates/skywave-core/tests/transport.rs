@@ -15,8 +15,8 @@ use skywave_core::{
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     ConversationsResult, DirEntry, DirsResult, EntryKind, EventKind, EventsQuery, FileBody,
-    FileResult, HelloResponse, ImageType, ListResult, LogResult, OutsideConversation,
-    PROTOCOL_VERSION, Seq, SessionId, UploadResult, WorkdirQuery,
+    FileResult, HelloResponse, ListResult, LogResult, OutsideConversation, PROTOCOL_VERSION, Seq,
+    SessionId, UploadResult, WorkdirQuery,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, Rng, seed};
 use skywaved::agent::fake::FakeOutside;
@@ -447,13 +447,13 @@ async fn conversations_are_listed_by_a_real_server() {
 
 /// `HEAD` and `PUT /v1/attachments/{sha256}` against a real server: an
 /// image is staged under its hash, a hash that does not match its bytes is
-/// refused and stages nothing, and a non-image is refused.
+/// refused and stages nothing, and a non-image is staged like any file.
 #[tokio::test(flavor = "multi_thread")]
 async fn attachments_stage_on_a_real_server() {
     let fx = Fixture::start().await;
     let transport = paired_transport(&fx).await;
-    // The server sniffs only the magic bytes, so a PNG header and padding
-    // are an image to it.
+    // The server checks only that a body hashes to its name, so a PNG header
+    // and padding stage like any bytes.
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend_from_slice(&[0u8; 64]);
     let sha = ContentHash::of(&png);
@@ -466,7 +466,6 @@ async fn attachments_stage_on_a_real_server() {
             .unwrap(),
         UploadResult::Stored {
             size: png.len() as u64,
-            media_type: ImageType::Png,
         }
     );
     assert!(transport.attachment_staged(sha).await.unwrap());
@@ -491,7 +490,9 @@ async fn attachments_stage_on_a_real_server() {
             .upload_attachment(ContentHash::of(text), Bytes::from_static(text))
             .await
             .unwrap(),
-        UploadResult::NotAnImage
+        UploadResult::Stored {
+            size: text.len() as u64,
+        }
     );
 }
 

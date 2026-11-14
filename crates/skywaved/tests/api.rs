@@ -1986,10 +1986,7 @@ async fn an_attachment_is_staged_once_and_reported_as_staged() {
     let mut device = f.client(&creds).await;
     let bytes = png(1000);
     let uri = path::attachment(ContentHash::of(&bytes));
-    let stored = UploadResult::Stored {
-        size: 1000,
-        media_type: ImageType::Png,
-    };
+    let stored = UploadResult::Stored { size: 1000 };
 
     let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
     assert_eq!(head.status, StatusCode::NOT_FOUND);
@@ -2013,10 +2010,10 @@ async fn an_attachment_is_staged_once_and_reported_as_staged() {
     assert_eq!(again.json::<UploadResult>(), stored);
 }
 
-/// A body is staged only under the hash its path names, and only if it is
-/// an image; a refusal leaves no file, temp files included.
+/// A body is staged only under the hash its path names, and any file will
+/// do; a refusal leaves no file, temp files included.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_staged_upload_must_hash_to_its_path_and_be_an_image() {
+async fn a_staged_upload_must_hash_to_its_path_and_may_be_any_file() {
     let f = Fixture::start().await;
     let creds = f.pair().await;
     let mut device = f.client(&creds).await;
@@ -2026,12 +2023,21 @@ async fn a_staged_upload_must_hash_to_its_path_and_be_an_image() {
         .send(Method::PUT, &other, &[], Bytes::from(image.clone()))
         .await;
     assert_eq!(reply.json::<UploadResult>(), UploadResult::HashMismatch);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
 
     let pdf = b"%PDF-1.4 not an image".to_vec();
     let uri = path::attachment(ContentHash::of(&pdf));
-    let reply = device.send(Method::PUT, &uri, &[], Bytes::from(pdf)).await;
-    assert_eq!(reply.json::<UploadResult>(), UploadResult::NotAnImage);
-    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(pdf.clone()))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored {
+            size: pdf.len() as u64,
+        }
+    );
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NO_CONTENT, "the pdf is staged");
 
     let uri = path::attachment(ContentHash::of(&image));
     let reply = device
@@ -2065,10 +2071,7 @@ async fn an_oversize_upload_is_refused_as_json() {
         .await;
     assert_eq!(
         reply.json::<UploadResult>(),
-        UploadResult::Stored {
-            size: 3 << 20,
-            media_type: ImageType::Png,
-        }
+        UploadResult::Stored { size: 3 << 20 }
     );
 }
 
@@ -2100,10 +2103,7 @@ async fn an_upload_on_a_low_disk_is_refused() {
         .await;
     assert_eq!(
         reply.json::<UploadResult>(),
-        UploadResult::Stored {
-            size: 1000,
-            media_type: ImageType::Png,
-        },
+        UploadResult::Stored { size: 1000 },
         "control: with room again, the upload is stored"
     );
 }
@@ -2301,6 +2301,50 @@ async fn a_message_naming_an_unstaged_image_is_refused_and_logs_nothing() {
     // Control: once staged, the same text with the image goes in.
     stage_image(&mut device, &bytes).await;
     let staged = message_command(session, context, "look", vec![hash]);
+    let seq = accepted_seq(&device.command(&staged).await);
+    assert_eq!(f.log.head(), seq);
+}
+
+/// A message naming a staged file that is not an image is `UnknownAttachment`,
+/// and logs and links nothing; the file stays staged for a resend. A staged
+/// image named the same way goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_naming_a_staged_non_image_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let pdf = b"%PDF-1.4 not an image".to_vec();
+    let hash = ContentHash::of(&pdf);
+    let reply = device
+        .send(Method::PUT, &path::attachment(hash), &[], Bytes::from(pdf))
+        .await;
+    assert!(matches!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { .. }
+    ));
+    let head = f.log.head();
+    let before = blob_files(&f);
+
+    let send = message_command(session, context, "look", vec![hash]);
+    assert_eq!(
+        device.command(&send).await,
+        rejected(RejectReason::UnknownAttachment)
+    );
+    assert_eq!(
+        device.command(&send).await,
+        rejected(RejectReason::UnknownAttachment),
+        "stored"
+    );
+    assert_eq!(f.log.head(), head, "nothing logged");
+    assert_eq!(blob_files(&f), before, "nothing linked");
+    assert!(is_staged(&mut device, hash).await, "the pdf stays staged");
+
+    // Control: a staged image named the same way goes in.
+    let bytes = png(1000);
+    let image = stage_image(&mut device, &bytes).await;
+    let staged = message_command(session, context, "look", vec![image]);
     let seq = accepted_seq(&device.command(&staged).await);
     assert_eq!(f.log.head(), seq);
 }
