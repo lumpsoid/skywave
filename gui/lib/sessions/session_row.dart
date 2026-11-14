@@ -34,8 +34,9 @@ class StateBadge extends StatelessWidget {
 /// in its workdir, renames, archives or unarchives, removes an archived
 /// session's worktree, and deletes an archived one from this device after
 /// asking.
-/// On a phone the state is a dot, the title takes two lines, the workdir
-/// is its last component and the menu is a sheet.
+/// On a phone the state is an icon whose shape says it without colour,
+/// the title takes two lines, the workdir is its last component and the
+/// menu is a sheet.
 class SessionRow extends StatelessWidget {
   const SessionRow({required this.row, required this.send, super.key});
 
@@ -63,9 +64,9 @@ class SessionRow extends StatelessWidget {
               ? Tooltip(
                   message: row.badgeLabel,
                   child: Icon(
-                    Icons.circle,
+                    agentIcon(row.state),
                     key: Key('row-state-${row.sessionId}'),
-                    size: 12,
+                    size: 20,
                     color: SkyColors.of(context).agent(row.state),
                   ),
                 )
