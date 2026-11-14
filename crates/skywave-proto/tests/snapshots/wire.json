@@ -2225,7 +2225,7 @@
                 "head": null,
                 "main": false,
                 "missing": true,
-                "dirty": false,
+                "dirty": null,
                 "merged": false
               }
             ],

@@ -3034,10 +3034,12 @@ pub struct WorktreeEntry {
     pub head: Option<String>,
     /// It is the repository's main working tree.
     pub main: bool,
-    /// Its directory is gone (git calls it prunable).
+    /// Its directory is gone: git calls it prunable, or it no longer exists.
     pub missing: bool,
-    /// It has uncommitted or untracked changes; `false` when `missing`.
-    pub dirty: bool,
+    /// It has uncommitted or untracked changes (a submodule's own dirty
+    /// content not counted); `None` when its status was not read: its
+    /// directory is missing or outside the server's roots.
+    pub dirty: Option<bool>,
     /// Its `HEAD` is merged into the main working tree's `HEAD`; `true` for
     /// the main working tree itself.
     pub merged: bool,
