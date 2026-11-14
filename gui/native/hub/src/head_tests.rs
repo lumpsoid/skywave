@@ -2544,7 +2544,7 @@ fn created_session(branch: Option<&str>) -> EventKind {
 }
 
 #[test]
-fn an_archived_worktree_row_is_removable() {
+fn a_worktree_row_is_removable_archived_or_not() {
     let mut rig = Rig::new();
     let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
     let me = rig.me;
@@ -2606,7 +2606,8 @@ fn an_archived_worktree_row_is_removable() {
     });
     rig.results();
     rig.view();
-    assert_eq!(flags(&rig, active_worktree), (false, false));
+    // An active worktree row is removable too: archiving never removes.
+    assert_eq!(flags(&rig, active_worktree), (true, false));
 }
 
 #[test]
@@ -2647,6 +2648,180 @@ fn the_remove_worktree_intent_queues_the_command() {
         entry.command.kind,
         CommandKind::RemoveWorktree { session_id } if session_id == session
     ));
+}
+
+/// The screen the head last sent.
+fn sent_screen(rig: &Rig) -> ScreenView {
+    rig.head.sent.screen.as_ref().unwrap().screen.clone()
+}
+
+/// Asks for the worktrees screen from the list, and returns the request.
+fn open_worktrees(
+    rig: &mut Rig,
+    requests: &std::sync::mpsc::Receiver<skywave_core::Request>,
+) -> u64 {
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::Worktrees,
+        },
+    });
+    rig.results();
+    rig.view();
+    requests
+        .try_iter()
+        .find_map(|r| match r {
+            skywave_core::Request::Worktrees { req } => Some(req),
+            _ => None,
+        })
+        .expect("the core asked for the worktrees")
+}
+
+#[test]
+fn the_worktrees_screen_lists_each_repo_with_its_sessions() {
+    use skywave_proto::{RepoListing, RepoWorktrees, WorktreeEntry, WorktreeList};
+
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let in_worktree = SessionId::new();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(in_worktree, at, created_session(Some("feat-x")))],
+        })
+        .unwrap();
+    rig.online_on_the_list();
+    let req = open_worktrees(&mut rig, &requests);
+    let ScreenView::Worktrees { status_label, .. } = sent_screen(&rig) else {
+        unreachable!()
+    };
+    assert_eq!(status_label.as_deref(), Some("Asking the server…"));
+
+    let (repo, path) = ("/srv/app", "/srv/app.worktrees/feat-x");
+    rig.seam.worktrees_listed(
+        req,
+        Ok(WorktreeList {
+            at,
+            repos: vec![
+                RepoWorktrees {
+                    repo: repo.into(),
+                    listing: RepoListing::Worktrees {
+                        worktrees: vec![
+                            WorktreeEntry {
+                                path: repo.into(),
+                                branch: Some("main".into()),
+                                head: None,
+                                main: true,
+                                missing: false,
+                                dirty: Some(false),
+                                merged: true,
+                            },
+                            WorktreeEntry {
+                                path: path.into(),
+                                branch: Some("feat-x".into()),
+                                head: None,
+                                main: false,
+                                missing: false,
+                                dirty: Some(true),
+                                merged: false,
+                            },
+                        ],
+                        more: false,
+                    },
+                },
+                RepoWorktrees {
+                    repo: "/srv/gone".into(),
+                    listing: RepoListing::Gone,
+                },
+            ],
+        }),
+    );
+    rig.view();
+    let ScreenView::Worktrees {
+        status_label,
+        repos,
+        empty_label,
+    } = sent_screen(&rig)
+    else {
+        unreachable!()
+    };
+    assert_eq!(status_label, None);
+    assert_eq!(empty_label, None);
+    let names: Vec<&str> = repos.iter().map(|r| r.repo.as_str()).collect();
+    assert_eq!(names, [repo, "/srv/gone"]);
+    assert_eq!(repos[0].note, None);
+    assert_eq!(repos[1].note.as_deref(), Some("Not a repository any more."));
+    assert!(repos[1].worktrees.is_empty());
+
+    let (main, feature) = (&repos[0].worktrees[0], &repos[0].worktrees[1]);
+    assert_eq!(main.tags, ["main"]);
+    assert!(main.sessions.is_empty(), "no session runs in the main tree");
+    assert_eq!(feature.branch, "feat-x");
+    assert_eq!(feature.tags, ["uncommitted changes", "not merged"]);
+    assert_eq!(feature.sessions.len(), 1);
+    let session = &feature.sessions[0];
+    assert_eq!(session.session_id, in_worktree.0.to_string());
+    assert!(!session.archived);
+    assert!(session.removable);
+    assert_eq!(session.removal_label, None);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::RemoveWorktree {
+            session_id: in_worktree.0.to_string(),
+        },
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::Worktrees { repos, .. } = sent_screen(&rig) else {
+        unreachable!()
+    };
+    assert_eq!(
+        repos[0].worktrees[1].sessions[0].removal_label.as_deref(),
+        Some("queued")
+    );
+}
+
+#[test]
+fn refreshing_the_worktrees_screen_asks_the_server_again() {
+    use skywave_proto::WorktreeList;
+
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    rig.online_on_the_list();
+    let req = open_worktrees(&mut rig, &requests);
+    rig.seam.worktrees_listed(
+        req,
+        Ok(WorktreeList {
+            at,
+            repos: Vec::new(),
+        }),
+    );
+    rig.view();
+    let ScreenView::Worktrees {
+        status_label,
+        empty_label,
+        ..
+    } = sent_screen(&rig)
+    else {
+        unreachable!()
+    };
+    assert_eq!(status_label, None);
+    assert_eq!(
+        empty_label.as_deref(),
+        Some("No session runs in a worktree yet.")
+    );
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::RefreshWorktrees,
+    });
+    assert_eq!(rig.actions.last(), Some(&Action::RefreshWorktrees));
+    rig.results();
+    rig.view();
+    let ScreenView::Worktrees { status_label, .. } = sent_screen(&rig) else {
+        unreachable!()
+    };
+    assert_eq!(status_label.as_deref(), Some("Refreshing…"));
 }
 
 impl Rig {

@@ -186,6 +186,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::RetryNow => Action::RetryNow,
         ActionIntent::ResetReplica => Action::ResetReplica,
         ActionIntent::RefreshStorage => Action::RefreshStorage,
+        ActionIntent::RefreshWorktrees => Action::RefreshWorktrees,
         ActionIntent::RefreshUsageLimits => Action::RefreshUsageLimits,
         // Checked here too so a typo is shown, not silently dropped.
         ActionIntent::SetServerAddress { address } => {
@@ -201,6 +202,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             RouteView::Pairing => Route::Pairing,
             RouteView::Usage => Route::Usage,
             RouteView::Storage => Route::Storage,
+            RouteView::Worktrees => Route::Worktrees,
             RouteView::UsageLimits => Route::UsageLimits,
         }),
         ActionIntent::Back => Action::Back,

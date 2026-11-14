@@ -499,10 +499,13 @@ pub enum ActionIntent {
     RetryAgentLogin,
     /// Forget this device's login, the code included.
     DismissAgentLogin,
-    /// Remove the archived session's git worktree and delete its branch.
+    /// Remove the session's git worktree and delete its branch
+    /// (`removable`); archived or not.
     RemoveWorktree {
         session_id: String,
     },
+    /// Ask the server for its worktree list again, on the worktrees screen.
+    RefreshWorktrees,
 }
 
 /// A login code as pasted. A secret: `Debug` prints `<redacted>`, so an
@@ -548,6 +551,7 @@ pub enum RouteView {
     Pairing,
     Usage,
     Storage,
+    Worktrees,
     UsageLimits,
 }
 
