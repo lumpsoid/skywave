@@ -1,7 +1,7 @@
 {
-  "protocol_version": 33,
+  "protocol_version": 34,
   "hello": {
-    "protocol_version": 33,
+    "protocol_version": 34,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -2190,6 +2190,71 @@
     },
     {
       "result": "not_found"
+    }
+  ],
+  "worktrees": [
+    {
+      "at": "2026-10-29T12:00:00Z",
+      "repos": [
+        {
+          "repo": "/srv/app",
+          "listing": {
+            "result": "worktrees",
+            "worktrees": [
+              {
+                "path": "/srv/app",
+                "branch": "main",
+                "head": "e3c8849a1f0b2c7d6e5f4a3b2c1d0e9f8a7b6c5d",
+                "main": true,
+                "missing": false,
+                "dirty": false,
+                "merged": true
+              },
+              {
+                "path": "/srv/app.worktrees/feature-x",
+                "branch": "feature/x",
+                "head": "1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c",
+                "main": false,
+                "missing": false,
+                "dirty": true,
+                "merged": false
+              },
+              {
+                "path": "/srv/app.worktrees/old",
+                "branch": null,
+                "head": null,
+                "main": false,
+                "missing": true,
+                "dirty": false,
+                "merged": false
+              }
+            ],
+            "more": true
+          }
+        },
+        {
+          "repo": "/srv/gone",
+          "listing": {
+            "result": "gone"
+          }
+        }
+      ]
+    },
+    {
+      "at": "2026-10-29T12:00:00Z",
+      "repos": [
+        {
+          "repo": "/srv/lib",
+          "listing": {
+            "result": "failed",
+            "reason": "git: command not found"
+          }
+        }
+      ]
+    },
+    {
+      "at": "2026-10-29T12:00:00Z",
+      "repos": []
     }
   ],
   "conversations": [

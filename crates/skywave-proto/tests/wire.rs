@@ -1185,6 +1185,67 @@ fn all_log_results() -> Vec<LogResult> {
     ]
 }
 
+fn all_worktree_lists() -> Vec<WorktreeList> {
+    let main = WorktreeEntry {
+        path: "/srv/app".into(),
+        branch: Some("main".into()),
+        head: Some("e3c8849a1f0b2c7d6e5f4a3b2c1d0e9f8a7b6c5d".into()),
+        main: true,
+        missing: false,
+        dirty: false,
+        merged: true,
+    };
+    let linked = WorktreeEntry {
+        path: "/srv/app.worktrees/feature-x".into(),
+        branch: Some("feature/x".into()),
+        head: Some("1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c".into()),
+        main: false,
+        missing: false,
+        dirty: true,
+        merged: false,
+    };
+    let detached = WorktreeEntry {
+        path: "/srv/app.worktrees/old".into(),
+        branch: None,
+        head: None,
+        main: false,
+        missing: true,
+        dirty: false,
+        merged: false,
+    };
+    vec![
+        WorktreeList {
+            at: at(),
+            repos: vec![
+                RepoWorktrees {
+                    repo: "/srv/app".into(),
+                    listing: RepoListing::Worktrees {
+                        worktrees: vec![main, linked, detached],
+                        more: true,
+                    },
+                },
+                RepoWorktrees {
+                    repo: "/srv/gone".into(),
+                    listing: RepoListing::Gone,
+                },
+            ],
+        },
+        WorktreeList {
+            at: at(),
+            repos: vec![RepoWorktrees {
+                repo: "/srv/lib".into(),
+                listing: RepoListing::Failed {
+                    reason: "git: command not found".into(),
+                },
+            }],
+        },
+        WorktreeList {
+            at: at(),
+            repos: vec![],
+        },
+    ]
+}
+
 fn all_list_results() -> Vec<ListResult> {
     let entry = |name: &str, kind: EntryKind| DirEntry {
         name: name.into(),
@@ -1604,6 +1665,9 @@ fn every_workdir_body_round_trips() {
     for result in all_log_results() {
         round_trip(&result);
     }
+    for list in all_worktree_lists() {
+        round_trip(&list);
+    }
     for result in all_list_results() {
         round_trip(&result);
     }
@@ -1701,6 +1765,16 @@ fn workdir_fixtures_cover_every_variant() {
             ListResult::NotFound => "not_found",
         });
     }
+    let mut listings = BTreeSet::new();
+    for list in all_worktree_lists() {
+        for repo in &list.repos {
+            listings.insert(match &repo.listing {
+                RepoListing::Worktrees { .. } => "worktrees",
+                RepoListing::Gone => "gone",
+                RepoListing::Failed { .. } => "failed",
+            });
+        }
+    }
     let mut files = BTreeSet::new();
     let mut bodies = BTreeSet::new();
     for result in all_file_results() {
@@ -1729,6 +1803,7 @@ fn workdir_fixtures_cover_every_variant() {
     assert_eq!(kinds.len(), 7, "{kinds:?}");
     assert_eq!(files.len(), 7, "{files:?}");
     assert_eq!(bodies.len(), 3, "{bodies:?}");
+    assert_eq!(listings.len(), 3, "{listings:?}");
 }
 
 #[test]
@@ -1739,6 +1814,7 @@ fn workdir_caps() {
     assert_eq!(limits::WORKDIR_DIFFS_MAX_BYTES, 8 * 1024 * 1024);
     assert_eq!(limits::WORKDIR_FILE_MAX_BYTES, 4 * 1024 * 1024);
     assert_eq!(limits::WORKDIR_LIST_MAX, 1000);
+    assert_eq!(limits::WORKTREES_MAX, 200);
     assert_eq!(limits::STORAGE_TOP_MAX, 50);
 }
 
@@ -1828,8 +1904,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v33() {
-    assert_eq!(PROTOCOL_VERSION, 33);
+fn protocol_is_v34() {
+    assert_eq!(PROTOCOL_VERSION, 34);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -2073,6 +2149,7 @@ fn api_paths() {
     assert_eq!(path::WORKDIR_LOG, "/v1/workdir/log");
     assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
+    assert_eq!(path::WORKTREES, "/v1/worktrees");
     assert_eq!(path::BLOB_ROUTE, "/v1/blobs/{id}");
     assert_eq!(
         path::blob(blob_id()),
@@ -2123,6 +2200,7 @@ fn wire_format_snapshot() {
         workdir_log: Vec<LogResult>,
         workdir_list: Vec<ListResult>,
         workdir_file: Vec<FileResult>,
+        worktrees: Vec<WorktreeList>,
         conversations: Vec<ConversationsResult>,
         storage: StorageReport,
         usage_limits: Vec<UsageLimitsResult>,
@@ -2161,6 +2239,7 @@ fn wire_format_snapshot() {
         workdir_log: all_log_results(),
         workdir_list: all_list_results(),
         workdir_file: all_file_results(),
+        worktrees: all_worktree_lists(),
         conversations: all_conversations_results(),
         storage: storage_report(),
         usage_limits: all_usage_limits_results(),
