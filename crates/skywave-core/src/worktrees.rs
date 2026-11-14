@@ -22,7 +22,6 @@ pub(crate) struct Worktrees {
 
 impl Worktrees {
     /// The screen opened: forget the last list and ask again.
-    #[allow(dead_code)]
     pub(crate) fn open(&mut self, online: bool) -> Option<Request> {
         self.list = None;
         self.refresh(online)
@@ -30,7 +29,6 @@ impl Worktrees {
 
     /// Asks the server again, keeping the list shown until the answer.
     /// Offline it is unavailable at once.
-    #[allow(dead_code)]
     pub(crate) fn refresh(&mut self, online: bool) -> Option<Request> {
         if !online {
             self.waiting = None;
@@ -67,7 +65,6 @@ impl Worktrees {
     }
 
     /// What the screen shows: its status and the latest list.
-    #[allow(dead_code)]
     pub(crate) fn shown(&self) -> (WorktreesStatus, Option<WorktreeList>) {
         (
             self.status.clone().unwrap_or(WorktreesStatus::Loading),

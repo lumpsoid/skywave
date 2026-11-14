@@ -115,3 +115,4 @@ pub use view::{
     UsageLimitsUnavailable, UsageLimitsView,
 };
 pub use view::{LoginCodeRefused, LoginFlowView, LoginNoAnswer, LoginOutcome, LoginView};
+pub use view::{WorktreeSession, WorktreesStatus, WorktreesUnavailable, WorktreesView};
