@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use skywave_proto::ContentHash;
 
-use crate::attachment::AttachedImage;
+use crate::attachment::{AttachedFile, AttachedImage};
 use crate::login::LoginCode;
 use crate::store::BlobPolicy;
 use crate::view::{
@@ -179,6 +179,21 @@ pub enum Action {
     Detach {
         session_id: SessionId,
         sha256: ContentHash,
+    },
+    /// Add a non-image file to the session's agent draft, after the files it
+    /// holds. The head copies it first (`attachment::store_file`); the sender
+    /// writes it into the workdir root as `file.name` before posting. A
+    /// no-op for an unknown session, for a name the draft already holds, and
+    /// for a name that is not a single plain path component.
+    AttachFile {
+        session_id: SessionId,
+        file: AttachedFile,
+    },
+    /// Take the file called `name` off the session's agent draft. A no-op
+    /// when the draft does not hold it.
+    DetachFile {
+        session_id: SessionId,
+        name: String,
     },
     /// Keep `text` on this device as a snippet of `kind`, to use again in
     /// any session, named `name` (blank for none; normalised as a session
