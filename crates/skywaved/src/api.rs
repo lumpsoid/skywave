@@ -148,10 +148,11 @@ use futures_util::StreamExt;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContentHash,
-    ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery,
-    HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult, LoginStartResult,
-    PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId, UploadResult,
-    UsageLimit, UsageLimitsResult, WorkdirQuery, check_conversation_id, limits, path,
+    ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventKind, EventsQuery, Fingerprint,
+    HelloQuery, HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult,
+    LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId,
+    UploadResult, UsageLimit, UsageLimitsResult, WorkdirQuery, WriteFileRequest, WriteFileResult,
+    check_conversation_id, limits, path,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -177,6 +178,7 @@ use crate::login::LoginFlows;
 use crate::server::{JoinedHook, ServerOptions};
 use crate::storage::{self, StorageReader};
 use crate::workdir::{self, Git, Snapshot, WorkdirReader};
+use crate::workdir_write::{self, WRITE_DEADLINE, WriteOutcome};
 use crate::worktree;
 use crate::{EventLog, lock};
 
@@ -391,6 +393,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::WORKTREES, get(worktrees))
         .route(path::WORKDIR_DOWNLOAD, get(workdir_download))
+        .route(path::WORKDIR_WRITE, post(workdir_write))
         .route(path::BLOB_ROUTE, get(blob))
         .route(
             path::ATTACHMENT_ROUTE,
@@ -1259,6 +1262,61 @@ async fn workdir_download(
     .await
 }
 
+/// `POST /v1/workdir/write`: writes a staged upload into a session's workdir
+/// and answers a [`WriteFileResult`] with 200, whatever the outcome. The
+/// rules are in the docs of [`mod@crate::workdir_write`]. A write that lands
+/// is logged as `FileWritten` by the calling device and answered `Written`
+/// with that event's seq. A low disk is checked first; a body that is not a
+/// request is a 400, and a write past [`WRITE_DEADLINE`] a 503.
+async fn workdir_write(
+    State(api): State<Arc<Api>>,
+    Extension(Caller(device)): Extension<Caller>,
+    body: std::result::Result<Json<WriteFileRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(req)) = body else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if api.log.disk().refresh() {
+        return Json(WriteFileResult::DiskLow).into_response();
+    }
+    let deadline = Instant::now() + WRITE_DEADLINE;
+    let session = req.session;
+    let staging = api.staging.clone();
+    let outcome = workdir_task(&api, WRITE_DEADLINE + Duration::from_secs(5), move |w| {
+        let workdir = match w.workdir_of(req.session, deadline)? {
+            Ok(workdir) => workdir,
+            Err(answer) => return Ok(WriteOutcome::Answer(answer)),
+        };
+        workdir_write::write(&workdir, &staging, &req, deadline)
+    })
+    .await;
+    let (path, sha256, size, replaced) = match outcome {
+        Ok(WriteOutcome::Wrote {
+            path,
+            sha256,
+            size,
+            replaced,
+        }) => (path, sha256, size, replaced),
+        Ok(WriteOutcome::Answer(answer)) => return Json(answer).into_response(),
+        Err(response) => return response,
+    };
+    let kind = EventKind::FileWritten {
+        path: path.clone(),
+        sha256,
+        size,
+        replaced,
+        by: device,
+    };
+    let logged = api
+        .blocking(move |api, db| api.log.file_written(db, session, kind))
+        .await;
+    match logged {
+        Ok(Some(seq)) => Json(WriteFileResult::Written { path, size, seq }).into_response(),
+        Ok(None) => Json(WriteFileResult::UnknownSession).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
 /// Runs `f` as one workdir snapshot on a blocking thread (module docs,
 /// "Workdir"): its answer is a 200, a passed deadline, [`WORKDIR_TIMEOUT`]
 /// or no file-system permit a 503, any other error a 500.
@@ -1278,9 +1336,22 @@ async fn workdir_blocking<T: serde::Serialize + Send + 'static>(
     timeout: Duration,
     f: impl FnOnce(&WorkdirReader) -> Result<T> + Send + 'static,
 ) -> Response {
+    match workdir_task(api, timeout, f).await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// [`workdir_blocking`] up to its answer: what `f` returned, or the response
+/// to send instead (a 503 or a 500).
+async fn workdir_task<T: Send + 'static>(
+    api: &Arc<Api>,
+    timeout: Duration,
+    f: impl FnOnce(&WorkdirReader) -> Result<T> + Send + 'static,
+) -> std::result::Result<T, Response> {
     let permit = match api.fs_permit().await {
         Ok(permit) => permit,
-        Err(status) => return status.into_response(),
+        Err(status) => return Err(status.into_response()),
     };
     let api = api.clone();
     let work = tokio::task::spawn_blocking(move || {
@@ -1288,22 +1359,22 @@ async fn workdir_blocking<T: serde::Serialize + Send + 'static>(
         f(&api.workdir)
     });
     match tokio::time::timeout(timeout, work).await {
-        Ok(Ok(Ok(answer))) => Json(answer).into_response(),
+        Ok(Ok(Ok(answer))) => Ok(answer),
         Ok(Ok(Err(Error::WorkdirDeadline))) => {
             tracing::warn!("workdir snapshot passed its deadline");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }
         Ok(Ok(Err(e))) => {
             tracing::error!(error = %e, "workdir read failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Ok(Err(e)) => {
             tracing::error!(error = %e, "workdir task failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(_) => {
             tracing::warn!("workdir read timed out");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }
     }
 }

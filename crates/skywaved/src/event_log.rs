@@ -615,6 +615,34 @@ impl EventLog {
         })
     }
 
+    /// Appends `kind`, the `FileWritten` a workdir write made (`POST`
+    /// [`skywave_proto::path::WORKDIR_WRITE`]), to `session_id` in its
+    /// current context, and returns its seq. `None` for an unknown session,
+    /// which logs nothing. Refused with [`Error::InvalidAppend`]: any other
+    /// kind. The write has already happened on disk when this runs, so the
+    /// caller answers from the seq, not from a second read.
+    pub fn file_written(
+        &self,
+        db: &mut Db,
+        session_id: SessionId,
+        kind: EventKind,
+    ) -> Result<Option<Seq>> {
+        if !matches!(kind, EventKind::FileWritten { .. }) {
+            return Err(Error::InvalidAppend(format!(
+                "{} is not a file write",
+                kind_name(&kind)
+            )));
+        }
+        let tx = begin(db)?;
+        let Some(session) = session_in(&tx, session_id)? else {
+            return Ok(None);
+        };
+        let seq = append_in(&tx, session_id, session.context, None, &kind)?;
+        tx.commit()?;
+        self.published(seq);
+        Ok(Some(seq))
+    }
+
     /// Every shell run not yet over, oldest first, and the head, read in one
     /// transaction: the shell runner's starting point after a daemon start.
     /// It follows the log from `head` on.

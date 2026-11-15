@@ -1472,3 +1472,27 @@ staging cap, and refused at load when larger). The PUT streams its body to a
 temp file in the staging directory and never buffers it; a body over the cap
 is `TooLarge` and leaves no file. `ATTACHMENT_MAX_BYTES` stays the per-image
 limit for images on a message.
+
+## D56. Writing a file into a workdir (v36)
+`POST /v1/workdir/write` writes a staged upload into a session's workdir. It
+is a route with a typed answer, not a command: a `RejectReason` carries no
+data, but a replace must say which file it replaces, and the answer
+`Exists` carries the sha256 the file holds now. A retry is definitive: a
+write that already landed answers `Same`, so a device that lost the reply
+settles from the answer, not from a guess.
+**Why:** the user confirms a replace against the file they saw. A `replace`
+flag would replace whatever is there when the write runs, which can be a
+file the user never looked at.
+
+The replace rule is a hash, not a flag. `replace` names the sha256 of the
+file the user saw, and the write replaces only that file. A file that changed
+after the user looked answers `Exists` again, with its new hash.
+
+The path rules: no `.git` component anywhere in the path, since git's own
+directory runs hooks and a device must never write into it; no symlink at the
+target; nothing outside the workdir. These are refused as `NotAllowed` before
+the file system is touched.
+
+A composer's non-image file is meant to use this route, written at
+`<workdir root>/<file name>`, the path the user sees. No head calls the route
+yet.
