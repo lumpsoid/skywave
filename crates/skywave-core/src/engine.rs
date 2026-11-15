@@ -124,7 +124,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
 use skywave_proto::limits::ATTACHMENT_MAX_BYTES;
 use skywave_proto::{
@@ -1209,7 +1208,13 @@ async fn stage_one(
         return Ok(ImageStaging::Staged);
     }
     let path = attachment_path(data_dir, sha);
-    let size = match tokio::fs::metadata(&path).await {
+    // Opening the copy is what finds an unreadable one; the upload then opens
+    // it again, so the handle is dropped here.
+    let opened = match tokio::fs::File::open(&path).await {
+        Ok(file) => file.metadata().await,
+        Err(error) => Err(error),
+    };
+    let size = match opened {
         Ok(meta) => meta.len(),
         Err(error) => {
             tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
@@ -1276,6 +1281,38 @@ enum FileWrite {
     Refused(AttachmentRefusal),
 }
 
+/// A file that counts the bytes read from it, so an upload can send exactly
+/// the bytes it hashed.
+struct CountingFile {
+    file: std::fs::File,
+    count: u64,
+}
+
+impl std::io::Read for CountingFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+
+/// The hash of the file at `path` and the number of bytes it hashed, by a
+/// streaming read on a blocking thread: the file is never held whole. The
+/// upload then sends exactly those bytes ([`UploadFile`]).
+async fn hash_file(path: &Path) -> std::io::Result<(ContentHash, u64)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<(ContentHash, u64)> {
+        let mut counted = CountingFile {
+            file: std::fs::File::open(&path)?,
+            count: 0,
+        };
+        let hash = ContentHash::read(&mut counted)?;
+        Ok((hash, counted.count))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 /// Writes one file of a message into the workdir root as its name. The device
 /// copy must still hash to the file's hash; it is staged the way an image is
 /// (a HEAD, then a PUT unless the server holds it), then written with the
@@ -1301,18 +1338,10 @@ async fn write_one(
             return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
         }
     }
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => Bytes::from(bytes),
+    let (hash, len) = match hash_file(&path).await {
+        Ok(hashed) => hashed,
         Err(error) => {
             tracing::warn!(%error, name = %file.name, "message file cannot be read");
-            return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
-        }
-    };
-    let copy = bytes.clone();
-    let hash = match tokio::task::spawn_blocking(move || ContentHash::of(&copy)).await {
-        Ok(hash) => hash,
-        Err(error) => {
-            tracing::warn!(%error, name = %file.name, "message file cannot be hashed");
             return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
         }
     };
@@ -1326,7 +1355,7 @@ async fn write_one(
         if round > 1 || !transport.attachment_staged(sha).await? {
             let file = UploadFile {
                 path: path.clone(),
-                len: bytes.len() as u64,
+                len,
             };
             match transport.upload_attachment(sha, file).await? {
                 UploadResult::Stored { .. } => {}
@@ -1367,11 +1396,12 @@ async fn write_one(
 }
 
 /// Pushes one device file into a session's workdir. The file is read where
-/// it is, not copied into the data dir; the hash is of the bytes read, so the
-/// content sent is the content named. A HEAD, then, unless the server holds
-/// the bytes, a PUT, then the write at `path`. A file that is missing,
-/// unreadable or over [`PUSH_MAX_BYTES`] is refused without an upload. A
-/// transport error is returned to the caller.
+/// it is, not copied into the data dir, and hashed by a streaming read; the
+/// upload sends the bytes hashed, so the content sent is the content named (a
+/// file changed in between fails as the server's hash mismatch). A HEAD, then,
+/// unless the server holds the bytes, a PUT, then the write at `path`. A file
+/// that is missing, unreadable or over [`PUSH_MAX_BYTES`] is refused without an
+/// upload. A transport error is returned to the caller.
 pub(crate) async fn push_workdir_file(
     transport: &dyn Transport,
     source: &Path,
@@ -1392,20 +1422,10 @@ pub(crate) async fn push_workdir_file(
             });
         }
     }
-    let bytes = match tokio::fs::read(source).await {
-        Ok(bytes) => Bytes::from(bytes),
+    let (sha, len) = match hash_file(source).await {
+        Ok(hashed) => hashed,
         Err(error) => {
             tracing::warn!(%error, "workdir push file cannot be read");
-            return Ok(PushOutcome::Unreadable {
-                reason: error.to_string(),
-            });
-        }
-    };
-    let copy = bytes.clone();
-    let sha = match tokio::task::spawn_blocking(move || ContentHash::of(&copy)).await {
-        Ok(sha) => sha,
-        Err(error) => {
-            tracing::warn!(%error, "workdir push file cannot be hashed");
             return Ok(PushOutcome::Unreadable {
                 reason: error.to_string(),
             });
@@ -1414,7 +1434,7 @@ pub(crate) async fn push_workdir_file(
     if !transport.attachment_staged(sha).await? {
         let file = UploadFile {
             path: source.to_path_buf(),
-            len: bytes.len() as u64,
+            len,
         };
         let answer = transport.upload_attachment(sha, file).await?;
         if !matches!(answer, UploadResult::Stored { .. }) {
@@ -3497,6 +3517,37 @@ mod tests {
         );
     }
 
+    /// A local image that exists but cannot be read is refused without an
+    /// upload: staging opens the copy, so an unreadable one is refused as
+    /// missing rather than retried as a transport error.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_image_fails_without_uploading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"unreadable image");
+        std::fs::set_permissions(
+            attachment_path(dir.path(), a),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        if std::fs::File::open(attachment_path(dir.path(), a)).is_ok() {
+            // Running as root reads any file, so there is nothing to refuse.
+            return;
+        }
+        let server = StagingServer::new();
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a)]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(AttachmentRefusal::Missing)]
+        );
+    }
+
     /// A local image over the upload limit is refused without an upload.
     #[tokio::test(start_paused = true)]
     async fn an_oversized_image_fails_without_uploading() {
@@ -4125,6 +4176,47 @@ mod tests {
                 replace: None,
             }]
         );
+    }
+
+    /// A file is hashed whole by a streaming read, across more than one chunk.
+    #[tokio::test]
+    async fn hash_file_hashes_the_whole_file_by_a_streaming_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..3 * 64 * 1024 + 5).map(|i| (i % 251) as u8).collect();
+        let path = source_file(dir.path(), &bytes);
+
+        assert_eq!(
+            hash_file(&path).await.unwrap(),
+            (ContentHash::of(&bytes), bytes.len() as u64)
+        );
+        assert!(hash_file(&dir.path().join("absent")).await.is_err());
+    }
+
+    /// A device file larger than one upload chunk is uploaded from its file,
+    /// the upload naming exactly the bytes hashed, and the write names their
+    /// hash.
+    #[tokio::test(start_paused = true)]
+    async fn push_hashes_and_uploads_a_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..196_613).map(|i| (i % 251) as u8).collect();
+        let source = source_file(dir.path(), &bytes);
+        let server = StagingServer::new();
+        let session = SessionId::new();
+
+        push_workdir_file(&server, &source, session, "big.bin".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.uploads.lock().unwrap().clone(),
+            [UploadFile {
+                path: source.clone(),
+                len: 196_613,
+            }]
+        );
+        let writes = server.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].content, ContentHash::of(&bytes));
     }
 
     /// A file the server already holds is only written: no upload, and the
