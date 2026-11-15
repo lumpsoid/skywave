@@ -2527,6 +2527,42 @@ fn a_removed_worktree_is_an_archive_style_row() {
     );
 }
 
+#[test]
+fn a_written_file_is_a_notice() {
+    let mut rig = Rig::new();
+    let me = rig.seam.pairing().unwrap().credentials.device_id;
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let events = vec![Event {
+        session_id: rig.session,
+        at,
+        command_id: Some(CommandId::new()),
+        context: skywave_proto::ContextId::first_of(rig.session),
+        kind: EventKind::FileWritten {
+            path: "docs/a.txt".into(),
+            sha256: ContentHash::of(b"a"),
+            size: 1,
+            replaced: None,
+            by: me,
+        },
+    }];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.view();
+    let rows: Vec<_> = rig
+        .rows()
+        .iter()
+        .map(|row| (row.kind, row.text.clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        [(RowKind::Archived, "docs/a.txt written by you".to_owned())]
+    );
+}
+
 /// A session created in `/srv/app`, or in its git worktree `branch`.
 fn created_session(branch: Option<&str>) -> EventKind {
     EventKind::SessionCreated {

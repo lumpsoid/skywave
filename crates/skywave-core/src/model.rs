@@ -3903,8 +3903,18 @@ impl Model {
                 // Nothing in the timeline: what it changes is the content of
                 // the event that referenced the blob.
                 EventKind::BlobDeleted { .. } | EventKind::BlobCropped { .. } => None,
-                // Temporary: a later step adds its timeline entry.
-                EventKind::FileWritten { .. } => None,
+                EventKind::FileWritten {
+                    path,
+                    size,
+                    replaced,
+                    by,
+                    ..
+                } => Some(Entry::FileWritten {
+                    path: path.clone(),
+                    size: *size,
+                    replaced: replaced.is_some(),
+                    by: self.device_ref(*by),
+                }),
                 EventKind::Imported { at, item } => self
                     .imported(&mut items, &mut imported_calls, *at, item)
                     .map(|entry| Entry::Imported {
@@ -6833,6 +6843,55 @@ mod tests {
                     me: true,
                 },
             }]
+        );
+    }
+
+    #[test]
+    fn a_written_file_has_a_timeline_entry() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        let by = f.me;
+        f.log(
+            sid,
+            vec![
+                EventKind::FileWritten {
+                    path: "docs/a.txt".into(),
+                    sha256: ContentHash::of(b"a"),
+                    size: 1,
+                    replaced: None,
+                    by,
+                },
+                EventKind::FileWritten {
+                    path: "docs/a.txt".into(),
+                    sha256: ContentHash::of(b"b"),
+                    size: 1,
+                    replaced: Some(ContentHash::of(b"old")),
+                    by,
+                },
+            ],
+        );
+        f.open(sid);
+        let by = DeviceRef {
+            id: f.me,
+            name: None,
+            me: true,
+        };
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::FileWritten {
+                    path: "docs/a.txt".into(),
+                    size: 1,
+                    replaced: false,
+                    by: by.clone(),
+                },
+                Entry::FileWritten {
+                    path: "docs/a.txt".into(),
+                    size: 1,
+                    replaced: true,
+                    by,
+                },
+            ]
         );
     }
 

@@ -652,6 +652,19 @@ impl Layout<'_> {
                 spans.push(Span::raw(format!("worktree removed by {who}")).dark_gray());
                 return vec![Line::from(spans)];
             }
+            Entry::FileWritten {
+                path, replaced, by, ..
+            } => {
+                let who = if by.me {
+                    "you".to_owned()
+                } else {
+                    device_label(by)
+                };
+                let verb = if *replaced { "replaced" } else { "written" };
+                let mut spans = lead;
+                spans.push(Span::raw(format!("{} {verb} by {who}", clean(path))).dark_gray());
+                return vec![Line::from(spans)];
+            }
             Entry::AgentSetting {
                 setting,
                 by,

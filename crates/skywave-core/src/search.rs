@@ -320,6 +320,7 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         Entry::ToolResult { summary, output } => result_texts(summary, output),
         Entry::Approval { tool, summary, .. } => vec![tool, summary],
         Entry::Renamed { name, .. } => name.as_deref().into_iter().collect(),
+        Entry::FileWritten { path, .. } => vec![path],
         Entry::ContextStarted { name, .. }
         | Entry::ContextSwitched { name, .. }
         | Entry::ContextMoved { name, .. }
@@ -549,6 +550,33 @@ mod tests {
         assert_eq!(hit("91bc"), [0]);
         assert_eq!(hit("aaaa"), [1]);
         assert!(hit("zzzz").is_empty());
+    }
+
+    #[test]
+    fn a_written_file_is_found_by_its_path() {
+        let timeline = vec![
+            logged(Entry::FileWritten {
+                path: "docs/a.txt".into(),
+                size: 1,
+                replaced: false,
+                by: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: false,
+                },
+            }),
+            // Control: an item without the path.
+            logged(Entry::Renamed {
+                name: Some("notes".into()),
+                by: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: false,
+                },
+            }),
+        ];
+        assert_eq!(indices(&timeline, &Query::new("docs/a.txt")), [0]);
+        assert!(indices(&timeline, &Query::new("zzzz")).is_empty());
     }
 
     #[test]
