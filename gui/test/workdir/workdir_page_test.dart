@@ -4,13 +4,16 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
+import 'package:skywave_gui/workdir/pushing.dart';
 import 'package:skywave_gui/workdir/saving.dart';
 import 'package:skywave_gui/workdir/workdir_page.dart';
 
 void main() {
   final originalSaver = saveWorkdirFile;
+  final originalPicker = pickPushFile;
   tearDown(() {
     saveWorkdirFile = originalSaver;
+    pickPushFile = originalPicker;
   });
 
   WorkdirScreen screen({
@@ -570,6 +573,168 @@ void main() {
       findsOneWidget,
     );
     expect(find.textContaining('Saved out/c.zip'), findsNothing);
+  });
+
+  testWidgets('the dir pane pushes a picked file under the shown directory', (
+    tester,
+  ) async {
+    pickPushFile = () async => '/home/u/notes.txt';
+    final sent = await pump(
+      tester,
+      screen(pane: WorkdirPaneKind.dir, path: 'src'),
+    );
+    await tester.tap(find.byKey(const ValueKey('workdir-push')));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<EditableText>(find.byType(EditableText)).controller.text,
+      'src/notes.txt',
+    );
+    await tester.tap(find.byKey(const Key('push-target-ok')));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentPushWorkdirFile(
+          sessionId: 's-1',
+          source: '/home/u/notes.txt',
+          path: 'src/notes.txt',
+        ),
+      ),
+    ]);
+
+    await tester.tap(find.byKey(const ValueKey('workdir-push')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('push-target-field')),
+      'docs/n.txt',
+    );
+    await tester.tap(find.byKey(const Key('push-target-ok')));
+    await tester.pumpAndSettle();
+    expect(sent, hasLength(2));
+    expect(
+      sent.last,
+      const GuiIntentAct(
+        action: ActionIntentPushWorkdirFile(
+          sessionId: 's-1',
+          source: '/home/u/notes.txt',
+          path: 'docs/n.txt',
+        ),
+      ),
+    );
+  });
+
+  testWidgets('a cancelled pick or dialog pushes nothing; only the dir pane '
+      'offers Push', (tester) async {
+    pickPushFile = () async => null;
+    final sent = await pump(
+      tester,
+      screen(pane: WorkdirPaneKind.dir, path: 'src'),
+    );
+    expect(find.byKey(const ValueKey('workdir-push')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('workdir-push')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('push-target-field')), findsNothing);
+    expect(sent, isEmpty);
+
+    pickPushFile = () async => '/home/u/notes.txt';
+    await tester.tap(find.byKey(const ValueKey('workdir-push')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('push-target-field')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('push-target-cancel')));
+    await tester.pumpAndSettle();
+    expect(sent, isEmpty);
+
+    await pump(
+      tester,
+      screen(pane: WorkdirPaneKind.file, path: 'bin/app', header: 'bin/app'),
+    );
+    expect(find.byKey(const ValueKey('workdir-push')), findsNothing);
+  });
+
+  testWidgets('the pushes panel replaces after asking, and retries', (
+    tester,
+  ) async {
+    final sha = List.filled(32, 'ab').join();
+    final sent = await pump(
+      tester,
+      screen(
+        pushes: [
+          WorkdirPushRow(
+            path: 'a.bin',
+            source: '/home/u/a.bin',
+            label: 'Sending…',
+            pushing: true,
+            done: false,
+            failed: false,
+          ),
+          WorkdirPushRow(
+            path: 'out/c.zip',
+            source: '/home/u/c.zip',
+            label: 'A file is already there (3 B)',
+            pushing: false,
+            done: false,
+            existingSha256: sha,
+            failed: false,
+          ),
+          WorkdirPushRow(
+            path: 'b.bin',
+            source: '/home/u/b.bin',
+            label: 'Push failed: timed out',
+            pushing: false,
+            done: false,
+            failed: true,
+          ),
+        ],
+      ),
+    );
+    for (final text in [
+      'Sending…',
+      'A file is already there (3 B)',
+      'Push failed: timed out',
+    ]) {
+      expect(find.text(text), findsOneWidget, reason: text);
+    }
+
+    await tester.ensureVisible(find.text('Replace…'));
+    await tester.pump();
+    await tester.tap(find.text('Replace…'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Replace out/c.zip in the workdir with c.zip?'),
+      findsOneWidget,
+    );
+    await tester.tap(find.byKey(const Key('confirm-cancel')));
+    await tester.pumpAndSettle();
+    expect(sent, isEmpty);
+
+    await tester.tap(find.text('Replace…'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('confirm-ok')));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      GuiIntentAct(
+        action: ActionIntentPushWorkdirFile(
+          sessionId: 's-1',
+          source: '/home/u/c.zip',
+          path: 'out/c.zip',
+          replace: sha,
+        ),
+      ),
+    ]);
+
+    await tester.ensureVisible(find.text('Retry'));
+    await tester.pump();
+    await tester.tap(find.text('Retry'));
+    expect(sent, hasLength(2));
+    expect(
+      sent.last,
+      const GuiIntentAct(
+        action: ActionIntentPushWorkdirFile(
+          sessionId: 's-1',
+          source: '/home/u/b.bin',
+          path: 'b.bin',
+        ),
+      ),
+    );
   });
 
   testWidgets('a file listing opens entries and goes up', (tester) async {
