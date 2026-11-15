@@ -318,7 +318,9 @@ the running ones have ended. Approvals, interrupts and stops still work in
 the meantime, so you can finish them from a device. `restart` executes the
 `serve` binary at its path again in the same process, so it works under
 systemd, `nohup` or a terminal, and picks up a binary you deployed since.
-SIGTERM (`systemctl stop`, Ctrl-C) still stops right away.
+SIGTERM (`systemctl stop`) still stops right away. Ctrl-C does too, unless
+something runs: then `serve` lists what would be lost, and a second Ctrl-C
+stops it.
 
 ### Running it as a service
 
