@@ -355,7 +355,13 @@ impl Seam {
         let data_dir = self.data_dir();
         // Before the state lock: copying and syncing a local image takes
         // long enough to hold off every dispatch and snapshot.
-        let prepared = blocking(|| prepare_own_images(&data_dir, batch));
+        let mut candidates = blocking(|| own_image_candidates(&data_dir, batch));
+        if !candidates.is_empty() {
+            // Only a blob this batch registers can use its file: skip the ones
+            // the replica already knows instead of linking them for nothing.
+            self.with_state(|state| candidates.retain(|(id, _)| !state.model.knows_blob(*id)));
+        }
+        let prepared = blocking(|| prepare_own_images(&data_dir, &candidates));
         let result = self.update(|state, requests| {
             let mut applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
@@ -1031,26 +1037,38 @@ fn own_images_available(
     }
 }
 
-/// Makes `<id>.own` for each blob `batch` references whose bytes are an
-/// attachment this device holds, and returns the ids made: the only ones
-/// `own_images_available` may rename into place. A file that cannot be made
-/// is logged, and its blob downloads. Attachment files are removed only at
-/// store open, so a file found here is still there when the batch applies.
-fn prepare_own_images(data_dir: &Path, batch: &EventBatch) -> HashSet<BlobId> {
-    let mut prepared = HashSet::new();
+/// The blobs `batch` references whose bytes are an attachment this device
+/// holds, one entry per id: the candidates `prepare_own_images` makes files
+/// for. Attachment files are removed only at store open, so a file found
+/// here is still there when the batch applies.
+fn own_image_candidates(data_dir: &Path, batch: &EventBatch) -> Vec<(BlobId, ContentHash)> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
     for (_, event) in batch.iter() {
         for blob in blob_refs(&event.kind) {
             let id = blob.id;
-            if prepared.contains(&id) || !attachment_path(data_dir, blob.sha256).exists() {
+            if seen.contains(&id) || !attachment_path(data_dir, blob.sha256).exists() {
                 continue;
             }
-            match prepare_own_image(data_dir, id, blob.sha256) {
-                Ok(()) => {
-                    prepared.insert(id);
-                }
-                Err(error) => {
-                    tracing::debug!(?id, %error, "cannot use the local image; it downloads");
-                }
+            seen.insert(id);
+            candidates.push((id, blob.sha256));
+        }
+    }
+    candidates
+}
+
+/// Makes `<id>.own` for each candidate (see `own_image_candidates`), and
+/// returns the ids made: the only ones `own_images_available` may rename
+/// into place. A file that cannot be made is logged, and its blob downloads.
+fn prepare_own_images(data_dir: &Path, candidates: &[(BlobId, ContentHash)]) -> HashSet<BlobId> {
+    let mut prepared = HashSet::new();
+    for (id, sha256) in candidates {
+        match prepare_own_image(data_dir, *id, *sha256) {
+            Ok(()) => {
+                prepared.insert(*id);
+            }
+            Err(error) => {
+                tracing::debug!(?id, %error, "cannot use the local image; it downloads");
             }
         }
     }
