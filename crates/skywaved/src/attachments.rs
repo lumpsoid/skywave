@@ -265,8 +265,11 @@ pub fn prepare(
 
 impl Prepared {
     /// Links the staged image `hash` as a new blob. `None` when it is not
-    /// staged, is no longer an image, or no longer hashes to its name: the
-    /// message then names an image it does not have.
+    /// staged or is no longer an image: the message then names an image it
+    /// does not have. A staged file that no longer hashes to its name is
+    /// removed as well, so the device's next `HEAD` misses and uploads it
+    /// again; `HEAD` checks only that the file exists, and would otherwise
+    /// keep answering for a file that is not the upload.
     fn link(&self, hash: ContentHash) -> Result<Option<(BlobMeta, ImageType)>> {
         let path = self.staging.path(hash);
         let mut file = match File::open(&path) {
@@ -291,6 +294,7 @@ impl Prepared {
         };
         if meta.sha256 != hash {
             self.blobs.discard(meta.id);
+            remove(&path)?;
             return Ok(None);
         }
         Ok(Some((meta, media_type)))
@@ -298,15 +302,24 @@ impl Prepared {
 
     /// Whether the message may be logged, or why not, checked in the order
     /// `apply` refuses: `DiskLow`, `TooManyAttachments` (more hashes than
-    /// [`limits::ATTACHMENTS_MAX`]), `AttachmentsTooLarge` (the images found
-    /// total over [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`]), then
-    /// `UnknownAttachment` for any hash not staged.
+    /// [`limits::ATTACHMENTS_MAX`]), `AttachmentsTooLarge` (an image found
+    /// over [`limits::ATTACHMENT_MAX_BYTES`], or the images found total over
+    /// [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`]), then `UnknownAttachment` for
+    /// any hash not staged.
     pub(crate) fn decide(&self) -> std::result::Result<(), RejectReason> {
         if self.disk_low {
             return Err(RejectReason::DiskLow);
         }
         if self.staged.len() > limits::ATTACHMENTS_MAX {
             return Err(RejectReason::TooManyAttachments);
+        }
+        if self
+            .links
+            .iter()
+            .flatten()
+            .any(|(meta, _)| meta.size > limits::ATTACHMENT_MAX_BYTES)
+        {
+            return Err(RejectReason::AttachmentsTooLarge);
         }
         let total: u64 = self.links.iter().flatten().map(|(meta, _)| meta.size).sum();
         if total > limits::ATTACHMENTS_MAX_TOTAL_BYTES {
@@ -638,6 +651,54 @@ mod tests {
             prepare(&staging, blobs, false, &big).unwrap().decide(),
             Err(RejectReason::AttachmentsTooLarge)
         );
+    }
+
+    #[test]
+    fn one_image_over_the_image_limit_is_too_large() {
+        let (_tmp, storage, staging) = stores();
+        let over = stage(
+            &staging,
+            &image(limits::ATTACHMENT_MAX_BYTES as usize + 1, 1),
+        );
+        assert_eq!(
+            prepare(&staging, &storage.blobs, false, &[over])
+                .unwrap()
+                .decide(),
+            Err(RejectReason::AttachmentsTooLarge)
+        );
+
+        let at_limit = stage(&staging, &image(limits::ATTACHMENT_MAX_BYTES as usize, 2));
+        assert_eq!(
+            prepare(&staging, &storage.blobs, false, &[at_limit])
+                .unwrap()
+                .decide(),
+            Ok(()),
+            "control: an image of exactly the limit is accepted"
+        );
+    }
+
+    #[test]
+    fn a_staged_file_that_no_longer_hashes_to_its_name_is_removed_when_a_message_names_it() {
+        let (_tmp, storage, staging) = stores();
+        let hash = stage(&staging, &image(100, 1));
+        let intact = prepare(&staging, &storage.blobs, false, &[hash]).unwrap();
+        assert_eq!(
+            intact.decide(),
+            Ok(()),
+            "control: the staged image is accepted"
+        );
+        drop(intact);
+
+        // Other PNG bytes: the sniff still passes, and the hash check fails.
+        fs::write(staging.path(hash), image(100, 2)).unwrap();
+        let prepared = prepare(&staging, &storage.blobs, false, &[hash]).unwrap();
+        assert_eq!(prepared.decide(), Err(RejectReason::UnknownAttachment));
+        assert!(
+            !staging.contains(hash),
+            "the file that is not the upload is removed"
+        );
+        drop(prepared);
+        assert_eq!(blob_files(&storage), 0, "no blob is left");
     }
 
     #[test]
