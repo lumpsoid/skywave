@@ -116,11 +116,13 @@ pub enum Action {
     /// Queue a message, written for the session view's
     /// [`context`](crate::SessionView::context), with the session's draft
     /// images ([`SessionView::draft_images`](crate::SessionView::draft_images))
-    /// as its attachments, in order. Sent when the text is not blank or the
-    /// draft holds images, so a blank message with images goes as it is.
-    /// Past either cap the draft's images allow (see [`Action::Attach`]) it
-    /// queues nothing. Queuing drops the session's agent draft, text and
-    /// images.
+    /// as its attachments, in order. The draft's files
+    /// ([`SessionView::draft_files`](crate::SessionView::draft_files)) add one
+    /// `Attached file: ./<name>` line each to the text. Sent when the text is
+    /// not blank or the draft holds images or files, so a blank message with
+    /// images or files goes as it is. Past either cap the draft's images allow
+    /// (see [`Action::Attach`]) it queues nothing. Queuing drops the session's
+    /// agent draft: its text, images and files.
     SendMessage {
         session_id: SessionId,
         text: String,
