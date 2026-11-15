@@ -23,6 +23,8 @@ TimelineRow anyRow(
   List<SectionView> sections = const [],
   List<MarkdownBlock> markdown = const [],
   List<RowImage> images = const [],
+  List<RowFile> files = const [],
+  bool canResendReplacing = false,
   String? timeLabel,
   String? mark,
   bool turnStart = false,
@@ -48,8 +50,8 @@ TimelineRow anyRow(
   tool: tool,
   sections: sections,
   images: images,
-  files: const [],
-  canResendReplacing: false,
+  files: files,
+  canResendReplacing: canResendReplacing,
 );
 
 ToolFacts shellFacts(String title, {ToolState state = ToolState.done}) =>

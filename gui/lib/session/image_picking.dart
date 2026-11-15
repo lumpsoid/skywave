@@ -4,12 +4,13 @@ import 'package:material_ui/material_ui.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:pasteboard/pasteboard.dart';
 
-/// Asks the user for images and returns their local paths; empty when
-/// they cancel.
-typedef PickImages = Future<List<String>> Function(BuildContext context);
+/// Asks the user for files (images among them) and returns their local
+/// paths; empty when they cancel. The hub tells an image from any other
+/// file by its content.
+typedef PickAttachments = Future<List<String>> Function(BuildContext context);
 
 /// The picker the composer uses. Tests replace it.
-PickImages pickImages = _pickPlatform;
+PickAttachments pickAttachments = _pickPlatform;
 
 /// The image on the system clipboard as PNG bytes, or null when it holds
 /// none. The composer uses it on desktop paste. Tests replace it.
@@ -24,22 +25,13 @@ Future<List<String>> _pickPlatform(BuildContext context) =>
     };
 
 Future<List<String>> _pickDesktop() async {
-  final files = await openFiles(
-    acceptedTypeGroups: const [
-      XTypeGroup(
-        label: 'Images',
-        extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'],
-        mimeTypes: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
-        uniformTypeIdentifiers: ['public.image'],
-      ),
-    ],
-  );
+  final files = await openFiles();
   return [for (final file in files) file.path];
 }
 
-enum _Source { gallery, camera }
+enum _Source { gallery, camera, file }
 
-/// A phone has no file dialog worth showing: the gallery or the camera.
+/// A phone: the gallery, the camera, or a file from the phone's storage.
 Future<List<String>> _pickMobile(BuildContext context) async {
   final source = await showModalBottomSheet<_Source>(
     context: context,
@@ -57,6 +49,11 @@ Future<List<String>> _pickMobile(BuildContext context) async {
             title: const Text('Camera'),
             onTap: () => Navigator.pop(context, _Source.camera),
           ),
+          ListTile(
+            leading: const Icon(Icons.insert_drive_file_outlined),
+            title: const Text('File'),
+            onTap: () => Navigator.pop(context, _Source.file),
+          ),
         ],
       ),
     ),
@@ -69,6 +66,9 @@ Future<List<String>> _pickMobile(BuildContext context) async {
     case _Source.camera:
       final image = await picker.pickImage(source: ImageSource.camera);
       return [?image?.path];
+    case _Source.file:
+      final files = await openFiles();
+      return [for (final file in files) file.path];
     case null:
       return const [];
   }

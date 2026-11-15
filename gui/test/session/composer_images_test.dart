@@ -10,7 +10,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 import 'rows.dart';
 
-final _originalPicker = pickImages;
+final _originalPicker = pickAttachments;
 final _originalClipboard = readClipboardImage;
 
 TimelineHolder _holding() =>
@@ -82,7 +82,7 @@ Future<void> _asLinux(Future<void> Function() body) async {
 
 void main() {
   tearDown(() {
-    pickImages = _originalPicker;
+    pickAttachments = _originalPicker;
     readClipboardImage = _originalClipboard;
     TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(SystemChannels.platform, null);
@@ -120,10 +120,10 @@ void main() {
       timeline: _holding(),
       sent: sent,
     );
-    pickImages = (_) async => ['/a.png', '/b.jpg'];
+    pickAttachments = (_) async => ['/a.png', '/b.jpg'];
     await tester.tap(find.byKey(const Key('composer-menu')));
     await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('attach-image')));
+    await tester.tap(find.byKey(const Key('attach-file')));
     await tester.pumpAndSettle();
     expect(sent.whereType<GuiIntentAttachFile>(), [
       const GuiIntentAttachFile(sessionId: 's1', path: '/a.png'),
@@ -132,10 +132,10 @@ void main() {
 
     // Control: a cancelled pick attaches nothing.
     sent.clear();
-    pickImages = (_) async => [];
+    pickAttachments = (_) async => [];
     await tester.tap(find.byKey(const Key('composer-menu')));
     await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('attach-image')));
+    await tester.tap(find.byKey(const Key('attach-file')));
     await tester.pumpAndSettle();
     expect(sent.whereType<GuiIntentAttachFile>(), isEmpty);
   });
@@ -196,7 +196,7 @@ void main() {
     );
     await tester.tap(find.byKey(const Key('composer-menu')));
     await tester.pumpAndSettle();
-    expect(find.byKey(const Key('attach-image')), findsNothing);
+    expect(find.byKey(const Key('attach-file')), findsNothing);
 
     // Control: the agent composer has it. Close the menu first.
     await tester.tapAt(Offset.zero);
@@ -209,7 +209,7 @@ void main() {
     );
     await tester.tap(find.byKey(const Key('composer-menu')));
     await tester.pumpAndSettle();
-    expect(find.byKey(const Key('attach-image')), findsOneWidget);
+    expect(find.byKey(const Key('attach-file')), findsOneWidget);
   });
 
   testWidgets(
