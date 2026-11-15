@@ -1583,6 +1583,7 @@ mod tests {
             model: Some("model-a".into()),
             context_tokens: Some(19_337),
             context_window: Some(1_000_000),
+            context_compacted: false,
         };
         let mut usage = SessionUsage::new(&turn);
         assert_eq!(

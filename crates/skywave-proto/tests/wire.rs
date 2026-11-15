@@ -382,9 +382,11 @@ fn all_event_kinds() -> Vec<EventKind> {
             model: Some("model-a".into()),
             context_tokens: Some(19_337),
             context_window: Some(1_000_000),
+            context_compacted: false,
         }),
         EventKind::TurnUsage(TurnUsage {
             duration_ms: Some(2_590),
+            context_compacted: true,
             ..TurnUsage::default()
         }),
         EventKind::SubagentUsage(SubagentUsage {
@@ -1904,8 +1906,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v34() {
-    assert_eq!(PROTOCOL_VERSION, 34);
+fn protocol_is_v35() {
+    assert_eq!(PROTOCOL_VERSION, 35);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

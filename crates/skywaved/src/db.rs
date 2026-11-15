@@ -494,7 +494,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// fail to compile. Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
-    v31_to_v32, v32_to_v33, v33_to_v34,
+    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35,
 ];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
@@ -583,6 +583,13 @@ fn v32_to_v33(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// v33 to v34. v34 added the read-only `GET /v1/worktrees` answer and nothing
 /// that is stored, so nothing stored changes.
 fn v33_to_v34(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v34 to v35. v35 added `context_compacted` to `TurnUsage`, which v34 JSON
+/// lacks and reads as `false`: no v34 turn is marked, so nothing stored
+/// changes.
+fn v34_to_v35(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -1342,6 +1349,7 @@ mod tests {
                     model: Some("model-a".into()),
                     context_tokens: None,
                     context_window: None,
+                    context_compacted: false,
                 },
                 TurnUsage {
                     duration_ms: Some(2_590),
@@ -1731,6 +1739,49 @@ mod tests {
                 worktree: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn v35_reads_what_v34_wrote() {
+        use skywave_proto::{EventKind, TurnUsage};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v34 = r#"{"type":"turn_usage","duration_ms":12400,"tokens_in":3100,"tokens_out":812,"cost_usd":0.04,"model":"model-a","context_tokens":19337,"context_window":1000000}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 34)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, 's', 't', 'c', ?1)",
+                [v34],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let kind: String = db
+            .conn()
+            .query_row("SELECT kind FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, v34);
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::TurnUsage(TurnUsage {
+                duration_ms: Some(12_400),
+                context_compacted: false,
+                ..
+            })
         ));
     }
 

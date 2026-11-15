@@ -783,6 +783,7 @@ fn haiku_turn(duration_ms: u64, tokens_in: u64, tokens_out: u64, fill: u64) -> T
         model: Some(HAIKU.to_owned()),
         context_tokens: Some(fill),
         context_window: Some(1_000_000),
+        context_compacted: false,
     }
 }
 
@@ -952,6 +953,13 @@ fn replay_the_fill_is_the_last_request_and_none_after_compact() {
             // The recall after it, from the summary.
             (Some(19_475), Some(1_000_000)),
         ]
+    );
+    assert_eq!(
+        usages
+            .iter()
+            .map(|u| u.context_compacted)
+            .collect::<Vec<_>>(),
+        [false, false, true, false]
     );
     assert!(
         usages[1].tokens_in.unwrap() > 3 * 18_000,
