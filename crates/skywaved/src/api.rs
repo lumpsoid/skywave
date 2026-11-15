@@ -1537,8 +1537,10 @@ async fn refuse_upload(
 /// meanwhile is answered as stored, its body unread. A body that ends early (a
 /// lost connection or a stall) keeps its partial, so the next `PUT` resumes
 /// it. The answer is `TooLarge` as soon as the bytes of the file, offset
-/// included, pass `upload_max`, and the partial goes. A low disk is `DiskLow`:
-/// checked before anything is written and again before each write, so an
+/// included, pass `upload_max`, and the partial goes. A `content-length` that
+/// already takes the file past it is `TooLarge` before the body is read. A low
+/// disk is `DiskLow`: checked before anything is written and again before each
+/// write, so an
 /// upload stops once the disk turns low. One `PUT` per sha256 writes at a
 /// time; the others wait for its lock. The lock is held until the file work
 /// ends, even if the client has gone away: that work runs on a task of its
@@ -1558,10 +1560,14 @@ async fn stage_attachment(
         Ok(offset) => offset,
         Err(status) => return status.into_response(),
     };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|t| t.parse::<u64>().ok());
     if api.log.disk().refresh() {
         return Json(UploadResult::DiskLow).into_response();
     }
-    let work = tokio::spawn(write_upload(api, hash, offset, body));
+    let work = tokio::spawn(write_upload(api, hash, offset, declared, body));
     match work.await {
         Ok(response) => response,
         Err(e) => {
@@ -1574,11 +1580,24 @@ async fn stage_attachment(
 /// The file work of a `PUT` (see [`stage_attachment`]), on its own task: it
 /// takes the upload lock and holds it to its end. The lock comes first so that
 /// the partial is checked, resumed and written by one `PUT` at a time.
-async fn write_upload(api: Arc<Api>, hash: ContentHash, offset: u64, body: Body) -> Response {
+async fn write_upload(
+    api: Arc<Api>,
+    hash: ContentHash,
+    offset: u64,
+    declared: Option<u64>,
+    body: Body,
+) -> Response {
     let _upload = upload_lock(&api, hash).await;
     if offset > api.upload_max {
         // A partial left from before `upload_max` was lowered: it is over the
         // cap already, and an empty body would stage it as it is.
+        drop_partial_logged(&api, hash).await;
+        return Json(UploadResult::TooLarge).into_response();
+    }
+    if declared.is_some_and(|len| offset.saturating_add(len) > api.upload_max) {
+        // The request says up front that the file passes the cap: answered
+        // before the body is read, so no body byte is in flight (and with
+        // `Expect: 100-continue`, none was sent).
         drop_partial_logged(&api, hash).await;
         return Json(UploadResult::TooLarge).into_response();
     }

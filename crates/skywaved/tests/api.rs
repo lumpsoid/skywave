@@ -2050,7 +2050,10 @@ async fn a_staged_upload_must_hash_to_its_path_and_may_be_any_file() {
 }
 
 /// An upload over `upload_max` is `TooLarge` as JSON, not a 413, and leaves
-/// no file, temp file included; a body of exactly the cap is stored.
+/// no file, temp file included; a body of exactly the cap is stored. The
+/// oversize request carries `Expect: 100-continue` and no body, as the device
+/// sends it; a client that sends the body unasked can lose the early answer to
+/// a reset (task 37b41c).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversize_upload_is_refused_as_json() {
     const CAP: u64 = 1 << 20;
@@ -2064,9 +2067,18 @@ async fn an_oversize_upload_is_refused_as_json() {
     let mut device = f.client(&creds).await;
     let big = png(CAP as usize + 1);
     let uri = path::attachment(ContentHash::of(&big));
-    let reply = device.send(Method::PUT, &uri, &[], Bytes::from(big)).await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(reply.json::<UploadResult>(), UploadResult::TooLarge);
+    let mut tls = tls_from(&f, LOCAL, Some(&creds), false).await.unwrap();
+    let head = format!(
+        "PUT {uri} HTTP/1.1\r\nhost: localhost\r\nexpect: 100-continue\r\ncontent-length: {}\r\n\r\n",
+        CAP + 1
+    );
+    tls.write_all(head.as_bytes()).await.unwrap();
+    tls.flush().await.unwrap();
+    let response = tokio::time::timeout(SOON, read_full_response(&mut tls))
+        .await
+        .expect("answered before the body");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("\"too_large\""), "{response}");
     assert!(
         files_under(&f.storage.dir.attachments_dir()).is_empty(),
         "nothing is left, temp file included"
@@ -2481,6 +2493,84 @@ async fn an_upload_past_the_cap_with_an_empty_body_is_too_large() {
         reply.json::<UploadResult>(),
         UploadResult::Stored { size: CAP },
         "control: a partial of exactly the cap is stored"
+    );
+}
+
+/// A `PUT` whose `content-length` takes the file past `upload_max` is
+/// `TooLarge` before any body byte arrives, and its partial is dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_length_over_the_cap_is_too_large_before_the_body() {
+    const CAP: u64 = 1 << 20;
+    let options = ServerOptions {
+        git: isolated_git(),
+        upload_max: CAP,
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_configured(|log| log, options).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(CAP as usize + 1);
+    let hash = ContentHash::of(&bytes);
+    let uri = path::attachment(hash);
+
+    // A fresh upload: the head declares the whole file, and no body follows.
+    let mut tls = tls_from(&f, LOCAL, Some(&creds), false).await.unwrap();
+    let head = format!(
+        "PUT {uri} HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n",
+        CAP + 1
+    );
+    tls.write_all(head.as_bytes()).await.unwrap();
+    tls.flush().await.unwrap();
+    let response = tokio::time::timeout(SOON, read_full_response(&mut tls))
+        .await
+        .expect("answered before the body");
+    assert!(
+        response.contains("\"too_large\""),
+        "a fresh declared length over the cap is TooLarge: {response}"
+    );
+    assert!(
+        files_under(&f.storage.dir.attachments_dir()).is_empty(),
+        "nothing is left after a fresh refusal"
+    );
+
+    // A resumed upload: the partial is dropped, and the head again sends no body.
+    let half = (CAP / 2) as usize;
+    std::fs::write(partial_of(&f, hash), &bytes[..half]).unwrap();
+    let mut tls = tls_from(&f, LOCAL, Some(&creds), false).await.unwrap();
+    let head = format!(
+        "PUT {uri} HTTP/1.1\r\nhost: localhost\r\n{}: {half}\r\ncontent-length: {}\r\n\r\n",
+        upload_offset_header(),
+        bytes.len() - half
+    );
+    tls.write_all(head.as_bytes()).await.unwrap();
+    tls.flush().await.unwrap();
+    let response = tokio::time::timeout(SOON, read_full_response(&mut tls))
+        .await
+        .expect("answered before the body");
+    assert!(
+        response.contains("\"too_large\""),
+        "a resumed declared length over the cap is TooLarge: {response}"
+    );
+    assert!(
+        files_under(&f.storage.dir.attachments_dir()).is_empty(),
+        "the partial is dropped"
+    );
+
+    // Control: the same file, declared at the cap, is stored.
+    let exact = png(CAP as usize);
+    let exact_hash = ContentHash::of(&exact);
+    let reply = device
+        .send(
+            Method::PUT,
+            &path::attachment(exact_hash),
+            &[],
+            Bytes::from(exact),
+        )
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: CAP },
+        "control: a file of exactly the cap is stored"
     );
 }
 
@@ -5177,9 +5267,9 @@ async fn a_half_sent_request_head_is_closed() {
     assert!(started.elapsed() >= idle, "not before the limit");
 }
 
-/// Reads one whole response (`Content-Length` framed) from `tls`; its
-/// status line.
-async fn read_response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> String {
+/// Reads one whole response (`Content-Length` framed) from `tls`; its head and
+/// body, as text.
+async fn read_full_response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> String {
     let mut received = Vec::new();
     let mut buf = [0; 4096];
     let (head_end, length) = loop {
@@ -5200,8 +5290,14 @@ async fn read_response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> 
         assert!(n > 0, "the connection ended inside the body");
         received.extend_from_slice(&buf[..n]);
     }
-    let head = String::from_utf8_lossy(&received[..head_end]);
-    head.lines().next().unwrap().to_owned()
+    String::from_utf8_lossy(&received[..head_end + length]).into_owned()
+}
+
+/// Reads one whole response (`Content-Length` framed) from `tls`; its status
+/// line.
+async fn read_response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> String {
+    let full = read_full_response(tls).await;
+    full.lines().next().unwrap().to_owned()
 }
 
 /// Sends `GET uri` on a keep-alive connection, reads the whole response,
