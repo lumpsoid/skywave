@@ -682,7 +682,10 @@ fn v33_to_v34(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// v34 to v35, as the server's step of the same name. v35 added
 /// `context_compacted` to `TurnUsage`, in `TurnUsage` events, `turns.usage`
 /// and `sessions.usage`: a new field, which v34 JSON lacks and reads as
-/// `false`, so nothing is rewritten and no v34 turn is marked.
+/// `false`, so nothing is rewritten and no v34 turn is marked. It also added
+/// `fills` to the `SessionUsage` in `sessions.usage`, which v34 JSON lacks
+/// and reads as empty, so a context switched back to shows unknown until its
+/// next turn reports a fill.
 fn v34_to_v35(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }

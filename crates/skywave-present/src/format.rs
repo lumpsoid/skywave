@@ -1585,7 +1585,8 @@ mod tests {
             context_window: Some(1_000_000),
             context_compacted: false,
         };
-        let mut usage = SessionUsage::new(&turn);
+        let context = skywave_core::ContextId::new();
+        let mut usage = SessionUsage::new(context, &turn);
         assert_eq!(
             session_usage_fields(&usage, true),
             [
@@ -1597,11 +1598,15 @@ mod tests {
                 "model-a",
             ]
         );
-        // A turn that reported no fill: unknown.
-        usage.add(&skywave_core::TurnUsage {
-            duration_ms: Some(30_000),
-            ..Default::default()
-        });
+        // A compacting turn reports no fill: unknown.
+        usage.add(
+            context,
+            &skywave_core::TurnUsage {
+                duration_ms: Some(30_000),
+                context_compacted: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             session_usage_fields(&usage, false),
             ["last turn 30.0s", "ctx ?", "session $0.04"]
