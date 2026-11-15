@@ -396,6 +396,10 @@ restore a backup.
    # or: flutter build apk --debug && adb install -r build/app/outputs/flutter-apk/app-debug.apk
    ```
 
+   Gradle needs JDK 21–25 for Android builds. If Flutter picks another JDK,
+   point it at one with `flutter config --jdk-dir=/path/to/jdk` (Android
+   Studio's bundled `jbr` works).
+
 2. **Make the server reachable.** The phone must reach `listen` and find the
    address it dials in the server certificate. Listen on all interfaces and
    put the server's LAN address (or a name the phone resolves) first in
