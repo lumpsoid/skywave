@@ -58,6 +58,8 @@ pub struct WorkdirScreen {
     /// The files asked for download, sorted by path, on every pane: the save
     /// flow reads them, not the pane shown.
     pub downloads: Vec<WorkdirDownloadRow>,
+    /// The device files pushed into the workdir, sorted by path, on every pane.
+    pub pushes: Vec<WorkdirPushRow>,
 }
 
 /// A file of the workdir asked for download, for the save flow.
@@ -76,6 +78,26 @@ pub struct WorkdirDownloadRow {
     /// The file on this device once the blob is available: the head
     /// copies it to where the user saves it.
     pub local_path: Option<String>,
+}
+
+/// A device file pushed into the workdir.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct WorkdirPushRow {
+    /// The path in the workdir written to.
+    pub path: String,
+    /// The device file sent.
+    pub source: String,
+    /// One line on where the push is.
+    pub label: String,
+    /// Still being sent: the head offers nothing.
+    pub pushing: bool,
+    /// Written, or the same content was already there.
+    pub done: bool,
+    /// A different file is at `path`: its sha256 (64 hex digits), to
+    /// resend the push with as `replace` once the user agrees.
+    pub existing_sha256: Option<String>,
+    /// Neither done nor waiting on the user: the head offers to try again.
+    pub failed: bool,
 }
 
 /// How a changed file changed.

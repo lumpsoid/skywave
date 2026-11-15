@@ -61,5 +61,5 @@ pub use timeline::{
 };
 pub use workdir::{
     WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent, WorkdirDownloadRow,
-    WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
+    WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirPushRow, WorkdirScreen,
 };

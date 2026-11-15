@@ -5240,13 +5240,18 @@ fn an_expanded_run_without_a_blob_shows_its_own_text_and_what_is_missing() {
 }
 
 mod workdir {
+    use std::path::PathBuf;
+
+    use skywave_core::workdir::PushOutcome;
     use skywave_core::{
         BlobId, BlobState, BlobView, ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry,
-        EntryKind, FileBody, FileChange, FileResult, LinkTarget, ListResult, Screen, WorkdirBody,
-        WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView,
+        EntryKind, FileBody, FileChange, FileResult, LinkTarget, ListResult, PushState, Screen,
+        WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirPush, WorkdirView,
     };
     use skywave_present::workdir::NOT_FETCHED;
-    use skywave_proto::{BlobRef, Commit, CommitLog, LogResult};
+    use skywave_proto::{
+        BlobRef, Commit, CommitLog, LogResult, Seq, UploadResult, WriteFileResult,
+    };
 
     use super::*;
     use crate::signals::{
@@ -5266,16 +5271,18 @@ mod workdir {
         fetch: WorkdirFetch,
         body: WorkdirBody,
     ) -> WorkdirScreen {
-        shown_with(rig, pane, fetch, body, Vec::new())
+        shown_with(rig, pane, fetch, body, Vec::new(), Vec::new())
     }
 
-    /// [`shown`] with the files asked for download, `downloads`.
+    /// [`shown`] with the files asked for download, `downloads`, and the
+    /// device files pushed into the workdir, `pushes`.
     fn shown_with(
         rig: &mut Rig,
         pane: WorkdirPane,
         fetch: WorkdirFetch,
         body: WorkdirBody,
         downloads: Vec<WorkdirDownload>,
+        pushes: Vec<WorkdirPush>,
     ) -> WorkdirScreen {
         rig.clock.wall_ms = (taken() + chrono::Duration::hours(1)).timestamp_millis();
         let mut view = rig.core.view();
@@ -5288,7 +5295,7 @@ mod workdir {
             fetch,
             body,
             downloads,
-            pushes: Vec::new(),
+            pushes,
         });
         let outs = rig.head.on_view(view, rig.clock);
         rig.apply(outs);
@@ -5786,6 +5793,22 @@ mod workdir {
                 path: "bin/app".into(),
             },
         });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::PushWorkdirFile {
+                session_id: rig.session.0.to_string(),
+                source: "/home/me/notes.txt".into(),
+                path: "docs/notes.txt".into(),
+                replace: None,
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::PushWorkdirFile {
+                session_id: rig.session.0.to_string(),
+                source: "/home/me/notes.txt".into(),
+                path: "docs/notes.txt".into(),
+                replace: Some(ContentHash::of(b"old").to_string()),
+            },
+        });
         let workdir: Vec<_> = rig
             .actions
             .iter()
@@ -5796,6 +5819,7 @@ mod workdir {
                         | Action::ShowWorkdir(_)
                         | Action::RefreshWorkdir
                         | Action::DownloadWorkdirFile { .. }
+                        | Action::PushWorkdirFile { .. }
                 )
             })
             .cloned()
@@ -5816,6 +5840,18 @@ mod workdir {
                 Action::DownloadWorkdirFile {
                     session_id: rig.session,
                     path: "bin/app".into(),
+                },
+                Action::PushWorkdirFile {
+                    session_id: rig.session,
+                    source: "/home/me/notes.txt".into(),
+                    path: "docs/notes.txt".into(),
+                    replace: None,
+                },
+                Action::PushWorkdirFile {
+                    session_id: rig.session,
+                    source: "/home/me/notes.txt".into(),
+                    path: "docs/notes.txt".into(),
+                    replace: Some(ContentHash::of(b"old")),
                 },
             ]
         );
@@ -5901,6 +5937,7 @@ mod workdir {
             WorkdirFetch::Idle,
             WorkdirBody::Nothing,
             downloads,
+            Vec::new(),
         );
         let rows = &screen.downloads;
         assert_eq!(
@@ -5937,6 +5974,118 @@ mod workdir {
                 (true, None, None),
                 (false, Some(BlobStateKind::Downloading), None),
                 (false, Some(BlobStateKind::Available), Some(ready_path)),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_workdir_screen_lists_each_push_with_its_state() {
+        let mut rig = Rig::new();
+        let source = |path: &str| PathBuf::from(format!("/home/me/{path}"));
+        let pushes = vec![
+            WorkdirPush {
+                path: "a.bin".into(),
+                source: source("a.bin"),
+                state: PushState::Pushing,
+            },
+            WorkdirPush {
+                path: "b.bin".into(),
+                source: source("b.bin"),
+                state: PushState::Failed("timed out".into()),
+            },
+            WorkdirPush {
+                path: "c.bin".into(),
+                source: source("c.bin"),
+                state: PushState::Done(PushOutcome::Written(WriteFileResult::Written {
+                    path: "c.bin".into(),
+                    size: 2048,
+                    seq: Seq(7),
+                })),
+            },
+            WorkdirPush {
+                path: "d.bin".into(),
+                source: source("d.bin"),
+                state: PushState::Done(PushOutcome::Written(WriteFileResult::Same {
+                    path: "d.bin".into(),
+                    size: 1,
+                })),
+            },
+            WorkdirPush {
+                path: "e.bin".into(),
+                source: source("e.bin"),
+                state: PushState::Done(PushOutcome::Written(WriteFileResult::Exists {
+                    sha256: ContentHash::of(b"old"),
+                    size: 3,
+                })),
+            },
+            WorkdirPush {
+                path: "f.bin".into(),
+                source: source("f.bin"),
+                state: PushState::Done(PushOutcome::UploadRefused(UploadResult::TooLarge)),
+            },
+            WorkdirPush {
+                path: "g.bin".into(),
+                source: source("g.bin"),
+                state: PushState::Done(PushOutcome::Unreadable {
+                    reason: "gone".into(),
+                }),
+            },
+        ];
+        let screen = shown_with(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Idle,
+            WorkdirBody::Nothing,
+            Vec::new(),
+            pushes,
+        );
+        let rows = &screen.pushes;
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            [
+                "a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin", "g.bin"
+            ]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Sending\u{2026}",
+                "Push failed: timed out",
+                "Written \u{b7} 2.0 KiB",
+                "Already there",
+                "A file is already there (3 B)",
+                "Too large to send",
+                "Cannot read the file: gone",
+            ]
+        );
+        let flags: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.pushing,
+                    row.done,
+                    row.existing_sha256.clone(),
+                    row.failed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (true, false, None, false),
+                (false, false, None, true),
+                (false, true, None, false),
+                (false, true, None, false),
+                (
+                    false,
+                    false,
+                    Some(ContentHash::of(b"old").to_string()),
+                    false
+                ),
+                (false, false, None, true),
+                (false, false, None, true),
             ]
         );
     }

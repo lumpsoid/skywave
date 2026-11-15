@@ -27,6 +27,7 @@ void main() {
     List<WorkdirEntryRow> entries = const [],
     WorkdirContent? content,
     List<WorkdirDownloadRow> downloads = const [],
+    List<WorkdirPushRow> pushes = const [],
   }) => WorkdirScreen(
     sessionId: 's-1',
     title: 'fix the build',
@@ -45,6 +46,7 @@ void main() {
     entries: entries,
     content: content,
     downloads: downloads,
+    pushes: pushes,
   );
 
   Future<List<GuiIntent>> pump(WidgetTester tester, WorkdirScreen s) async {
