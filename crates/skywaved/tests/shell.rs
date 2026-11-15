@@ -25,6 +25,7 @@ use skywaved::event_log::ShellStatus;
 use skywaved::shell::{DISABLED_REASON, Progress, ShellConfig, ShellHandle, ShellRunner};
 use skywaved::{Activity, EventLog, Storage};
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 
 #[path = "support/control.rs"]
@@ -1551,6 +1552,85 @@ async fn the_daemon_stops_when_its_shell_runner_fails() {
     let runner = f.start().await;
     assert_eq!(f.finished(run).await.end, exited(0));
     runner.shutdown().await.unwrap();
+}
+
+/// Waits until the log file at `path` says `serve` listens.
+async fn wait_listening(path: &Path) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .contains(" listening addr=")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "serve never listened"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A Ctrl-C with a run going warns and stops nothing; the next Ctrl-C stops
+/// `serve`, and the run with it.
+#[tokio::test]
+async fn ctrl_c_with_a_shell_run_warns_and_a_second_stops() {
+    let mut f = Fixture::new();
+    f.run("sleep 30");
+    let log_file = f.dir().join("skywaved.log");
+    let config = f.dir().join("skywaved.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nroots = [{:?}]\nlog_file = {:?}\n\
+             [shell]\nenabled = true\n[disk]\nmin_free = 0\n",
+            f.data, f.root, log_file
+        ),
+    )
+    .unwrap();
+    let mut serve = tokio::process::Command::new(env!("CARGO_BIN_EXE_skywaved"))
+        .arg("--config")
+        .arg(&config)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_listening(&log_file).await;
+    let pid = libc::pid_t::try_from(serve.id().unwrap()).unwrap();
+    // SAFETY: signals a child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let mut lines = BufReader::new(serve.stderr.take().unwrap()).lines();
+    let mut printed = Vec::new();
+    tokio::time::timeout(WAIT, async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let asked = line.contains("press Ctrl-C again");
+            printed.push(line);
+            if asked {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("serve asks for a second Ctrl-C");
+    let (asked, before) = printed.split_last().unwrap();
+    assert!(asked.contains("press Ctrl-C again"), "{printed:?}");
+    assert!(
+        before.iter().any(|l| l.contains("shell run `sleep 30`")),
+        "{printed:?}"
+    );
+    assert!(
+        serve.try_wait().unwrap().is_none(),
+        "the first Ctrl-C stopped serve"
+    );
+
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    tokio::time::timeout(WAIT, serve.wait())
+        .await
+        .expect("the second Ctrl-C stops serve")
+        .unwrap();
 }
 
 // Stopping serve over its control socket (`skywaved::control`), with the
