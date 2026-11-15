@@ -130,10 +130,17 @@ pub struct ServerOptions {
     /// Largest file an upload stages (`[files] upload_max`); the body
     /// streams to disk, so it is never held whole.
     pub upload_max: u64,
+    /// Run in every upload before it is staged; tests hold uploads with it.
+    /// `None` in the daemon.
+    pub upload_hook: Option<UploadHook>,
 }
 
 /// [`ServerOptions::joined_hook`].
 pub type JoinedHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Run on an upload's blocking thread once its body is written, before
+/// it is staged; tests hold an upload there.
+pub type UploadHook = Arc<dyn Fn() + Send + Sync>;
 
 impl Default for ServerOptions {
     fn default() -> Self {
@@ -154,6 +161,7 @@ impl Default for ServerOptions {
             joined_hook: None,
             download_max: DEFAULT_DOWNLOAD_MAX,
             upload_max: DEFAULT_UPLOAD_MAX,
+            upload_hook: None,
         }
     }
 }

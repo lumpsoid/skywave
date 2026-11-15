@@ -2286,6 +2286,85 @@ async fn an_upload_cut_off_midway_keeps_its_partial_and_resumes() {
     assert_eq!(std::fs::read(&staged).unwrap(), bytes);
 }
 
+/// The upload lock and the upload outlive the handler hyper drops when the
+/// client leaves after its body: the file work runs on its own task.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_dropped_after_its_body_keeps_the_upload_lock_until_staged() {
+    let entered = Gate::new();
+    let release = Gate::new();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _open = OpenOnDrop(release.clone());
+    let hook = {
+        let (entered, release, calls) = (entered.clone(), release.clone(), calls.clone());
+        move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            entered.open();
+            release.wait_blocking();
+        }
+    };
+    let options = ServerOptions {
+        upload_hook: Some(Arc::new(hook)),
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_cropping_with(Disk::default(), options).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(10_000);
+    let hash = ContentHash::of(&bytes);
+    let uri = path::attachment(hash);
+
+    let mut tls = tls_from(&f, LOCAL, Some(&creds), false).await.unwrap();
+    let request = format!("PUT {uri} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 10000\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+    tls.write_all(&bytes).await.unwrap();
+    tls.flush().await.unwrap();
+    tokio::time::timeout(SOON, entered.opened())
+        .await
+        .expect("the upload reaches the hook with its whole body read");
+    drop(tls);
+
+    let second = {
+        let (uri, bytes) = (uri.clone(), bytes.clone());
+        tokio::spawn(async move {
+            device
+                .send(Method::PUT, &uri, &[], Bytes::from(bytes))
+                .await
+        })
+    };
+    // A lock released early would let the second PUT reach the hook by now.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !second.is_finished(),
+        "the second PUT waits for the upload lock"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the first upload has reached the hook"
+    );
+
+    release.open();
+    let reply = tokio::time::timeout(SOON, second)
+        .await
+        .expect("the second PUT is answered once the upload is staged")
+        .unwrap();
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: 10_000 }
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the second PUT, let in once the first is staged, writes its body again"
+    );
+    let staged = f.storage.dir.attachments_dir().join(hash.to_hex());
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+
+    let mut check = f.client(&creds).await;
+    let head = check.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NO_CONTENT);
+}
+
 /// An upload offset that is not a decimal number is a bad request, and
 /// writes nothing.
 #[tokio::test(flavor = "multi_thread")]
