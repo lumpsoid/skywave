@@ -4,9 +4,9 @@ import 'package:skywave_gui/session/highlight.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The shell history picker, an inline list over the composer's field (not
-/// a modal). Rust owns the rows and the filter, which follows the field's
-/// text; this only draws them. Newest is at the bottom, nearest the field,
+/// The shell history picker, an inline list at the top of the composer, above
+/// its shell bar (not a modal). Rust owns the rows and the filter, which
+/// follows the field's text; this only draws them. Newest is at the bottom,
 /// as fzf lays it out, and the count sits under the list as fzf's info line.
 class HistoryPicker extends StatefulWidget {
   const HistoryPicker({required this.view, required this.send, super.key});
