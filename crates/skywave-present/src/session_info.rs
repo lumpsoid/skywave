@@ -172,8 +172,8 @@ pub const NO_SUBAGENTS: &str = "No subagents ran in this session.";
 mod tests {
     use chrono::Utc;
     use skywave_core::{
-        CallId, Seq, SessionId, SessionUsage, SubagentStatus, SubagentUsage, TurnRecord, TurnUsage,
-        UsageLimitsStatus, UsageLimitsView,
+        CallId, ContextId, Seq, SessionId, SessionUsage, SubagentStatus, SubagentUsage, TurnRecord,
+        TurnUsage, UsageLimitsStatus, UsageLimitsView,
     };
 
     use super::*;
@@ -244,13 +244,17 @@ mod tests {
             turn(None, 0.1),
             turn(Some("opus"), 0.25),
         ];
-        let mut usage = SessionUsage::new(&turns[0].usage);
-        usage.add(&turns[1].usage);
-        usage.add(&TurnUsage {
-            context_tokens: Some(19_300),
-            context_window: Some(1_000_000),
-            ..turns[2].usage.clone()
-        });
+        let context = ContextId::new();
+        let mut usage = SessionUsage::new(context, &turns[0].usage);
+        usage.add(context, &turns[1].usage);
+        usage.add(
+            context,
+            &TurnUsage {
+                context_tokens: Some(19_300),
+                context_window: Some(1_000_000),
+                ..turns[2].usage.clone()
+            },
+        );
         let view = SessionInfoView {
             usage: Some(usage),
             turns,

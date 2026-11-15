@@ -1321,9 +1321,11 @@ logs) an event that no longer decodes rather than failing.
   its turns with it, and the screen says so.
 - **Context fill and subagent figures** (D46): two separate numbers, never
   added. The session's `SessionUsage::context` is the newest `TurnUsage`'s
-  `context_tokens` of `context_window`, set at each turn's end; it is
-  unknown after a turn that reported none and once a `ContextStarted` or
-  `ContextSwitched` (to another context) is folded. Heads put it in the
+  `context_tokens` of `context_window`, set at each turn's end; a turn that
+  reports none keeps it, and one marked `context_compacted` makes it
+  unknown. `SessionUsage::fills` keeps each context's last fill, which a
+  `ContextSwitched` restores; a `ContextStarted` context is unknown until
+  its first turn reports one. Heads put it in the
   session footer as `skywave_present::format::context_label` (`ctx
   19k/1M · 2%`, `ctx ?`), among `session_usage_fields`. A
   `SubagentUsage` event folds into its call's `SubagentStatus::usage`, which

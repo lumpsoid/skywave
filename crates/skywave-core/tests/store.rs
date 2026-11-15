@@ -1592,7 +1592,8 @@ fn v25_reads_the_turn_usage_a_v24_replica_holds() {
          UPDATE turns SET usage = json_remove(usage, '$.context_tokens', '$.context_window');
          UPDATE sessions SET usage = json_remove(usage,
              '$.context', '$.last_turn.context_tokens', '$.last_turn.context_window',
-             '$.total.context_tokens', '$.total.context_window');
+             '$.total.context_tokens', '$.total.context_window',
+             '$.last_turn.context_compacted', '$.total.context_compacted');
          UPDATE protocol_stamp SET version = 24;",
     )
     .unwrap();

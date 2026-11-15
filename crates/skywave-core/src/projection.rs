@@ -4,6 +4,8 @@
 //! pure: the store persists its result in the same transaction that stores
 //! the events, so the projection never runs ahead of or behind the log.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
@@ -83,11 +85,16 @@ pub struct SessionUsage {
     /// turn has. `model` is the newest one named. The context figures are
     /// never summed and stay `None` here.
     pub total: TurnUsage,
-    /// How full the current context is, as of the newest turn's end
-    /// (D46). `None` (unknown) after a turn that reported no fill, and
-    /// once a context starts or is switched to, until a turn reports one.
+    /// How full the current context is, as of the newest turn's end that
+    /// reported a fill (D46). `None` (unknown) in a context no turn has
+    /// reported a fill for, and after a turn that compacted it, until a turn
+    /// reports one.
     #[serde(default)]
     pub context: Option<ContextFill>,
+    /// Each context's last known fill, by the turns stamped with it: what
+    /// `context` shows again once the session switches back to one.
+    #[serde(default)]
+    pub fills: BTreeMap<ContextId, ContextFill>,
 }
 
 /// How full a context is: what its next request will read, of what its
@@ -110,21 +117,25 @@ impl ContextFill {
 }
 
 impl SessionUsage {
-    /// Usage after a first `turn`.
-    pub fn new(turn: &TurnUsage) -> Self {
-        SessionUsage {
+    /// Usage after a first `turn`, which ran in `context`.
+    pub fn new(context: ContextId, turn: &TurnUsage) -> Self {
+        let mut usage = SessionUsage {
             last_turn: turn.clone(),
             total: TurnUsage {
                 context_tokens: None,
                 context_window: None,
+                context_compacted: false,
                 ..turn.clone()
             },
-            context: ContextFill::of(turn),
-        }
+            context: None,
+            fills: BTreeMap::new(),
+        };
+        usage.note_fill(context, turn);
+        usage
     }
 
-    /// Folds in the next `turn`.
-    pub fn add(&mut self, turn: &TurnUsage) {
+    /// Folds in the next `turn`, which ran in `context`.
+    pub fn add(&mut self, context: ContextId, turn: &TurnUsage) {
         fn sum<T: std::ops::Add<Output = T> + Copy>(
             total: Option<T>,
             turn: Option<T>,
@@ -135,7 +146,7 @@ impl SessionUsage {
             }
         }
         self.last_turn = turn.clone();
-        self.context = ContextFill::of(turn);
+        self.note_fill(context, turn);
         let total = &mut self.total;
         total.duration_ms = sum(total.duration_ms, turn.duration_ms);
         total.tokens_in = sum(total.tokens_in, turn.tokens_in);
@@ -143,6 +154,24 @@ impl SessionUsage {
         total.cost_usd = sum(total.cost_usd, turn.cost_usd);
         if turn.model.is_some() {
             total.model.clone_from(&turn.model);
+        }
+    }
+
+    /// The session made `context` current: its last known fill, if any.
+    pub fn switch_to(&mut self, context: ContextId) {
+        self.context = self.fills.get(&context).copied();
+    }
+
+    /// Applies the fill of a turn that ran in `context`. A reported fill is
+    /// the context's last known one. A turn that compacted the context
+    /// reports none and leaves it unknown; any other keeps the last known.
+    fn note_fill(&mut self, context: ContextId, turn: &TurnUsage) {
+        if let Some(fill) = ContextFill::of(turn) {
+            self.fills.insert(context, fill);
+            self.context = Some(fill);
+        } else if turn.context_compacted {
+            self.fills.remove(&context);
+            self.context = None;
         }
     }
 }
@@ -239,11 +268,11 @@ impl SessionSummary {
                 return;
             }
             EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
-                // Another context's fill is not known until its next turn.
+                // Each context shows its own last known fill.
                 if self.context != event.context
                     && let Some(usage) = &mut self.usage
                 {
-                    usage.context = None;
+                    usage.switch_to(event.context);
                 }
                 self.context = event.context;
                 return;
@@ -320,10 +349,19 @@ impl SessionSummary {
                 }
             }
             EventKind::SessionStopped => self.stopped = true,
-            EventKind::TurnUsage(turn) => match &mut self.usage {
-                Some(usage) => usage.add(turn),
-                None => self.usage = Some(SessionUsage::new(turn)),
-            },
+            EventKind::TurnUsage(turn) => {
+                match &mut self.usage {
+                    Some(usage) => usage.add(event.context, turn),
+                    None => self.usage = Some(SessionUsage::new(event.context, turn)),
+                }
+                // An old context's turn can end after a switch: it updates only
+                // its own fill, so the display is re-derived for the current one.
+                if let Some(usage) = &mut self.usage
+                    && event.context != self.context
+                {
+                    usage.switch_to(self.context);
+                }
+            }
             EventKind::AgentMessage { .. }
             | EventKind::SubagentUsage(_)
             | EventKind::ToolCall { .. }
@@ -586,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn the_context_fill_is_the_newest_turns_and_unknown_after_a_context_change() {
+    fn the_context_fill_is_each_contexts_last_known_and_unknown_after_a_compact() {
         let sid = SessionId::new();
         let first = ContextId::first_of(sid);
         let created = EventKind::SessionCreated {
@@ -601,6 +639,13 @@ mod tests {
                 duration_ms: Some(1_000),
                 context_tokens: tokens,
                 context_window: tokens.map(|_| 1_000_000),
+                ..TurnUsage::default()
+            })
+        };
+        let compact = || {
+            EventKind::TurnUsage(TurnUsage {
+                duration_ms: Some(1_000),
+                context_compacted: true,
                 ..TurnUsage::default()
             })
         };
@@ -625,28 +670,65 @@ mod tests {
         let usage = summary.usage.clone().unwrap();
         assert_eq!(usage.context.unwrap().tokens, 20_000);
         assert_eq!(usage.total.context_tokens, None);
-        // A turn that reports no fill (`/compact`'s): unknown.
+        // A turn that reports no fill keeps the last known.
         summary.apply(Seq(4), &event(sid, 3, turn(None)));
+        assert_eq!(fill(&summary).unwrap().tokens, 20_000);
+        // A compaction: unknown until the next turn.
+        summary.apply(Seq(5), &event(sid, 4, compact()));
         assert_eq!(fill(&summary), None);
-        summary.apply(Seq(5), &event(sid, 4, turn(Some(19_300))));
+        summary.apply(Seq(6), &event(sid, 5, turn(Some(19_300))));
         assert_eq!(fill(&summary), known);
 
         // A switch back to the current context changes nothing.
         let by = DeviceId::new();
-        summary.apply(Seq(6), &at(first, EventKind::ContextSwitched { by }));
+        summary.apply(Seq(7), &at(first, EventKind::ContextSwitched { by }));
         assert_eq!(fill(&summary), known);
-        // A new context, and a switch to another: unknown until a turn.
+        // A new context starts unknown.
         let fresh = ContextId::new();
         let started = EventKind::ContextStarted {
             by,
             name: "fresh".into(),
         };
-        summary.apply(Seq(7), &at(fresh, started));
+        summary.apply(Seq(8), &at(fresh, started));
         assert_eq!(fill(&summary), None);
-        summary.apply(Seq(8), &at(fresh, turn(Some(9_000))));
+        summary.apply(Seq(9), &at(fresh, turn(Some(9_000))));
         assert_eq!(fill(&summary).unwrap().tokens, 9_000);
-        summary.apply(Seq(9), &at(first, EventKind::ContextSwitched { by }));
+        // Back to the first context: its own last fill.
+        summary.apply(Seq(10), &at(first, EventKind::ContextSwitched { by }));
+        assert_eq!(fill(&summary), known);
+        // Back to the fresh one: its own too.
+        summary.apply(Seq(11), &at(fresh, EventKind::ContextSwitched { by }));
+        assert_eq!(fill(&summary).unwrap().tokens, 9_000);
+        // An old context's turn ending after the switch updates only its own
+        // fill: the current one keeps its own.
+        summary.apply(Seq(12), &at(first, turn(Some(150_000))));
+        assert_eq!(fill(&summary).unwrap().tokens, 9_000);
+        summary.apply(Seq(13), &at(first, compact()));
+        assert_eq!(fill(&summary).unwrap().tokens, 9_000);
+        // Switching to the old context shows what its turns left: the compact
+        // removed its fill.
+        summary.apply(Seq(14), &at(first, EventKind::ContextSwitched { by }));
         assert_eq!(fill(&summary), None);
+
+        // A first turn that compacted does not make the total compacted.
+        let compacted = TurnUsage {
+            duration_ms: Some(1_000),
+            context_compacted: true,
+            ..TurnUsage::default()
+        };
+        let usage = SessionUsage::new(first, &compacted);
+        assert!(usage.last_turn.context_compacted);
+        assert!(!usage.total.context_compacted);
+
+        // The fills are stored with the usage. A stored usage without them
+        // (protocol v34's) reads with none.
+        let usage = summary.usage.clone().unwrap();
+        let json = serde_json::to_string(&usage).unwrap();
+        assert_eq!(serde_json::from_str::<SessionUsage>(&json).unwrap(), usage);
+        let mut stored: serde_json::Value = serde_json::from_str(&json).unwrap();
+        stored.as_object_mut().unwrap().remove("fills");
+        let read: SessionUsage = serde_json::from_value(stored).unwrap();
+        assert!(read.fills.is_empty());
     }
 
     #[test]
