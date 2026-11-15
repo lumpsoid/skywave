@@ -213,3 +213,21 @@ async fn sighup_reopens_a_moved_log_file() {
     let current = std::fs::read_to_string(&d.log_file).unwrap();
     assert!(current.contains("stopped"), "{current}");
 }
+
+#[tokio::test]
+async fn ctrl_c_with_nothing_running_stops_at_once() {
+    let d = Daemon::new();
+    let mut serve = d.serve();
+    d.listening(1).await;
+    let pid = libc::pid_t::try_from(serve.id().unwrap()).unwrap();
+    // SAFETY: signals a child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    tokio::time::timeout(WAIT, serve.wait())
+        .await
+        .expect("serve ends")
+        .unwrap();
+    let current = std::fs::read_to_string(&d.log_file).unwrap();
+    assert!(current.contains("received Ctrl-C"), "{current}");
+    assert!(current.contains("stopped"), "{current}");
+    assert!(!current.contains("work running"), "{current}");
+}
