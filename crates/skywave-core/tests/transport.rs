@@ -16,7 +16,7 @@ use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     ConversationsResult, DirEntry, DirsResult, EntryKind, EventKind, EventsQuery, FileBody,
     FileResult, HelloResponse, ListResult, LogResult, OutsideConversation, PROTOCOL_VERSION, Seq,
-    SessionId, UploadResult, WorkdirQuery,
+    SessionId, UploadResult, WorkdirQuery, WriteFileRequest, WriteFileResult,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, Rng, seed};
 use skywaved::agent::fake::FakeOutside;
@@ -788,6 +788,16 @@ async fn workdir_reads_default_to_not_found() {
         Old.workdir_download(&query).await,
         Err(TransportError::NotFound)
     );
+    let write = WriteFileRequest {
+        session: query.session,
+        path: "notes.txt".into(),
+        content: ContentHash::of(b"hello\n"),
+        replace: None,
+    };
+    assert_eq!(
+        Old.write_workdir_file(&write).await,
+        Err(TransportError::NotFound)
+    );
 }
 
 /// A transport that cannot read the worktree list answers `NotFound`, as a
@@ -980,6 +990,104 @@ async fn workdir_download_reaches_a_real_server() {
             ..
         }
     ));
+}
+
+/// The write against a real server: a staged upload is written into the
+/// workdir; the same content again is `Same`; other content at the path is
+/// `Exists` until its hash is named as `replace`.
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_write_reaches_a_real_server() {
+    let fx = Fixture::start().await;
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let identity = paired.credentials;
+    let transport =
+        HttpsTransport::new(&paired.address, &identity, config(), ExpectedRun::default()).unwrap();
+
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: fx.workdir(),
+            conversation: None,
+            worktree: None,
+        },
+    };
+    let accepted = transport.send_command(&create).await.unwrap();
+    assert!(matches!(accepted, CommandResult::Accepted { .. }));
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    let session = batch.events[0].session_id;
+    let file = std::path::Path::new(&fx.workdir()).join("notes.txt");
+
+    let hello = b"hello\n";
+    let staged = ContentHash::of(hello);
+    assert!(matches!(
+        transport
+            .upload_attachment(staged, Bytes::from_static(hello))
+            .await
+            .unwrap(),
+        UploadResult::Stored { .. }
+    ));
+    let write = WriteFileRequest {
+        session,
+        path: "notes.txt".into(),
+        content: staged,
+        replace: None,
+    };
+
+    let WriteFileResult::Written { path, size: 6, .. } =
+        transport.write_workdir_file(&write).await.unwrap()
+    else {
+        panic!("expected the file written");
+    };
+    assert_eq!(path, "notes.txt");
+    assert_eq!(std::fs::read(&file).unwrap(), hello);
+
+    assert!(matches!(
+        transport.write_workdir_file(&write).await.unwrap(),
+        WriteFileResult::Same { size: 6, .. }
+    ));
+
+    let other = b"other\n";
+    let other_hash = ContentHash::of(other);
+    assert!(matches!(
+        transport
+            .upload_attachment(other_hash, Bytes::from_static(other))
+            .await
+            .unwrap(),
+        UploadResult::Stored { .. }
+    ));
+    let other_write = WriteFileRequest {
+        session,
+        path: "notes.txt".into(),
+        content: other_hash,
+        replace: None,
+    };
+    let WriteFileResult::Exists { sha256, size: 6 } =
+        transport.write_workdir_file(&other_write).await.unwrap()
+    else {
+        panic!("expected the other file to be refused");
+    };
+    assert_eq!(sha256, staged);
+    assert_eq!(std::fs::read(&file).unwrap(), hello);
+
+    let replacing = WriteFileRequest {
+        replace: Some(staged),
+        ..other_write
+    };
+    assert!(matches!(
+        transport.write_workdir_file(&replacing).await.unwrap(),
+        WriteFileResult::Written { size: 6, .. }
+    ));
+    assert_eq!(std::fs::read(&file).unwrap(), other);
 }
 
 /// A wrong fingerprint fails the TLS handshake, so the code never reaches

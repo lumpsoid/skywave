@@ -14,7 +14,7 @@ use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
     EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
     LoginFinishResult, LoginStartResult, RunId, StorageReport, UploadResult, UsageLimitsResult,
-    WorkdirQuery, WorktreeList,
+    WorkdirQuery, WorktreeList, WriteFileRequest, WriteFileResult,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -205,6 +205,18 @@ pub trait Transport: Send + Sync {
         bytes: Bytes,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
         let _ = (sha256, bytes);
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `POST /v1/workdir/write`: writes a staged upload into the session's
+    /// workdir. Every outcome the server decides is an `Ok`
+    /// [`WriteFileResult`]. Defaults to [`TransportError::NotFound`] like
+    /// [`workdir_download`](Transport::workdir_download).
+    fn write_workdir_file<'a>(
+        &'a self,
+        request: &'a WriteFileRequest,
+    ) -> BoxFuture<'a, Result<WriteFileResult, TransportError>> {
+        let _ = request;
         Box::pin(async { Err(TransportError::NotFound) })
     }
 }
