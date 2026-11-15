@@ -470,7 +470,7 @@ impl Http {
                 .to_bytes();
             self.put_idle(head.conn);
             Ok(Reply {
-                body: encoding::decoded(&head.headers, body)?,
+                body: encoding::decoded(&head.headers, body).await?,
                 status: head.status,
                 headers: head.headers,
             })
@@ -536,7 +536,7 @@ impl Http {
         }
         self.put_idle(head.conn);
         Ok(Reply {
-            body: encoding::decoded(&head.headers, read.into())?,
+            body: encoding::decoded(&head.headers, read.into()).await?,
             status: head.status,
             headers: head.headers,
         })
