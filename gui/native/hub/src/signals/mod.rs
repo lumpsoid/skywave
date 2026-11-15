@@ -12,7 +12,8 @@
 //! - [`timeline`]: the open session's timeline, snapshot then keyed diffs.
 //! - [`search`]: the timeline search (`SearchUpdate`).
 //! - [`shell`]: the open session's shell runs, snapshot then keyed diffs.
-//! - [`workdir`]: the workdir screen's data (`ScreenView::Workdir`).
+//! - [`workdir`]: the workdir screen's data (`ScreenView::Workdir`), and the
+//!   text of its shown diff or file (`WorkdirTextUpdate`), once per blob.
 //! - [`crop`]: the crop page (`ScreenView::Crop`), its line windows
 //!   (`CropLinesUpdate`), and the blob a delete or crop names
 //!   (`BlobTargetView`).
@@ -63,4 +64,5 @@ pub use timeline::{
 pub use workdir::{
     WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent, WorkdirDownloadRow,
     WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirPushRow, WorkdirScreen,
+    WorkdirTextUpdate,
 };

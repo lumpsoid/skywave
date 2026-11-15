@@ -43,10 +43,10 @@ use crate::signals::{
     ComposerFile, ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate,
     GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, PairForm, PlatformEffect,
     RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
-    TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range,
+    TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range, WorkdirTextUpdate,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
-use crate::workdir::{WorkdirText, shown_blob};
+use crate::workdir::{WorkdirText, shown_blob, shown_text};
 use crate::{intents, link, screen, search, shell, timeline};
 
 /// How often running clocks on screen (a tool's elapsed time, how long a
@@ -103,6 +103,8 @@ pub enum Out {
     Search(SearchUpdate),
     /// The crop page's line window.
     CropLines(CropLinesUpdate),
+    /// The text of the workdir diff or file shown, once per blob.
+    WorkdirText(WorkdirTextUpdate),
     Effect(PlatformEffect),
     /// Hand `action` to the dispatcher with `tag`.
     Dispatch(Tag, Action),
@@ -291,6 +293,9 @@ struct Sent {
     shell: Option<(Option<SessionId>, Vec<ShellRunRow>)>,
     search: Option<SearchUpdate>,
     crop_lines: Option<CropLinesUpdate>,
+    /// The blob id of the workdir text last sent, so it goes out once per
+    /// blob; `None` when no text is shown, so returning to it sends again.
+    workdir_text: Option<String>,
 }
 
 /// The Stay connected preference as the head keeps it (D21), offered on
@@ -1636,6 +1641,23 @@ impl Head {
         if let Some(lines) = lines.filter(|l| self.sent.crop_lines.as_ref() != Some(l)) {
             self.sent.crop_lines = Some(lines.clone());
             out.push(Out::CropLines(lines));
+        }
+        // Compared by blob id, never by value: cloning a megabyte of lines
+        // on every publish would cost the hub more than the send saves.
+        let text = match &view.screen {
+            Screen::Workdir(workdir) => shown_text(workdir, workdir_text),
+            _ => None,
+        };
+        match text {
+            None => self.sent.workdir_text = None,
+            Some((blob_id, _)) if self.sent.workdir_text.as_ref() == Some(&blob_id) => {}
+            Some((blob_id, text)) => {
+                self.sent.workdir_text = Some(blob_id.clone());
+                out.push(Out::WorkdirText(WorkdirTextUpdate {
+                    blob_id,
+                    lines: text.lines.clone(),
+                }));
+            }
         }
         if !rows {
             return;

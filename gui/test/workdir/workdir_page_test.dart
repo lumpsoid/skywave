@@ -7,6 +7,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'package:skywave_gui/workdir/pushing.dart';
 import 'package:skywave_gui/workdir/saving.dart';
 import 'package:skywave_gui/workdir/workdir_page.dart';
+import 'package:skywave_gui/workdir/workdir_text_holder.dart';
 
 void main() {
   final originalSaver = saveWorkdirFile;
@@ -52,11 +53,20 @@ void main() {
     pushes: pushes,
   );
 
-  Future<List<GuiIntent>> pump(WidgetTester tester, WorkdirScreen s) async {
+  Future<List<GuiIntent>> pump(
+    WidgetTester tester,
+    WorkdirScreen s, {
+    WorkdirTextHolder? text,
+  }) async {
     final sent = <GuiIntent>[];
     await tester.pumpWidget(
       MaterialApp(
-        home: WorkdirPage(screen: s, canGoBack: true, send: sent.add),
+        home: WorkdirPage(
+          screen: s,
+          text: text ?? WorkdirTextHolder(),
+          canGoBack: true,
+          send: sent.add,
+        ),
       ),
     );
     return sent;
@@ -240,14 +250,20 @@ void main() {
             label: 'downloaded',
             canDownload: false,
           ),
-          lines: [
-            WorkdirLine(kind: WorkdirLineKind.hunk, text: '@@ -1 +1 @@'),
-            WorkdirLine(kind: WorkdirLineKind.removed, text: '---x'),
-            WorkdirLine(kind: WorkdirLineKind.added, text: '+new'),
-          ],
           cut: 'cut short: 1.0 MiB of 3.0 MiB shown',
         ),
       ),
+      text: WorkdirTextHolder()
+        ..apply(
+          const WorkdirTextUpdate(
+            blobId: 'b-1',
+            lines: [
+              WorkdirLine(kind: WorkdirLineKind.hunk, text: '@@ -1 +1 @@'),
+              WorkdirLine(kind: WorkdirLineKind.removed, text: '---x'),
+              WorkdirLine(kind: WorkdirLineKind.added, text: '+new'),
+            ],
+          ),
+        ),
     );
     for (final text in [
       '@@ -1 +1 @@',
@@ -283,7 +299,6 @@ void main() {
             label: 'download failed: offline · 812 B',
             canDownload: true,
           ),
-          lines: [],
         ),
       ),
     );
@@ -308,16 +323,60 @@ void main() {
             label: 'downloaded',
             canDownload: false,
           ),
-          lines: [
-            WorkdirLine(kind: WorkdirLineKind.plain, text: 'fn main() {}'),
-            WorkdirLine(kind: WorkdirLineKind.plain, text: '-not a diff'),
-          ],
         ),
       ),
+      text: WorkdirTextHolder()
+        ..apply(
+          const WorkdirTextUpdate(
+            blobId: 'b-3',
+            lines: [
+              WorkdirLine(kind: WorkdirLineKind.plain, text: 'fn main() {}'),
+              WorkdirLine(kind: WorkdirLineKind.plain, text: '-not a diff'),
+            ],
+          ),
+        ),
     );
     expect(find.text('fn main() {}'), findsOneWidget);
     expect(find.text('1  '), findsOneWidget);
     expect(find.text('2  '), findsOneWidget);
+  });
+
+  testWidgets('a text for another blob shows no lines', (tester) async {
+    final text = WorkdirTextHolder()
+      ..apply(
+        const WorkdirTextUpdate(
+          blobId: 'b-2',
+          lines: [WorkdirLine(kind: WorkdirLineKind.plain, text: 'nope')],
+        ),
+      );
+    await pump(
+      tester,
+      screen(
+        pane: WorkdirPaneKind.file,
+        path: 'src/main.rs',
+        header: 'src/main.rs  4 B',
+        content: const WorkdirContent(
+          blob: BlobFacts(
+            blobId: 'b-1',
+            state: BlobStateKind.available,
+            label: 'downloaded',
+            canDownload: false,
+          ),
+        ),
+      ),
+      text: text,
+    );
+    expect(find.text('nope'), findsNothing);
+
+    // The same page shows the lines once their blob's text arrives.
+    text.apply(
+      const WorkdirTextUpdate(
+        blobId: 'b-1',
+        lines: [WorkdirLine(kind: WorkdirLineKind.plain, text: 'yes')],
+      ),
+    );
+    await tester.pump();
+    expect(find.text('yes'), findsOneWidget);
   });
 
   // A file of two lines with a blank one between, and the clipboard writes.
@@ -351,13 +410,19 @@ void main() {
             label: 'downloaded',
             canDownload: false,
           ),
-          lines: [
-            WorkdirLine(kind: WorkdirLineKind.plain, text: 'fn main() {}'),
-            WorkdirLine(kind: WorkdirLineKind.plain, text: ''),
-            WorkdirLine(kind: WorkdirLineKind.plain, text: '-not a diff'),
-          ],
         ),
       ),
+      text: WorkdirTextHolder()
+        ..apply(
+          const WorkdirTextUpdate(
+            blobId: 'b-3',
+            lines: [
+              WorkdirLine(kind: WorkdirLineKind.plain, text: 'fn main() {}'),
+              WorkdirLine(kind: WorkdirLineKind.plain, text: ''),
+              WorkdirLine(kind: WorkdirLineKind.plain, text: '-not a diff'),
+            ],
+          ),
+        ),
     );
     return copied;
   }

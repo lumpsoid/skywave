@@ -32,11 +32,11 @@ use skywave_present::text::clean_line;
 
 use crate::timeline::{blob_facts, content_lines};
 
-/// Most of a diff or file the screen carries. Lower than the TUI's
-/// 4 MiB: every line crosses to Dart in the screen signal, which is sent
-/// whole whenever it changes. Past it, "Open" shows the whole file.
+/// Most of a diff or file the hub carries. Lower than the TUI's 4 MiB:
+/// its lines cross to Dart in `WorkdirTextUpdate`, decoded on Dart's UI
+/// isolate, sent once per blob. Past it, "Open" shows the whole file.
 pub const WORKDIR_SHOW_BYTES: u64 = 1024 * 1024;
-/// Most lines of a diff or file the screen carries, for the same reason.
+/// Most lines of a diff or file the hub carries, for the same reason.
 pub const WORKDIR_SHOW_LINES: usize = 20_000;
 
 /// The text of the blob the shown diff or file pane holds, read once per
@@ -58,7 +58,7 @@ struct Read {
 /// The head of a diff or file, as the screen shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Text {
-    lines: Vec<WorkdirLine>,
+    pub(crate) lines: Vec<WorkdirLine>,
     /// More lines, or more bytes, than shown.
     cut: Option<String>,
 }
@@ -93,6 +93,20 @@ pub fn shown_blob(view: &WorkdirView) -> Option<&BlobView> {
     match &view.body {
         WorkdirBody::Diff { blob, .. } | WorkdirBody::File { blob, .. } => blob.as_ref(),
         _ => None,
+    }
+}
+
+/// The shown blob's id and its read text, when both are here: what
+/// `WorkdirTextUpdate` carries. `text` is the shown blob's
+/// ([`WorkdirText::of`]); a read error or no blob has no lines to send.
+pub fn shown_text<'a>(
+    view: &WorkdirView,
+    text: Option<&'a Result<Text, String>>,
+) -> Option<(String, &'a Text)> {
+    let blob = shown_blob(view)?;
+    match text? {
+        Ok(text) => Some((blob.id.0.to_string(), text)),
+        Err(_) => None,
     }
 }
 
@@ -209,14 +223,13 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
         _ => Vec::new(),
     };
     let content = shown_blob(view).filter(|_| wording.is_none()).map(|blob| {
-        let (lines, cut, error) = match text {
-            Some(Ok(text)) => (text.lines.clone(), text.cut.clone(), None),
-            Some(Err(error)) => (Vec::new(), None, Some(clean_line(error))),
-            None => (Vec::new(), None, None),
+        let (cut, error) = match text {
+            Some(Ok(text)) => (text.cut.clone(), None),
+            Some(Err(error)) => (None, Some(clean_line(error))),
+            None => (None, None),
         };
         WorkdirContent {
             blob: blob_facts(blob),
-            lines,
             cut,
             error,
         }
