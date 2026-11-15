@@ -505,6 +505,19 @@ async fn attachments_stage_on_a_real_server() {
             size: text.len() as u64,
         }
     );
+
+    // Many chunks long: the upload is streamed from the file, not read whole.
+    let big: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        transport
+            .upload_attachment(
+                ContentHash::of(&big),
+                upload_file(dir.path(), "big.bin", &big)
+            )
+            .await
+            .unwrap(),
+        UploadResult::Stored { size: 1_000_000 }
+    );
 }
 
 /// Writes `bytes` to `dir/name` and names that file as the upload of all of
