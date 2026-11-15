@@ -128,7 +128,8 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
 use skywave_proto::limits::ATTACHMENT_MAX_BYTES;
 use skywave_proto::{
-    Command, CommandKind, CommandResult, ContentHash, EventsQuery, Seq, UploadResult,
+    Command, CommandKind, CommandResult, ContentHash, EventsQuery, Seq, SessionId, UploadResult,
+    WriteFileRequest,
 };
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -145,7 +146,9 @@ use crate::seam::{Request, Seam};
 use crate::store::{AttachmentRefusal, LogCheck, OutboxEntry, StoreError};
 use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
-use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
+use crate::workdir::{
+    PUSH_MAX_BYTES, PushOutcome, WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected,
+};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
 pub const DEFAULT_WAIT_SECS: u32 = 30;
@@ -546,6 +549,25 @@ impl Engine {
                     answer_workdir(&seam, req, ask, result);
                 });
             }
+            Request::PushWorkdirFile {
+                req,
+                session,
+                source,
+                path,
+                replace,
+            } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    answer_push(&seam, req, session, path, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a workdir push", async move {
+                    let result =
+                        push_workdir_file(&*transport, &source, session, path.clone(), replace)
+                            .await;
+                    answer_push(&seam, req, session, path, result);
+                });
+            }
             Request::CountLines { req, path } => {
                 let seam = self.seam.clone();
                 self.seam.spawn("a line count", async move {
@@ -680,6 +702,18 @@ fn answer_workdir(
 ) {
     if let Err(error) = seam.workdir_answered(req, ask, result) {
         tracing::warn!(%error, "cannot keep a workdir answer");
+    }
+}
+
+fn answer_push(
+    seam: &Seam,
+    req: u64,
+    session: SessionId,
+    path: String,
+    result: Result<PushOutcome, TransportError>,
+) {
+    if let Err(error) = seam.workdir_pushed(req, session, path, result) {
+        tracing::warn!(%error, "cannot keep a workdir push");
     }
 }
 
@@ -1196,6 +1230,58 @@ async fn stage_one(
     })
 }
 
+/// Pushes one device file into a session's workdir. The file is read where
+/// it is, not copied into the data dir; the hash is of the bytes read, so the
+/// content sent is the content named. A HEAD, then, unless the server holds
+/// the bytes, a PUT, then the write at `path`. A file that is missing,
+/// unreadable or over [`PUSH_MAX_BYTES`] is refused without an upload. A
+/// transport error is returned to the caller.
+pub(crate) async fn push_workdir_file(
+    transport: &dyn Transport,
+    source: &Path,
+    session: SessionId,
+    path: String,
+    replace: Option<ContentHash>,
+) -> Result<PushOutcome, TransportError> {
+    match tokio::fs::metadata(source).await {
+        Ok(meta) if meta.len() > PUSH_MAX_BYTES => {
+            tracing::warn!("workdir push file is over the upload limit");
+            return Ok(PushOutcome::UploadRefused(UploadResult::TooLarge));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "workdir push file cannot be read");
+            return Ok(PushOutcome::Unreadable {
+                reason: error.to_string(),
+            });
+        }
+    }
+    let bytes = match tokio::fs::read(source).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "workdir push file cannot be read");
+            return Ok(PushOutcome::Unreadable {
+                reason: error.to_string(),
+            });
+        }
+    };
+    let sha = ContentHash::of(&bytes);
+    if !transport.attachment_staged(sha).await? {
+        let answer = transport.upload_attachment(sha, Bytes::from(bytes)).await?;
+        if !matches!(answer, UploadResult::Stored { .. }) {
+            return Ok(PushOutcome::UploadRefused(answer));
+        }
+    }
+    let request = WriteFileRequest {
+        session,
+        path,
+        content: sha,
+        replace,
+    };
+    let answer = transport.write_workdir_file(&request).await?;
+    Ok(PushOutcome::Written(answer))
+}
+
 /// The background stager for agent drafts: uploads the images a draft
 /// gains as soon as it gains them, so on a bad link the bytes are usually on
 /// the server before the message is sent. It runs beside the pull and the
@@ -1436,7 +1522,7 @@ mod tests {
     use skywave_proto::{
         Attachment, BlobId as ProtoBlobId, BlobRef, Command, CommandId, CommandKind, CommandResult,
         ContentHash, EventBatch, EventKind, HelloResponse, ImageType, PROTOCOL_VERSION, ServerId,
-        SessionId, UploadResult,
+        SessionId, UploadResult, WriteFileRequest, WriteFileResult,
     };
 
     use super::*;
@@ -2853,6 +2939,10 @@ mod tests {
         check_staged: bool,
         /// Runs on every PUT, after it is recorded and before it answers.
         on_put: Option<Box<dyn Fn() + Send + Sync>>,
+        /// Every workdir write, in the order it came.
+        writes: Mutex<Vec<WriteFileRequest>>,
+        /// When set, every write answers this; otherwise it writes.
+        write_answer: Option<WriteFileResult>,
     }
 
     impl StagingServer {
@@ -2865,6 +2955,8 @@ mod tests {
                 put_failures: Mutex::new(0),
                 check_staged: true,
                 on_put: None,
+                writes: Mutex::new(Vec::new()),
+                write_answer: None,
             }
         }
 
@@ -2887,6 +2979,10 @@ mod tests {
 
     fn put_call(sha256: ContentHash) -> String {
         format!("put {}", &sha256.to_hex()[..8])
+    }
+
+    fn write_call(sha256: ContentHash) -> String {
+        format!("write {}", &sha256.to_hex()[..8])
     }
 
     fn post_call(text: &str) -> String {
@@ -2985,6 +3081,31 @@ mod tests {
                 }
             })
         }
+
+        fn write_workdir_file<'a>(
+            &'a self,
+            request: &'a WriteFileRequest,
+        ) -> BoxFuture<'a, Result<WriteFileResult, TransportError>> {
+            Box::pin(async move {
+                self.record(write_call(request.content));
+                self.writes.lock().unwrap().push(request.clone());
+                Ok(match &self.write_answer {
+                    Some(answer) => answer.clone(),
+                    None => WriteFileResult::Written {
+                        path: request.path.clone(),
+                        size: 0,
+                        seq: Seq(1),
+                    },
+                })
+            })
+        }
+    }
+
+    /// Writes `bytes` to `dir/device.bin`, the way a picked file sits on disk.
+    fn source_file(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join("device.bin");
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 
     /// Writes `bytes` where the outbox looks for the image they hash to.
@@ -3396,6 +3517,148 @@ mod tests {
     async fn stage_for_a_minute(ctx: &LinkCtx, server: &StagingServer) {
         let staged = tokio::time::timeout(Duration::from_secs(60), stage_drafts(ctx, server)).await;
         assert!(staged.is_err(), "the stager only ends on an error");
+    }
+
+    /// A device file is staged, then written at its path: a HEAD, a PUT, then
+    /// the write, which names the staged hash.
+    #[tokio::test(start_paused = true)]
+    async fn push_uploads_then_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let server = StagingServer::new();
+        let session = SessionId::new();
+        let sha = ContentHash::of(b"device bytes");
+
+        let outcome = push_workdir_file(&server, &source, session, "docs/a.txt".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.calls(),
+            [head_call(sha), put_call(sha), write_call(sha)]
+        );
+        assert!(
+            matches!(
+                outcome,
+                PushOutcome::Written(WriteFileResult::Written { .. })
+            ),
+            "{outcome:?}"
+        );
+        let writes = server.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            [WriteFileRequest {
+                session,
+                path: "docs/a.txt".into(),
+                content: sha,
+                replace: None,
+            }]
+        );
+    }
+
+    /// A file the server already holds is only written: no upload, and the
+    /// `replace` the user chose goes along with the write.
+    #[tokio::test(start_paused = true)]
+    async fn push_of_a_staged_file_only_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let server = StagingServer::new();
+        let sha = ContentHash::of(b"device bytes");
+        server.staged.lock().unwrap().insert(sha);
+        let session = SessionId::new();
+        let old = ContentHash::of(b"old");
+
+        push_workdir_file(&server, &source, session, "a.txt".into(), Some(old))
+            .await
+            .unwrap();
+
+        assert_eq!(server.calls(), [head_call(sha), write_call(sha)]);
+        let writes = server.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            [WriteFileRequest {
+                session,
+                path: "a.txt".into(),
+                content: sha,
+                replace: Some(old),
+            }]
+        );
+    }
+
+    /// A file that is not there is refused on the device: nothing is sent.
+    #[tokio::test(start_paused = true)]
+    async fn push_of_a_missing_file_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = StagingServer::new();
+        let missing = dir.path().join("gone.bin");
+
+        let outcome = push_workdir_file(&server, &missing, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, PushOutcome::Unreadable { .. }),
+            "{outcome:?}"
+        );
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+    }
+
+    /// A file over [`PUSH_MAX_BYTES`] is refused without being read or sent.
+    #[tokio::test(start_paused = true)]
+    async fn push_of_an_oversized_file_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("big.bin");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(PUSH_MAX_BYTES + 1).unwrap();
+        let server = StagingServer::new();
+
+        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, PushOutcome::UploadRefused(UploadResult::TooLarge));
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+    }
+
+    /// A refused upload stops the push: nothing is written.
+    #[tokio::test(start_paused = true)]
+    async fn push_stops_at_a_refused_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let sha = ContentHash::of(b"device bytes");
+        let server = StagingServer {
+            put_answer: Some(UploadResult::DiskLow),
+            ..StagingServer::new()
+        };
+
+        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(server.calls(), [head_call(sha), put_call(sha)]);
+        assert_eq!(outcome, PushOutcome::UploadRefused(UploadResult::DiskLow));
+        assert!(server.writes.lock().unwrap().is_empty());
+    }
+
+    /// The server's answer to the write is the push's answer, whatever it is.
+    #[tokio::test(start_paused = true)]
+    async fn push_passes_the_write_answer_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let answer = WriteFileResult::Exists {
+            sha256: ContentHash::of(b"old"),
+            size: 3,
+        };
+        let server = StagingServer {
+            write_answer: Some(answer.clone()),
+            ..StagingServer::new()
+        };
+
+        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, PushOutcome::Written(answer));
     }
 
     /// A draft image is uploaded as soon as it is attached, and only once

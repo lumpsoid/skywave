@@ -1,5 +1,7 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
+use std::path::PathBuf;
+
 use skywave_proto::ContentHash;
 
 use crate::attachment::AttachedImage;
@@ -391,6 +393,18 @@ pub enum Action {
     DownloadWorkdirFile {
         session_id: SessionId,
         path: String,
+    },
+    /// Push a device file into the session's workdir at `path`: it is read,
+    /// uploaded unless the server holds it, and written there. `replace` is the
+    /// sha256 of the file now at `path` (from a `WriteFileResult::Exists`), when
+    /// the user chose to replace it; `None` writes only where no file is.
+    /// Nothing happens while a push to the same path is in flight, or for an
+    /// unknown session. Its state is [`WorkdirView::pushes`](crate::WorkdirView::pushes).
+    PushWorkdirFile {
+        session_id: SessionId,
+        source: PathBuf,
+        path: String,
+        replace: Option<ContentHash>,
     },
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),

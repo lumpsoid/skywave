@@ -34,7 +34,7 @@ use crate::view::{
     ApprovalId, BlobId, CommandId, DeviceId, PairedLink, Seq, SessionId, UsageLimitsResult,
     UsageLimitsUnavailable,
 };
-use crate::workdir::{WorkdirAnswer, WorkdirAsk};
+use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk};
 
 /// The bytes a local crop is made from ([`Seam::local_crop`]).
 #[derive(Debug, Clone)]
@@ -106,6 +106,16 @@ pub enum Request {
     Workdir {
         req: u64,
         ask: WorkdirAsk,
+    },
+    /// Push the device file `source` into the session's workdir at `path`
+    /// (see [`Action::PushWorkdirFile`](crate::Action::PushWorkdirFile)).
+    /// Answer with [`Seam::workdir_pushed`], naming `req`.
+    PushWorkdirFile {
+        req: u64,
+        session: SessionId,
+        source: PathBuf,
+        path: String,
+        replace: Option<ContentHash>,
     },
     /// Ask the server for its agent's usage limits, for the usage limits
     /// page, within [`USAGE_LIMITS_TIMEOUT`](crate::USAGE_LIMITS_TIMEOUT).
@@ -552,6 +562,22 @@ impl Seam {
                 requests.push(Request::BlobsPurged(stored.purged));
             }
             requests.extend(wanted);
+            Ok(())
+        })
+    }
+
+    /// The answer to [`Request::PushWorkdirFile`] `req`, for the push to
+    /// `path` of `session`. In one update: the model keeps it only if `req`
+    /// is still the push's latest. Nothing is stored; a push is in memory.
+    pub fn workdir_pushed(
+        &self,
+        req: u64,
+        session: SessionId,
+        path: String,
+        result: Result<PushOutcome, TransportError>,
+    ) -> Result<(), CoreError> {
+        self.update(|state, _requests| {
+            state.model.workdir_pushed(req, session, path, result);
             Ok(())
         })
     }

@@ -31,6 +31,7 @@ pub use crate::projection::{SessionUsage, TurnRecord};
 use crate::address::ServerAddress;
 use crate::attachment::AttachedImage;
 use crate::store::{AttachmentRefusal, BlobPolicy, OutboxEntry, OutboxStatus};
+use crate::workdir::PushOutcome;
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.
@@ -639,6 +640,8 @@ pub struct WorkdirView {
     /// ([`Action::DownloadWorkdirFile`](crate::Action::DownloadWorkdirFile))
     /// that are stored, in flight or failed, sorted by path.
     pub downloads: Vec<WorkdirDownload>,
+    /// The pushes into this session's workdir ([`Action::PushWorkdirFile`](crate::Action::PushWorkdirFile)), sorted by path.
+    pub pushes: Vec<WorkdirPush>,
 }
 
 /// A file of the workdir asked for download ([`Action::DownloadWorkdirFile`]).
@@ -652,6 +655,25 @@ pub struct WorkdirDownload {
     /// The content, when the answer carries a blob: its progress, and
     /// `BlobState::Available { path }` once it is on the device.
     pub blob: Option<BlobView>,
+}
+
+/// A device file pushed into the session's workdir.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkdirPush {
+    /// The workdir path written to, relative, `/` separated.
+    pub path: String,
+    /// The device file sent.
+    pub source: PathBuf,
+    pub state: PushState,
+}
+
+/// Where a push stands. Nothing is stored: a push lives as long as the model.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PushState {
+    Pushing,
+    /// A transport failure, or offline; nothing is known to be written.
+    Failed(String),
+    Done(PushOutcome),
 }
 
 /// The state of the read a workdir pane shows.
