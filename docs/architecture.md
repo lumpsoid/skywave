@@ -1182,9 +1182,12 @@ logs) an event that no longer decodes rather than failing.
   whose hash is an attachment this device holds (the image of its own
   message, D50) is not downloaded, under any policy: before the batch applies,
   outside the state lock, it is hard-linked (copied, and synced, where linking
-  fails) from `attachments/` to `blobs/<id>.own`; in the locked change that
-  applies the batch it is renamed onto `blobs/<id>` and marked available, so a
-  replica rebuilt from the log while those files exist reads them too. A
+  fails) from `attachments/` to `blobs/<id>.own`, but only for a blob the
+  replica does not know yet (a short in-memory check under the state lock,
+  taken only when some referenced blob is an own attachment); in the locked
+  change that applies the batch it is renamed onto `blobs/<id>` and marked
+  available, so a replica rebuilt from the log while those files exist reads
+  them too. A
   `.own` file the batch did not use is removed afterwards. A hard link outlives
   the attachment's file, which only the next store open removes.
   A wrong hash deletes the file; the first
