@@ -2798,7 +2798,7 @@ pub enum LoginFinishResult {
 pub enum UploadResult {
     /// The file is staged, or already was. `size` is in bytes.
     Stored { size: u64 },
-    /// Over [`limits::ATTACHMENT_MAX_BYTES`]; nothing stored.
+    /// Over the server's `[files] upload_max`; nothing stored.
     TooLarge,
     /// The body does not hash to the path's sha256.
     HashMismatch,

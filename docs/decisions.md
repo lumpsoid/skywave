@@ -1466,3 +1466,9 @@ on either side.
 **Why:** the check that matters is where the bytes are used as an image, not
 where they arrive, and one cache of uploads is simpler to evict and sweep than
 one per kind of file.
+
+The upload cap is `[files] upload_max` (64 MiB by default, at most the 256 MiB
+staging cap, and refused at load when larger). The PUT streams its body to a
+temp file in the staging directory and never buffers it; a body over the cap
+is `TooLarge` and leaves no file. `ATTACHMENT_MAX_BYTES` stays the per-image
+limit for images on a message.

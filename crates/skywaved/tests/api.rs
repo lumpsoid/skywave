@@ -2049,21 +2049,45 @@ async fn a_staged_upload_must_hash_to_its_path_and_may_be_any_file() {
     );
 }
 
-/// An upload over `ATTACHMENT_MAX_BYTES` is `TooLarge` as JSON, not a 413,
-/// and stores nothing. A 3 MiB image, over axum's default 2 MB body limit,
-/// is stored: the limit is off for this route.
+/// An upload over `upload_max` is `TooLarge` as JSON, not a 413, and leaves
+/// no file, temp file included; a body of exactly the cap is stored.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversize_upload_is_refused_as_json() {
-    let f = Fixture::start().await;
+    const CAP: u64 = 1 << 20;
+    let options = ServerOptions {
+        git: isolated_git(),
+        upload_max: CAP,
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_configured(|log| log, options).await;
     let creds = f.pair().await;
     let mut device = f.client(&creds).await;
-    let big = png(limits::ATTACHMENT_MAX_BYTES as usize + 1);
+    let big = png(CAP as usize + 1);
     let uri = path::attachment(ContentHash::of(&big));
     let reply = device.send(Method::PUT, &uri, &[], Bytes::from(big)).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.json::<UploadResult>(), UploadResult::TooLarge);
-    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+    assert!(
+        files_under(&f.storage.dir.attachments_dir()).is_empty(),
+        "nothing is left, temp file included"
+    );
 
+    let exact = png(CAP as usize);
+    let uri = path::attachment(ContentHash::of(&exact));
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(exact))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: CAP },
+        "control: a body of exactly the cap is stored"
+    );
+
+    // Past axum's default 2 MB body limit, which is off for this route: a
+    // 3 MiB file is stored under the default cap.
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
     let three_mib = png(3 << 20);
     let uri = path::attachment(ContentHash::of(&three_mib));
     let reply = device

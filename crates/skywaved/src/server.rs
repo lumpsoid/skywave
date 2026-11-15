@@ -57,6 +57,7 @@ use crate::agent::{
     OutsideConversations, UsageLimitsSource,
 };
 use crate::api::{self, Api, CONVERSATIONS_TIMEOUT, LOGIN_FINISH_TIMEOUT, PeerCert};
+use crate::config::DEFAULT_UPLOAD_MAX;
 use crate::crop::{CROP_DEADLINE, CropHook};
 use crate::data_dir::DataDir;
 use crate::db::Db;
@@ -126,6 +127,9 @@ pub struct ServerOptions {
     pub joined_hook: Option<JoinedHook>,
     /// Largest workdir file a download serves (`[files] download_max`).
     pub download_max: u64,
+    /// Largest file an upload stages (`[files] upload_max`); the body
+    /// streams to disk, so it is never held whole.
+    pub upload_max: u64,
 }
 
 /// [`ServerOptions::joined_hook`].
@@ -149,6 +153,7 @@ impl Default for ServerOptions {
             crop_hook: None,
             joined_hook: None,
             download_max: DEFAULT_DOWNLOAD_MAX,
+            upload_max: DEFAULT_UPLOAD_MAX,
         }
     }
 }
