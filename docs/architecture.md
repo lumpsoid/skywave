@@ -1180,12 +1180,13 @@ logs) an event that no longer decodes rather than failing.
   renamed when complete. A blob already whole on disk (an empty one always
   is) is checked the same way without a request. A newly registered blob
   whose hash is an attachment this device holds (the image of its own
-  message, D50) is not downloaded, under any policy: after the batch commits it
-  is hard-linked (copied, and synced, where linking fails) from `attachments/`
-  to `blobs/<id>.own` outside the state lock, renamed onto `blobs/<id>`, and
-  marked available, so a replica rebuilt from the log
-  while those files exist reads them too. A hard link outlives the
-  attachment's file, which only the next store open removes.
+  message, D50) is not downloaded, under any policy: before the batch applies,
+  outside the state lock, it is hard-linked (copied, and synced, where linking
+  fails) from `attachments/` to `blobs/<id>.own`; in the locked change that
+  applies the batch it is renamed onto `blobs/<id>` and marked available, so a
+  replica rebuilt from the log while those files exist reads them too. A
+  `.own` file the batch did not use is removed afterwards. A hard link outlives
+  the attachment's file, which only the next store open removes.
   A wrong hash deletes the file; the first
   one a worker sees while it holds the blob refetches it from zero at once (the
   bytes may be the device's own, kept from an earlier try), a second is

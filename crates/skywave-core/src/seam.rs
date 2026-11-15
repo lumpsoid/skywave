@@ -24,7 +24,7 @@ use crate::attachment::attachment_path;
 use crate::blobs::{blob_dir, remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, blocking, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
-use crate::projection::BlobFate;
+use crate::projection::{BlobFate, blob_refs};
 use crate::store::{
     Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
     PendingCrop, ServerFacts, Settings, StoreError,
@@ -353,8 +353,11 @@ impl Seam {
     pub fn apply_events(&self, batch: &EventBatch) -> Result<Applied, CoreError> {
         let now = Utc::now();
         let data_dir = self.data_dir();
-        let (mut applied, own) = self.update(|state, requests| {
-            let applied = state.store.apply_batch(batch, now)?;
+        // Before the state lock: copying and syncing a local image takes
+        // long enough to hold off every dispatch and snapshot.
+        let prepared = blocking(|| prepare_own_images(&data_dir, batch));
+        let result = self.update(|state, requests| {
+            let mut applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
             for (id, seq) in &applied.settled {
@@ -376,35 +379,21 @@ impl Seam {
                 requests.push(Request::BlobsPurged(applied.purged.clone()));
             }
             // After the model took the batch: it registers the blobs there.
-            let own = match state.store.own_images(&applied.blobs) {
-                Ok(own) => own,
-                Err(error) => {
-                    tracing::warn!(%error, "cannot look up the device's own images; they download");
-                    Vec::new()
+            own_images_available(state, &data_dir, &prepared, &mut applied);
+            Ok(applied)
+        });
+        blocking(|| {
+            for id in &prepared {
+                match std::fs::remove_file(own_image_temp(&data_dir, *id)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(?id, %error, "cannot remove a local image's temporary file");
+                    }
                 }
-            };
-            Ok((applied, own))
-        })?;
-        if own.is_empty() {
-            return Ok(applied);
-        }
-        // Outside the state lock: copying and syncing a local image takes
-        // long enough to hold off every dispatch and snapshot.
-        let made = blocking(|| {
-            own.into_iter()
-                .map(|(id, sha256)| (id, own_image_file(&data_dir, id, sha256)))
-                .collect()
+            }
         });
-        let shown = self.update(|state, _| {
-            own_images_available(state, &data_dir, made, &mut applied);
-            Ok(())
-        });
-        if let Err(error) = shown {
-            // The batch is stored; the own images stay in `applied.blobs`
-            // and download.
-            tracing::debug!(%error, "cannot make the own images available; they download");
-        }
-        Ok(applied)
+        result
     }
 
     /// The server said `hello`: keep the names of its devices, whether it
@@ -1001,41 +990,36 @@ fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
     }
 }
 
-/// Makes the device's own message images available from the files `made`
-/// (see `apply_events`), rather than downloading them. Each blob whose file
-/// was made and which is still not downloaded becomes available at it, and
-/// is taken out of `applied.blobs`, so the engine does not queue it. A blob
-/// whose file could not be made, or that a download got to first, stays as
-/// it is. A store error is logged, and the blob it touches downloads as
-/// normal.
+/// Makes the device's own message images available, rather than downloading
+/// them, in the locked change that applies the batch. Each blob the batch
+/// registered as not downloaded whose file `prepare_own_images` made is
+/// renamed from `<id>.own` onto its blob file, marked available, and taken
+/// out of `applied.blobs`, so the engine does not queue it. Doing it in that
+/// one change means no snapshot shows such a blob as not downloaded. A blob
+/// whose file was not made stays as it is and downloads. A store error is
+/// logged, and the blob it touches downloads as normal.
 fn own_images_available(
     state: &mut State,
     data_dir: &Path,
-    made: Vec<(BlobId, std::io::Result<PathBuf>)>,
+    prepared: &HashSet<BlobId>,
     applied: &mut Applied,
 ) {
-    for (id, made) in made {
-        let path = match made {
-            Ok(path) => path,
-            Err(error) => {
-                tracing::debug!(?id, %error, "cannot use the local image; it downloads");
-                continue;
-            }
-        };
-        match state.store.blob(id) {
-            Ok(Some(record)) if record.status == BlobStatus::NotDownloaded => {}
-            // A download got there first: the file is the same bytes at the
-            // same path, so it stays.
-            Ok(Some(_)) => continue,
-            // Purged meanwhile: its files go, the one made just now too.
-            Ok(None) => {
-                remove_blob_files(data_dir, id);
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!(?id, %error, "cannot read the blob; it downloads");
-                continue;
-            }
+    let own = match state.store.own_images(&applied.blobs) {
+        Ok(own) => own,
+        Err(error) => {
+            tracing::warn!(%error, "cannot look up the device's own images; they download");
+            return;
+        }
+    };
+    for (id, _) in own {
+        if !prepared.contains(&id) {
+            tracing::debug!(?id, "cannot use the local image; it downloads");
+            continue;
+        }
+        let path = blob_dir(data_dir).join(id.0.to_string());
+        if let Err(error) = std::fs::rename(own_image_temp(data_dir, id), &path) {
+            tracing::debug!(?id, %error, "cannot use the local image; it downloads");
+            continue;
         }
         let status = BlobStatus::Available { path };
         if let Err(error) = state.store.set_blob_status(id, &status) {
@@ -1047,17 +1031,40 @@ fn own_images_available(
     }
 }
 
-/// Puts the attachment `sha256` at the blob file of `id`: a hard link, or a
-/// copy where linking fails, synced before it is used. It is made under
-/// `<id>.own` and renamed onto the blob file, so that file is never missing
-/// or half-written: a download of the same blob may write it at the same
-/// time, with the same bytes. A file already at that path is replaced, as it
-/// is no proof of the content.
-fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<PathBuf> {
-    let dir = blob_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
-    let dst = dir.join(id.0.to_string());
-    let tmp = dir.join(format!("{}.own", id.0));
+/// Makes `<id>.own` for each blob `batch` references whose bytes are an
+/// attachment this device holds, and returns the ids made: the only ones
+/// `own_images_available` may rename into place. A file that cannot be made
+/// is logged, and its blob downloads. Attachment files are removed only at
+/// store open, so a file found here is still there when the batch applies.
+fn prepare_own_images(data_dir: &Path, batch: &EventBatch) -> HashSet<BlobId> {
+    let mut prepared = HashSet::new();
+    for (_, event) in batch.iter() {
+        for blob in blob_refs(&event.kind) {
+            let id = blob.id;
+            if prepared.contains(&id) || !attachment_path(data_dir, blob.sha256).exists() {
+                continue;
+            }
+            match prepare_own_image(data_dir, id, blob.sha256) {
+                Ok(()) => {
+                    prepared.insert(id);
+                }
+                Err(error) => {
+                    tracing::debug!(?id, %error, "cannot use the local image; it downloads");
+                }
+            }
+        }
+    }
+    prepared
+}
+
+/// Makes `<id>.own` from the attachment `sha256`: a hard link, or a copy
+/// where linking fails, synced before it is used. It stays under that name
+/// until `own_images_available` renames it onto the blob file, so the blob
+/// file is never a half-written copy. A temporary file an earlier attempt
+/// left is replaced.
+fn prepare_own_image(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<()> {
+    std::fs::create_dir_all(blob_dir(data_dir))?;
+    let tmp = own_image_temp(data_dir, id);
     match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1071,8 +1078,12 @@ fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::
             .open(&tmp)?
             .sync_all()?;
     }
-    std::fs::rename(&tmp, &dst)?;
-    Ok(dst)
+    Ok(())
+}
+
+/// Where the own image of `id` is made until it is renamed onto its blob file.
+fn own_image_temp(data_dir: &Path, id: BlobId) -> PathBuf {
+    blob_dir(data_dir).join(format!("{}.own", id.0))
 }
 
 #[cfg(test)]
@@ -1170,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn own_image_file_replaces_the_blob_file_in_one_step() {
+    fn prepare_own_image_replaces_a_stale_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path();
         let sha256 = ContentHash::of(b"image");
@@ -1178,14 +1189,15 @@ mod tests {
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
         std::fs::write(&src, b"image").unwrap();
         let id = BlobId::new();
-        let blobs = blob_dir(data_dir);
-        std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::write(blobs.join(id.0.to_string()), b"stale").unwrap();
+        std::fs::create_dir_all(blob_dir(data_dir)).unwrap();
+        std::fs::write(own_image_temp(data_dir, id), b"stale").unwrap();
 
-        let dst = own_image_file(data_dir, id, sha256).unwrap();
+        prepare_own_image(data_dir, id, sha256).unwrap();
 
-        assert_eq!(dst, blobs.join(id.0.to_string()));
-        assert_eq!(std::fs::read(&dst).unwrap(), b"image");
-        assert!(!blobs.join(format!("{}.own", id.0)).exists());
+        assert_eq!(
+            std::fs::read(own_image_temp(data_dir, id)).unwrap(),
+            b"image"
+        );
+        assert!(!blob_dir(data_dir).join(id.0.to_string()).exists());
     }
 }
