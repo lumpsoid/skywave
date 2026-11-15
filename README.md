@@ -75,8 +75,10 @@ you open them.
 ### 📂 See the workdir
 Check what the agent actually changed without a shell on the server. Open a
 session's workdir to see its net git changes, with a diff per file, or browse
-its files. It is read-only and fetched only when you ask, and what you read
-stays on the device, so you can still read it offline.
+its files. Nothing is fetched until you ask, and what you read stays on the
+device, so you can still read it offline. A file can also be saved to the
+device, and a file from the device pushed into the workdir at a path you name;
+a push replaces a file already there only after you confirm.
 
 ### 🌿 Parallel sessions on one repo
 Give a new session a branch name and it runs in its own git worktree on that

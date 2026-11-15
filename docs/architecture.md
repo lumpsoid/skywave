@@ -175,7 +175,7 @@ every version.
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
 | `GET /v1/workdir/download?session=&path=` | One file of a session's workdir to save on the device (D54), text or binary, as a `FileResult` whose content is a blob up to the server's download cap (`[files] download_max`, 64 MiB by default), else `TooLarge`. Recorded apart from `file`, so neither frees the other's blob. Since v36. |
-| `POST /v1/workdir/write` | Writes a staged upload (`PUT /v1/attachments/{sha256}`) to `path` in a session's workdir, a `WriteFileRequest { session, path, content, replace }` answered with a `WriteFileResult`, always 200. The parent directory must exist. Refused as `NotAllowed` before the file system is touched: an absolute path, one climbing out of the workdir, any `.git` component, a symlink at the target. `Same` when the file already holds the content, and nothing is written. `Exists { sha256, size }` when another file is there and `replace` does not name its sha256; naming it replaces it, and a new file is never created over one made meanwhile. A replaced file keeps its mode, a new one is 0644. The staged upload is kept. A write that lands is logged as `FileWritten` by the calling device and answered `Written` with that event's seq. `DiskLow` is checked first; a write past 120 s is a 503. Since v36. |
+| `POST /v1/workdir/write` | Writes a staged upload (`PUT /v1/attachments/{sha256}`) to `path` in a session's workdir, a `WriteFileRequest { session, path, content, replace }` answered with a `WriteFileResult`, always 200. The parent directory must exist. Refused as `NotAllowed` before the file system is touched: an absolute path, one climbing out of the workdir, any `.git` component. A symlink at the target is `NotAllowed` too, found when the file is opened and never followed. `Same` when the file already holds the content, and nothing is written. `Exists { sha256, size }` when another file is there and `replace` does not name its sha256; naming it replaces it, and a new file is never created over one made meanwhile. A replaced file keeps its mode, a new one is 0644. The staged upload is kept. A write that lands is logged as `FileWritten` by the calling device and answered `Written` with that event's seq. `DiskLow` is checked first; a write past 120 s is a 503. Since v36. |
 
 - **Seqs** are global and contiguous: the first event is 1, 0 is "before
   everything". Events carry no seq on the wire; the batch carries `from`.
@@ -810,6 +810,25 @@ collects one. `serve`,
   any other exit `Failed` for that repo); the main working tree is merged by
   definition. Entries past `WORKTREES_MAX` get no git call. Nothing is
   recorded.
+- **Workdir writes** (D56): `POST /v1/workdir/write` runs as one workdir
+  snapshot (`workdir_task`), under `WRITE_DEADLINE` (120 s, a 503 past it),
+  and checks `DiskLow` first. The target is refused `NotAllowed` for an
+  absolute path, one climbing out with `..`, any `.git` component, or a last
+  component that is not a normal name. The parent must exist as a directory
+  (`NotFound`) and canonicalise under the canonical workdir (`NotAllowed` for
+  a link out; a link inside it is followed). The file is opened with
+  `O_NOFOLLOW`: a symlink is `NotAllowed`, a directory `IsADirectory`, another
+  non-regular file `NotAFile`. A regular file already holding the staged bytes
+  is `Same`, and nothing is written. Otherwise it is replaced only when
+  `replace` names its sha256, else the answer is `Exists { sha256, size }`. A
+  new file is placed without clobbering, so a file that appears meanwhile is
+  read and answered by the same rule. The staged upload is copied into a temp
+  file in the target's directory and hashed as it goes; one that no longer
+  hashes to its name is `NotStaged`, and the staged file is kept (staging is a
+  cache). A replaced file keeps its mode, a new one is `0644`, and the
+  directory is synced after the rename. A write that lands is logged as
+  `FileWritten` by the calling device and answered `Written`
+  (`workdir_write::write`, `api.rs`).
 
 ## Pairing
 
@@ -1055,7 +1074,8 @@ logs) an event that no longer decodes rather than failing.
   disk. A third loop,
   the draft stager, runs beside the pull and the sender: it uploads a draft's
   images as soon as they are attached (woken when a draft gains images), HEAD
-  then PUT, each image once per connection. It only saves time, since the
+  then PUT, each image once per connection (a draft's files are not staged
+  early: the sender uploads them at send). It only saves time, since the
   outbox still checks every image before posting; a transport error makes it
   wait a backoff and never ends the connection, and a refused image is left
   for the outbox to report when the message is sent. The user may
@@ -1347,6 +1367,23 @@ logs) an event that no longer decodes rather than failing.
   directory, diff → changes, directory → its parent, and the changes, the
   commits or the workdir root → the session; a session deleted here falls back to the
   archived list.
+- **Workdir downloads and pushes** (D54, D56). `Action::DownloadWorkdirFile`
+  asks for one file as a `WorkdirAsk::Download`, stored under its own kind so
+  it never replaces a file view's answer; the stored `WorkdirAnswer::File`
+  keeps its content as a workdir blob, which the model wants at once, off
+  screen (`Model::want_blob`). An action while that download is in flight
+  asks nothing. `WorkdirView.downloads` lists the session's downloads that are
+  stored, in flight or failed, each with its `fetch`, `result` and `blob`.
+  `Action::PushWorkdirFile { session_id, source, path, replace }` makes a
+  `Request::PushWorkdirFile`, which the engine's `push_workdir_file` carries
+  out: it reads the device file where it is (not copied into the data dir),
+  hashes the bytes read, HEADs `/v1/attachments/{sha256}` and PUTs them unless
+  the server holds them, then posts the write route. `WorkdirView.pushes`
+  lists the session's pushes with a `PushState` (`Pushing`, `Failed`, or
+  `Done(PushOutcome)`); a push the server answers `Exists` is
+  `Done(Written(Exists { sha256, size }))`, the hash the GUI's Replace… resends
+  with. A download's answer is stored like a read's; a push is held in
+  memory only.
 - **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
   the sessions they ran in; heads total them with `skywave_present::usage`
   by local day, session, workdir or model. A turn with no cost is unpriced,
@@ -1681,18 +1718,40 @@ skywave-core                 all logic, sync, replica
   only. The head counts each session's preparations in flight: a send waits
   for them, and the image cap counts the draft's images and those still
   being prepared.
-- **Image input and display** (D50). The attach button sends file paths
-  (`AttachImageFile`): `file_selector` on desktop, the `image_picker` gallery
-  or camera sheet on Android and iOS. Desktop paste (Ctrl/Cmd+V) reads a
-  clipboard image with `pasteboard`, which wins over text (text alone is a
-  normal paste), and mobile keyboard insertion (the TextField's
-  `contentInsertionConfiguration`) sends bytes (`AttachImageBytes`), as paste
-  does. Desktop drop (`desktop_drop`) sends one `AttachImageFile` per dropped
-  path, and the hub refuses a non-image with a notice. Each goes through the
-  preparation above. The timeline shows an image as a thumbnail (160 px high)
-  above the text; while it loads, or until it is downloaded, a placeholder
-  shows its size. A tap downloads it (`DownloadBlob`) or, once loaded, opens
-  it (`OpenFull`, or the local file for a message still queued).
+- **Attachments** (D50, D57). The composer's "Attach file" menu entry picks
+  any file: `file_selector`'s open dialog on desktop, and on Android and iOS
+  a sheet with the `image_picker` gallery, the camera, or the phone's `File`
+  option. Each picked path is sent as `GuiIntent::AttachFile`, and the hub
+  sniffs its first bytes: an image goes through the preparation above; any
+  other file is copied as it is and attached under its name. A second file of
+  a name the draft holds is refused with a notice ("a file named … is already
+  attached"), since the core keeps one per name. Desktop drop (`desktop_drop`)
+  sends one `AttachFile` per dropped path, of any kind. Desktop paste
+  (Ctrl/Cmd+V) reads a clipboard image with `pasteboard`, which wins over text
+  (text alone is a normal paste), and mobile keyboard insertion (the
+  TextField's `contentInsertionConfiguration`) sends bytes
+  (`AttachImageBytes`), as paste does; each image goes through the preparation
+  above. The draft's files show as chips with a ✕ above the field. A queued
+  message lists its files; one already in the workdir is marked "already in the
+  workdir", and "Replace & resend" for it asks first. The timeline shows an
+  image as a thumbnail (160 px high) above the text; while it loads, or until
+  it is downloaded, a placeholder shows its size. A tap downloads it
+  (`DownloadBlob`) or, once loaded, opens it (`OpenFull`, or the local file
+  for a message still queued).
+- **Workdir download and push** (D54, D56). A file row in a directory listing
+  and the file pane's app bar carry Download
+  (`ActionIntentDownloadWorkdirFile`).
+  The downloads panel shows each download: its progress, Retry when it failed,
+  and Save… once the file is on the device. Save… is the system save sheet on
+  Android and iOS (`flutter_file_dialog`), and `file_selector`'s
+  `getSaveLocation` on desktop, which copies the file
+  (`gui/lib/workdir/saving.dart`). The directory pane's push action picks a
+  device file (`pickPushFile`), proposes `<shown dir>/<file name>` in a target
+  dialog, and sends `ActionIntentPushWorkdirFile`. The pushes panel shows each
+  push's one line of progress or outcome, Retry when it failed, and Replace…
+  when the path holds another file: asked first, then pushed again with the
+  hash found. A written file's timeline row reads `<path> written by <who>`,
+  or `replaced` when it replaced one.
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.
