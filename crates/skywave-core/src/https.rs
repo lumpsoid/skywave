@@ -49,7 +49,7 @@ use skywave_proto::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio_rustls::TlsConnector;
 
 use crate::address::ServerAddress;
@@ -192,6 +192,95 @@ impl Body for FileBody {
     fn size_hint(&self) -> SizeHint {
         SizeHint::with_exact(self.left)
     }
+}
+
+/// A request body held until the server's `100 Continue`. The server answers
+/// a refusal before it asks for the body, so the answer can come with no body
+/// byte sent, and a connection reset then cannot drop bytes the server left
+/// unread. A body answered without a `100` stays pending: ending or failing
+/// it would fail the connection under the answer still being read.
+struct ContinueGate {
+    gate: Gate,
+    inner: ReqBody,
+}
+
+/// Where a [`ContinueGate`] stands.
+enum Gate {
+    /// Held until the `100` comes.
+    Waiting(oneshot::Receiver<()>),
+    /// The `100` came: the body goes.
+    Open,
+    /// The final answer came without a `100`: the body is never sent, and the
+    /// server closes the connection after it. The receiver is not polled
+    /// again, since a finished one panics.
+    Refused,
+}
+
+impl Body for ContinueGate {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let this = self.get_mut();
+        if let Gate::Waiting(go) = &mut this.gate {
+            this.gate = match std::task::ready!(Pin::new(go).poll(cx)) {
+                Ok(()) => Gate::Open,
+                Err(_) => Gate::Refused,
+            };
+        }
+        match this.gate {
+            Gate::Open => Pin::new(&mut this.inner).poll_frame(cx),
+            Gate::Waiting(_) | Gate::Refused => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// A gate over `inner`, and the function that opens it when the server's
+/// informational status comes: only a `100` opens it. Dropping the function
+/// (hyper does, at the final response) leaves the gate held for good.
+fn continue_gate(inner: ReqBody) -> (ContinueGate, impl Fn(StatusCode) + Send + Sync + 'static) {
+    let (go, held) = oneshot::channel();
+    // The function is `Fn`, so the sender is taken out of a lock once.
+    let go = Mutex::new(Some(go));
+    let open = move |status: StatusCode| {
+        if status == StatusCode::CONTINUE
+            && let Some(go) = go.lock().unwrap_or_else(|p| p.into_inner()).take()
+        {
+            let _ = go.send(());
+        }
+    };
+    let gate = ContinueGate {
+        gate: Gate::Waiting(held),
+        inner,
+    };
+    (gate, open)
+}
+
+/// Asks the server for `100 Continue` before the body and holds the body
+/// until it comes ([`ContinueGate`]). hyper does not wait for the `100` on
+/// its own; the callback sees it as an informational response.
+fn expect_continue(mut req: Request<ReqBody>) -> Request<ReqBody> {
+    req.headers_mut()
+        .insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+    let empty = Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed();
+    let inner = std::mem::replace(req.body_mut(), empty);
+    let (gate, open) = continue_gate(inner);
+    *req.body_mut() = gate.boxed();
+    hyper::ext::on_informational(&mut req, move |res| open(res.status()));
+    req
 }
 
 /// One HTTP/1.1 connection: its request handle and a signal of every write
@@ -503,7 +592,8 @@ impl Http {
         let caller_sets_type = headers
             .iter()
             .any(|(name, _)| *name == header::CONTENT_TYPE);
-        // Each attempt opens the body afresh ([`RequestBody::open`]).
+        // Each attempt opens the body afresh ([`RequestBody::open`]). A file
+        // body waits for the server's `100` ([`expect_continue`]).
         let build = || -> Result<Request<ReqBody>, TransportError> {
             let mut req = Request::builder()
                 .method(method.clone())
@@ -518,8 +608,13 @@ impl Http {
             for (name, value) in headers {
                 req = req.header(name, value.clone());
             }
-            req.body(body.open()?)
-                .map_err(|e| TransportError::Decode(format!("building request: {e}")))
+            let req = req
+                .body(body.open()?)
+                .map_err(|e| TransportError::Decode(format!("building request: {e}")))?;
+            if matches!(body, RequestBody::File { .. }) && !body.is_empty() {
+                return Ok(expect_continue(req));
+            }
+            Ok(req)
         };
         if let Some(mut conn) = self.take_idle() {
             match conn.send(build()?, stall).await? {
@@ -1283,7 +1378,6 @@ impl Transport for HttpsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::oneshot;
 
     #[test]
     fn content_range_parses() {
@@ -1707,6 +1801,120 @@ mod tests {
             matches!(result, Err(TransportError::Io(_))),
             "an offset past the file must not open: {result:?}"
         );
+    }
+
+    /// A server on `io` for an upload sent with [`expect_continue`]. It reads
+    /// the head, answers `100 Continue`, reads the whole body and answers
+    /// `200`. It hands back the head and the bytes after it.
+    async fn continue_server(
+        mut io: tokio::io::DuplexStream,
+        got: oneshot::Sender<(Vec<u8>, Vec<u8>)>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const ANSWER: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+        let mut bytes = Vec::new();
+        let mut buf = vec![0u8; BODY * 2];
+        while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = io.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        io.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .unwrap();
+        while request_end(&bytes).is_none_or(|end| bytes.len() < end) {
+            let n = io.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        io.write_all(ANSWER).await.unwrap();
+        let head_end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let after = bytes.split_off(head_end);
+        let _ = got.send((bytes, after));
+    }
+
+    /// A file body sent with `Expect: 100-continue` waits for the server's
+    /// `100`, then sends all of its bytes.
+    #[tokio::test]
+    async fn an_upload_sends_its_body_after_100_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload");
+        let contents: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &contents).unwrap();
+        let (sent, got) = oneshot::channel();
+        let (client, far) = tokio::io::duplex(PIECE);
+        tokio::spawn(continue_server(far, sent));
+        let (client, written) = Metered::new(client);
+        let mut conn = Conn::open(client, written).await.unwrap();
+        let body = RequestBody::File {
+            file: UploadFile {
+                path,
+                len: contents.len() as u64,
+            },
+            from: 0,
+        }
+        .open()
+        .unwrap();
+        let req = expect_continue(
+            Request::put("/v1/attachments/x")
+                .header(header::HOST, "srv")
+                .body(body)
+                .unwrap(),
+        );
+        let resp = conn.send(req, None).await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let answer = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(answer, "{}");
+        let (head, body) = got.await.unwrap();
+        let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+        assert!(head.contains("expect: 100-continue"), "{head}");
+        assert_eq!(
+            body.len(),
+            contents.len(),
+            "the server did not get the whole body"
+        );
+        assert!(body == contents, "the body is not the file");
+    }
+
+    /// The gate of a body of `abc`, polled with no waker: it stays held
+    /// through an informational status that is not a `100`, and opens on the
+    /// `100`, after which its bytes come as the body's own.
+    #[test]
+    fn a_continue_gate_holds_the_body_until_a_100() {
+        use std::task::Waker;
+        let inner = Full::new(Bytes::from_static(b"abc"))
+            .map_err(|never| match never {})
+            .boxed();
+        let (mut gate, open) = continue_gate(inner);
+        assert_eq!(gate.size_hint().exact(), Some(3));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut gate).poll_frame(&mut cx).is_pending());
+        open(StatusCode::PROCESSING);
+        assert!(Pin::new(&mut gate).poll_frame(&mut cx).is_pending());
+        open(StatusCode::CONTINUE);
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut gate).poll_frame(&mut cx) else {
+            panic!("the body did not come after the 100");
+        };
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"abc"));
+    }
+
+    /// A final answer without a `100` drops the callback, so its open is
+    /// gone: the body stays held, and polling it again stays held too.
+    #[test]
+    fn a_continue_gate_answered_without_a_100_stays_held() {
+        use std::task::Waker;
+        let inner = Full::new(Bytes::from_static(b"abc"))
+            .map_err(|never| match never {})
+            .boxed();
+        let (mut gate, open) = continue_gate(inner);
+        drop(open);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut gate).poll_frame(&mut cx).is_pending());
+        assert!(Pin::new(&mut gate).poll_frame(&mut cx).is_pending());
     }
 
     /// How many bytes a socket to a peer that reads nothing and advertises

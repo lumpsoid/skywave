@@ -1065,7 +1065,10 @@ logs) an event that no longer decodes rather than failing.
   stored before v36 may carry `NotAnImage`, which the server no longer
   answers.) A low disk
   stops the uploads and posts the message anyway, so the server's stored
-  `DiskLow` refusal shows it and the outbox keeps moving. A HEAD or PUT that
+  `DiskLow` refusal shows it and the outbox keeps moving. An upload sends
+  `Expect: 100-continue` and holds its body until the server's `100 Continue`:
+  a refusal the server answers before it asks for the body (`DiskLow`) then
+  finds no body byte in flight, so a connection reset can't drop it. A HEAD or PUT that
   fails in transport backs off like the command's own request. After its
   images, the sender writes each file of the message into the workdir root as
   `<name>`: the file is uploaded as an attachment, then written with the
