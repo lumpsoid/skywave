@@ -639,10 +639,9 @@ packages:
   rinf:
     dependency: "direct main"
     description:
-      name: rinf
-      sha256: d48f3972caf200ac3fa8f1512a9ce29470995af51aa0289e4cc291a4df5a373c
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/rinf"
+      relative: true
+    source: path
     version: "8.11.0"
   sky_engine:
     dependency: transitive

@@ -60,6 +60,12 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
 
+# Vendored rinf 8.11.0 (minus example/) so its cargokit Gradle script can be
+# patched; see third_party/rinf. Drop once upstream fixes it.
+dependency_overrides:
+  rinf:
+    path: third_party/rinf
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 
