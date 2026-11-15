@@ -557,16 +557,16 @@ impl Seam {
     }
 
     pub fn set_link(&self, link: PairedLink) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 if self.current(state) {
                     let alerted = state.model.set_link(link);
                     mark_alerted(state, &alerted);
                 }
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::Workdir`] `req`, for `ask`. In one update:
@@ -644,13 +644,13 @@ impl Seam {
     /// The answer to [`Request::ListDirs`] `req`. Kept in memory only; an
     /// answer to an older request than the latest is ignored.
     pub fn dirs_listed(&self, req: u64, result: Result<DirsResult, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.dirs_listed(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::ListConversations`] `req`. Kept in memory
@@ -661,37 +661,37 @@ impl Seam {
         req: u64,
         result: Result<ConversationsResult, TransportError>,
     ) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.conversations_listed(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::Storage`] `req`. Kept in memory only; an
     /// answer to an older request than the latest is ignored.
     pub fn storage_reported(&self, req: u64, result: Result<StorageReport, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.storage_reported(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::Worktrees`] `req`. Kept in memory only; an
     /// answer to an older request than the latest is ignored.
     pub fn worktrees_listed(&self, req: u64, result: Result<WorktreeList, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.worktrees_listed(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::UsageLimits`] `req`. In one update: an
@@ -738,13 +738,13 @@ impl Seam {
     /// The answer to [`Request::LoginStart`] `req`. Kept in memory only;
     /// an answer to any request but the one the login waits on is ignored.
     pub fn login_started(&self, req: u64, result: Result<LoginStartResult, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.login_started(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::LoginFinish`] `req`. An answer to any
@@ -783,13 +783,13 @@ impl Seam {
     /// could not be read. Kept in memory only; an answer to any request but
     /// the one the crop page on screen waits on is ignored.
     pub fn lines_counted(&self, req: u64, result: std::io::Result<u64>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.lines_counted(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// Pairing with the server at `address` returned these credentials:
@@ -855,13 +855,13 @@ impl Seam {
     /// Pairing failed; the pairing screen shows `reason`.
     pub fn pairing_failed(&self, reason: impl Into<String>) {
         let reason = reason.into();
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.pairing_failed(reason);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// Download progress or completion of a blob.
@@ -953,13 +953,13 @@ impl Seam {
     /// resumed them; the views say so. Nothing is stored: a restart
     /// resumes.
     pub(crate) fn blobs_disk_full(&self, full: bool) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.set_blobs_disk_full(full);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// Runs a change that persists before touching the model, so a failed
