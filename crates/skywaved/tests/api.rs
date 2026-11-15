@@ -2354,8 +2354,8 @@ async fn a_put_dropped_after_its_body_keeps_the_upload_lock_until_staged() {
     );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "the second PUT, let in once the first is staged, writes its body again"
+        1,
+        "the second PUT answers the staged image without writing its body again"
     );
     let staged = f.storage.dir.attachments_dir().join(hash.to_hex());
     assert_eq!(std::fs::read(&staged).unwrap(), bytes);
