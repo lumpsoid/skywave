@@ -9,8 +9,8 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, BlobDownload, Core, ExpectedRun, HttpsTransport, Identity, PairError,
-    PairedCredentials, Pairing, PairingStatus, Request, Screen, ServerAddress, Transport,
-    TransportConfig, TransportError, UploadFile, pair, pair_and_report,
+    PairedCredentials, Pairing, PairingStatus, Request, Screen, ServerAddress, StagedUpload,
+    Transport, TransportConfig, TransportError, UploadFile, pair, pair_and_report,
 };
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
@@ -399,7 +399,8 @@ async fn attachment_calls_default_to_not_found() {
             UploadFile {
                 path: PathBuf::new(),
                 len: 0,
-            }
+            },
+            0
         )
         .await,
         Err(TransportError::NotFound)
@@ -466,17 +467,23 @@ async fn attachments_stage_on_a_real_server() {
     png.extend_from_slice(&[0u8; 64]);
     let sha = ContentHash::of(&png);
 
-    assert!(!transport.attachment_staged(sha).await.unwrap());
+    assert_eq!(
+        transport.attachment_staged(sha).await.unwrap(),
+        StagedUpload::Missing { held: 0 }
+    );
     assert_eq!(
         transport
-            .upload_attachment(sha, upload_file(dir.path(), "image.png", &png))
+            .upload_attachment(sha, upload_file(dir.path(), "image.png", &png), 0)
             .await
             .unwrap(),
         UploadResult::Stored {
             size: png.len() as u64,
         }
     );
-    assert!(transport.attachment_staged(sha).await.unwrap());
+    assert_eq!(
+        transport.attachment_staged(sha).await.unwrap(),
+        StagedUpload::Staged
+    );
 
     // The PNG's bytes, one byte changed, under a hash they do not match.
     let mut altered = png.clone();
@@ -485,19 +492,23 @@ async fn attachments_stage_on_a_real_server() {
     let fresh = ContentHash::of(b"other");
     assert_eq!(
         transport
-            .upload_attachment(fresh, upload_file(dir.path(), "altered.png", &altered))
+            .upload_attachment(fresh, upload_file(dir.path(), "altered.png", &altered), 0)
             .await
             .unwrap(),
         UploadResult::HashMismatch
     );
-    assert!(!transport.attachment_staged(fresh).await.unwrap());
+    assert_eq!(
+        transport.attachment_staged(fresh).await.unwrap(),
+        StagedUpload::Missing { held: 0 }
+    );
 
     let text = b"just text";
     assert_eq!(
         transport
             .upload_attachment(
                 ContentHash::of(text),
-                upload_file(dir.path(), "text.txt", text)
+                upload_file(dir.path(), "text.txt", text),
+                0
             )
             .await
             .unwrap(),
@@ -512,11 +523,73 @@ async fn attachments_stage_on_a_real_server() {
         transport
             .upload_attachment(
                 ContentHash::of(&big),
-                upload_file(dir.path(), "big.bin", &big)
+                upload_file(dir.path(), "big.bin", &big),
+                0
             )
             .await
             .unwrap(),
         UploadResult::Stored { size: 1_000_000 }
+    );
+}
+
+/// An interrupted upload resumes where the server says it stopped: `HEAD`
+/// names the bytes the server holds, a `PUT` from that offset completes the
+/// file, and an offset the server does not hold is refused with what it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_upload_resumes_on_a_real_server() {
+    let fx = Fixture::start().await;
+    let transport = paired_transport(&fx).await;
+    let dir = tempfile::tempdir().unwrap();
+    let staging = fx.storage.dir.attachments_dir();
+    std::fs::create_dir_all(&staging).unwrap();
+
+    let big: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
+    let sha = ContentHash::of(&big);
+    std::fs::write(
+        staging.join(format!(".part-{}", sha.to_hex())),
+        &big[..300_000],
+    )
+    .unwrap();
+    assert_eq!(
+        transport.attachment_staged(sha).await.unwrap(),
+        StagedUpload::Missing { held: 300_000 }
+    );
+    assert_eq!(
+        transport
+            .upload_attachment(sha, upload_file(dir.path(), "big.bin", &big), 300_000)
+            .await
+            .unwrap(),
+        UploadResult::Stored { size: 1_000_000 }
+    );
+    assert_eq!(
+        transport.attachment_staged(sha).await.unwrap(),
+        StagedUpload::Staged
+    );
+
+    // A partial holding 4 bytes: an offset of 6 is refused with what the
+    // server holds, and an offset of 0 starts the file again.
+    let small = b"a small file".to_vec();
+    let small_sha = ContentHash::of(&small);
+    std::fs::write(
+        staging.join(format!(".part-{}", small_sha.to_hex())),
+        &small[..4],
+    )
+    .unwrap();
+    assert_eq!(
+        transport
+            .upload_attachment(small_sha, upload_file(dir.path(), "small.txt", &small), 6)
+            .await
+            .unwrap(),
+        UploadResult::OffsetMismatch { have: 4 }
+    );
+    assert_eq!(
+        transport
+            .upload_attachment(small_sha, upload_file(dir.path(), "small.txt", &small), 0)
+            .await
+            .unwrap(),
+        UploadResult::Stored {
+            size: small.len() as u64,
+        }
     );
 }
 
@@ -1067,7 +1140,7 @@ async fn workdir_write_reaches_a_real_server() {
     let staged = ContentHash::of(hello);
     assert!(matches!(
         transport
-            .upload_attachment(staged, upload_file(uploads.path(), "hello", hello))
+            .upload_attachment(staged, upload_file(uploads.path(), "hello", hello), 0)
             .await
             .unwrap(),
         UploadResult::Stored { .. }
@@ -1096,7 +1169,7 @@ async fn workdir_write_reaches_a_real_server() {
     let other_hash = ContentHash::of(other);
     assert!(matches!(
         transport
-            .upload_attachment(other_hash, upload_file(uploads.path(), "other", other))
+            .upload_attachment(other_hash, upload_file(uploads.path(), "other", other), 0)
             .await
             .unwrap(),
         UploadResult::Stored { .. }

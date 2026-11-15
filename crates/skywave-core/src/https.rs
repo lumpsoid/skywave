@@ -44,8 +44,8 @@ use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
     EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
     LoginFinishResult, LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport,
-    UploadResult, UsageLimitsResult, WorkdirQuery, WorktreeList, WriteFileRequest, WriteFileResult,
-    path,
+    UPLOAD_OFFSET_HEADER, UploadResult, UsageLimitsResult, WorkdirQuery, WorktreeList,
+    WriteFileRequest, WriteFileResult, path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -58,7 +58,8 @@ use crate::engine::WORKTREES_TIMEOUT;
 use crate::identity::Identity;
 use crate::tls;
 use crate::transport::{
-    BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError, UploadFile,
+    BlobBody, BlobDownload, BoxFuture, ExpectedRun, StagedUpload, Transport, TransportError,
+    UploadFile,
 };
 use crate::workdir::{WORKDIR_TIMEOUT, WORKDIR_WRITE_TIMEOUT};
 
@@ -92,35 +93,46 @@ impl Default for TransportConfig {
 /// The body of a request on the wire.
 type ReqBody = BoxBody<Bytes, io::Error>;
 
-/// What a request sends: bytes in memory, or the first `len` bytes of a
-/// file, read from disk as the socket takes them ([`FileBody`]).
+/// What a request sends: bytes in memory, or the bytes of a file from
+/// `from` to its `len`, read from disk as the socket takes them
+/// ([`FileBody`]).
 enum RequestBody {
     Bytes(Bytes),
-    File(UploadFile),
+    File { file: UploadFile, from: u64 },
 }
 
 impl RequestBody {
     fn is_empty(&self) -> bool {
         match self {
             RequestBody::Bytes(bytes) => bytes.is_empty(),
-            RequestBody::File(file) => file.len == 0,
+            RequestBody::File { file, from } => *from >= file.len,
         }
     }
 
     /// A body for one send. A file is opened afresh, so a retry on a fresh
-    /// connection sends it from its start.
+    /// connection sends it from `from` again.
     fn open(&self) -> Result<ReqBody, TransportError> {
         match self {
             RequestBody::Bytes(bytes) => Ok(Full::new(bytes.clone())
                 .map_err(|never| match never {})
                 .boxed()),
-            RequestBody::File(file) => {
-                let opened = std::fs::File::open(&file.path).map_err(|e| {
+            RequestBody::File { file, from } => {
+                if *from > file.len {
+                    return Err(TransportError::Io(format!(
+                        "upload offset {from} is past {} bytes of {}",
+                        file.len,
+                        file.path.display()
+                    )));
+                }
+                let mut opened = std::fs::File::open(&file.path).map_err(|e| {
                     TransportError::Io(format!("opening upload {}: {e}", file.path.display()))
+                })?;
+                io::Seek::seek(&mut opened, io::SeekFrom::Start(*from)).map_err(|e| {
+                    TransportError::Io(format!("seeking upload {}: {e}", file.path.display()))
                 })?;
                 Ok(FileBody {
                     file: tokio::fs::File::from_std(opened),
-                    left: file.len,
+                    left: file.len - from,
                     buf: vec![0; FILE_CHUNK].into_boxed_slice(),
                 }
                 .boxed())
@@ -809,8 +821,9 @@ impl HttpsTransport {
     }
 
     /// `HEAD /v1/attachments/{sha256}`: `204` when the server holds the
-    /// staged upload, `404` when it does not.
-    async fn attachment_staged(&self, sha256: ContentHash) -> Result<bool, TransportError> {
+    /// staged upload, `404` when it does not, with the bytes it holds of an
+    /// interrupted upload in [`UPLOAD_OFFSET_HEADER`] (none when absent).
+    async fn attachment_staged(&self, sha256: ContentHash) -> Result<StagedUpload, TransportError> {
         let reply = self
             .http
             .request(
@@ -822,32 +835,46 @@ impl HttpsTransport {
             )
             .await?;
         match reply.status {
-            StatusCode::NO_CONTENT => Ok(true),
-            StatusCode::NOT_FOUND => Ok(false),
+            StatusCode::NO_CONTENT => Ok(StagedUpload::Staged),
+            StatusCode::NOT_FOUND => {
+                let offset = header::HeaderName::from_static(UPLOAD_OFFSET_HEADER);
+                let held = header_str(&reply.headers, offset)
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                Ok(StagedUpload::Missing { held })
+            }
             status => Err(status_error(status, &reply.headers)),
         }
     }
 
-    /// `PUT /v1/attachments/{sha256}` with the first `len` bytes of the file,
-    /// streamed from disk, never held whole. Every outcome the server decides
-    /// is a 200 [`UploadResult`], refusals included.
+    /// `PUT /v1/attachments/{sha256}` with the bytes of the file from `from`
+    /// to its `len`, streamed from disk, never held whole. A `from` above 0
+    /// names the offset in [`UPLOAD_OFFSET_HEADER`]. Every outcome the server
+    /// decides is a 200 [`UploadResult`], refusals included.
     async fn upload_attachment(
         &self,
         sha256: ContentHash,
         file: UploadFile,
+        from: u64,
     ) -> Result<UploadResult, TransportError> {
         let mut headers = self.run_header();
         headers.push((
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         ));
+        if from > 0 {
+            headers.push((
+                header::HeaderName::from_static(UPLOAD_OFFSET_HEADER),
+                HeaderValue::from(from),
+            ));
+        }
         let reply = self
             .http
             .upload(
                 Method::PUT,
                 &path::attachment(sha256),
                 &headers,
-                RequestBody::File(file),
+                RequestBody::File { file, from },
             )
             .await?;
         ok_json(reply)
@@ -1232,7 +1259,7 @@ impl Transport for HttpsTransport {
     fn attachment_staged(
         &self,
         sha256: ContentHash,
-    ) -> BoxFuture<'_, Result<bool, TransportError>> {
+    ) -> BoxFuture<'_, Result<StagedUpload, TransportError>> {
         Box::pin(HttpsTransport::attachment_staged(self, sha256))
     }
 
@@ -1240,8 +1267,9 @@ impl Transport for HttpsTransport {
         &self,
         sha256: ContentHash,
         file: UploadFile,
+        from: u64,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
-        Box::pin(HttpsTransport::upload_attachment(self, sha256, file))
+        Box::pin(HttpsTransport::upload_attachment(self, sha256, file, from))
     }
 
     fn write_workdir_file<'a>(
@@ -1542,10 +1570,13 @@ mod tests {
         tokio::spawn(echo_request(far, sent));
         let (client, written) = Metered::new(client);
         let mut conn = Conn::open(client, written).await.unwrap();
-        let body = RequestBody::File(UploadFile {
-            path,
-            len: len as u64,
-        })
+        let body = RequestBody::File {
+            file: UploadFile {
+                path,
+                len: len as u64,
+            },
+            from: 0,
+        }
         .open()
         .unwrap();
         let req = Request::put("/v1/attachments/x")
@@ -1580,9 +1611,12 @@ mod tests {
         tokio::spawn(echo_request(far, sent));
         let (client, written) = Metered::new(client);
         let mut conn = Conn::open(client, written).await.unwrap();
-        let body = RequestBody::File(UploadFile { path, len: 20 })
-            .open()
-            .unwrap();
+        let body = RequestBody::File {
+            file: UploadFile { path, len: 20 },
+            from: 0,
+        }
+        .open()
+        .unwrap();
         let req = Request::put("/v1/attachments/x")
             .header(header::HOST, "srv")
             .body(body)
@@ -1605,9 +1639,74 @@ mod tests {
             len: 1,
         };
         assert!(matches!(
-            RequestBody::File(file).open(),
+            RequestBody::File { file, from: 0 }.open(),
             Err(TransportError::Io(_))
         ));
+    }
+
+    /// A file body from an offset is the rest of the file up to its `len`:
+    /// the `content-length` counts from the offset, and the bytes before it
+    /// are not sent.
+    #[tokio::test]
+    async fn a_file_body_from_an_offset_streams_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload");
+        let len = 3 * FILE_CHUNK + 17;
+        let from = FILE_CHUNK + 5;
+        let contents: Vec<u8> = (0..len + 100).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &contents).unwrap();
+        let (sent, got) = oneshot::channel();
+        let (client, far) = tokio::io::duplex(PIECE);
+        tokio::spawn(echo_request(far, sent));
+        let (client, written) = Metered::new(client);
+        let mut conn = Conn::open(client, written).await.unwrap();
+        let body = RequestBody::File {
+            file: UploadFile {
+                path,
+                len: len as u64,
+            },
+            from: from as u64,
+        }
+        .open()
+        .unwrap();
+        let req = Request::put("/v1/attachments/x")
+            .header(header::HOST, "srv")
+            .body(body)
+            .unwrap();
+        let resp = conn.send(req, None).await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = got.await.unwrap();
+        let head_end = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = std::str::from_utf8(&got[..head_end]).unwrap();
+        let rest = len - from;
+        assert!(
+            head.lines().any(|l| l == format!("content-length: {rest}")),
+            "{head}"
+        );
+        assert_eq!(got.len() - head_end, rest);
+        assert!(
+            got[head_end..] == contents[from..len],
+            "the body is not the file's bytes from {from} to {len}"
+        );
+    }
+
+    /// An offset past the file's `len` cannot be sent: opening the body is
+    /// an I/O error, not a request that sends nothing.
+    #[test]
+    fn an_upload_offset_past_the_file_fails_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload");
+        std::fs::write(&path, [7u8; 10]).unwrap();
+        let result = RequestBody::File {
+            file: UploadFile { path, len: 10 },
+            from: 11,
+        }
+        .open()
+        .map(|_| ());
+        assert!(
+            matches!(result, Err(TransportError::Io(_))),
+            "an offset past the file must not open: {result:?}"
+        );
     }
 
     /// How many bytes a socket to a peer that reads nothing and advertises

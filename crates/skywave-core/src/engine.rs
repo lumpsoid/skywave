@@ -143,7 +143,7 @@ use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
 use crate::store::{AttachmentRefusal, LogCheck, OutboxEntry, StoreError};
-use crate::transport::{ExpectedRun, Transport, TransportError, UploadFile};
+use crate::transport::{ExpectedRun, StagedUpload, Transport, TransportError, UploadFile};
 use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
 use crate::workdir::{
     PUSH_MAX_BYTES, PushOutcome, WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected,
@@ -1204,9 +1204,10 @@ async fn stage_one(
     data_dir: &Path,
     sha: ContentHash,
 ) -> Result<ImageStaging, TransportError> {
-    if transport.attachment_staged(sha).await? {
-        return Ok(ImageStaging::Staged);
-    }
+    let held = match transport.attachment_staged(sha).await? {
+        StagedUpload::Staged => return Ok(ImageStaging::Staged),
+        StagedUpload::Missing { held } => held,
+    };
     let path = attachment_path(data_dir, sha);
     // Opening the copy is what finds an unreadable one; the upload then opens
     // it again, so the handle is dropped here.
@@ -1225,14 +1226,15 @@ async fn stage_one(
         tracing::warn!(sha256 = %sha.to_hex(), size, "attachment is over the upload limit");
         return Ok(ImageStaging::Refused(AttachmentRefusal::TooLarge));
     }
-    let answer = transport
-        .upload_attachment(sha, UploadFile { path, len: size })
-        .await?;
+    let answer = upload_resuming(transport, sha, UploadFile { path, len: size }, held).await?;
     Ok(match answer {
         UploadResult::Stored { .. } => ImageStaging::Staged,
         UploadResult::DiskLow => ImageStaging::DiskLow,
         UploadResult::TooLarge => ImageStaging::Refused(AttachmentRefusal::TooLarge),
         UploadResult::HashMismatch => ImageStaging::Refused(AttachmentRefusal::HashMismatch),
+        UploadResult::OffsetMismatch { .. } => {
+            return Err(TransportError::Io("upload offset kept moving".to_owned()));
+        }
     })
 }
 
@@ -1313,6 +1315,35 @@ async fn hash_file(path: &Path) -> std::io::Result<(ContentHash, u64)> {
     .map_err(std::io::Error::other)?
 }
 
+/// Most PUTs one [`upload_resuming`] call makes before it gives up.
+const UPLOAD_ATTEMPTS: u32 = 3;
+
+/// Uploads `file` as `sha256` from the `held` bytes the server keeps of an
+/// interrupted upload (0 if more than the file). `OffsetMismatch { have }`
+/// re-PUTs from `have`; a `HashMismatch` to a resumed PUT restarts from 0 once,
+/// as the server dropped its partial. Still unsettled after
+/// [`UPLOAD_ATTEMPTS`] PUTs is a retryable error: the caller starts from the HEAD.
+async fn upload_resuming(
+    transport: &dyn Transport,
+    sha256: ContentHash,
+    file: UploadFile,
+    held: u64,
+) -> Result<UploadResult, TransportError> {
+    let mut from = if held <= file.len { held } else { 0 };
+    for _ in 0..UPLOAD_ATTEMPTS {
+        let answer = transport
+            .upload_attachment(sha256, file.clone(), from)
+            .await?;
+        from = match answer {
+            UploadResult::OffsetMismatch { have } if have <= file.len => have,
+            UploadResult::OffsetMismatch { .. } => 0,
+            UploadResult::HashMismatch if from > 0 => 0,
+            other => return Ok(other),
+        };
+    }
+    Err(TransportError::Io("upload offset kept moving".to_owned()))
+}
+
 /// Writes one file of a message into the workdir root as its name. The device
 /// copy must still hash to the file's hash; it is staged the way an image is
 /// (a HEAD, then a PUT unless the server holds it), then written with the
@@ -1352,12 +1383,19 @@ async fn write_one(
     let sha = file.sha256;
     let mut round = 1;
     loop {
-        if round > 1 || !transport.attachment_staged(sha).await? {
+        // A second round follows a `NotStaged` write: no HEAD, and the upload
+        // starts from 0.
+        let state = if round > 1 {
+            StagedUpload::Missing { held: 0 }
+        } else {
+            transport.attachment_staged(sha).await?
+        };
+        if let StagedUpload::Missing { held } = state {
             let file = UploadFile {
                 path: path.clone(),
                 len,
             };
-            match transport.upload_attachment(sha, file).await? {
+            match upload_resuming(transport, sha, file, held).await? {
                 UploadResult::Stored { .. } => {}
                 UploadResult::TooLarge => {
                     return Ok(FileWrite::Refused(AttachmentRefusal::TooLarge));
@@ -1367,6 +1405,9 @@ async fn write_one(
                 }
                 UploadResult::DiskLow => {
                     return Ok(FileWrite::Refused(AttachmentRefusal::ServerDiskLow));
+                }
+                UploadResult::OffsetMismatch { .. } => {
+                    return Err(TransportError::Io("upload offset kept moving".to_owned()));
                 }
             }
         }
@@ -1431,12 +1472,12 @@ pub(crate) async fn push_workdir_file(
             });
         }
     };
-    if !transport.attachment_staged(sha).await? {
+    if let StagedUpload::Missing { held } = transport.attachment_staged(sha).await? {
         let file = UploadFile {
             path: source.to_path_buf(),
             len,
         };
-        let answer = transport.upload_attachment(sha, file).await?;
+        let answer = upload_resuming(transport, sha, file, held).await?;
         if !matches!(answer, UploadResult::Stored { .. }) {
             return Ok(PushOutcome::UploadRefused(answer));
         }
@@ -1700,6 +1741,7 @@ async fn settled_by_log(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -3142,6 +3184,15 @@ mod tests {
         write_not_staged: Mutex<u32>,
         /// Every upload the server was sent, in the order it came.
         uploads: Mutex<Vec<UploadFile>>,
+        /// The `from` of every PUT, in the order it came.
+        put_froms: Mutex<Vec<u64>>,
+        /// Bytes held of an interrupted upload, per hash: what a HEAD reports
+        /// and a PUT resumes at.
+        partials: Mutex<HashMap<ContentHash, u64>>,
+        /// Scripted answers, one per PUT, used before `put_answer`. A scripted
+        /// answer stages nothing; a scripted `OffsetMismatch` also sets the
+        /// held count to its `have`, as the server would.
+        answers: Mutex<VecDeque<UploadResult>>,
     }
 
     impl StagingServer {
@@ -3158,6 +3209,9 @@ mod tests {
                 write_answer: None,
                 write_not_staged: Mutex::new(0),
                 uploads: Mutex::new(Vec::new()),
+                put_froms: Mutex::new(Vec::new()),
+                partials: Mutex::new(HashMap::new()),
+                answers: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -3243,10 +3297,21 @@ mod tests {
         fn attachment_staged(
             &self,
             sha256: ContentHash,
-        ) -> BoxFuture<'_, Result<bool, TransportError>> {
+        ) -> BoxFuture<'_, Result<StagedUpload, TransportError>> {
             Box::pin(async move {
                 self.record(head_call(sha256));
-                Ok(self.staged.lock().unwrap().contains(&sha256))
+                if self.staged.lock().unwrap().contains(&sha256) {
+                    Ok(StagedUpload::Staged)
+                } else {
+                    let held = self
+                        .partials
+                        .lock()
+                        .unwrap()
+                        .get(&sha256)
+                        .copied()
+                        .unwrap_or(0);
+                    Ok(StagedUpload::Missing { held })
+                }
             })
         }
 
@@ -3254,10 +3319,12 @@ mod tests {
             &self,
             sha256: ContentHash,
             file: UploadFile,
+            from: u64,
         ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
             Box::pin(async move {
                 self.record(put_call(sha256));
                 self.uploads.lock().unwrap().push(file.clone());
+                self.put_froms.lock().unwrap().push(from);
                 if let Some(on_put) = &self.on_put {
                     on_put();
                 }
@@ -3274,10 +3341,28 @@ mod tests {
                     ContentHash::of(&bytes) == sha256,
                     "the upload does not hash to its name"
                 );
+                let scripted = self.answers.lock().unwrap().pop_front();
+                if let Some(answer) = scripted {
+                    if let UploadResult::OffsetMismatch { have } = answer {
+                        self.partials.lock().unwrap().insert(sha256, have);
+                    }
+                    return Ok(answer);
+                }
+                let held = self
+                    .partials
+                    .lock()
+                    .unwrap()
+                    .get(&sha256)
+                    .copied()
+                    .unwrap_or(0);
+                if from != 0 && from != held {
+                    return Ok(UploadResult::OffsetMismatch { have: held });
+                }
                 match &self.put_answer {
                     Some(answer) => Ok(answer.clone()),
                     None => {
                         self.staged.lock().unwrap().insert(sha256);
+                        self.partials.lock().unwrap().remove(&sha256);
                         Ok(UploadResult::Stored {
                             size: bytes.len() as u64,
                         })
@@ -3445,6 +3530,138 @@ mod tests {
                 post_call("m"),
             ]
         );
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// An interrupted upload resumes at the bytes the HEAD says the server
+    /// holds, not at 0.
+    #[tokio::test(start_paused = true)]
+    async fn an_image_upload_resumes_from_the_held_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        server.partials.lock().unwrap().insert(a, 3);
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a), post_call("m")]);
+        assert_eq!(*server.put_froms.lock().unwrap(), [3]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// An `OffsetMismatch` says where the server is, and the upload goes again
+    /// from there.
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_mismatch_uploads_again_from_what_the_server_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        server.partials.lock().unwrap().insert(a, 3);
+        server
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(UploadResult::OffsetMismatch { have: 2 });
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), put_call(a), post_call("m")]
+        );
+        assert_eq!(*server.put_froms.lock().unwrap(), [3, 2]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// A held count past the file's length is no resume point: the upload
+    /// starts from 0.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_count_past_the_file_uploads_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        server.partials.lock().unwrap().insert(a, 100);
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(server.calls(), [head_call(a), put_call(a), post_call("m")]);
+        assert_eq!(*server.put_froms.lock().unwrap(), [0]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// A resumed upload the server answers `HashMismatch` restarts from 0
+    /// once, as the server has dropped its partial.
+    #[tokio::test(start_paused = true)]
+    async fn a_hash_mismatch_on_a_resumed_upload_restarts_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        server.partials.lock().unwrap().insert(a, 3);
+        server
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(UploadResult::HashMismatch);
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [head_call(a), put_call(a), put_call(a), post_call("m")]
+        );
+        assert_eq!(*server.put_froms.lock().unwrap(), [3, 0]);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// An offset that keeps moving is three PUTs and then a retryable error,
+    /// and the next attempt starts again from the HEAD.
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_that_keeps_moving_backs_off_to_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let a = put_file(dir.path(), b"image a");
+        let server = StagingServer::new();
+        server.partials.lock().unwrap().insert(a, 1);
+        server.answers.lock().unwrap().extend([
+            UploadResult::OffsetMismatch { have: 1 },
+            UploadResult::OffsetMismatch { have: 2 },
+            UploadResult::OffsetMismatch { have: 1 },
+        ]);
+        enqueue_with(&seam, "m", vec![a]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(a),
+                put_call(a),
+                put_call(a),
+                put_call(a),
+                head_call(a),
+                put_call(a),
+                post_call("m"),
+            ]
+        );
+        assert_eq!(*server.put_froms.lock().unwrap(), [1, 1, 2, 1]);
         assert_eq!(
             statuses(&seam),
             [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
@@ -3646,6 +3863,38 @@ mod tests {
         assert_eq!(writes[0].path, "notes.txt");
         assert_eq!(writes[0].content, file.sha256);
         assert_eq!(writes[0].replace, None);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// A message file the server holds part of resumes its upload at those
+    /// bytes, then is written and the message posted.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_write_resumes_from_the_held_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let img = put_file(dir.path(), b"image a");
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let server = StagingServer::new();
+        server.partials.lock().unwrap().insert(file.sha256, 3);
+        enqueue_with_files(&seam, "m", vec![img], vec![file.clone()]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(img),
+                put_call(img),
+                head_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                post_call("m"),
+            ]
+        );
+        assert_eq!(*server.put_froms.lock().unwrap(), [0, 3]);
+        assert_eq!(server.writes.lock().unwrap().len(), 1);
         assert_eq!(
             statuses(&seam),
             [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
@@ -4132,6 +4381,35 @@ mod tests {
     async fn stage_for_a_minute(ctx: &LinkCtx, server: &StagingServer) {
         let staged = tokio::time::timeout(Duration::from_secs(60), stage_drafts(ctx, server)).await;
         assert!(staged.is_err(), "the stager only ends on an error");
+    }
+
+    /// A device file the server holds part of resumes its upload at those
+    /// bytes, then is written at its path.
+    #[tokio::test(start_paused = true)]
+    async fn push_resumes_from_the_held_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let server = StagingServer::new();
+        let session = SessionId::new();
+        let sha = ContentHash::of(b"device bytes");
+        server.partials.lock().unwrap().insert(sha, 3);
+
+        let outcome = push_workdir_file(&server, &source, session, "docs/a.txt".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.calls(),
+            [head_call(sha), put_call(sha), write_call(sha)]
+        );
+        assert_eq!(*server.put_froms.lock().unwrap(), [3]);
+        assert!(
+            matches!(
+                outcome,
+                PushOutcome::Written(WriteFileResult::Written { .. })
+            ),
+            "{outcome:?}"
+        );
     }
 
     /// A device file is staged, then written at its path: a HEAD, a PUT, then

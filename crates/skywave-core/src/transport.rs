@@ -58,6 +58,16 @@ pub struct UploadFile {
     pub len: u64,
 }
 
+/// What `HEAD /v1/attachments/{sha256}` says of an upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedUpload {
+    /// The server holds the whole file, staged.
+    Staged,
+    /// Not staged. The server holds the first `held` bytes of it from an
+    /// interrupted upload, 0 when none, so a `PUT` may start there.
+    Missing { held: u64 },
+}
+
 /// The v1 API as seen by a paired device.
 pub trait Transport: Send + Sync {
     /// `GET /v1/hello`, asking what became of run `since` of the server
@@ -195,25 +205,31 @@ pub trait Transport: Send + Sync {
     }
 
     /// `HEAD /v1/attachments/{sha256}`: whether the server holds a staged
-    /// upload with this hash. Defaults to [`TransportError::NotFound`] like
-    /// [`list_dirs`](Transport::list_dirs).
+    /// upload with this hash, and how many bytes of an interrupted upload
+    /// of it the server holds otherwise. Defaults to
+    /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
     fn attachment_staged(
         &self,
         sha256: ContentHash,
-    ) -> BoxFuture<'_, Result<bool, TransportError>> {
+    ) -> BoxFuture<'_, Result<StagedUpload, TransportError>> {
         let _ = sha256;
         Box::pin(async { Err(TransportError::NotFound) })
     }
 
-    /// `PUT /v1/attachments/{sha256}`: stage a device file under its hash. A
-    /// refusal is an `Ok` [`UploadResult`], not an error. Defaults to
-    /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
+    /// `PUT /v1/attachments/{sha256}`: stage a device file under its hash.
+    /// The body is the file's bytes from `from` to its `len`; a `from` above
+    /// 0 is sent as [`UPLOAD_OFFSET_HEADER`](skywave_proto::UPLOAD_OFFSET_HEADER)
+    /// and must be what the server holds or 0 (a restart), else the answer
+    /// is [`UploadResult::OffsetMismatch`]. A refusal is an `Ok`
+    /// [`UploadResult`], not an error. Defaults to [`TransportError::NotFound`]
+    /// like [`list_dirs`](Transport::list_dirs).
     fn upload_attachment(
         &self,
         sha256: ContentHash,
         file: UploadFile,
+        from: u64,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
-        let _ = (sha256, file);
+        let _ = (sha256, file, from);
         Box::pin(async { Err(TransportError::NotFound) })
     }
 

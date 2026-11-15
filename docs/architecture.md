@@ -161,8 +161,8 @@ every version.
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
-| `HEAD /v1/attachments/{sha256}` | 204 if a file with that sha256 is staged, else 404; lets a device skip a re-upload across reconnects. Since v30. |
-| `PUT /v1/attachments/{sha256}` | Stages a file of any type (raw bytes, at most the server's `[files] upload_max`, default 64 MiB; streamed to a temp file, never held in memory) for a later `SendMessage` to name, answering an `UploadResult` with 200: `Stored { size }`, `TooLarge`, `HashMismatch` or `DiskLow`. `DiskLow` is checked before the body and again before each write. The file is `attachments/<sha256 hex>`, with no table, kept only while it hashes to its name; staging is a cache, capped at 256 MiB (the oldest evicted on each upload) and swept of files older than 7 days at startup. A lost upload surfaces as `UnknownAttachment`. Since v30. |
+| `HEAD /v1/attachments/{sha256}` | 204 if a file with that sha256 is staged, else 404; lets a device skip a re-upload across reconnects. A 404 carries `skywave-upload-offset: N` when the server holds N bytes of an interrupted upload (since v37), so the device resumes at N. Since v30. |
+| `PUT /v1/attachments/{sha256}` | Stages a file of any type (raw bytes, at most the server's `[files] upload_max`, default 64 MiB, counted over the whole file; streamed to the upload's partial, `attachments/.part-<sha256 hex>`, never held in memory) for a later `SendMessage` to name, answering an `UploadResult` with 200: `Stored { size }`, `TooLarge`, `HashMismatch`, `DiskLow` or `OffsetMismatch { have }`. An optional `skywave-upload-offset: N` header makes the body the file from byte N on: N must be the partial's length (the body appends), or 0 (the partial restarts); any other N is `OffsetMismatch { have }` with nothing written. A body that ends early (a lost connection, a stall) keeps its partial for the next `PUT`. One `PUT` per sha256 writes at a time; the others wait for its lock. `DiskLow` is checked before the body and again before each write. The file is `attachments/<sha256 hex>`, with no table, kept only while it hashes to its name; staging is a cache, capped at 256 MiB (the oldest evicted on each upload) and swept of files older than 7 days at startup. Partials survive a restart, are never evicted and are swept with the same age limit. A lost upload surfaces as `UnknownAttachment`. Since v30; the offset header since v37. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
@@ -1053,8 +1053,13 @@ logs) an event that no longer decodes rather than failing.
   HEAD on every attempt and PUT from its local file when the server does not
   hold it (the PUT streams the file from disk, a 64 KiB chunk at a time, and
   never reads it whole), since the server unlinks the staged files a message
-  used, so nothing is cached. A missing, unreadable or too-large local file,
-  or an upload the server refuses as too large or a hash mismatch, fails the
+  used, so nothing is cached. When the HEAD reports bytes held of an
+  interrupted upload (`skywave-upload-offset`, v37), the PUT resumes there:
+  an `OffsetMismatch { have }` answer re-PUTs from `have`, a `HashMismatch` to
+  a resumed PUT restarts once from 0, and an offset that keeps moving after 3
+  PUTs is a transport error, retried from the HEAD (D58). A missing,
+  unreadable or too-large local file, or an upload the server refuses as too
+  large or a hash mismatch, fails the
   message as
   `AttachmentRefused`: final, discardable, never posted. (An outbox entry
   stored before v36 may carry `NotAnImage`, which the server no longer
@@ -1388,9 +1393,10 @@ logs) an event that no longer decodes rather than failing.
   `Request::PushWorkdirFile`, which the engine's `push_workdir_file` carries
   out: it hashes the device file where it is (not copied into the data dir)
   by a streaming read, HEADs `/v1/attachments/{sha256}` and, unless the server
-  holds them, PUTs the bytes hashed, streamed from the file, so a push of up to
-  256 MiB holds one chunk in memory; a file changed between the hash and the
-  PUT is the server's `HashMismatch`. Then it posts the write route.
+  holds them, PUTs the bytes hashed, streamed from the file and resuming at
+  the bytes the server holds, as the outbox does, so a push of up to 256 MiB
+  holds one chunk in memory; a file changed between the hash and the PUT is
+  the server's `HashMismatch`. Then it posts the write route.
   `WorkdirView.pushes`
   lists the session's pushes with a `PushState` (`Pushing`, `Failed`, or
   `Done(PushOutcome)`); a push the server answers `Exists` is
