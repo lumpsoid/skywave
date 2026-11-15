@@ -3958,6 +3958,37 @@ mod tests {
         );
     }
 
+    /// A blob the replica already knows gets no local file from a batch that
+    /// references it again: the planted file under its `.own` name is left
+    /// alone, and the blob stays available.
+    #[test]
+    fn a_known_blob_gets_no_own_image_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let session = SessionId::new();
+        let own = b"an image this device attached";
+        put_file(dir.path(), own);
+        attach_draft_image(&seam, session, own);
+        let own_blob = ProtoBlobId::new();
+        seam.apply_events(&message_with_images(session, &[(own_blob, own)]))
+            .unwrap();
+        assert!(matches!(
+            seam.blob(own_blob).unwrap().unwrap().status,
+            BlobStatus::Available { .. }
+        ));
+
+        let planted = blob_dir(dir.path()).join(format!("{}.own", own_blob.0));
+        std::fs::write(&planted, b"planted").unwrap();
+        seam.apply_events(&message_with_images(session, &[(own_blob, own)]))
+            .unwrap();
+
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
+        assert!(matches!(
+            seam.blob(own_blob).unwrap().unwrap().status,
+            BlobStatus::Available { .. }
+        ));
+    }
+
     /// An image this device attached whose local file is gone is no image
     /// to use: its blob stays not downloaded and is queued as any other.
     #[test]

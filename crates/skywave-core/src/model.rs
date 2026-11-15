@@ -2608,6 +2608,12 @@ impl Model {
         }
     }
 
+    /// Whether the replica already knows `id`, registered or fated: a batch
+    /// that references it cannot register it again.
+    pub(crate) fn knows_blob(&self, id: BlobId) -> bool {
+        self.blobs.contains_key(&id) || self.fates.contains_key(&id)
+    }
+
     /// `blob` left the replica, and so did any blob a pending crop would
     /// have made it from (as `Store::apply_batch` and
     /// `Store::end_local_crop` purge them).
