@@ -105,11 +105,18 @@ class ShellOutputView extends StatelessWidget {
   }
 }
 
-class _Body extends StatelessWidget {
+class _Body extends StatefulWidget {
   const _Body({required this.run, required this.send});
 
   final ShellRunRow run;
   final SendIntent send;
+
+  @override
+  State<_Body> createState() => _BodyState();
+}
+
+class _BodyState extends State<_Body> {
+  final _lines = OutputLines();
 
   @override
   Widget build(BuildContext context) {
@@ -121,13 +128,9 @@ class _Body extends StatelessWidget {
       fontFamilyFallback: monoFallback,
       height: 1.35,
     );
-    final whole = run.whole;
-    final output = run.output;
-    // A final line break ends the last line; it does not start one.
-    final lines = whole == null || whole.isEmpty
-        ? const <String>[]
-        : (whole.endsWith('\n') ? whole.substring(0, whole.length - 1) : whole)
-              .split('\n');
+    final whole = widget.run.whole;
+    final output = widget.run.output;
+    final lines = _lines.of(whole);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -139,10 +142,11 @@ class _Body extends StatelessWidget {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               StateBadge(
-                label: run.stateLabel,
-                color: colors.shellRun(run.state),
+                label: widget.run.stateLabel,
+                color: colors.shellRun(widget.run.state),
               ),
-              if (run.wholeNote case final note?) Text(note, style: small),
+              if (widget.run.wholeNote case final note?)
+                Text(note, style: small),
             ],
           ),
         ),
@@ -155,7 +159,7 @@ class _Body extends StatelessWidget {
                       if (output != null) Text(output.label, style: small),
                       if (output != null && output.canDownload)
                         TextButton(
-                          onPressed: () => send.act(
+                          onPressed: () => widget.send.act(
                             ActionIntentDownloadBlob(blobId: output.blobId),
                           ),
                           child: const Text('Download'),
@@ -176,5 +180,23 @@ class _Body extends StatelessWidget {
         ),
       ],
     );
+  }
+}
+
+/// The lines of a run's whole output, split once per distinct text: the
+/// view rebuilds on every shell update, and the text can be 512 KiB.
+class OutputLines {
+  String? _of;
+  List<String> _lines = const [];
+
+  /// The lines of [whole]. A final line break ends the last line; it does
+  /// not start one.
+  List<String> of(String? whole) {
+    if (whole == null || whole.isEmpty) return const [];
+    if (whole == _of) return _lines;
+    _of = whole;
+    return _lines =
+        (whole.endsWith('\n') ? whole.substring(0, whole.length - 1) : whole)
+            .split('\n');
   }
 }
