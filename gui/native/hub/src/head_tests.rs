@@ -1381,7 +1381,7 @@ fn an_image_is_prepared_before_it_is_attached() {
 }
 
 #[test]
-fn sending_waits_for_an_image_being_prepared() {
+fn sending_waits_for_an_attachment_being_prepared() {
     let mut rig = Rig::new();
     rig.edit("look at this");
     let attaching = attach_intent(&mut rig, &png(2));
@@ -1389,7 +1389,7 @@ fn sending_waits_for_an_image_being_prepared() {
     assert!(rig.actions.is_empty(), "{:?}", rig.kinds());
     assert_eq!(
         notices(&outs),
-        ["an image is still being prepared"],
+        ["an attachment is still being prepared"],
         "the message waits"
     );
     assert_eq!(rig.text(), "look at this", "the text stays");

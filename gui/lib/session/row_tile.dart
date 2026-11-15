@@ -398,8 +398,9 @@ class _UnreadRule extends StatelessWidget {
   }
 }
 
-/// A message: the author, the text, and for this device's own, how it
-/// went out (with Edit and Discard while it can be taken back).
+/// A message: the author, the text and its files, and for this device's own,
+/// how it went out (with Edit and Discard while it can be taken back, and
+/// Replace & resend when a file it carries is already in the workdir).
 class _Message extends StatelessWidget {
   const _Message({
     required this.row,
@@ -430,6 +431,25 @@ class _Message extends StatelessWidget {
       send(GuiIntentOpenFull(blobId: blob));
     } else {
       openLocalImage(path);
+    }
+  }
+
+  /// Resends the message so it replaces the files it found in the workdir,
+  /// once the user confirms that their current content is lost.
+  Future<void> _resendReplacing(BuildContext context) async {
+    final names = [
+      for (final file in row.files)
+        if (file.found) file.name,
+    ].join(', ');
+    final yes = await confirmIrreversible(
+      context,
+      question:
+          'Replace $names in the workdir with the attached file? '
+          'Its current content is lost.',
+      action: 'Replace',
+    );
+    if (yes && context.mounted) {
+      send.act(ActionIntentResendReplacing(commandId: row.commandId!));
     }
   }
 
@@ -510,6 +530,38 @@ class _Message extends StatelessWidget {
                 ],
               ),
             ),
+          if (row.files.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final (index, file) in row.files.indexed)
+                    Row(
+                      key: Key('row-file-$index'),
+                      children: [
+                        Icon(
+                          Icons.insert_drive_file_outlined,
+                          size: 16,
+                          color: foreground,
+                        ),
+                        const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            '${file.name} · ${file.sizeLabel}',
+                            style: body,
+                          ),
+                        ),
+                        if (file.found)
+                          Text(
+                            ' · already in the workdir',
+                            style: body.copyWith(color: scheme.error),
+                          ),
+                      ],
+                    ),
+                ],
+              ),
+            ),
           if (row.text.isNotEmpty)
             _SelectableBody(
               onTap: onTap,
@@ -549,7 +601,8 @@ class _Message extends StatelessWidget {
               bubble,
               if (outgoing != null ||
                   row.deliveryLabel != null ||
-                  row.discardable)
+                  row.discardable ||
+                  row.canResendReplacing)
                 Padding(
                   padding: const EdgeInsets.only(top: 4),
                   child: Wrap(
@@ -579,6 +632,12 @@ class _Message extends StatelessWidget {
                           ),
                         ),
                       ],
+                      if (row.canResendReplacing && row.commandId != null)
+                        _LinkButton(
+                          key: const Key('resend-replacing'),
+                          label: 'Replace & resend',
+                          onPressed: () => _resendReplacing(context),
+                        ),
                     ],
                   ),
                 ),
@@ -733,7 +792,7 @@ class _SelectableBodyState extends State<_SelectableBody> {
 }
 
 class _LinkButton extends StatelessWidget {
-  const _LinkButton({required this.label, required this.onPressed});
+  const _LinkButton({required this.label, required this.onPressed, super.key});
 
   final String label;
   final VoidCallback onPressed;

@@ -1241,7 +1241,7 @@ void main() {
     });
 
     testWidgets(
-      'the input menu offers snippets, an image and the previous prompt',
+      'the input menu offers snippets, a file and the previous prompt',
       (tester) async {
         tall(tester);
         final sent = <GuiIntent>[];
@@ -1254,7 +1254,7 @@ void main() {
         await tester.tap(find.byKey(const Key('composer-menu')));
         await tester.pumpAndSettle();
         expect(find.byKey(const Key('composer-snippets')), findsOneWidget);
-        expect(find.byKey(const Key('attach-image')), findsOneWidget);
+        expect(find.byKey(const Key('attach-file')), findsOneWidget);
         expect(find.byKey(const Key('history-older')), findsOneWidget);
         expect(find.byType(BottomSheet), findsNothing);
 

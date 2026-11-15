@@ -738,9 +738,9 @@ impl Head {
                         when: session.when,
                     }
                 } else if self.preparing_of(id) > 0 {
-                    // The message would go without the image being prepared.
+                    // The message would go without the attachment being prepared.
                     out.push(Out::Effect(PlatformEffect::Notice {
-                        text: "an image is still being prepared".to_owned(),
+                        text: "an attachment is still being prepared".to_owned(),
                     }));
                     return Ok(());
                 } else if let Some(text) = message_refusal(&text) {
