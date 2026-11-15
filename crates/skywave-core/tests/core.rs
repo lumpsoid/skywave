@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use chrono::{TimeZone, Utc};
-use skywave_core::attachment::AttachedImage;
+use skywave_core::attachment::{AttachedFile, AttachedImage};
 use skywave_core::{
     Action, Attention, BlobState, BlobStatus, ComposerMode, ContentHash, Core, CoreError, Delivery,
     DeviceRef, Draft, Entry, FailReason, Fingerprint, FullView, ImageType, Link, OutboxStatus,
@@ -361,6 +361,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             context: ContextId::first_of(sid),
             text: "fix the build".into(),
             images: Vec::new(),
+            files: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: Some(queued),
@@ -638,6 +639,74 @@ fn draft_images_survive_a_restart_and_an_edit() {
     let core = Core::open_detached(dir.path()).unwrap();
     core.dispatch(Action::OpenSession(sid)).unwrap();
     assert_eq!(session_view(&core.view()).draft_images, vec![image]);
+}
+
+#[test]
+fn draft_files_survive_a_restart_and_an_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _, _) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![event(
+            sid,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+                context_name: "start".into(),
+                from: None,
+                worktree: None,
+            },
+        )],
+    })
+    .unwrap();
+    // The head copies the picked file into the attachments first.
+    let source = dir.path().join("notes.txt");
+    std::fs::write(&source, b"some notes").unwrap();
+    let (sha256, size) = skywave_core::attachment::store_file(dir.path(), &source).unwrap();
+    let file = AttachedFile {
+        sha256,
+        name: "notes.txt".into(),
+        size,
+        replace: None,
+    };
+    core.dispatch(Action::AttachFile {
+        session_id: sid,
+        file: file.clone(),
+    })
+    .unwrap();
+    drop((core, seam));
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(session_view(&core.view()).draft_files, vec![file.clone()]);
+
+    // A blank message with the file goes, names it in its text, and takes
+    // the draft's files.
+    core.dispatch(Action::SendMessage {
+        session_id: sid,
+        text: " ".into(),
+    })
+    .unwrap();
+    assert!(session_view(&core.view()).draft_files.is_empty());
+    let queued = Store::open(dir.path()).unwrap().pending_outbox().unwrap();
+    assert_eq!(queued.len(), 1);
+    let CommandKind::SendMessage { text, .. } = &queued[0].command.kind else {
+        panic!("expected a message: {:?}", queued[0].command.kind);
+    };
+    assert_eq!(text, "Attached file: ./notes.txt");
+    let names: Vec<AttachedFile> = queued[0].files.iter().map(|f| f.file.clone()).collect();
+    assert_eq!(names, vec![file.clone()]);
+
+    // Taken back, the file is the draft's again, across a restart too.
+    core.dispatch(Action::EditQueued(queued[0].command.id))
+        .unwrap();
+    assert_eq!(session_view(&core.view()).draft_files, vec![file.clone()]);
+    drop(core);
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(session_view(&core.view()).draft_files, vec![file]);
 }
 
 #[test]

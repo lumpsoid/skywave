@@ -507,6 +507,7 @@ mod tests {
                 context: ContextId::new(),
                 text: "queued question".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 outgoing: Outgoing::Queued,
                 discardable: true,
                 delivery: None,
