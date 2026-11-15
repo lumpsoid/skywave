@@ -1489,10 +1489,42 @@ file the user saw, and the write replaces only that file. A file that changed
 after the user looked answers `Exists` again, with its new hash.
 
 The path rules: no `.git` component anywhere in the path, since git's own
-directory runs hooks and a device must never write into it; no symlink at the
-target; nothing outside the workdir. These are refused as `NotAllowed` before
-the file system is touched.
+directory runs hooks and a device must never write into it; nothing outside
+the workdir (an absolute path, or one climbing out with `..`). Both are
+refused as `NotAllowed` before the file system is touched. A symlink at
+the target is refused when the file is opened (`O_NOFOLLOW`), never followed,
+and a parent that resolves outside the workdir is `NotAllowed`.
 
-A composer's non-image file is meant to use this route, written at
-`<workdir root>/<file name>`, the path the user sees. No head calls the route
-yet.
+Two callers use this route: the GUI's push action in the directory pane, and
+the outbox sender, which writes a composer's non-image file at
+`<workdir root>/<file name>`, the path the user sees (D57).
+
+## D57. Composer files go into the workdir root at send (v36)
+The agent only sees the session's workdir, so a non-image file attached in a
+composer is put there before the message that names it is posted. The
+message's text says where it is: one `Attached file: ./<name>` line per file.
+Images are not written: they stay native image blocks (D50).
+
+**Decided:** "Composer non-image file: one rule, no setting, no user-chosen
+target. It is written at the ROOT of the session's workdir as `<file name>`,
+then the message names that path for the agent. Same collision guard as
+push-to-workdir (an existing file is refused unless the head resends with
+`replace` = its current sha256 after the user confirms)."
+
+- "Written at SEND time by the outbox sender (works queued offline), not at
+  attach." Writing at attach time fails offline, and writes for a draft that
+  may never be sent.
+- "Same file name twice in one draft: second attach is a no-op - root/<name>
+  is one target."
+- **Collision.** The sender uploads the file (`PUT /v1/attachments/{sha256}`,
+  D55) and writes it with the write route. A file already there settles the
+  entry `AttachmentRefused(FileExists)`, and keeps the hash found on it.
+  `Action::ResendReplacing(CommandId)`, which the GUI asks the user about
+  first, requeues the same command with `replace` set to that hash. A file
+  changed again meanwhile is refused again.
+
+**Rejected:**
+- Copying the file into a server-side path outside the repo. The agent would
+  see a path the user does not.
+- A configurable default directory. It is a setting for one rule.
+- Writing at attach time. See above.
