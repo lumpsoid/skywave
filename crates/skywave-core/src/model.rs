@@ -57,7 +57,7 @@ use crate::view::{
     UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload,
     WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
-use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
+use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -1105,6 +1105,22 @@ impl Model {
                 let online = self.online();
                 self.workdirs
                     .ask(ask, online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::PushWorkdirFile {
+                session_id,
+                source,
+                path,
+                replace,
+            } => {
+                if self.device().is_none() || self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.workdirs
+                    .push(session_id, source, path, replace, online)
                     .map(Effect::Request)
                     .into_iter()
                     .collect()
@@ -2268,6 +2284,18 @@ impl Model {
         self.workdirs.dropped(ask);
     }
 
+    /// The answer to the push `req` to `path` of `session`: kept only if it
+    /// is still that push's.
+    pub(crate) fn workdir_pushed(
+        &mut self,
+        req: u64,
+        session: SessionId,
+        path: String,
+        result: Result<PushOutcome, TransportError>,
+    ) {
+        self.workdirs.pushed(req, session, path, result);
+    }
+
     /// Mirrors [`Store::put_workdir`](crate::Store::put_workdir), which
     /// stored the awaited `answer` to `ask`: the answer replaces the last
     /// one, the blobs it registered join the blob map and those it purged
@@ -2678,6 +2706,7 @@ impl Model {
             fetch: self.workdirs.fetch(&ask),
             body,
             downloads: self.workdir_downloads(id),
+            pushes: self.workdirs.pushes(id),
         })
     }
 
@@ -12759,13 +12788,13 @@ mod tests {
         use std::sync::mpsc::Receiver;
 
         use skywave_proto::{
-            BlobId as ProtoBlobId, BlobUse, ChangeSet, Commit, CommitLog, DirEntry, EntryKind,
-            LineSpan, ListResult, LogResult, ToolResult,
+            BlobId as ProtoBlobId, BlobUse, ChangeSet, Commit, CommitLog, ContentHash, DirEntry,
+            EntryKind, LineSpan, ListResult, LogResult, ToolResult, WriteFileResult,
         };
 
         use super::*;
         use crate::identity::PairedCredentials;
-        use crate::view::{WorkdirFetch, WorkdirView};
+        use crate::view::{PushState, WorkdirFetch, WorkdirPush, WorkdirView};
         use crate::{Core, Seam};
 
         fn blob(size: u64) -> BlobRef {
@@ -13213,6 +13242,110 @@ mod tests {
                 .expect("listed");
             assert_eq!(entry.fetch, WorkdirFetch::Failed(not_connected()));
             assert_eq!(entry.result, None);
+        }
+
+        /// The one push `effects` ask for, with its `req`.
+        fn push_asked(effects: Vec<Effect>) -> (u64, Request) {
+            match &requests(effects)[..] {
+                [request @ Request::PushWorkdirFile { req, .. }] => (*req, request.clone()),
+                other => panic!("expected one push, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn workdir_push_asks_once_per_path_and_keeps_its_outcome() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let other = f.session("/srv/b");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let push = |session: SessionId, path: &str| Action::PushWorkdirFile {
+                session_id: session,
+                source: PathBuf::from("/home/me/notes.md"),
+                path: path.into(),
+                replace: None,
+            };
+            let pushing = |path: &str| WorkdirPush {
+                path: path.into(),
+                source: PathBuf::from("/home/me/notes.md"),
+                state: PushState::Pushing,
+            };
+
+            // Asked for once, naming the file, the path and the session.
+            let (req, request) = push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_eq!(
+                request,
+                Request::PushWorkdirFile {
+                    req,
+                    session: id,
+                    source: PathBuf::from("/home/me/notes.md"),
+                    path: "docs/notes.md".into(),
+                    replace: None,
+                }
+            );
+
+            // In flight: a second push to the path asks nothing.
+            assert!(
+                f.dispatch(push(id, "docs/notes.md")).is_empty(),
+                "in flight"
+            );
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // An answer to another req is stale: nothing changes.
+            f.model.workdir_pushed(
+                req + 100,
+                id,
+                "docs/notes.md".into(),
+                Err(TransportError::Timeout),
+            );
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // The awaited answer is kept.
+            let written = PushOutcome::Written(WriteFileResult::Exists {
+                sha256: ContentHash::of(b"old"),
+                size: 3,
+            });
+            f.model
+                .workdir_pushed(req, id, "docs/notes.md".into(), Ok(written.clone()));
+            assert_eq!(
+                view(&f).pushes,
+                [WorkdirPush {
+                    state: PushState::Done(written),
+                    ..pushing("docs/notes.md")
+                }]
+            );
+
+            // Pushed again once done: asked afresh, and the old req's answer
+            // is dropped.
+            let (again, _) = push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_ne!(again, req);
+            f.model.workdir_pushed(
+                req,
+                id,
+                "docs/notes.md".into(),
+                Err(TransportError::Timeout),
+            );
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // Another session's push is not in this view.
+            push_asked(f.dispatch(push(other, "other.md")));
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // An unknown session: nothing.
+            assert!(
+                f.dispatch(push(SessionId::new(), "x.md")).is_empty(),
+                "unknown"
+            );
+
+            // Offline: asked for nothing, and the entry fails at once.
+            f.model.set_link(offline());
+            assert!(f.dispatch(push(id, "offline.md")).is_empty());
+            let shown = view(&f).pushes;
+            let entry = shown
+                .iter()
+                .find(|p| p.path == "offline.md")
+                .expect("listed");
+            assert_eq!(entry.state, PushState::Failed(not_connected()));
         }
 
         #[test]
