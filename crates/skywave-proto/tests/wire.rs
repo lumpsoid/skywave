@@ -568,6 +568,22 @@ fn all_event_kinds() -> Vec<EventKind> {
         holds: BlobUse::ShellOutput,
         by: device(),
     }])
+    .chain([
+        EventKind::FileWritten {
+            path: "notes/todo.md".into(),
+            sha256: ContentHash::of(b"new notes"),
+            size: 9,
+            replaced: None,
+            by: device(),
+        },
+        EventKind::FileWritten {
+            path: "notes/todo.md".into(),
+            sha256: ContentHash::of(b"edited notes"),
+            size: 12,
+            replaced: Some(ContentHash::of(b"new notes")),
+            by: device(),
+        },
+    ])
     .chain([EventKind::BlobCropped {
         blob: Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_00b1).into(),
         holds: BlobUse::ToolOutput,
@@ -812,6 +828,41 @@ fn all_upload_results() -> Vec<UploadResult> {
         UploadResult::HashMismatch,
         UploadResult::DiskLow,
     ]
+}
+
+fn all_write_results() -> Vec<WriteFileResult> {
+    vec![
+        WriteFileResult::Written {
+            path: "notes/todo.md".into(),
+            size: 9,
+            seq: Seq(17),
+        },
+        WriteFileResult::Same {
+            path: "notes/todo.md".into(),
+            size: 9,
+        },
+        WriteFileResult::Exists {
+            sha256: ContentHash::of(b"old notes"),
+            size: 10,
+        },
+        WriteFileResult::NotStaged,
+        WriteFileResult::IsADirectory,
+        WriteFileResult::NotAFile,
+        WriteFileResult::UnknownSession,
+        WriteFileResult::WorkdirGone,
+        WriteFileResult::NotAllowed,
+        WriteFileResult::NotFound,
+        WriteFileResult::DiskLow,
+    ]
+}
+
+fn write_file_request(replace: Option<ContentHash>) -> WriteFileRequest {
+    WriteFileRequest {
+        session: session(),
+        path: "notes/todo.md".into(),
+        content: ContentHash::of(b"edited notes"),
+        replace,
+    }
 }
 
 fn all_shell_ends() -> Vec<ShellEnd> {
@@ -1847,6 +1898,37 @@ fn every_upload_result_round_trips() {
 }
 
 #[test]
+fn every_write_result_round_trips() {
+    for result in all_write_results() {
+        round_trip(&result);
+    }
+}
+
+#[test]
+fn a_write_file_request_omits_replace_only_when_none() {
+    let fresh = write_file_request(None);
+    let json = serde_json::to_value(&fresh).unwrap();
+    assert!(json.get("replace").is_none(), "{json}");
+    // A body without `replace` parses to `None`.
+    assert_eq!(
+        serde_json::from_value::<WriteFileRequest>(json).unwrap(),
+        fresh
+    );
+    round_trip(&fresh);
+
+    // Positive control: a `Some` is written out, and round-trips.
+    let digest = ContentHash::of(b"new notes");
+    let replacing = write_file_request(Some(digest));
+    let json = serde_json::to_value(&replacing).unwrap();
+    assert_eq!(
+        json["replace"],
+        serde_json::json!(digest.to_hex()),
+        "{json}"
+    );
+    round_trip(&replacing);
+}
+
+#[test]
 fn a_login_finish_never_prints_its_code() {
     let printed = format!("{:?}", login_finish());
     assert!(printed.contains("<redacted>"), "{printed}");
@@ -2149,6 +2231,7 @@ fn api_paths() {
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
     assert_eq!(path::WORKTREES, "/v1/worktrees");
     assert_eq!(path::WORKDIR_DOWNLOAD, "/v1/workdir/download");
+    assert_eq!(path::WORKDIR_WRITE, "/v1/workdir/write");
     assert_eq!(path::BLOB_ROUTE, "/v1/blobs/{id}");
     assert_eq!(
         path::blob(blob_id()),
@@ -2200,6 +2283,8 @@ fn wire_format_snapshot() {
         workdir_list: Vec<ListResult>,
         workdir_file: Vec<FileResult>,
         worktrees: Vec<WorktreeList>,
+        write_file_request: WriteFileRequest,
+        write_results: Vec<WriteFileResult>,
         conversations: Vec<ConversationsResult>,
         storage: StorageReport,
         usage_limits: Vec<UsageLimitsResult>,
@@ -2239,6 +2324,8 @@ fn wire_format_snapshot() {
         workdir_list: all_list_results(),
         workdir_file: all_file_results(),
         worktrees: all_worktree_lists(),
+        write_file_request: write_file_request(Some(ContentHash::of(b"new notes"))),
+        write_results: all_write_results(),
         conversations: all_conversations_results(),
         storage: storage_report(),
         usage_limits: all_usage_limits_results(),

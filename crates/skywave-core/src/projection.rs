@@ -396,7 +396,8 @@ impl SessionSummary {
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
-            | EventKind::BlobCropped { .. } => {}
+            | EventKind::BlobCropped { .. }
+            | EventKind::FileWritten { .. } => {}
         }
     }
 
@@ -493,7 +494,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::Imported { .. }
         | EventKind::ImportFinished { .. }
         | EventKind::BlobDeleted { .. }
-        | EventKind::BlobCropped { .. } => false,
+        | EventKind::BlobCropped { .. }
+        | EventKind::FileWritten { .. } => false,
     }
 }
 
