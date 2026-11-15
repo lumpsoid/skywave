@@ -178,7 +178,7 @@ use crate::encoding;
 use crate::error::{Error, Result};
 use crate::event_log::{self, DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
 use crate::login::LoginFlows;
-use crate::server::{JoinedHook, ServerOptions};
+use crate::server::{JoinedHook, ServerOptions, UploadHook};
 use crate::storage::{self, StorageReader};
 use crate::workdir::{self, Git, Snapshot, WorkdirReader};
 use crate::workdir_write::{self, WRITE_DEADLINE, WriteOutcome};
@@ -279,6 +279,8 @@ pub(crate) struct Api {
     crop_hook: Option<Arc<dyn CropHook>>,
     /// Run when a request waits for another's preparation (tests).
     joined_hook: Option<JoinedHook>,
+    /// Run in every upload before it is staged (tests).
+    upload_hook: Option<UploadHook>,
     /// The commands being prepared (adopting creates and crops), by command
     /// id: each answers with the command's reply once it has one.
     preparing: Mutex<HashMap<CommandId, watch::Receiver<Option<Reply>>>>,
@@ -338,6 +340,7 @@ impl Api {
             crop_deadline: options.crop_deadline,
             crop_hook: options.crop_hook,
             joined_hook: options.joined_hook,
+            upload_hook: options.upload_hook,
             preparing: Mutex::new(HashMap::new()),
             fs: Arc::new(Semaphore::new(FS_PERMITS)),
         })
@@ -1626,8 +1629,15 @@ async fn write_upload(api: Arc<Api>, hash: ContentHash, offset: u64, body: Body)
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     drop(out);
-    let staging = api.staging.clone();
-    match tokio::task::spawn_blocking(move || staging.finish(hash)).await {
+    let (staging, hook) = (api.staging.clone(), api.upload_hook.clone());
+    match tokio::task::spawn_blocking(move || {
+        if let Some(hook) = hook {
+            hook();
+        }
+        staging.finish(hash)
+    })
+    .await
+    {
         Ok(Ok(result)) => Json(result).into_response(),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "staging an attachment failed");
