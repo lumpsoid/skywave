@@ -1,4 +1,4 @@
-use rinf::SignalPiece;
+use rinf::{RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
 use super::timeline::BlobFacts;
@@ -157,19 +157,27 @@ pub struct WorkdirEntryRow {
     pub path: String,
 }
 
-/// The diff or file a pane shows: its blob, and its text once the blob is
-/// here. Only the pane shown carries it.
+/// The diff or file a pane shows: its blob, and how its text was cut. Only
+/// the pane shown carries it. The text's lines come in [`WorkdirTextUpdate`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct WorkdirContent {
     /// Its download; `OpenFull` with its id opens the whole file once
     /// `Available`.
     pub blob: BlobFacts,
-    /// The head of the text, as the hub caps it; empty until downloaded.
-    pub lines: Vec<WorkdirLine>,
     /// `cut short: 1.0 MiB of 3.2 MiB shown`, when the text is longer.
     pub cut: Option<String>,
     /// The downloaded file could not be read.
     pub error: Option<String>,
+}
+
+/// The head of the diff or file the workdir screen shows, sent once per
+/// blob rather than with every screen: the screen is re-sent on each
+/// transfer tick, and Dart decodes every signal on its UI isolate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, RustSignal)]
+pub struct WorkdirTextUpdate {
+    /// The blob the lines are of (`WorkdirContent.blob.blob_id`).
+    pub blob_id: String,
+    pub lines: Vec<WorkdirLine>,
 }
 
 /// One line of a diff or a file.

@@ -8,6 +8,7 @@ import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'package:skywave_gui/workdir/pushing.dart';
 import 'package:skywave_gui/workdir/saving.dart';
+import 'package:skywave_gui/workdir/workdir_text_holder.dart';
 
 /// A session's workdir, read-only: its git changes and a changed file's
 /// diff (Changes), its newest commits (Commits), or its files and one
@@ -18,12 +19,16 @@ import 'package:skywave_gui/workdir/saving.dart';
 class WorkdirPage extends StatelessWidget {
   const WorkdirPage({
     required this.screen,
+    required this.text,
     required this.send,
     this.canGoBack = false,
     super.key,
   });
 
   final WorkdirScreen screen;
+
+  /// The lines of the diff or file shown, sent apart from the screen.
+  final WorkdirTextHolder text;
   final bool canGoBack;
   final SendIntent send;
 
@@ -168,8 +173,11 @@ class WorkdirPage extends StatelessWidget {
                 WorkdirPaneKind.changes ||
                 WorkdirPaneKind.commits ||
                 WorkdirPaneKind.dir => _ListPane(screen: screen, send: send),
-                WorkdirPaneKind.diff ||
-                WorkdirPaneKind.file => _TextPane(screen: screen, send: send),
+                WorkdirPaneKind.diff || WorkdirPaneKind.file => _TextPane(
+                  screen: screen,
+                  text: text,
+                  send: send,
+                ),
               },
             ),
             if (screen.downloads.isNotEmpty) ...[
@@ -591,9 +599,14 @@ class _CommitTile extends StatelessWidget {
 /// A diff coloured by line kind, or a file with line numbers, from its
 /// downloaded blob; its download and an Open button above it.
 class _TextPane extends StatelessWidget {
-  const _TextPane({required this.screen, required this.send});
+  const _TextPane({
+    required this.screen,
+    required this.text,
+    required this.send,
+  });
 
   final WorkdirScreen screen;
+  final WorkdirTextHolder text;
   final SendIntent send;
 
   @override
@@ -624,8 +637,6 @@ class _TextPane extends StatelessWidget {
       color: theme.colorScheme.onSurface,
     );
     final numbered = screen.pane == WorkdirPaneKind.file;
-    final lines = content.lines;
-    final width = '${lines.length}'.length;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -665,29 +676,38 @@ class _TextPane extends StatelessWidget {
           ),
         Expanded(
           child: SelectionArea(
-            child: ListView.builder(
-              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-              itemCount: lines.length,
-              itemBuilder: (context, i) {
-                final line = lines[i];
-                final text = _SelectableLine(
-                  text: line.text,
-                  style: _style(line.kind, base, colors),
-                );
-                if (!numbered) {
-                  return text;
-                }
-                return Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SelectionContainer.disabled(
-                      child: Text(
-                        '${'${i + 1}'.padLeft(width)}  ',
-                        style: base.copyWith(color: colors.muted),
-                      ),
-                    ),
-                    Expanded(child: text),
-                  ],
+            // Only the lines rebuild when they arrive; the rest of the pane
+            // stays as it is.
+            child: ListenableBuilder(
+              listenable: text,
+              builder: (context, _) {
+                final lines = text.lines(blob.blobId);
+                final width = '${lines.length}'.length;
+                return ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                  itemCount: lines.length,
+                  itemBuilder: (context, i) {
+                    final line = lines[i];
+                    final selectable = _SelectableLine(
+                      text: line.text,
+                      style: _style(line.kind, base, colors),
+                    );
+                    if (!numbered) {
+                      return selectable;
+                    }
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SelectionContainer.disabled(
+                          child: Text(
+                            '${'${i + 1}'.padLeft(width)}  ',
+                            style: base.copyWith(color: colors.muted),
+                          ),
+                        ),
+                        Expanded(child: selectable),
+                      ],
+                    );
+                  },
                 );
               },
             ),

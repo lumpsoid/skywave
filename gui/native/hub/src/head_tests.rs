@@ -5353,7 +5353,7 @@ mod workdir {
     use super::*;
     use crate::signals::{
         BlobStateKind, WorkdirChangeKind, WorkdirLine, WorkdirLineKind, WorkdirPaneKind,
-        WorkdirScreen,
+        WorkdirScreen, WorkdirTextUpdate,
     };
 
     fn taken() -> chrono::DateTime<Utc> {
@@ -5381,6 +5381,19 @@ mod workdir {
         downloads: Vec<WorkdirDownload>,
         pushes: Vec<WorkdirPush>,
     ) -> WorkdirScreen {
+        shown_outs(rig, pane, fetch, body, downloads, pushes).0
+    }
+
+    /// [`shown_with`], and the outs the view sent besides the screen's
+    /// command: what Dart is sent for it.
+    fn shown_outs(
+        rig: &mut Rig,
+        pane: WorkdirPane,
+        fetch: WorkdirFetch,
+        body: WorkdirBody,
+        downloads: Vec<WorkdirDownload>,
+        pushes: Vec<WorkdirPush>,
+    ) -> (WorkdirScreen, Vec<Out>) {
         rig.clock.wall_ms = (taken() + chrono::Duration::hours(1)).timestamp_millis();
         let mut view = rig.core.view();
         view.screen = Screen::Workdir(WorkdirView {
@@ -5395,11 +5408,12 @@ mod workdir {
             pushes,
         });
         let outs = rig.head.on_view(view, rig.clock);
-        rig.apply(outs);
-        match &rig.head.sent.screen.as_ref().unwrap().screen {
+        let outs = rig.apply(outs);
+        let screen = match &rig.head.sent.screen.as_ref().unwrap().screen {
             ScreenView::Workdir { workdir } => workdir.clone(),
             other => panic!("not the workdir screen: {other:?}"),
-        }
+        };
+        (screen, outs)
     }
 
     fn file(path: &str, change: FileChange, diff: DiffBody) -> ChangedFile {
@@ -5430,6 +5444,16 @@ mod workdir {
             kind,
             text: text.into(),
         }
+    }
+
+    /// The text updates among `outs`.
+    fn workdir_text(outs: &[Out]) -> Vec<WorkdirTextUpdate> {
+        outs.iter()
+            .filter_map(|out| match out {
+                Out::WorkdirText(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -5647,7 +5671,7 @@ mod workdir {
             path: "a.txt".into(),
             untracked: false,
         };
-        let screen = shown(
+        let (screen, outs) = shown_outs(
             &mut rig,
             pane.clone(),
             WorkdirFetch::Idle,
@@ -5655,6 +5679,8 @@ mod workdir {
                 file: Some(changed.clone()),
                 blob: Some(blob.clone()),
             },
+            Vec::new(),
+            Vec::new(),
         );
         assert_eq!(screen.pane, WorkdirPaneKind::Diff);
         assert_eq!(screen.path, "a.txt");
@@ -5664,8 +5690,11 @@ mod workdir {
         assert_eq!(content.blob.state, BlobStateKind::Available);
         assert_eq!(content.blob.blob_id, blob.id.0.to_string());
         assert_eq!(content.cut, None);
+        let text = workdir_text(&outs);
+        assert_eq!(text.len(), 1, "{outs:?}");
+        assert_eq!(text[0].blob_id, content.blob.blob_id);
         assert_eq!(
-            content.lines,
+            text[0].lines,
             [
                 line(WorkdirLineKind::FileHeader, "diff --git a/a.txt b/a.txt"),
                 line(WorkdirLineKind::FileHeader, "--- a/a.txt"),
@@ -5678,7 +5707,7 @@ mod workdir {
             ]
         );
 
-        // Before it is here: its download, no lines.
+        // Before it is here: its download, and no text.
         let waiting = BlobView {
             id: blob.id,
             state: BlobState::Failed {
@@ -5688,7 +5717,7 @@ mod workdir {
             change: None,
             pending: None,
         };
-        let screen = shown(
+        let (screen, outs) = shown_outs(
             &mut rig,
             pane.clone(),
             WorkdirFetch::Idle,
@@ -5696,13 +5725,15 @@ mod workdir {
                 file: Some(changed),
                 blob: Some(waiting),
             },
+            Vec::new(),
+            Vec::new(),
         );
         let content = screen.content.unwrap();
         assert!(content.blob.can_download);
-        assert!(content.lines.is_empty());
+        assert!(workdir_text(&outs).is_empty(), "{outs:?}");
 
         // A file gone from the changes says so, with no content.
-        let screen = shown(
+        let (screen, outs) = shown_outs(
             &mut rig,
             pane,
             WorkdirFetch::Idle,
@@ -5710,9 +5741,12 @@ mod workdir {
                 file: None,
                 blob: None,
             },
+            Vec::new(),
+            Vec::new(),
         );
         assert!(screen.wording.unwrap().contains("no longer in the changes"));
         assert_eq!(screen.content, None);
+        assert!(workdir_text(&outs).is_empty(), "{outs:?}");
     }
 
     #[test]
@@ -5795,7 +5829,7 @@ mod workdir {
         let pane = WorkdirPane::File {
             path: "src/main.rs".into(),
         };
-        let screen = shown(
+        let (screen, outs) = shown_outs(
             &mut rig,
             pane.clone(),
             WorkdirFetch::Idle,
@@ -5812,10 +5846,16 @@ mod workdir {
                 },
                 blob: Some(blob.clone()),
             },
+            Vec::new(),
+            Vec::new(),
         );
         assert_eq!(screen.header, "src/main.rs  25 B · taken 12:00:00");
+        let content = screen.content.unwrap();
+        let text = workdir_text(&outs);
+        assert_eq!(text.len(), 1, "{outs:?}");
+        assert_eq!(text[0].blob_id, content.blob.blob_id);
         assert_eq!(
-            screen.content.unwrap().lines,
+            text[0].lines,
             [
                 line(WorkdirLineKind::Plain, "fn main() {}"),
                 line(WorkdirLineKind::Plain, "-not a diff"),
@@ -5850,6 +5890,78 @@ mod workdir {
             Some("A FIFO, socket or device: not opened.")
         );
         assert_eq!(screen.content, None);
+    }
+
+    #[test]
+    fn the_workdir_text_is_sent_once_per_blob_not_with_each_screen() {
+        let mut rig = Rig::new();
+        let blob = available(&rig, "fn main() {}\n");
+        let pane = WorkdirPane::File {
+            path: "src/main.rs".into(),
+        };
+        let body = || WorkdirBody::File {
+            result: FileResult::File {
+                at: taken(),
+                path: "src/main.rs".into(),
+                size: 13,
+                content: FileBody::Blob(BlobRef {
+                    id: blob.id,
+                    size: 13,
+                    sha256: skywave_proto::ContentHash::of(b""),
+                }),
+            },
+            blob: Some(blob.clone()),
+        };
+        let (_, outs) = shown_outs(
+            &mut rig,
+            pane.clone(),
+            WorkdirFetch::Idle,
+            body(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(workdir_text(&outs).len(), 1, "{outs:?}");
+
+        // A download row changes the screen alone: no text again.
+        let downloads = vec![WorkdirDownload {
+            path: "a.log".into(),
+            fetch: WorkdirFetch::Loading,
+            result: None,
+            blob: None,
+        }];
+        let (screen, outs) = shown_outs(
+            &mut rig,
+            pane.clone(),
+            WorkdirFetch::Idle,
+            body(),
+            downloads,
+            Vec::new(),
+        );
+        assert_eq!(screen.downloads.len(), 1);
+        assert!(
+            outs.iter().any(|out| matches!(out, Out::Screen(_))),
+            "{outs:?}"
+        );
+        assert!(workdir_text(&outs).is_empty(), "{outs:?}");
+
+        // Another screen in between: coming back to the blob sends its text.
+        let away = rig.view();
+        assert!(
+            matches!(
+                rig.head.sent.screen.as_ref().unwrap().screen,
+                ScreenView::Session { .. }
+            ),
+            "{away:?}"
+        );
+        let (_, outs) = shown_outs(
+            &mut rig,
+            pane,
+            WorkdirFetch::Idle,
+            body(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(workdir_text(&outs).len(), 1, "{outs:?}");
     }
 
     #[test]
