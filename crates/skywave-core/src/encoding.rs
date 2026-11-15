@@ -25,13 +25,16 @@ pub(crate) fn is_zstd(headers: &HeaderMap) -> Result<bool, TransportError> {
 }
 
 /// A whole body as its decoded bytes: decompressed when `headers` say it is
-/// a zstd frame, else as it came.
-pub(crate) fn decoded(headers: &HeaderMap, body: Bytes) -> Result<Bytes, TransportError> {
+/// a zstd frame, else as it came. The decompression runs off the core's
+/// workers.
+pub(crate) async fn decoded(headers: &HeaderMap, body: Bytes) -> Result<Bytes, TransportError> {
     if !is_zstd(headers)? {
         return Ok(body);
     }
-    zstd::stream::decode_all(&body[..])
-        .map(Bytes::from)
+    tokio::task::spawn_blocking(move || zstd::stream::decode_all(&body[..]).map(Bytes::from))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|decoded| decoded.map_err(|e| e.to_string()))
         .map_err(|e| TransportError::Decode(format!("decompressing a body: {e}")))
 }
 
@@ -200,22 +203,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_whole_body_decodes_only_when_marked() {
+    #[tokio::test]
+    async fn a_whole_body_decodes_only_when_marked() {
         let content = text(5000);
         let frame = Bytes::from(zstd::bulk::compress(&content, 3).unwrap());
         let mut headers = HeaderMap::new();
-        assert_eq!(decoded(&headers, frame.clone()).unwrap(), frame);
+        assert_eq!(decoded(&headers, frame.clone()).await.unwrap(), frame);
         headers.insert(header::CONTENT_ENCODING, ZSTD.parse().unwrap());
-        assert_eq!(decoded(&headers, frame.clone()).unwrap(), content);
+        assert_eq!(decoded(&headers, frame.clone()).await.unwrap(), content);
         let cut = frame.slice(..frame.len() - 1);
         assert!(matches!(
-            decoded(&headers, cut),
+            decoded(&headers, cut).await,
             Err(TransportError::Decode(_))
         ));
         headers.insert(header::CONTENT_ENCODING, "br".parse().unwrap());
         assert!(matches!(
-            decoded(&headers, frame),
+            decoded(&headers, frame).await,
             Err(TransportError::Decode(_))
         ));
     }
