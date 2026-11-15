@@ -794,6 +794,10 @@ pub enum StoreError {
     /// or was accepted.
     #[error("command {0:?} cannot be withdrawn")]
     NotWithdrawable(CommandId),
+    /// [`Store::requeue_replacing`] found no message refused for a file in the
+    /// workdir: the command is gone, or refused for another reason.
+    #[error("command {0:?} cannot be resent replacing its files")]
+    NotResendable(CommandId),
     #[error("blob {0:?} is not known")]
     UnknownBlob(BlobId),
     #[error("path {0} is not valid UTF-8")]
@@ -1987,6 +1991,41 @@ impl Store {
         }
         tx.commit()?;
         Ok(settled)
+    }
+
+    /// Requeues a message refused with [`AttachmentRefusal::FileExists`] to
+    /// go out again, keeping its place in the outbox. Its refusal and the
+    /// hashes found for its files are cleared, and each `(position, hash)` of
+    /// `replaces` becomes that file's `replace`, so the sender overwrites the
+    /// file found there. All of it is one transaction. `false` when nothing
+    /// changed: the command is not in the outbox or not refused that way, and
+    /// nothing is written.
+    pub fn requeue_replacing(
+        &self,
+        id: CommandId,
+        replaces: &[(usize, ContentHash)],
+    ) -> Result<bool, StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        let requeued = tx.execute(
+            "UPDATE outbox SET result = NULL, sending = 0, answered_at = NULL
+             WHERE command_id = ?1
+                AND json_extract(result, '$.result') = 'attachment_refused'
+                AND json_extract(result, '$.reason') = 'file_exists'",
+            [id.0.to_string()],
+        )?;
+        if requeued == 0 {
+            return Ok(false);
+        }
+        for (position, hash) in replaces {
+            tx.execute(
+                "UPDATE outbox_files SET replace = ?3, existing = NULL
+                 WHERE command_id = ?1 AND position = ?2",
+                params![id.0.to_string(), u64_sql(*position as u64)?, hash.to_hex()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Takes a command back: deletes it from the outbox if the server has

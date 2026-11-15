@@ -1046,10 +1046,13 @@ logs) an event that no longer decodes rather than failing.
   is missing, or no longer hashes to its name, fails the message as `Missing`,
   without a request. A workdir that already holds other content at the name
   fails it as `AttachmentRefused(FileExists)`, and the hash found there is kept
-  on that file. An `Exists` or `Same` answer with our content counts as
-  written, so a resend after a lost answer is safe. A `NotStaged` answer
-  uploads the file once more; any other refusal fails the message as
-  `FileNotWritten`, or as `ServerDiskLow` on a low disk. A third loop,
+  on that file. The user can then resend it replacing that file
+  (`ResendReplacing`): the same command is requeued with `replace` set to the
+  hash found, and a file changed again meanwhile is refused again. An `Exists`
+  or `Same` answer with our content counts as written, so a resend after a lost
+  answer is safe. A `NotStaged` answer uploads the file once more; any other
+  refusal fails the message as `FileNotWritten`, or as `ServerDiskLow` on a low
+  disk. A third loop,
   the draft stager, runs beside the pull and the sender: it uploads a draft's
   images as soon as they are attached (woken when a draft gains images), HEAD
   then PUT, each image once per connection. It only saves time, since the

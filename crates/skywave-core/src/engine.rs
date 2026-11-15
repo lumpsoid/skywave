@@ -3635,6 +3635,54 @@ mod tests {
         assert!(entries[0].discardable());
     }
 
+    /// The user resends a message refused for a file the workdir holds, now
+    /// replacing that file: the same command goes out, and its write carries
+    /// the hash found.
+    #[tokio::test(start_paused = true)]
+    async fn a_resent_message_replaces_the_found_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let other = ContentHash::of(b"other notes");
+        let mut server = StagingServer::new();
+        server.write_answer = Some(WriteFileResult::Exists {
+            sha256: other,
+            size: 1,
+        });
+        let command = enqueue_with_files(&seam, "one", Vec::new(), vec![file.clone()]);
+        drain(&seam, &server).await;
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(
+                AttachmentRefusal::FileExists
+            )]
+        );
+
+        // This entry went into the store past the model, so the model is
+        // reloaded from the store, as opening the core would do.
+        crate::client::lock(&seam.core.shared.state).resync();
+        // The user confirms: the write from now on replaces the file.
+        server.write_answer = None;
+        seam.core
+            .dispatch(crate::Action::ResendReplacing(command.id))
+            .unwrap();
+        drain(&seam, &server).await;
+
+        let replaces: Vec<Option<ContentHash>> = server
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|write| write.replace)
+            .collect();
+        assert_eq!(replaces, [None, Some(other)]);
+        assert_eq!(server.calls().last(), Some(&post_call("one")));
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
     /// The workdir already holds this file's content, from a write whose
     /// answer was lost: the write counts as landed and the message is posted.
     #[tokio::test(start_paused = true)]

@@ -810,6 +810,15 @@ impl State {
                         .as_ref()
                         .map(|(session, files)| (*session, files.as_slice())),
                 ),
+                // Refused when the store disagrees with the model; the
+                // resync below then shows what the store holds.
+                Effect::Requeue { id, replaces } => {
+                    match self.store.requeue_replacing(id, &replaces) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(StoreError::NotResendable(id)),
+                        Err(err) => Err(err),
+                    }
+                }
                 Effect::LoadSession(id) => self
                     .store
                     .session_events(id)
