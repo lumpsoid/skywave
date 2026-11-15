@@ -593,6 +593,47 @@ async fn an_interrupted_upload_resumes_on_a_real_server() {
     );
 }
 
+/// An upload over the server's cap is refused, and one of exactly the cap is
+/// stored: the `100 Continue` comes from a real server and the body follows
+/// it. The refusal is found mid-body today; the server answers it before the
+/// body once it checks `content-length`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_over_the_cap_is_refused_on_a_real_server() {
+    let options = ServerOptions {
+        upload_max: 1 << 20,
+        ..ServerOptions::default()
+    };
+    let fx = Fixture::start_with_options(&["localhost", "127.0.0.1"], options).await;
+    let transport = paired_transport(&fx).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let over = vec![7u8; (1 << 20) + 1];
+    assert_eq!(
+        transport
+            .upload_attachment(
+                ContentHash::of(&over),
+                upload_file(dir.path(), "big.bin", &over),
+                0
+            )
+            .await
+            .unwrap(),
+        UploadResult::TooLarge
+    );
+
+    let exact = vec![7u8; 1 << 20];
+    assert_eq!(
+        transport
+            .upload_attachment(
+                ContentHash::of(&exact),
+                upload_file(dir.path(), "exact.bin", &exact),
+                0
+            )
+            .await
+            .unwrap(),
+        UploadResult::Stored { size: 1 << 20 }
+    );
+}
+
 /// Writes `bytes` to `dir/name` and names that file as the upload of all of
 /// its bytes.
 fn upload_file(dir: &Path, name: &str, bytes: &[u8]) -> UploadFile {
