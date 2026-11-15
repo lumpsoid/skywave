@@ -353,8 +353,8 @@ impl Seam {
     pub fn apply_events(&self, batch: &EventBatch) -> Result<Applied, CoreError> {
         let now = Utc::now();
         let data_dir = self.data_dir();
-        self.update(|state, requests| {
-            let mut applied = state.store.apply_batch(batch, now)?;
+        let (mut applied, own) = self.update(|state, requests| {
+            let applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
             for (id, seq) in &applied.settled {
@@ -376,9 +376,35 @@ impl Seam {
                 requests.push(Request::BlobsPurged(applied.purged.clone()));
             }
             // After the model took the batch: it registers the blobs there.
-            own_images_available(state, &data_dir, &mut applied);
-            Ok(applied)
-        })
+            let own = match state.store.own_images(&applied.blobs) {
+                Ok(own) => own,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot look up the device's own images; they download");
+                    Vec::new()
+                }
+            };
+            Ok((applied, own))
+        })?;
+        if own.is_empty() {
+            return Ok(applied);
+        }
+        // Outside the state lock: copying and syncing a local image takes
+        // long enough to hold off every dispatch and snapshot.
+        let made = blocking(|| {
+            own.into_iter()
+                .map(|(id, sha256)| (id, own_image_file(&data_dir, id, sha256)))
+                .collect()
+        });
+        let shown = self.update(|state, _| {
+            own_images_available(state, &data_dir, made, &mut applied);
+            Ok(())
+        });
+        if let Err(error) = shown {
+            // The batch is stored; the own images stay in `applied.blobs`
+            // and download.
+            tracing::debug!(%error, "cannot make the own images available; they download");
+        }
+        Ok(applied)
     }
 
     /// The server said `hello`: keep the names of its devices, whether it
@@ -975,28 +1001,42 @@ fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
     }
 }
 
-/// Makes the device's own message images available from their local files,
-/// rather than downloading them: each blob the batch registered whose hash
-/// is an attachment here. Those are taken out of `applied.blobs`, so the
-/// engine does not queue them. A blob whose file cannot be had stays as it
-/// is and downloads as normal. A store error is logged, and the blobs it
-/// touches download as normal.
-fn own_images_available(state: &mut State, data_dir: &Path, applied: &mut Applied) {
-    let own = match state.store.own_images(&applied.blobs) {
-        Ok(own) => own,
-        Err(error) => {
-            tracing::warn!(%error, "cannot look up the device's own images; they download");
-            return;
-        }
-    };
-    for (id, sha256) in own {
-        let path = match own_image_file(data_dir, id, sha256) {
+/// Makes the device's own message images available from the files `made`
+/// (see `apply_events`), rather than downloading them. Each blob whose file
+/// was made and which is still not downloaded becomes available at it, and
+/// is taken out of `applied.blobs`, so the engine does not queue it. A blob
+/// whose file could not be made, or that a download got to first, stays as
+/// it is. A store error is logged, and the blob it touches downloads as
+/// normal.
+fn own_images_available(
+    state: &mut State,
+    data_dir: &Path,
+    made: Vec<(BlobId, std::io::Result<PathBuf>)>,
+    applied: &mut Applied,
+) {
+    for (id, made) in made {
+        let path = match made {
             Ok(path) => path,
             Err(error) => {
                 tracing::debug!(?id, %error, "cannot use the local image; it downloads");
                 continue;
             }
         };
+        match state.store.blob(id) {
+            Ok(Some(record)) if record.status == BlobStatus::NotDownloaded => {}
+            // A download got there first: the file is the same bytes at the
+            // same path, so it stays.
+            Ok(Some(_)) => continue,
+            // Purged meanwhile: its files go, the one made just now too.
+            Ok(None) => {
+                remove_blob_files(data_dir, id);
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(?id, %error, "cannot read the blob; it downloads");
+                continue;
+            }
+        }
         let status = BlobStatus::Available { path };
         if let Err(error) = state.store.set_blob_status(id, &status) {
             tracing::warn!(?id, %error, "cannot store the local image; it downloads");
@@ -1008,25 +1048,30 @@ fn own_images_available(state: &mut State, data_dir: &Path, applied: &mut Applie
 }
 
 /// Puts the attachment `sha256` at the blob file of `id`: a hard link, or a
-/// copy where linking fails, synced before it is used. A file already at
-/// that path is replaced, as it is no proof of the content.
+/// copy where linking fails, synced before it is used. It is made under
+/// `<id>.own` and renamed onto the blob file, so that file is never missing
+/// or half-written: a download of the same blob may write it at the same
+/// time, with the same bytes. A file already at that path is replaced, as it
+/// is no proof of the content.
 fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<PathBuf> {
     let dir = blob_dir(data_dir);
     std::fs::create_dir_all(&dir)?;
     let dst = dir.join(id.0.to_string());
-    match std::fs::remove_file(&dst) {
+    let tmp = dir.join(format!("{}.own", id.0));
+    match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     let src = attachment_path(data_dir, sha256);
-    if std::fs::hard_link(&src, &dst).is_err() {
-        std::fs::copy(&src, &dst)?;
+    if std::fs::hard_link(&src, &tmp).is_err() {
+        std::fs::copy(&src, &tmp)?;
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&dst)?
+            .open(&tmp)?
             .sync_all()?;
     }
+    std::fs::rename(&tmp, &dst)?;
     Ok(dst)
 }
 
@@ -1122,5 +1167,25 @@ mod tests {
         let core = Core::open_detached(dir.path()).unwrap();
         assert_eq!(core.seam().pairing().as_deref(), Some(&expected));
         assert_eq!(settings(&core), shown);
+    }
+
+    #[test]
+    fn own_image_file_replaces_the_blob_file_in_one_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let sha256 = ContentHash::of(b"image");
+        let src = attachment_path(data_dir, sha256);
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"image").unwrap();
+        let id = BlobId::new();
+        let blobs = blob_dir(data_dir);
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(id.0.to_string()), b"stale").unwrap();
+
+        let dst = own_image_file(data_dir, id, sha256).unwrap();
+
+        assert_eq!(dst, blobs.join(id.0.to_string()));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"image");
+        assert!(!blobs.join(format!("{}.own", id.0)).exists());
     }
 }
