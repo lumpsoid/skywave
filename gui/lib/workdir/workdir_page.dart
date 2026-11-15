@@ -1,10 +1,12 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
+import 'package:skywave_gui/workdir/pushing.dart';
 import 'package:skywave_gui/workdir/saving.dart';
 
 /// A session's workdir, read-only: its git changes and a changed file's
@@ -79,6 +81,13 @@ class WorkdirPage extends StatelessWidget {
                   path: screen.path,
                 ),
               ),
+            ),
+          if (screen.pane == WorkdirPaneKind.dir)
+            IconButton(
+              key: const ValueKey('workdir-push'),
+              tooltip: 'Push a file here',
+              icon: const Icon(Icons.upload_file_outlined),
+              onPressed: () => _push(context, screen, send),
             ),
           IconButton(
             tooltip: 'Refresh',
@@ -168,6 +177,14 @@ class WorkdirPage extends StatelessWidget {
               _DownloadsPanel(
                 sessionId: screen.sessionId,
                 downloads: screen.downloads,
+                send: send,
+              ),
+            ],
+            if (screen.pushes.isNotEmpty) ...[
+              const Divider(height: 1),
+              _PushesPanel(
+                sessionId: screen.sessionId,
+                pushes: screen.pushes,
                 send: send,
               ),
             ],
@@ -329,6 +346,168 @@ class _DownloadsPanel extends StatelessWidget {
 
   void _say(BuildContext context, String text) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+}
+
+/// Asks for the file to push and the path it lands at, then sends the push.
+/// The path proposed is the shown directory and the file's name; nothing is
+/// sent when the picker is cancelled or the path is left empty.
+Future<void> _push(
+  BuildContext context,
+  WorkdirScreen screen,
+  SendIntent send,
+) async {
+  final source = await pickPushFile();
+  if (source == null || !context.mounted) {
+    return;
+  }
+  final name = _fileName(source);
+  final dir = screen.lastDir;
+  final proposal = dir.isEmpty || dir == '.' ? name : '$dir/$name';
+  final target = await showDialog<String>(
+    context: context,
+    builder: (context) => _TargetDialog(proposal: proposal),
+  );
+  if (target == null || target.isEmpty) {
+    return;
+  }
+  send.act(
+    ActionIntentPushWorkdirFile(
+      sessionId: screen.sessionId,
+      source: source,
+      path: target,
+    ),
+  );
+}
+
+/// The last segment of a path, split on `/` or `\` so a Windows path works.
+String _fileName(String path) => path.split(RegExp(r'[/\\]')).last;
+
+/// Edits the path a file is pushed to: pops the trimmed text, or null when
+/// cancelled.
+class _TargetDialog extends StatefulWidget {
+  const _TargetDialog({required this.proposal});
+
+  final String proposal;
+
+  @override
+  State<_TargetDialog> createState() => _TargetDialogState();
+}
+
+class _TargetDialogState extends State<_TargetDialog> {
+  late final _target = TextEditingController(text: widget.proposal);
+
+  @override
+  void dispose() {
+    _target.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Push into the workdir'),
+      content: SizedBox(
+        width: 420,
+        child: TextField(
+          key: const Key('push-target-field'),
+          controller: _target,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Path in the workdir'),
+        ),
+      ),
+      actions: [
+        TextButton(
+          key: const Key('push-target-cancel'),
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('push-target-ok'),
+          onPressed: () => Navigator.of(context).pop(_target.text.trim()),
+          child: const Text('Push'),
+        ),
+      ],
+    );
+  }
+}
+
+/// The pushes this session started, one row each: the path, its one line of
+/// progress or outcome, then Replace… when a different file is already at the
+/// path (asked first), or Retry when the push failed.
+class _PushesPanel extends StatelessWidget {
+  const _PushesPanel({
+    required this.sessionId,
+    required this.pushes,
+    required this.send,
+  });
+
+  final String sessionId;
+  final List<WorkdirPushRow> pushes;
+  final SendIntent send;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = SkyColors.of(context);
+    final muted = Theme.of(context).textTheme.bodySmall
+        ?.copyWith(color: colors.muted);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 160),
+      child: ListView(
+        shrinkWrap: true,
+        children: [
+          for (final row in pushes)
+            ListTile(
+              dense: true,
+              title: Text(row.path),
+              subtitle: Text(row.label, style: muted),
+              trailing: _action(context, row),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget? _action(BuildContext context, WorkdirPushRow row) {
+    if (row.existingSha256 != null) {
+      return TextButton(
+        onPressed: () => _replace(context, row),
+        child: const Text('Replace…'),
+      );
+    }
+    if (row.failed) {
+      return TextButton(
+        onPressed: () => send.act(
+          ActionIntentPushWorkdirFile(
+            sessionId: sessionId,
+            source: row.source,
+            path: row.path,
+          ),
+        ),
+        child: const Text('Retry'),
+      );
+    }
+    return null;
+  }
+
+  /// Replaces the file at the row's path only after the user confirms.
+  Future<void> _replace(BuildContext context, WorkdirPushRow row) async {
+    final name = _fileName(row.source);
+    final yes = await confirmIrreversible(
+      context,
+      question: 'Replace ${row.path} in the workdir with $name?',
+      action: 'Replace',
+    );
+    if (yes) {
+      send.act(
+        ActionIntentPushWorkdirFile(
+          sessionId: sessionId,
+          source: row.source,
+          path: row.path,
+          replace: row.existingSha256,
+        ),
+      );
+    }
   }
 }
 
