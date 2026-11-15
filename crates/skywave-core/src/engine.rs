@@ -144,7 +144,7 @@ use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
 use crate::store::{AttachmentRefusal, LogCheck, OutboxEntry, StoreError};
-use crate::transport::{ExpectedRun, Transport, TransportError};
+use crate::transport::{ExpectedRun, Transport, TransportError, UploadFile};
 use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
 use crate::workdir::{
     PUSH_MAX_BYTES, PushOutcome, WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected,
@@ -1220,14 +1220,9 @@ async fn stage_one(
         tracing::warn!(sha256 = %sha.to_hex(), size, "attachment is over the upload limit");
         return Ok(ImageStaging::Refused(AttachmentRefusal::TooLarge));
     }
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(%error, sha256 = %sha.to_hex(), "attachment file cannot be read");
-            return Ok(ImageStaging::Refused(AttachmentRefusal::Missing));
-        }
-    };
-    let answer = transport.upload_attachment(sha, Bytes::from(bytes)).await?;
+    let answer = transport
+        .upload_attachment(sha, UploadFile { path, len: size })
+        .await?;
     Ok(match answer {
         UploadResult::Stored { .. } => ImageStaging::Staged,
         UploadResult::DiskLow => ImageStaging::DiskLow,
@@ -1329,7 +1324,11 @@ async fn write_one(
     let mut round = 1;
     loop {
         if round > 1 || !transport.attachment_staged(sha).await? {
-            match transport.upload_attachment(sha, bytes.clone()).await? {
+            let file = UploadFile {
+                path: path.clone(),
+                len: bytes.len() as u64,
+            };
+            match transport.upload_attachment(sha, file).await? {
                 UploadResult::Stored { .. } => {}
                 UploadResult::TooLarge => {
                     return Ok(FileWrite::Refused(AttachmentRefusal::TooLarge));
@@ -1413,7 +1412,11 @@ pub(crate) async fn push_workdir_file(
         }
     };
     if !transport.attachment_staged(sha).await? {
-        let answer = transport.upload_attachment(sha, bytes).await?;
+        let file = UploadFile {
+            path: source.to_path_buf(),
+            len: bytes.len() as u64,
+        };
+        let answer = transport.upload_attachment(sha, file).await?;
         if !matches!(answer, UploadResult::Stored { .. }) {
             return Ok(PushOutcome::UploadRefused(answer));
         }
@@ -3117,6 +3120,8 @@ mod tests {
         /// The first this many writes answer `NotStaged` and unstage the
         /// file's content, as a server that lost it does.
         write_not_staged: Mutex<u32>,
+        /// Every upload the server was sent, in the order it came.
+        uploads: Mutex<Vec<UploadFile>>,
     }
 
     impl StagingServer {
@@ -3132,6 +3137,7 @@ mod tests {
                 writes: Mutex::new(Vec::new()),
                 write_answer: None,
                 write_not_staged: Mutex::new(0),
+                uploads: Mutex::new(Vec::new()),
             }
         }
 
@@ -3227,10 +3233,11 @@ mod tests {
         fn upload_attachment(
             &self,
             sha256: ContentHash,
-            bytes: Bytes,
+            file: UploadFile,
         ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
             Box::pin(async move {
                 self.record(put_call(sha256));
+                self.uploads.lock().unwrap().push(file.clone());
                 if let Some(on_put) = &self.on_put {
                     on_put();
                 }
@@ -3241,6 +3248,8 @@ mod tests {
                         return Err(TransportError::Timeout);
                     }
                 }
+                let mut bytes = std::fs::read(&file.path).unwrap();
+                bytes.truncate(file.len as usize);
                 assert!(
                     ContentHash::of(&bytes) == sha256,
                     "the upload does not hash to its name"
@@ -4091,6 +4100,13 @@ mod tests {
         assert_eq!(
             server.calls(),
             [head_call(sha), put_call(sha), write_call(sha)]
+        );
+        assert_eq!(
+            server.uploads.lock().unwrap().clone(),
+            [UploadFile {
+                path: source.clone(),
+                len: b"device bytes".len() as u64,
+            }]
         );
         assert!(
             matches!(
