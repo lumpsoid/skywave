@@ -83,7 +83,9 @@ pub use store::{
     Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
     OutboxStatus, PendingCrop, ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
 };
-pub use transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
+pub use transport::{
+    BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError, UploadFile,
+};
 pub use view::{
     AgentSetting, AgentView, AgentWork, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus,
     Attention, BackgroundTask, BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobView,

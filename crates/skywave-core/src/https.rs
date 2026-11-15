@@ -56,7 +56,9 @@ use crate::encoding::{self, ZstdBody};
 use crate::engine::WORKTREES_TIMEOUT;
 use crate::identity::Identity;
 use crate::tls;
-use crate::transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
+use crate::transport::{
+    BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError, UploadFile,
+};
 use crate::workdir::{WORKDIR_TIMEOUT, WORKDIR_WRITE_TIMEOUT};
 
 /// Timeouts and pool size of an [`HttpsTransport`].
@@ -729,13 +731,25 @@ impl HttpsTransport {
         }
     }
 
-    /// `PUT /v1/attachments/{sha256}` with the image's bytes. Every outcome
-    /// the server decides is a 200 [`UploadResult`], refusals included.
+    /// `PUT /v1/attachments/{sha256}` with the first `len` bytes of the file.
+    /// Every outcome the server decides is a 200 [`UploadResult`], refusals
+    /// included.
     async fn upload_attachment(
         &self,
         sha256: ContentHash,
-        bytes: Bytes,
+        file: UploadFile,
     ) -> Result<UploadResult, TransportError> {
+        let mut bytes = tokio::fs::read(&file.path).await.map_err(|e| {
+            TransportError::Io(format!("reading upload {}: {e}", file.path.display()))
+        })?;
+        if (bytes.len() as u64) < file.len {
+            return Err(TransportError::Io(format!(
+                "upload {} is shorter than {} bytes",
+                file.path.display(),
+                file.len
+            )));
+        }
+        bytes.truncate(file.len as usize);
         let mut headers = self.run_header();
         headers.push((
             header::CONTENT_TYPE,
@@ -743,7 +757,12 @@ impl HttpsTransport {
         ));
         let reply = self
             .http
-            .upload(Method::PUT, &path::attachment(sha256), &headers, bytes)
+            .upload(
+                Method::PUT,
+                &path::attachment(sha256),
+                &headers,
+                Bytes::from(bytes),
+            )
             .await?;
         ok_json(reply)
     }
@@ -1134,9 +1153,9 @@ impl Transport for HttpsTransport {
     fn upload_attachment(
         &self,
         sha256: ContentHash,
-        bytes: Bytes,
+        file: UploadFile,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
-        Box::pin(HttpsTransport::upload_attachment(self, sha256, bytes))
+        Box::pin(HttpsTransport::upload_attachment(self, sha256, file))
     }
 
     fn write_workdir_file<'a>(

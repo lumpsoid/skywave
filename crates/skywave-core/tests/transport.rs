@@ -1,16 +1,16 @@
 //! The pairing client and `HttpsTransport` against a real `skywaved`
 //! server, in-process on 127.0.0.1 over real TLS.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, BlobDownload, Core, ExpectedRun, HttpsTransport, Identity, PairError,
     PairedCredentials, Pairing, PairingStatus, Request, Screen, ServerAddress, Transport,
-    TransportConfig, TransportError, pair, pair_and_report,
+    TransportConfig, TransportError, UploadFile, pair, pair_and_report,
 };
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
@@ -394,7 +394,14 @@ async fn attachment_calls_default_to_not_found() {
         Err(TransportError::NotFound)
     );
     assert_eq!(
-        Old.upload_attachment(sha, Bytes::new()).await,
+        Old.upload_attachment(
+            sha,
+            UploadFile {
+                path: PathBuf::new(),
+                len: 0,
+            }
+        )
+        .await,
         Err(TransportError::NotFound)
     );
 }
@@ -452,6 +459,7 @@ async fn conversations_are_listed_by_a_real_server() {
 async fn attachments_stage_on_a_real_server() {
     let fx = Fixture::start().await;
     let transport = paired_transport(&fx).await;
+    let dir = tempfile::tempdir().unwrap();
     // The server checks only that a body hashes to its name, so a PNG header
     // and padding stage like any bytes.
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -461,7 +469,7 @@ async fn attachments_stage_on_a_real_server() {
     assert!(!transport.attachment_staged(sha).await.unwrap());
     assert_eq!(
         transport
-            .upload_attachment(sha, Bytes::from(png.clone()))
+            .upload_attachment(sha, upload_file(dir.path(), "image.png", &png))
             .await
             .unwrap(),
         UploadResult::Stored {
@@ -477,7 +485,7 @@ async fn attachments_stage_on_a_real_server() {
     let fresh = ContentHash::of(b"other");
     assert_eq!(
         transport
-            .upload_attachment(fresh, Bytes::from(altered))
+            .upload_attachment(fresh, upload_file(dir.path(), "altered.png", &altered))
             .await
             .unwrap(),
         UploadResult::HashMismatch
@@ -487,13 +495,27 @@ async fn attachments_stage_on_a_real_server() {
     let text = b"just text";
     assert_eq!(
         transport
-            .upload_attachment(ContentHash::of(text), Bytes::from_static(text))
+            .upload_attachment(
+                ContentHash::of(text),
+                upload_file(dir.path(), "text.txt", text)
+            )
             .await
             .unwrap(),
         UploadResult::Stored {
             size: text.len() as u64,
         }
     );
+}
+
+/// Writes `bytes` to `dir/name` and names that file as the upload of all of
+/// its bytes.
+fn upload_file(dir: &Path, name: &str, bytes: &[u8]) -> UploadFile {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    UploadFile {
+        path,
+        len: bytes.len() as u64,
+    }
 }
 
 /// A transport for a device freshly paired with `fx`.
@@ -1027,11 +1049,12 @@ async fn workdir_write_reaches_a_real_server() {
     let session = batch.events[0].session_id;
     let file = std::path::Path::new(&fx.workdir()).join("notes.txt");
 
+    let uploads = tempfile::tempdir().unwrap();
     let hello = b"hello\n";
     let staged = ContentHash::of(hello);
     assert!(matches!(
         transport
-            .upload_attachment(staged, Bytes::from_static(hello))
+            .upload_attachment(staged, upload_file(uploads.path(), "hello", hello))
             .await
             .unwrap(),
         UploadResult::Stored { .. }
@@ -1060,7 +1083,7 @@ async fn workdir_write_reaches_a_real_server() {
     let other_hash = ContentHash::of(other);
     assert!(matches!(
         transport
-            .upload_attachment(other_hash, Bytes::from_static(other))
+            .upload_attachment(other_hash, upload_file(uploads.path(), "other", other))
             .await
             .unwrap(),
         UploadResult::Stored { .. }
