@@ -3201,6 +3201,43 @@ fn withdrawing_puts_files_back_in_the_draft() {
 }
 
 #[test]
+fn record_file_exists_settles_and_keeps_the_hash() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let files = [draft_file("a"), draft_file("b")];
+    let store = Store::open(&dir).unwrap();
+    let command = send(session, "with files");
+    store.enqueue(&command, &files).unwrap();
+    let found = ContentHash::of(b"what the workdir holds");
+
+    assert!(
+        store
+            .record_file_exists(command.id, 1, found, at(1))
+            .unwrap()
+    );
+    // The first refusal is kept, hash and all.
+    assert!(
+        !store
+            .record_file_exists(command.id, 0, ContentHash::of(b"later"), at(2))
+            .unwrap()
+    );
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(
+        entry.status,
+        OutboxStatus::AttachmentRefused(AttachmentRefusal::FileExists)
+    );
+    assert!(entry.status.is_settled());
+    assert_eq!(entry.files[0].existing, None);
+    assert_eq!(entry.files[1].existing, Some(found));
+    // Settled, so it is never claimed for sending.
+    assert!(!store.claim_send(command.id, at(3)).unwrap());
+
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.outbox().unwrap()[0].files[1].existing, Some(found));
+}
+
+#[test]
 fn the_file_tables_come_with_the_migration() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());

@@ -2300,6 +2300,23 @@ impl Model {
         }
     }
 
+    /// Mirrors [`Store::record_file_exists`](crate::Store::record_file_exists).
+    pub(crate) fn command_file_exists(
+        &mut self,
+        id: CommandId,
+        position: usize,
+        existing: ContentHash,
+        now: DateTime<Utc>,
+    ) {
+        if let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) {
+            entry.status = OutboxStatus::AttachmentRefused(AttachmentRefusal::FileExists);
+            entry.answered_at = Some(now);
+            if let Some(file) = entry.files.get_mut(position) {
+                file.existing = Some(existing);
+            }
+        }
+    }
+
     /// Returns the approvals newly marked alerted, as
     /// [`apply_batch`](Model::apply_batch). Only a paired device has a
     /// link to set: unpaired, the link stays `Unpaired`.

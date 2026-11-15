@@ -1038,7 +1038,18 @@ logs) an event that no longer decodes rather than failing.
   answers.) A low disk
   stops the uploads and posts the message anyway, so the server's stored
   `DiskLow` refusal shows it and the outbox keeps moving. A HEAD or PUT that
-  fails in transport backs off like the command's own request. A third loop,
+  fails in transport backs off like the command's own request. After its
+  images, the sender writes each file of the message into the workdir root as
+  `<name>`: the file is uploaded as an attachment, then written with the
+  workdir write route, with the file's `replace`, and only then is the message
+  posted. The message text already names `./<name>`. A file whose device copy
+  is missing, or no longer hashes to its name, fails the message as `Missing`,
+  without a request. A workdir that already holds other content at the name
+  fails it as `AttachmentRefused(FileExists)`, and the hash found there is kept
+  on that file. An `Exists` or `Same` answer with our content counts as
+  written, so a resend after a lost answer is safe. A `NotStaged` answer
+  uploads the file once more; any other refusal fails the message as
+  `FileNotWritten`, or as `ServerDiskLow` on a low disk. A third loop,
   the draft stager, runs beside the pull and the sender: it uploads a draft's
   images as soon as they are attached (woken when a draft gains images), HEAD
   then PUT, each image once per connection. It only saves time, since the
