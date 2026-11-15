@@ -9,11 +9,13 @@
 //! to its name, so a name never holds a partial file. An interrupted upload's
 //! partial is kept, so the next `PUT` resumes it at [`Staging::resume`].
 //!
-//! Staging is a cache. [`Staging::stage_file`] keeps it under [`STAGING_MAX_BYTES`]
-//! by evicting the oldest files, and [`Staging::sweep`] removes files older
-//! than [`STAGING_MAX_AGE`] at startup. Eviction is garbage collection, not an
-//! outcome: a message naming an image that is no longer staged is refused as
-//! `UnknownAttachment` when its command arrives.
+//! Staging is a cache. [`Staging::finish`] keeps it under
+//! [`STAGING_MAX_BYTES`] by evicting the oldest files, and [`Staging::sweep`]
+//! removes files older than [`STAGING_MAX_AGE`] at startup, along with the
+//! temp files a server before v37 left behind (staging writes only partials
+//! now). Eviction is garbage collection, not an outcome: a message naming an
+//! image that is no longer staged is refused as `UnknownAttachment` when its
+//! command arrives.
 //!
 //! A `SendMessage` naming staged images takes each as a new blob: [`prepare`]
 //! hard-links every one into the blob store before the command's transaction
@@ -37,7 +39,8 @@ pub const STAGING_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Staged files last modified longer ago than this are removed at startup.
 pub const STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Prefix of the temp files a write is made in; never a staged image.
+/// Prefix of the temp files a server before v37 wrote uploads in; never a
+/// staged image. Nothing writes them since v37: the startup sweep removes them.
 const TEMP_PREFIX: &str = ".tmp-";
 /// Prefix of the file an interrupted upload left, followed by its sha256 hex;
 /// never a staged file.
@@ -67,71 +70,35 @@ impl Staging {
         self.path(sha256).is_file()
     }
 
-    /// Stages `bytes` under `sha256` and answers what the upload route
-    /// answers: the bytes go to a temp file, which [`Staging::stage_file`]
-    /// stages. Nothing is left behind on any refusal.
+    /// Stages `bytes` under `sha256` as one complete upload, and answers what
+    /// the upload route answers. The partial restarts, is written and is
+    /// finished, as a `PUT` at offset 0 would. Takes no upload lock: a caller
+    /// must not race a `PUT` of the same hash (tests and tools only). Nothing
+    /// is left behind on any refusal.
     pub fn stage(&self, sha256: ContentHash, bytes: &[u8]) -> Result<UploadResult> {
-        let mut file = self
-            .temp()
-            .context(|| format!("staging in {}", self.dir.display()))?;
-        file.write_all(bytes)
-            .context(|| format!("staging in {}", self.dir.display()))?;
-        self.stage_file(sha256, file)
-    }
-
-    /// A temp file in the staging directory: never a staged file, and deleted
-    /// when dropped unless [`Staging::stage_file`] persists it.
-    pub fn temp(&self) -> io::Result<tempfile::NamedTempFile> {
-        tempfile::Builder::new()
-            .prefix(TEMP_PREFIX)
-            .tempfile_in(&self.dir)
-    }
-
-    /// Stages the temp file `file`, holding the bytes that `sha256` names, and
-    /// answers what the upload route answers. A file already staged under
-    /// `sha256` is answered as stored, and `file` is deleted unwritten.
-    /// Otherwise `file` must hash to `sha256`; it is then synced and renamed
-    /// to its name, and the oldest files evicted down to
-    /// [`STAGING_MAX_BYTES`]. A refused `file` is deleted.
-    pub fn stage_file(
-        &self,
-        sha256: ContentHash,
-        file: tempfile::NamedTempFile,
-    ) -> Result<UploadResult> {
-        let path = self.path(sha256);
-        if let Some(stored) = self.existing(&path, sha256)? {
-            return Ok(stored);
+        let mut file = match self.resume(sha256, 0)? {
+            Resume::Append(file) => file,
+            Resume::Staged(answer) => return Ok(answer),
+            Resume::Mismatch { .. } => {
+                return Err(io::Error::other("a restart at offset 0 was refused"))
+                    .context(|| format!("staging in {}", self.dir.display()));
+            }
+        };
+        let written = file
+            .write_all(bytes)
+            .context(|| format!("staging in {}", self.dir.display()));
+        drop(file);
+        if let Err(e) = written {
+            let _ = self.drop_partial(sha256);
+            return Err(e);
         }
-        let opened =
-            File::open(file.path()).context(|| format!("opening {}", file.path().display()))?;
-        let hash =
-            ContentHash::read(opened).context(|| format!("reading {}", file.path().display()))?;
-        if hash != sha256 {
-            return Ok(UploadResult::HashMismatch);
-        }
-        let size = file
-            .as_file()
-            .metadata()
-            .context(|| format!("reading {}", file.path().display()))?
-            .len();
-        file.as_file()
-            .sync_all()
-            .context(|| format!("syncing {}", file.path().display()))?;
-        file.persist(&path)
-            .map_err(|e| e.error)
-            .context(|| format!("staging {}", path.display()))?;
-        if let Err(e) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
-            let _ = fs::remove_file(&path);
-            return Err(e).context(|| format!("staging {}", path.display()));
-        }
-        self.evict(STAGING_MAX_BYTES)?;
-        Ok(UploadResult::Stored { size })
+        self.finish(sha256)
     }
 
     /// Removes the oldest staged files, by modification time, until they
     /// total at most `cap` bytes; returns how many were removed. Temp files
-    /// and partials are not staged files: they are neither removed nor
-    /// counted.
+    /// (left by a server before v37) and partials are not staged files: they
+    /// are neither removed nor counted.
     pub fn evict(&self, cap: u64) -> Result<usize> {
         let mut staged: Vec<Entry> = self
             .files()?
@@ -153,11 +120,12 @@ impl Staging {
         Ok(removed)
     }
 
-    /// Removes the temp files and the files last modified more than
-    /// `max_age` ago; returns how many were removed. A partial is kept until
-    /// it is that old, so an upload resumes across a restart. A missing
-    /// directory has nothing to remove. Startup only: a write in flight is a
-    /// temp file, so nothing may be staging meanwhile.
+    /// Removes the temp files a server before v37 left, and the files last
+    /// modified more than `max_age` ago; returns how many were removed. A
+    /// partial is kept until it is that old, so an upload resumes across a
+    /// restart. A missing directory has nothing to remove. Startup only: a
+    /// temp file is removed whatever its age, so nothing may be writing one
+    /// meanwhile (no server since v37 writes any).
     pub fn sweep(&self, max_age: Duration) -> Result<usize> {
         let now = SystemTime::now();
         let mut removed = 0;
@@ -619,6 +587,36 @@ mod tests {
             }
         );
         assert_eq!(fs::read(staging.path(hash)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn stage_leaves_no_partial_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = ContentHash::of(&bytes);
+        assert_eq!(
+            staging.stage(hash, &bytes).unwrap(),
+            UploadResult::Stored {
+                size: bytes.len() as u64,
+            },
+            "control: the image under its own hash is stored"
+        );
+        assert!(!staging.partial(hash).exists(), "the partial was renamed");
+
+        let wrong = ContentHash::of(b"other bytes");
+        assert_eq!(
+            staging.stage(wrong, &bytes).unwrap(),
+            UploadResult::HashMismatch
+        );
+        assert!(
+            !staging.partial(wrong).exists(),
+            "the refused partial is gone"
+        );
+        assert!(
+            !staging.contains(wrong),
+            "nothing is staged under the wrong hash"
+        );
     }
 
     #[test]
