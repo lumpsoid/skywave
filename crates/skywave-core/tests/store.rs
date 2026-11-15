@@ -3238,6 +3238,58 @@ fn record_file_exists_settles_and_keeps_the_hash() {
 }
 
 #[test]
+fn requeue_replacing_clears_the_refusal_and_sets_replace() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let store = Store::open(&dir).unwrap();
+    let command = send(session, "with a file");
+    store.enqueue(&command, &[draft_file("a")]).unwrap();
+    let found = ContentHash::of(b"what the workdir holds");
+    assert!(
+        store
+            .record_file_exists(command.id, 0, found, at(1))
+            .unwrap()
+    );
+
+    assert!(store.requeue_replacing(command.id, &[(0, found)]).unwrap());
+    let pending = store.pending_outbox().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status, OutboxStatus::Queued);
+    assert_eq!(pending[0].answered_at, None);
+    assert_eq!(pending[0].files[0].file.replace, Some(found));
+    assert_eq!(pending[0].files[0].existing, None);
+    // The same entry is claimable for sending again.
+    assert!(store.claim_send(command.id, at(2)).unwrap());
+
+    // Nothing is refused any more, so a second requeue changes nothing.
+    assert!(!store.requeue_replacing(command.id, &[(0, found)]).unwrap());
+}
+
+#[test]
+fn requeue_replacing_leaves_other_refusals() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let store = Store::open(&dir).unwrap();
+    let command = send(session, "with a file");
+    store.enqueue(&command, &[draft_file("a")]).unwrap();
+    assert!(
+        store
+            .record_attachment_refused(command.id, AttachmentRefusal::Missing, at(1))
+            .unwrap()
+    );
+
+    let found = ContentHash::of(b"what the workdir holds");
+    assert!(!store.requeue_replacing(command.id, &[(0, found)]).unwrap());
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(
+        entry.status,
+        OutboxStatus::AttachmentRefused(AttachmentRefusal::Missing)
+    );
+    assert_eq!(entry.answered_at, Some(at(1)));
+    assert_eq!(entry.files[0].file.replace, None);
+}
+
+#[test]
 fn the_file_tables_come_with_the_migration() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());

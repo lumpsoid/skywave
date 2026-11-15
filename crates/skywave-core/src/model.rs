@@ -96,6 +96,13 @@ pub(crate) enum Effect {
         /// written with the rest; `None` leaves them as they are.
         files: Option<(SessionId, Vec<AttachedFile>)>,
     },
+    /// Requeue a message refused for a file already in the workdir, replacing
+    /// those files: each `(position, hash)` is the `replace` of that file
+    /// ([`Store::requeue_replacing`](crate::Store::requeue_replacing)).
+    Requeue {
+        id: CommandId,
+        replaces: Vec<(usize, ContentHash)>,
+    },
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
     /// Delete the session from this device's replica, then from the model
@@ -954,6 +961,7 @@ impl Model {
             }
             Action::Discard(id) => self.withdraw(id, false),
             Action::EditQueued(id) => self.withdraw(id, true),
+            Action::ResendReplacing(id) => self.resend_replacing(id),
             Action::ResolveApproval { id, decision, rule } => {
                 let granted = |rule| decision == Decision::Approve && self.offers(id, rule);
                 // A question takes answers; only a denial declines it.
@@ -1813,6 +1821,36 @@ impl Model {
             effects.push(Effect::Request(Request::DraftImagesChanged));
         }
         effects
+    }
+
+    /// Requeues the message `id` for the files its refusal found in the
+    /// workdir: each such file's `replace` becomes the hash found there, and
+    /// the message goes out next, keeping its place. Its `tries` and
+    /// `first_sent_at` stay. A no-op unless the entry is a message refused
+    /// with [`AttachmentRefusal::FileExists`] that found a file.
+    fn resend_replacing(&mut self, id: CommandId) -> Vec<Effect> {
+        let Some(entry) = self.outbox_entry(id) else {
+            return Vec::new();
+        };
+        let refused =
+            entry.status == OutboxStatus::AttachmentRefused(AttachmentRefusal::FileExists);
+        let is_message = matches!(entry.command.kind, CommandKind::SendMessage { .. });
+        if !refused || !is_message || entry.files.iter().all(|held| held.existing.is_none()) {
+            return Vec::new();
+        }
+        let mut replaces = Vec::new();
+        for (position, held) in entry.files.iter_mut().enumerate() {
+            if let Some(existing) = held.existing.take() {
+                held.file.replace = Some(existing);
+                replaces.push((position, existing));
+            }
+        }
+        entry.status = OutboxStatus::Queued;
+        entry.answered_at = None;
+        vec![
+            Effect::Requeue { id, replaces },
+            Effect::Request(Request::OutboxChanged),
+        ]
     }
 
     /// The images an edited message puts back into `session_id`'s agent
@@ -8710,6 +8748,104 @@ mod tests {
             ]
         );
         assert_eq!(draft_files(&f), vec![a, b]);
+    }
+
+    /// The files and outgoing state of the open session's pending message
+    /// `command`.
+    fn pending_item(f: &Fixture, command: CommandId) -> (Vec<OutboxFile>, Outgoing) {
+        f.session_view()
+            .timeline
+            .into_iter()
+            .find_map(|item| match item {
+                TimelineItem::Pending {
+                    command_id,
+                    files,
+                    outgoing,
+                    ..
+                } if command_id == command => Some((files, outgoing)),
+                _ => None,
+            })
+            .expect("the message is pending")
+    }
+
+    #[test]
+    fn a_found_file_is_kept_on_the_entry() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: draft_file("a.txt", 1),
+        });
+        let command = send(&mut f, sid, "look");
+        let found = ContentHash::of(b"what the workdir holds");
+
+        f.model
+            .command_file_exists(command.id, 0, found, Utc::now());
+
+        let (files, outgoing) = pending_item(&f, command.id);
+        assert_eq!(files[0].existing, Some(found));
+        assert_eq!(
+            outgoing,
+            Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::FileExists))
+        );
+    }
+
+    #[test]
+    fn resending_replacing_requeues_with_the_found_hash() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: draft_file("a.txt", 1),
+        });
+        let command = send(&mut f, sid, "look");
+        let found = ContentHash::of(b"what the workdir holds");
+        f.model
+            .command_file_exists(command.id, 0, found, Utc::now());
+
+        assert_eq!(
+            f.dispatch(Action::ResendReplacing(command.id)),
+            vec![
+                Effect::Requeue {
+                    id: command.id,
+                    replaces: vec![(0, found)],
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        let (files, outgoing) = pending_item(&f, command.id);
+        assert_eq!(outgoing, Outgoing::Queued);
+        assert_eq!(files[0].file.replace, Some(found));
+        assert_eq!(files[0].existing, None);
+        // Requeued, it is no longer a refusal to resend.
+        assert!(f.dispatch(Action::ResendReplacing(command.id)).is_empty());
+    }
+
+    #[test]
+    fn resending_replacing_is_a_no_op_otherwise() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let queued_message = send(&mut f, sid, "queued");
+        let missing = send(&mut f, sid, "missing");
+        f.model
+            .command_attachment_refused(missing.id, AttachmentRefusal::Missing, Utc::now());
+
+        assert!(
+            f.dispatch(Action::ResendReplacing(queued_message.id))
+                .is_empty()
+        );
+        assert!(f.dispatch(Action::ResendReplacing(missing.id)).is_empty());
+        assert!(
+            f.dispatch(Action::ResendReplacing(CommandId::new()))
+                .is_empty()
+        );
+        assert_eq!(
+            pending_item(&f, missing.id).1,
+            Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::Missing))
+        );
     }
 
     #[test]

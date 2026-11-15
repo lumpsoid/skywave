@@ -227,6 +227,10 @@ pub enum Action {
     /// into the shell draft, with its `when`. The session view's
     /// `draft_rev` changes so heads refill their composer.
     EditQueued(CommandId),
+    /// Send again a message the outbox refused because a file it writes is
+    /// already in the workdir with other content, replacing that file this
+    /// time. The head asks the user first. A no-op for any other entry.
+    ResendReplacing(CommandId),
     /// Answer an approval. `rule` grants the prompt's suggestion with that
     /// index along with an approval; with a denial, or an index the prompt
     /// does not offer, the action is a no-op.
