@@ -1233,6 +1233,9 @@ async fn stage_one(
         UploadResult::DiskLow => ImageStaging::DiskLow,
         UploadResult::TooLarge => ImageStaging::Refused(AttachmentRefusal::TooLarge),
         UploadResult::HashMismatch => ImageStaging::Refused(AttachmentRefusal::HashMismatch),
+        UploadResult::OffsetMismatch { .. } => {
+            return Err(TransportError::Io("upload offset mismatch".to_owned()));
+        }
     })
 }
 
@@ -1367,6 +1370,9 @@ async fn write_one(
                 }
                 UploadResult::DiskLow => {
                     return Ok(FileWrite::Refused(AttachmentRefusal::ServerDiskLow));
+                }
+                UploadResult::OffsetMismatch { .. } => {
+                    return Err(TransportError::Io("upload offset mismatch".to_owned()));
                 }
             }
         }
