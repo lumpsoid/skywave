@@ -1051,9 +1051,11 @@ logs) an event that no longer decodes rather than failing.
   is really down fails the pull, which ends the connection. Before a message
   with images is posted (D50), the outbox stages them: each image is checked with a
   HEAD on every attempt and PUT from its local file when the server does not
-  hold it, since the server unlinks the staged files a message used, so
-  nothing is cached. A missing or too-large local file, or an upload the
-  server refuses as too large or a hash mismatch, fails the message as
+  hold it (the PUT streams the file from disk, a 64 KiB chunk at a time, and
+  never reads it whole), since the server unlinks the staged files a message
+  used, so nothing is cached. A missing, unreadable or too-large local file,
+  or an upload the server refuses as too large or a hash mismatch, fails the
+  message as
   `AttachmentRefused`: final, discardable, never posted. (An outbox entry
   stored before v36 may carry `NotAnImage`, which the server no longer
   answers.) A low disk
@@ -1384,9 +1386,12 @@ logs) an event that no longer decodes rather than failing.
   stored, in flight or failed, each with its `fetch`, `result` and `blob`.
   `Action::PushWorkdirFile { session_id, source, path, replace }` makes a
   `Request::PushWorkdirFile`, which the engine's `push_workdir_file` carries
-  out: it reads the device file where it is (not copied into the data dir),
-  hashes the bytes read, HEADs `/v1/attachments/{sha256}` and PUTs them unless
-  the server holds them, then posts the write route. `WorkdirView.pushes`
+  out: it hashes the device file where it is (not copied into the data dir)
+  by a streaming read, HEADs `/v1/attachments/{sha256}` and, unless the server
+  holds them, PUTs the bytes hashed, streamed from the file, so a push of up to
+  256 MiB holds one chunk in memory; a file changed between the hash and the
+  PUT is the server's `HashMismatch`. Then it posts the write route.
+  `WorkdirView.pushes`
   lists the session's pushes with a `PushState` (`Pushing`, `Failed`, or
   `Done(PushOutcome)`); a push the server answers `Exists` is
   `Done(Written(Exists { sha256, size }))`, the hash the GUI's Replace… resends

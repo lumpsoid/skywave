@@ -6,6 +6,7 @@
 //! the link harness can wrap or inject one.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +48,14 @@ impl ExpectedRun {
     pub fn get(&self) -> Option<RunId> {
         *self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// A device file to upload: the first `len` bytes of `path`, the bytes
+/// whose hash names the upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFile {
+    pub path: PathBuf,
+    pub len: u64,
 }
 
 /// The v1 API as seen by a paired device.
@@ -196,15 +205,15 @@ pub trait Transport: Send + Sync {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 
-    /// `PUT /v1/attachments/{sha256}`: stage an image's bytes under their
-    /// hash. A refusal is an `Ok` [`UploadResult`], not an error. Defaults to
+    /// `PUT /v1/attachments/{sha256}`: stage a device file under its hash. A
+    /// refusal is an `Ok` [`UploadResult`], not an error. Defaults to
     /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
     fn upload_attachment(
         &self,
         sha256: ContentHash,
-        bytes: Bytes,
+        file: UploadFile,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
-        let _ = (sha256, bytes);
+        let _ = (sha256, file);
         Box::pin(async { Err(TransportError::NotFound) })
     }
 
