@@ -1540,12 +1540,11 @@ async fn refuse_upload(
 /// included, pass `upload_max`, and the partial goes. A `content-length` that
 /// already takes the file past it is `TooLarge` before the body is read. A low
 /// disk is `DiskLow`: checked before anything is written and again before each
-/// write, so an
-/// upload stops once the disk turns low. One `PUT` per sha256 writes at a
-/// time; the others wait for its lock. The lock is held until the file work
-/// ends, even if the client has gone away: that work runs on a task of its
-/// own ([`write_upload`]), so a later `PUT` never meets a partial still being
-/// written.
+/// write, so an upload stops once the disk turns low. One `PUT` per sha256
+/// writes at a time; the others wait for its lock. The lock is held until the
+/// file work ends, even if the client has gone away: that work runs on a task
+/// of its own ([`write_upload`]), so a later `PUT` never meets a partial still
+/// being written.
 async fn stage_attachment(
     State(api): State<Arc<Api>>,
     sha256: std::result::Result<Path<String>, PathRejection>,

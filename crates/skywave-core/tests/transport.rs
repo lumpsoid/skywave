@@ -595,8 +595,8 @@ async fn an_interrupted_upload_resumes_on_a_real_server() {
 
 /// An upload over the server's cap is refused, and one of exactly the cap is
 /// stored: the `100 Continue` comes from a real server and the body follows
-/// it. The refusal is found mid-body today; the server answers it before the
-/// body once it checks `content-length`.
+/// it. The server answers the refusal from the `content-length`, before it
+/// asks for the body.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_over_the_cap_is_refused_on_a_real_server() {
     let options = ServerOptions {
