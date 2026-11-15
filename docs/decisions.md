@@ -1528,3 +1528,29 @@ push-to-workdir (an existing file is refused unless the head resends with
   see a path the user does not.
 - A configurable default directory. It is a setting for one rule.
 - Writing at attach time. See above.
+
+## D58. An interrupted upload resumes where the server stopped (v37)
+A dropped link used to restart `PUT /v1/attachments/{sha256}` from byte
+zero, so a large file on a bad network might never finish. The server now
+keeps what an interrupted PUT wrote, as `attachments/.part-<sha256 hex>`,
+and the device resumes from there.
+
+**Decided:** "HEAD stays 204/404; a 404 carries `skywave-upload-offset: N`
+when the server holds N bytes. PUT takes an optional `skywave-upload-offset:
+N` (absent = 0 = restart) and appends; any other N answers
+`OffsetMismatch { have }`, and the device re-PUTs from `have`."
+
+- One PUT per sha256 writes at a time; the others wait on a per-hash lock.
+- Partials survive a restart, are never evicted, and are swept by age (7
+  days) like staged files. `TooLarge`, `HashMismatch` and `Stored` drop
+  the partial.
+- The device starts at the held bytes (0 if more than the file), re-PUTs
+  from 0 once after a `HashMismatch` to a resumed PUT, and gives up after
+  3 PUTs with a retryable transport error, so the next attempt starts
+  from the HEAD again.
+
+**Rejected:**
+- A `Range`-style `Content-Range` on PUT. A custom header with one meaning
+  is simpler to check than a range grammar.
+- Keeping partials in memory. A restart would lose them, which is the
+  failure the feature exists for.
