@@ -48,6 +48,8 @@ TimelineRow anyRow(
   tool: tool,
   sections: sections,
   images: images,
+  files: const [],
+  canResendReplacing: false,
 );
 
 ToolFacts shellFacts(String title, {ToolState state = ToolState.done}) =>
@@ -87,6 +89,7 @@ const composerAt1 = ComposerView(
   shellEnabled: false,
   canStop: false,
   images: [],
+  files: [],
   preparing: 0,
 );
 

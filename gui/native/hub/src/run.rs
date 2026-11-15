@@ -21,12 +21,11 @@ use std::task::Poll;
 
 use rinf::{DartSignal, DartSignalPack, RustSignal, SignalReceiver};
 use skywave_core::SessionId;
-use skywave_core::attachment::AttachedImage;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
-use crate::attach::prepare_image;
+use crate::attach::{Prepared, prepare_attachment};
 use crate::boot::{self, Running};
 use crate::dispatcher::Report;
 use crate::head::{Clock, Head, Out};
@@ -349,7 +348,7 @@ async fn run(
     head.set_data_dir(hub.data_dir.clone());
     recovery.stepped(*head.awake());
     let mut shown = None;
-    // Images prepared off this task answer here, in the order they finish.
+    // Attachments prepared off this task answer here, in the order they finish.
     let (prepared_tx, mut prepared) = unbounded_channel();
     loop {
         // Read afresh each turn: what is due changes with every step.
@@ -433,7 +432,7 @@ fn perform(
     outs: Vec<Out>,
     hub: &Running,
     shown: &mut Option<&'static str>,
-    prepared: &UnboundedSender<(SessionId, Result<AttachedImage, String>)>,
+    prepared: &UnboundedSender<(SessionId, Result<Prepared, String>)>,
 ) {
     for out in outs {
         match out {
@@ -459,10 +458,10 @@ fn perform(
                 let (data_dir, done) = (hub.data_dir.clone(), prepared.clone());
                 tokio::spawn(async move {
                     let result =
-                        tokio::task::spawn_blocking(move || prepare_image(&data_dir, source))
+                        tokio::task::spawn_blocking(move || prepare_attachment(&data_dir, source))
                             .await
                             .unwrap_or_else(|err| {
-                                Err(format!("the image could not be prepared: {err}"))
+                                Err(format!("the attachment could not be prepared: {err}"))
                             });
                     // Nothing waits for the answer once the loop has ended.
                     let _ = done.send((session_id, result));

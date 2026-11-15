@@ -121,15 +121,17 @@ pub enum GuiIntent {
         session_id: String,
         snippet_id: String,
     },
-    /// Attach an image file at `path` (the picker's or a drop's) to the
-    /// session's agent draft. The hub prepares it off the dispatch path and
-    /// answers a refusal as a notice; a session not open is ignored.
-    AttachImageFile {
+    /// Attach the file at `path` (the picker's or a drop's) to the session's
+    /// agent draft. An image (by content) is prepared as one; any other file
+    /// is copied and written into the workdir root as its file name when the
+    /// message is sent. The hub prepares it off the dispatch path and answers
+    /// a refusal as a notice; a session not open is ignored.
+    AttachFile {
         session_id: String,
         path: String,
     },
     /// Attach image bytes (a paste's or a keyboard insert's), as
-    /// `AttachImageFile`. `mime` is what the platform said; the hub sniffs
+    /// `AttachFile`. `mime` is what the platform said; the hub sniffs
     /// the bytes itself.
     AttachImageBytes {
         session_id: String,
@@ -141,6 +143,11 @@ pub enum GuiIntent {
     DetachImage {
         session_id: String,
         sha256: String,
+    },
+    /// Take the file called `name` off the session's agent draft.
+    DetachFile {
+        session_id: String,
+        name: String,
     },
     /// Show only the conversation, tool calls hidden, in every session; or
     /// every row again.
@@ -521,6 +528,11 @@ pub enum ActionIntent {
     },
     /// Ask the server for its worktree list again, on the worktrees screen.
     RefreshWorktrees,
+    /// Send again a message refused because a file it writes is already in
+    /// the workdir, replacing that file; the GUI asks the user first.
+    ResendReplacing {
+        command_id: String,
+    },
 }
 
 /// A login code as pasted. A secret: `Debug` prints `<redacted>`, so an

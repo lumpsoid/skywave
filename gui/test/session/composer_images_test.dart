@@ -49,6 +49,7 @@ ComposerView _draft({
   shellEnabled: false,
   canStop: false,
   images: images,
+  files: const [],
   preparing: preparing,
 );
 
@@ -124,9 +125,9 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('attach-image')));
     await tester.pumpAndSettle();
-    expect(sent.whereType<GuiIntentAttachImageFile>(), [
-      const GuiIntentAttachImageFile(sessionId: 's1', path: '/a.png'),
-      const GuiIntentAttachImageFile(sessionId: 's1', path: '/b.jpg'),
+    expect(sent.whereType<GuiIntentAttachFile>(), [
+      const GuiIntentAttachFile(sessionId: 's1', path: '/a.png'),
+      const GuiIntentAttachFile(sessionId: 's1', path: '/b.jpg'),
     ]);
 
     // Control: a cancelled pick attaches nothing.
@@ -136,7 +137,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('attach-image')));
     await tester.pumpAndSettle();
-    expect(sent.whereType<GuiIntentAttachImageFile>(), isEmpty);
+    expect(sent.whereType<GuiIntentAttachFile>(), isEmpty);
   });
 
   testWidgets(
@@ -282,9 +283,9 @@ void main() {
         ),
       );
       await tester.pump();
-      expect(sent.whereType<GuiIntentAttachImageFile>(), [
-        const GuiIntentAttachImageFile(sessionId: 's1', path: '/a.png'),
-        const GuiIntentAttachImageFile(sessionId: 's1', path: '/b.txt'),
+      expect(sent.whereType<GuiIntentAttachFile>(), [
+        const GuiIntentAttachFile(sessionId: 's1', path: '/a.png'),
+        const GuiIntentAttachFile(sessionId: 's1', path: '/b.txt'),
       ]);
 
       // Control: in shell mode the drop target is off.

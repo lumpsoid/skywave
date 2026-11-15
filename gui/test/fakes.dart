@@ -54,6 +54,8 @@ TimelineRow row(String key, String text) => TimelineRow(
   discardable: false,
   sections: const [],
   images: const [],
+  files: const [],
+  canResendReplacing: false,
 );
 
 /// An own message, pending or logged.
@@ -73,6 +75,8 @@ TimelineRow message(String key, String text, {required bool pending}) =>
       discardable: pending,
       sections: const [],
       images: const [],
+      files: const [],
+      canResendReplacing: false,
     );
 
 const _composer = ComposerView(
@@ -83,6 +87,7 @@ const _composer = ComposerView(
   shellEnabled: false,
   canStop: false,
   images: [],
+  files: [],
   preparing: 0,
 );
 
