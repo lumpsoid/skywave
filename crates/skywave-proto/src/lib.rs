@@ -202,7 +202,13 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// message's image is checked when the message names it. `POST`
 /// [`path::WORKDIR_WRITE`] writes a staged upload into a workdir
 /// ([`WriteFileResult`]), logged as the event [`EventKind::FileWritten`].
-pub const PROTOCOL_VERSION: u32 = 36;
+///
+/// v37: resumable staging. A `HEAD` [`path::ATTACHMENT_ROUTE`] 404 carries
+/// [`UPLOAD_OFFSET_HEADER`] when the server holds part of the file from an
+/// interrupted upload; a `PUT` with that header sends the rest, and
+/// [`UploadResult::OffsetMismatch`] answers one whose offset is not what the
+/// server holds.
+pub const PROTOCOL_VERSION: u32 = 37;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2823,7 +2829,16 @@ pub enum UploadResult {
     HashMismatch,
     /// The server's disk is low; nothing stored.
     DiskLow,
+    /// The `PUT`'s [`UPLOAD_OFFSET_HEADER`] is not the number of bytes the
+    /// server holds of this file; nothing written. Send again from `have`.
+    OffsetMismatch { have: u64 },
 }
+
+/// The byte offset of an upload. On `PUT` [`path::ATTACHMENT_ROUTE`]: the
+/// body is the file from this byte on (absent means 0, the whole file). On
+/// a `HEAD` 404: the bytes the server already holds from an interrupted
+/// upload (absent means none).
+pub const UPLOAD_OFFSET_HEADER: &str = "skywave-upload-offset";
 
 /// Response to `GET /v1/usage-limits` (no query), always 200: every outcome
 /// is a domain answer. The limits belong to the account the server's agent

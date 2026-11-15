@@ -426,9 +426,9 @@ fn push_row(push: &WorkdirPush) -> WorkdirPushRow {
             None,
             true,
         ),
-        PushState::Done(PushOutcome::UploadRefused(UploadResult::Stored { .. })) => {
-            ("Push failed".to_owned(), false, false, None, true)
-        }
+        PushState::Done(PushOutcome::UploadRefused(
+            UploadResult::Stored { .. } | UploadResult::OffsetMismatch { .. },
+        )) => ("Push failed".to_owned(), false, false, None, true),
         PushState::Done(PushOutcome::Written(WriteFileResult::Written { size, .. })) => (
             format!("Written \u{b7} {}", bytes(*size)),
             false,
