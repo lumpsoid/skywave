@@ -22,9 +22,9 @@ use skywave_proto::{
 use crate::address::ServerAddress;
 use crate::attachment::attachment_path;
 use crate::blobs::{blob_dir, remove_all_blob_files, remove_blob_files};
-use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
+use crate::client::{BlobLease, Core, CoreError, State, blocking, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
-use crate::projection::BlobFate;
+use crate::projection::{BlobFate, blob_refs};
 use crate::store::{
     Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
     PendingCrop, ServerFacts, Settings, StoreError,
@@ -168,13 +168,14 @@ impl Seam {
     /// [`CoreError::Superseded`] and its link changes are ignored, so work
     /// still running for the old server cannot reach the new replica.
     pub(crate) fn bind(&self) -> Option<(Seam, Arc<Pairing>)> {
-        let state = lock(&self.core.shared.state);
-        let pairing = state.pairing.clone()?;
-        let bound = Seam {
-            core: self.core.clone(),
-            epoch: Some(state.server_epoch),
-        };
-        Some((bound, pairing))
+        self.with_state(|state| {
+            let pairing = state.pairing.clone()?;
+            let bound = Seam {
+                core: self.core.clone(),
+                epoch: Some(state.server_epoch),
+            };
+            Some((bound, pairing))
+        })
     }
 
     /// Spawns `work`, as `what`, on the current runtime; a panic in it
@@ -196,6 +197,11 @@ impl Seam {
         self.epoch.is_none_or(|epoch| epoch == state.server_epoch)
     }
 
+    /// Locks the state for `access`, off the async workers (see `blocking`).
+    fn with_state<R>(&self, access: impl FnOnce(&mut State) -> R) -> R {
+        blocking(|| access(&mut lock(&self.core.shared.state)))
+    }
+
     /// The request channel. There is one receiver; later calls get `None`.
     pub fn take_requests(&self) -> Option<Receiver<Request>> {
         lock(&self.core.shared.request_rx).take()
@@ -209,27 +215,27 @@ impl Seam {
     /// The device's pairing — its identity and the server's addresses —
     /// `None` before pairing.
     pub fn pairing(&self) -> Option<Arc<Pairing>> {
-        lock(&self.core.shared.state).pairing.clone()
+        self.with_state(|state| state.pairing.clone())
     }
 
     pub fn settings(&self) -> Result<Settings, CoreError> {
-        Ok(lock(&self.core.shared.state).store.settings()?)
+        Ok(self.with_state(|state| state.store.settings())?)
     }
 
     /// Seq of the newest applied event: where the pull resumes.
     pub fn cursor(&self) -> Result<Seq, CoreError> {
-        Ok(lock(&self.core.shared.state).store.cursor()?)
+        Ok(self.with_state(|state| state.store.cursor())?)
     }
 
     /// Commands awaiting a result, in send order.
     pub fn pending_outbox(&self) -> Result<Vec<OutboxEntry>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.pending_outbox()?)
+        Ok(self.with_state(|state| state.store.pending_outbox())?)
     }
 
     /// The images agent drafts hold, each hash once: a session's in the
     /// order they were attached.
     pub fn draft_image_hashes(&self) -> Result<Vec<ContentHash>, CoreError> {
-        let drafts = lock(&self.core.shared.state).store.draft_images()?;
+        let drafts = self.with_state(|state| state.store.draft_images())?;
         let mut seen = HashSet::new();
         Ok(drafts
             .values()
@@ -240,12 +246,12 @@ impl Seam {
     }
 
     pub fn blobs(&self) -> Result<Vec<BlobRecord>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.blobs()?)
+        Ok(self.with_state(|state| state.store.blobs())?)
     }
 
     /// One blob, `None` if no event references it.
     pub fn blob(&self, id: BlobId) -> Result<Option<BlobRecord>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.blob(id)?)
+        Ok(self.with_state(|state| state.store.blob(id))?)
     }
 
     /// One blob with the lease a download of it holds: its reports through
@@ -255,30 +261,31 @@ impl Seam {
         &self,
         id: BlobId,
     ) -> Result<Option<(BlobRecord, BlobLease)>, CoreError> {
-        let mut state = lock(&self.core.shared.state);
-        let Some(record) = state.store.blob(id)? else {
-            return Ok(None);
-        };
-        Ok(Some((record, state.blob_lease(id))))
+        self.with_state(|state| {
+            let Some(record) = state.store.blob(id)? else {
+                return Ok(None);
+            };
+            Ok(Some((record, state.blob_lease(id))))
+        })
     }
 
     /// The crops this device still makes itself, in log order
     /// ([`Store::pending_crops`](crate::Store::pending_crops)).
     pub fn pending_crops(&self) -> Result<Vec<PendingCrop>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.pending_crops()?)
+        Ok(self.with_state(|state| state.store.pending_crops())?)
     }
 
     /// The pending crop that makes `into`, if any: a worker claiming
     /// `into` makes it locally first, however it was queued.
     pub(crate) fn pending_crop_into(&self, into: BlobId) -> Result<Option<PendingCrop>, CoreError> {
-        Ok(lock(&self.core.shared.state)
-            .store
-            .pending_crop_into(into)?)
+        Ok(self.with_state(|state| state.store.pending_crop_into(into))?)
     }
 
     /// Whether the server deleted or cropped `id`: it no longer serves it.
     pub(crate) fn blob_fated(&self, id: BlobId) -> Result<bool, CoreError> {
-        Ok(lock(&self.core.shared.state).store.blob_fate(id)?.is_some())
+        Ok(self
+            .with_state(|state| state.store.blob_fate(id))?
+            .is_some())
     }
 
     /// What a local crop needs: `crop.into`'s record with the lease its
@@ -289,25 +296,28 @@ impl Seam {
         &self,
         crop: PendingCrop,
     ) -> Result<Option<(BlobRecord, BlobLease, Option<CropSource>)>, CoreError> {
-        let mut state = lock(&self.core.shared.state);
-        let Some(record) = state.store.blob(crop.into)? else {
-            return Ok(None);
-        };
-        let lease = state.blob_lease(crop.into);
-        let path = match state.store.blob(crop.from)? {
-            Some(BlobRecord {
-                status: BlobStatus::Available { path },
-                ..
-            }) => Some(path),
-            _ => None,
-        };
-        let source = match (path, state.store.blob_fate(crop.from)?) {
-            (Some(path), Some(BlobFate::Cropped { into, kept, .. })) if into.id == crop.into => {
-                Some(CropSource { path, kept })
-            }
-            _ => None,
-        };
-        Ok(Some((record, lease, source)))
+        self.with_state(|state| {
+            let Some(record) = state.store.blob(crop.into)? else {
+                return Ok(None);
+            };
+            let lease = state.blob_lease(crop.into);
+            let path = match state.store.blob(crop.from)? {
+                Some(BlobRecord {
+                    status: BlobStatus::Available { path },
+                    ..
+                }) => Some(path),
+                _ => None,
+            };
+            let source = match (path, state.store.blob_fate(crop.from)?) {
+                (Some(path), Some(BlobFate::Cropped { into, kept, .. }))
+                    if into.id == crop.into =>
+                {
+                    Some(CropSource { path, kept })
+                }
+                _ => None,
+            };
+            Ok(Some((record, lease, source)))
+        })
     }
 
     /// The local crop of `crop` ended, made or not: the blob it was made
@@ -343,7 +353,10 @@ impl Seam {
     pub fn apply_events(&self, batch: &EventBatch) -> Result<Applied, CoreError> {
         let now = Utc::now();
         let data_dir = self.data_dir();
-        self.update(|state, requests| {
+        // Before the state lock: copying and syncing a local image takes
+        // long enough to hold off every dispatch and snapshot.
+        let prepared = blocking(|| prepare_own_images(&data_dir, batch));
+        let result = self.update(|state, requests| {
             let mut applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
@@ -366,9 +379,21 @@ impl Seam {
                 requests.push(Request::BlobsPurged(applied.purged.clone()));
             }
             // After the model took the batch: it registers the blobs there.
-            own_images_available(state, &data_dir, &mut applied);
+            own_images_available(state, &data_dir, &prepared, &mut applied);
             Ok(applied)
-        })
+        });
+        blocking(|| {
+            for id in &prepared {
+                match std::fs::remove_file(own_image_temp(&data_dir, *id)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(?id, %error, "cannot remove a local image's temporary file");
+                    }
+                }
+            }
+        });
+        result
     }
 
     /// The server said `hello`: keep the names of its devices, whether it
@@ -390,7 +415,7 @@ impl Seam {
     /// The run of the server to ask a connection's `hello` about
     /// ([`Store::server_run`](crate::Store::server_run)).
     pub fn server_run(&self) -> Result<Option<skywave_proto::RunId>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.server_run()?)
+        Ok(self.with_state(|state| state.store.server_run())?)
     }
 
     /// A connection's `hello`, before anything is pulled or sent on it:
@@ -403,7 +428,7 @@ impl Seam {
     /// Devices `batch` names that this device knows no name for: paired
     /// since the last `hello`, or never listed.
     pub fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
-        lock(&self.core.shared.state).model.unnamed_devices(batch)
+        self.with_state(|state| state.model.unnamed_devices(batch))
     }
 
     /// Claims the command for the transport, durably, before it is sent
@@ -521,16 +546,16 @@ impl Seam {
     }
 
     pub fn set_link(&self, link: PairedLink) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 if self.current(state) {
                     let alerted = state.model.set_link(link);
                     mark_alerted(state, &alerted);
                 }
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::Workdir`] `req`, for `ask`. In one update:
@@ -608,13 +633,13 @@ impl Seam {
     /// The answer to [`Request::ListDirs`] `req`. Kept in memory only; an
     /// answer to an older request than the latest is ignored.
     pub fn dirs_listed(&self, req: u64, result: Result<DirsResult, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.dirs_listed(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::ListConversations`] `req`. Kept in memory
@@ -625,37 +650,37 @@ impl Seam {
         req: u64,
         result: Result<ConversationsResult, TransportError>,
     ) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.conversations_listed(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::Storage`] `req`. Kept in memory only; an
     /// answer to an older request than the latest is ignored.
     pub fn storage_reported(&self, req: u64, result: Result<StorageReport, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.storage_reported(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::Worktrees`] `req`. Kept in memory only; an
     /// answer to an older request than the latest is ignored.
     pub fn worktrees_listed(&self, req: u64, result: Result<WorktreeList, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.worktrees_listed(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::UsageLimits`] `req`. In one update: an
@@ -702,13 +727,13 @@ impl Seam {
     /// The answer to [`Request::LoginStart`] `req`. Kept in memory only;
     /// an answer to any request but the one the login waits on is ignored.
     pub fn login_started(&self, req: u64, result: Result<LoginStartResult, TransportError>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.login_started(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// The answer to [`Request::LoginFinish`] `req`. An answer to any
@@ -747,13 +772,13 @@ impl Seam {
     /// could not be read. Kept in memory only; an answer to any request but
     /// the one the crop page on screen waits on is ignored.
     pub fn lines_counted(&self, req: u64, result: std::io::Result<u64>) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.lines_counted(req, result);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// Pairing with the server at `address` returned these credentials:
@@ -819,13 +844,13 @@ impl Seam {
     /// Pairing failed; the pairing screen shows `reason`.
     pub fn pairing_failed(&self, reason: impl Into<String>) {
         let reason = reason.into();
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.pairing_failed(reason);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// Download progress or completion of a blob.
@@ -917,13 +942,13 @@ impl Seam {
     /// resumed them; the views say so. Nothing is stored: a restart
     /// resumes.
     pub(crate) fn blobs_disk_full(&self, full: bool) {
-        self.core
-            .shared
-            .update::<(), Infallible>(|state, _| {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.set_blobs_disk_full(full);
                 Ok(())
             })
-            .unwrap_or_else(|never| match never {});
+        })
+        .unwrap_or_else(|never| match never {});
     }
 
     /// Runs a change that persists before touching the model, so a failed
@@ -934,11 +959,13 @@ impl Seam {
         &self,
         change: impl FnOnce(&mut State, &mut Vec<Request>) -> Result<R, CoreError>,
     ) -> Result<R, CoreError> {
-        self.core.shared.update(|state, requests| {
-            if !self.current(state) {
-                return Err(CoreError::Superseded);
-            }
-            change(state, requests)
+        blocking(|| {
+            self.core.shared.update(|state, requests| {
+                if !self.current(state) {
+                    return Err(CoreError::Superseded);
+                }
+                change(state, requests)
+            })
         })
     }
 }
@@ -963,13 +990,20 @@ fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
     }
 }
 
-/// Makes the device's own message images available from their local files,
-/// rather than downloading them: each blob the batch registered whose hash
-/// is an attachment here. Those are taken out of `applied.blobs`, so the
-/// engine does not queue them. A blob whose file cannot be had stays as it
-/// is and downloads as normal. A store error is logged, and the blobs it
-/// touches download as normal.
-fn own_images_available(state: &mut State, data_dir: &Path, applied: &mut Applied) {
+/// Makes the device's own message images available, rather than downloading
+/// them, in the locked change that applies the batch. Each blob the batch
+/// registered as not downloaded whose file `prepare_own_images` made is
+/// renamed from `<id>.own` onto its blob file, marked available, and taken
+/// out of `applied.blobs`, so the engine does not queue it. Doing it in that
+/// one change means no snapshot shows such a blob as not downloaded. A blob
+/// whose file was not made stays as it is and downloads. A store error is
+/// logged, and the blob it touches downloads as normal.
+fn own_images_available(
+    state: &mut State,
+    data_dir: &Path,
+    prepared: &HashSet<BlobId>,
+    applied: &mut Applied,
+) {
     let own = match state.store.own_images(&applied.blobs) {
         Ok(own) => own,
         Err(error) => {
@@ -977,14 +1011,16 @@ fn own_images_available(state: &mut State, data_dir: &Path, applied: &mut Applie
             return;
         }
     };
-    for (id, sha256) in own {
-        let path = match own_image_file(data_dir, id, sha256) {
-            Ok(path) => path,
-            Err(error) => {
-                tracing::debug!(?id, %error, "cannot use the local image; it downloads");
-                continue;
-            }
-        };
+    for (id, _) in own {
+        if !prepared.contains(&id) {
+            tracing::debug!(?id, "cannot use the local image; it downloads");
+            continue;
+        }
+        let path = blob_dir(data_dir).join(id.0.to_string());
+        if let Err(error) = std::fs::rename(own_image_temp(data_dir, id), &path) {
+            tracing::debug!(?id, %error, "cannot use the local image; it downloads");
+            continue;
+        }
         let status = BlobStatus::Available { path };
         if let Err(error) = state.store.set_blob_status(id, &status) {
             tracing::warn!(?id, %error, "cannot store the local image; it downloads");
@@ -995,27 +1031,59 @@ fn own_images_available(state: &mut State, data_dir: &Path, applied: &mut Applie
     }
 }
 
-/// Puts the attachment `sha256` at the blob file of `id`: a hard link, or a
-/// copy where linking fails, synced before it is used. A file already at
-/// that path is replaced, as it is no proof of the content.
-fn own_image_file(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<PathBuf> {
-    let dir = blob_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
-    let dst = dir.join(id.0.to_string());
-    match std::fs::remove_file(&dst) {
+/// Makes `<id>.own` for each blob `batch` references whose bytes are an
+/// attachment this device holds, and returns the ids made: the only ones
+/// `own_images_available` may rename into place. A file that cannot be made
+/// is logged, and its blob downloads. Attachment files are removed only at
+/// store open, so a file found here is still there when the batch applies.
+fn prepare_own_images(data_dir: &Path, batch: &EventBatch) -> HashSet<BlobId> {
+    let mut prepared = HashSet::new();
+    for (_, event) in batch.iter() {
+        for blob in blob_refs(&event.kind) {
+            let id = blob.id;
+            if prepared.contains(&id) || !attachment_path(data_dir, blob.sha256).exists() {
+                continue;
+            }
+            match prepare_own_image(data_dir, id, blob.sha256) {
+                Ok(()) => {
+                    prepared.insert(id);
+                }
+                Err(error) => {
+                    tracing::debug!(?id, %error, "cannot use the local image; it downloads");
+                }
+            }
+        }
+    }
+    prepared
+}
+
+/// Makes `<id>.own` from the attachment `sha256`: a hard link, or a copy
+/// where linking fails, synced before it is used. It stays under that name
+/// until `own_images_available` renames it onto the blob file, so the blob
+/// file is never a half-written copy. A temporary file an earlier attempt
+/// left is replaced.
+fn prepare_own_image(data_dir: &Path, id: BlobId, sha256: ContentHash) -> std::io::Result<()> {
+    std::fs::create_dir_all(blob_dir(data_dir))?;
+    let tmp = own_image_temp(data_dir, id);
+    match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     let src = attachment_path(data_dir, sha256);
-    if std::fs::hard_link(&src, &dst).is_err() {
-        std::fs::copy(&src, &dst)?;
+    if std::fs::hard_link(&src, &tmp).is_err() {
+        std::fs::copy(&src, &tmp)?;
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&dst)?
+            .open(&tmp)?
             .sync_all()?;
     }
-    Ok(dst)
+    Ok(())
+}
+
+/// Where the own image of `id` is made until it is renamed onto its blob file.
+fn own_image_temp(data_dir: &Path, id: BlobId) -> PathBuf {
+    blob_dir(data_dir).join(format!("{}.own", id.0))
 }
 
 #[cfg(test)]
@@ -1110,5 +1178,26 @@ mod tests {
         let core = Core::open_detached(dir.path()).unwrap();
         assert_eq!(core.seam().pairing().as_deref(), Some(&expected));
         assert_eq!(settings(&core), shown);
+    }
+
+    #[test]
+    fn prepare_own_image_replaces_a_stale_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let sha256 = ContentHash::of(b"image");
+        let src = attachment_path(data_dir, sha256);
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"image").unwrap();
+        let id = BlobId::new();
+        std::fs::create_dir_all(blob_dir(data_dir)).unwrap();
+        std::fs::write(own_image_temp(data_dir, id), b"stale").unwrap();
+
+        prepare_own_image(data_dir, id, sha256).unwrap();
+
+        assert_eq!(
+            std::fs::read(own_image_temp(data_dir, id)).unwrap(),
+            b"image"
+        );
+        assert!(!blob_dir(data_dir).join(id.0.to_string()).exists());
     }
 }

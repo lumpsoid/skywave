@@ -3946,6 +3946,16 @@ mod tests {
         let other_record = seam.blob(other_blob).unwrap().unwrap();
         assert_eq!(other_record.status, BlobStatus::NotDownloaded);
         assert_eq!(applied.blobs, [other_blob]);
+        assert!(
+            !blob_dir(dir.path())
+                .join(format!("{}.own", own_blob.0))
+                .exists()
+        );
+        assert!(
+            !blob_dir(dir.path())
+                .join(format!("{}.own", other_blob.0))
+                .exists()
+        );
     }
 
     /// An image this device attached whose local file is gone is no image
