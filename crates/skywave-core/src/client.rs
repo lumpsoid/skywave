@@ -966,6 +966,21 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Runs blocking work (the store, the disk) from engine code. On the
+/// core's multi-thread runtime it runs in `block_in_place`, so the
+/// worker's other tasks (the link, downloads) move to another thread
+/// meanwhile. Elsewhere (a head's thread, a `current_thread` test
+/// runtime, where `block_in_place` would panic) it just runs.
+pub(crate) fn blocking<R>(work: impl FnOnce() -> R) -> R {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -984,6 +999,35 @@ mod tests {
 
     fn navigate(core: &Core) {
         core.dispatch(Action::Navigate(Route::Settings)).unwrap();
+    }
+
+    /// With one worker, a plain blocking `recv` would leave the sender task
+    /// nowhere to run; `blocking` hands the worker over meanwhile.
+    #[test]
+    fn blocking_work_leaves_the_worker_to_other_tasks() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let received = runtime.block_on(async {
+            tokio::spawn(async {
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                tokio::spawn(async move {
+                    let _ = tx.send(());
+                });
+                blocking(|| rx.recv_timeout(TIMEOUT))
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!(received, Ok(()));
+    }
+
+    /// `block_in_place` panics on a current-thread runtime; there the work
+    /// must just run.
+    #[tokio::test]
+    async fn blocking_runs_inline_on_a_current_thread_runtime() {
+        assert_eq!(blocking(|| 7), 7);
     }
 
     #[test]

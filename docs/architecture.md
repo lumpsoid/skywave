@@ -935,6 +935,8 @@ fails it. The GUI hub answers `HubFailed` and reopens the core on Restart
 (or by itself, once, off screen under the Stay connected service);
 the TUI exits with "the client core failed: ...".
 
+The runtime has two workers, and the store's SQLite (and the disk work done under the state lock) blocks the thread it runs on. Engine tasks reach the state only through `Seam`, which runs each access in `block_in_place`, so the runtime moves the worker's other tasks (the link, downloads) to another thread meanwhile. Heads call `dispatch` from their own threads, never a core worker.
+
 One core per data dir: an open core holds an exclusive OS lock (`flock`)
 on `core.lock` in it, released when its last handle goes (`Core::shutdown`
 for a deterministic close) or the process exits. A second core on the same

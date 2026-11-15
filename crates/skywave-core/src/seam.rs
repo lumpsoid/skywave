@@ -22,7 +22,7 @@ use skywave_proto::{
 use crate::address::ServerAddress;
 use crate::attachment::attachment_path;
 use crate::blobs::{blob_dir, remove_all_blob_files, remove_blob_files};
-use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
+use crate::client::{BlobLease, Core, CoreError, State, blocking, failing_on_panic, lock};
 use crate::identity::{PairedCredentials, Pairing};
 use crate::projection::BlobFate;
 use crate::store::{
@@ -168,13 +168,14 @@ impl Seam {
     /// [`CoreError::Superseded`] and its link changes are ignored, so work
     /// still running for the old server cannot reach the new replica.
     pub(crate) fn bind(&self) -> Option<(Seam, Arc<Pairing>)> {
-        let state = lock(&self.core.shared.state);
-        let pairing = state.pairing.clone()?;
-        let bound = Seam {
-            core: self.core.clone(),
-            epoch: Some(state.server_epoch),
-        };
-        Some((bound, pairing))
+        self.with_state(|state| {
+            let pairing = state.pairing.clone()?;
+            let bound = Seam {
+                core: self.core.clone(),
+                epoch: Some(state.server_epoch),
+            };
+            Some((bound, pairing))
+        })
     }
 
     /// Spawns `work`, as `what`, on the current runtime; a panic in it
@@ -196,6 +197,11 @@ impl Seam {
         self.epoch.is_none_or(|epoch| epoch == state.server_epoch)
     }
 
+    /// Locks the state for `access`, off the async workers (see `blocking`).
+    fn with_state<R>(&self, access: impl FnOnce(&mut State) -> R) -> R {
+        blocking(|| access(&mut lock(&self.core.shared.state)))
+    }
+
     /// The request channel. There is one receiver; later calls get `None`.
     pub fn take_requests(&self) -> Option<Receiver<Request>> {
         lock(&self.core.shared.request_rx).take()
@@ -209,27 +215,27 @@ impl Seam {
     /// The device's pairing — its identity and the server's addresses —
     /// `None` before pairing.
     pub fn pairing(&self) -> Option<Arc<Pairing>> {
-        lock(&self.core.shared.state).pairing.clone()
+        self.with_state(|state| state.pairing.clone())
     }
 
     pub fn settings(&self) -> Result<Settings, CoreError> {
-        Ok(lock(&self.core.shared.state).store.settings()?)
+        Ok(self.with_state(|state| state.store.settings())?)
     }
 
     /// Seq of the newest applied event: where the pull resumes.
     pub fn cursor(&self) -> Result<Seq, CoreError> {
-        Ok(lock(&self.core.shared.state).store.cursor()?)
+        Ok(self.with_state(|state| state.store.cursor())?)
     }
 
     /// Commands awaiting a result, in send order.
     pub fn pending_outbox(&self) -> Result<Vec<OutboxEntry>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.pending_outbox()?)
+        Ok(self.with_state(|state| state.store.pending_outbox())?)
     }
 
     /// The images agent drafts hold, each hash once: a session's in the
     /// order they were attached.
     pub fn draft_image_hashes(&self) -> Result<Vec<ContentHash>, CoreError> {
-        let drafts = lock(&self.core.shared.state).store.draft_images()?;
+        let drafts = self.with_state(|state| state.store.draft_images())?;
         let mut seen = HashSet::new();
         Ok(drafts
             .values()
@@ -240,12 +246,12 @@ impl Seam {
     }
 
     pub fn blobs(&self) -> Result<Vec<BlobRecord>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.blobs()?)
+        Ok(self.with_state(|state| state.store.blobs())?)
     }
 
     /// One blob, `None` if no event references it.
     pub fn blob(&self, id: BlobId) -> Result<Option<BlobRecord>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.blob(id)?)
+        Ok(self.with_state(|state| state.store.blob(id))?)
     }
 
     /// One blob with the lease a download of it holds: its reports through
@@ -255,30 +261,31 @@ impl Seam {
         &self,
         id: BlobId,
     ) -> Result<Option<(BlobRecord, BlobLease)>, CoreError> {
-        let mut state = lock(&self.core.shared.state);
-        let Some(record) = state.store.blob(id)? else {
-            return Ok(None);
-        };
-        Ok(Some((record, state.blob_lease(id))))
+        self.with_state(|state| {
+            let Some(record) = state.store.blob(id)? else {
+                return Ok(None);
+            };
+            Ok(Some((record, state.blob_lease(id))))
+        })
     }
 
     /// The crops this device still makes itself, in log order
     /// ([`Store::pending_crops`](crate::Store::pending_crops)).
     pub fn pending_crops(&self) -> Result<Vec<PendingCrop>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.pending_crops()?)
+        Ok(self.with_state(|state| state.store.pending_crops())?)
     }
 
     /// The pending crop that makes `into`, if any: a worker claiming
     /// `into` makes it locally first, however it was queued.
     pub(crate) fn pending_crop_into(&self, into: BlobId) -> Result<Option<PendingCrop>, CoreError> {
-        Ok(lock(&self.core.shared.state)
-            .store
-            .pending_crop_into(into)?)
+        Ok(self.with_state(|state| state.store.pending_crop_into(into))?)
     }
 
     /// Whether the server deleted or cropped `id`: it no longer serves it.
     pub(crate) fn blob_fated(&self, id: BlobId) -> Result<bool, CoreError> {
-        Ok(lock(&self.core.shared.state).store.blob_fate(id)?.is_some())
+        Ok(self
+            .with_state(|state| state.store.blob_fate(id))?
+            .is_some())
     }
 
     /// What a local crop needs: `crop.into`'s record with the lease its
@@ -289,25 +296,28 @@ impl Seam {
         &self,
         crop: PendingCrop,
     ) -> Result<Option<(BlobRecord, BlobLease, Option<CropSource>)>, CoreError> {
-        let mut state = lock(&self.core.shared.state);
-        let Some(record) = state.store.blob(crop.into)? else {
-            return Ok(None);
-        };
-        let lease = state.blob_lease(crop.into);
-        let path = match state.store.blob(crop.from)? {
-            Some(BlobRecord {
-                status: BlobStatus::Available { path },
-                ..
-            }) => Some(path),
-            _ => None,
-        };
-        let source = match (path, state.store.blob_fate(crop.from)?) {
-            (Some(path), Some(BlobFate::Cropped { into, kept, .. })) if into.id == crop.into => {
-                Some(CropSource { path, kept })
-            }
-            _ => None,
-        };
-        Ok(Some((record, lease, source)))
+        self.with_state(|state| {
+            let Some(record) = state.store.blob(crop.into)? else {
+                return Ok(None);
+            };
+            let lease = state.blob_lease(crop.into);
+            let path = match state.store.blob(crop.from)? {
+                Some(BlobRecord {
+                    status: BlobStatus::Available { path },
+                    ..
+                }) => Some(path),
+                _ => None,
+            };
+            let source = match (path, state.store.blob_fate(crop.from)?) {
+                (Some(path), Some(BlobFate::Cropped { into, kept, .. }))
+                    if into.id == crop.into =>
+                {
+                    Some(CropSource { path, kept })
+                }
+                _ => None,
+            };
+            Ok(Some((record, lease, source)))
+        })
     }
 
     /// The local crop of `crop` ended, made or not: the blob it was made
@@ -390,7 +400,7 @@ impl Seam {
     /// The run of the server to ask a connection's `hello` about
     /// ([`Store::server_run`](crate::Store::server_run)).
     pub fn server_run(&self) -> Result<Option<skywave_proto::RunId>, CoreError> {
-        Ok(lock(&self.core.shared.state).store.server_run()?)
+        Ok(self.with_state(|state| state.store.server_run())?)
     }
 
     /// A connection's `hello`, before anything is pulled or sent on it:
@@ -403,7 +413,7 @@ impl Seam {
     /// Devices `batch` names that this device knows no name for: paired
     /// since the last `hello`, or never listed.
     pub fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
-        lock(&self.core.shared.state).model.unnamed_devices(batch)
+        self.with_state(|state| state.model.unnamed_devices(batch))
     }
 
     /// Claims the command for the transport, durably, before it is sent
@@ -934,11 +944,13 @@ impl Seam {
         &self,
         change: impl FnOnce(&mut State, &mut Vec<Request>) -> Result<R, CoreError>,
     ) -> Result<R, CoreError> {
-        self.core.shared.update(|state, requests| {
-            if !self.current(state) {
-                return Err(CoreError::Superseded);
-            }
-            change(state, requests)
+        blocking(|| {
+            self.core.shared.update(|state, requests| {
+                if !self.current(state) {
+                    return Err(CoreError::Superseded);
+                }
+                change(state, requests)
+            })
         })
     }
 }
