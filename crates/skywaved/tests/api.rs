@@ -2403,9 +2403,11 @@ async fn a_refused_message_keeps_its_staged_images() {
     accepted_seq(&device.command(&current).await);
 }
 
-/// Too many names (more than `ATTACHMENTS_MAX`) and images over the total
+/// Too many names (more than `ATTACHMENTS_MAX`), an image over
+/// `ATTACHMENT_MAX_BYTES`, and images over the total
 /// (`ATTACHMENTS_MAX_TOTAL_BYTES`) are refused. Nothing is linked, and the
-/// staged images stay staged.
+/// staged images stay staged. An over-large image still stages: uploads have
+/// their own cap, `[files] upload_max`.
 #[tokio::test(flavor = "multi_thread")]
 async fn too_many_or_too_large_images_are_refused() {
     let f = Fixture::start().await;
@@ -2442,6 +2444,20 @@ async fn too_many_or_too_large_images_are_refused() {
     for hash in &big {
         assert!(is_staged(&mut device, *hash).await, "still staged");
     }
+
+    // One image over the per-image limit: it stages, but a message naming it
+    // is refused, and nothing is logged.
+    let over = stage_image(&mut device, &png(limits::ATTACHMENT_MAX_BYTES as usize + 1)).await;
+    let head = f.log.head();
+    let before = blob_files(&f);
+    let large = message_command(session, context, "large", vec![over]);
+    assert_eq!(
+        device.command(&large).await,
+        rejected(RejectReason::AttachmentsTooLarge)
+    );
+    assert_eq!(f.log.head(), head, "nothing logged");
+    assert_eq!(blob_files(&f), before, "no blob added");
+    assert!(is_staged(&mut device, over).await, "still staged");
 
     // Control: two of them, 7.2 MB, go in.
     let two = message_command(session, context, "two", big[..2].to_vec());

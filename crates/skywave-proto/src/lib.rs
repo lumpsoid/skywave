@@ -1309,7 +1309,10 @@ pub mod limits {
     /// Largest [`Attachment`](crate::Attachment), in raw bytes, once the
     /// device has shrunk it. The API takes an image up to 5 MiB of base64,
     /// 3,932,160 raw bytes; this keeps a margin. The device shrinks images
-    /// before this applies.
+    /// before this applies. The device refuses a larger image before it
+    /// sends it, and the server refuses a `SendMessage` naming one
+    /// (`AttachmentsTooLarge`). Uploads have their own cap, the server's
+    /// `[files] upload_max`.
     pub const ATTACHMENT_MAX_BYTES: u64 = 3_750_000;
     /// Most raw bytes of one message's [`Attachment`](crate::Attachment)s
     /// together. Bounds one message's upload and the images the agent's
@@ -2421,8 +2424,8 @@ pub enum RejectReason {
     UnknownAttachment,
     /// A `SendMessage` with more than [`limits::ATTACHMENTS_MAX`] attachments.
     TooManyAttachments,
-    /// A `SendMessage` whose attachments together exceed
-    /// [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`].
+    /// A `SendMessage` with an image over [`limits::ATTACHMENT_MAX_BYTES`],
+    /// or whose images together exceed [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`].
     AttachmentsTooLarge,
 }
 
