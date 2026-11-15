@@ -30,8 +30,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode};
@@ -56,7 +57,9 @@ use crate::encoding::{self, ZstdBody};
 use crate::engine::WORKTREES_TIMEOUT;
 use crate::identity::Identity;
 use crate::tls;
-use crate::transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
+use crate::transport::{
+    BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError, UploadFile,
+};
 use crate::workdir::{WORKDIR_TIMEOUT, WORKDIR_WRITE_TIMEOUT};
 
 /// Timeouts and pool size of an [`HttpsTransport`].
@@ -86,10 +89,103 @@ impl Default for TransportConfig {
     }
 }
 
+/// The body of a request on the wire.
+type ReqBody = BoxBody<Bytes, io::Error>;
+
+/// What a request sends: bytes in memory, or the first `len` bytes of a
+/// file, read from disk as the socket takes them ([`FileBody`]).
+enum RequestBody {
+    Bytes(Bytes),
+    File(UploadFile),
+}
+
+impl RequestBody {
+    fn is_empty(&self) -> bool {
+        match self {
+            RequestBody::Bytes(bytes) => bytes.is_empty(),
+            RequestBody::File(file) => file.len == 0,
+        }
+    }
+
+    /// A body for one send. A file is opened afresh, so a retry on a fresh
+    /// connection sends it from its start.
+    fn open(&self) -> Result<ReqBody, TransportError> {
+        match self {
+            RequestBody::Bytes(bytes) => Ok(Full::new(bytes.clone())
+                .map_err(|never| match never {})
+                .boxed()),
+            RequestBody::File(file) => {
+                let opened = std::fs::File::open(&file.path).map_err(|e| {
+                    TransportError::Io(format!("opening upload {}: {e}", file.path.display()))
+                })?;
+                Ok(FileBody {
+                    file: tokio::fs::File::from_std(opened),
+                    left: file.len,
+                    buf: vec![0; FILE_CHUNK].into_boxed_slice(),
+                }
+                .boxed())
+            }
+        }
+    }
+}
+
+/// What one read of a [`FileBody`] takes: one frame of the body.
+const FILE_CHUNK: usize = 64 * 1024;
+
+/// The first `left` bytes of a file as a request body, read a
+/// [`FILE_CHUNK`] at a time, so an upload holds one chunk in memory, not
+/// the file. Its exact size is known, so the request carries a
+/// `content-length`. A file that ends early fails the body, and with it
+/// the request.
+struct FileBody {
+    file: tokio::fs::File,
+    left: u64,
+    buf: Box<[u8]>,
+}
+
+impl Body for FileBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let this = self.get_mut();
+        if this.left == 0 {
+            return Poll::Ready(None);
+        }
+        let want = usize::try_from(this.left)
+            .unwrap_or(usize::MAX)
+            .min(this.buf.len());
+        let mut read = ReadBuf::new(&mut this.buf[..want]);
+        if let Err(e) = std::task::ready!(Pin::new(&mut this.file).poll_read(cx, &mut read)) {
+            return Poll::Ready(Some(Err(e)));
+        }
+        let n = read.filled().len();
+        if n == 0 {
+            return Poll::Ready(Some(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upload file ended early",
+            ))));
+        }
+        this.left -= n as u64;
+        Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(read.filled())))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.left == 0
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.left)
+    }
+}
+
 /// One HTTP/1.1 connection: its request handle and a signal of every write
 /// its socket takes ([`Metered`]).
 struct Conn {
-    sender: SendRequest<Full<Bytes>>,
+    sender: SendRequest<ReqBody>,
     written: watch::Receiver<()>,
 }
 
@@ -119,7 +215,7 @@ impl Conn {
     /// one hyper's.
     async fn send(
         &mut self,
-        req: Request<Full<Bytes>>,
+        req: Request<ReqBody>,
         stall: Option<Duration>,
     ) -> Result<hyper::Result<hyper::Response<Incoming>>, TransportError> {
         let Some(stall) = stall else {
@@ -387,7 +483,7 @@ impl Http {
         method: Method,
         uri: &str,
         headers: &[(header::HeaderName, HeaderValue)],
-        body: Bytes,
+        body: RequestBody,
         stall: Option<Duration>,
     ) -> Result<Head, TransportError> {
         // A caller's own Content-Type replaces the JSON default; a second
@@ -395,7 +491,8 @@ impl Http {
         let caller_sets_type = headers
             .iter()
             .any(|(name, _)| *name == header::CONTENT_TYPE);
-        let build = || {
+        // Each attempt opens the body afresh ([`RequestBody::open`]).
+        let build = || -> Result<Request<ReqBody>, TransportError> {
             let mut req = Request::builder()
                 .method(method.clone())
                 .uri(uri)
@@ -409,7 +506,7 @@ impl Http {
             for (name, value) in headers {
                 req = req.header(name, value.clone());
             }
-            req.body(Full::new(body.clone()))
+            req.body(body.open()?)
                 .map_err(|e| TransportError::Decode(format!("building request: {e}")))
         };
         if let Some(mut conn) = self.take_idle() {
@@ -440,7 +537,7 @@ impl Http {
         method: Method,
         uri: &str,
         headers: &[(header::HeaderName, HeaderValue)],
-        body: Bytes,
+        body: RequestBody,
     ) -> Result<Reply, TransportError> {
         let exchange = async {
             let head = self
@@ -461,7 +558,9 @@ impl Http {
         timeout: Duration,
     ) -> Result<Reply, TransportError> {
         let exchange = async {
-            let head = self.head(method, uri, headers, body, None).await?;
+            let head = self
+                .head(method, uri, headers, RequestBody::Bytes(body), None)
+                .await?;
             let body = head
                 .body
                 .collect()
@@ -496,7 +595,7 @@ impl Http {
         let exchange = async {
             let head = tokio::time::timeout(
                 head_timeout,
-                self.head(method, uri, headers, Bytes::new(), None),
+                self.head(method, uri, headers, RequestBody::Bytes(Bytes::new()), None),
             )
             .await
             .map_err(|_| TransportError::Timeout)??;
@@ -515,7 +614,7 @@ impl Http {
     ) -> Result<Head, TransportError> {
         let head = tokio::time::timeout(
             self.request_timeout(),
-            self.head(method, uri, headers, Bytes::new(), None),
+            self.head(method, uri, headers, RequestBody::Bytes(Bytes::new()), None),
         )
         .await
         .map_err(|_| TransportError::Timeout)
@@ -703,7 +802,7 @@ impl HttpsTransport {
                 Method::POST,
                 path::COMMANDS,
                 &self.run_header(),
-                body.into(),
+                RequestBody::Bytes(body.into()),
             )
             .await?;
         ok_json(reply)
@@ -729,12 +828,13 @@ impl HttpsTransport {
         }
     }
 
-    /// `PUT /v1/attachments/{sha256}` with the image's bytes. Every outcome
-    /// the server decides is a 200 [`UploadResult`], refusals included.
+    /// `PUT /v1/attachments/{sha256}` with the first `len` bytes of the file,
+    /// streamed from disk, never held whole. Every outcome the server decides
+    /// is a 200 [`UploadResult`], refusals included.
     async fn upload_attachment(
         &self,
         sha256: ContentHash,
-        bytes: Bytes,
+        file: UploadFile,
     ) -> Result<UploadResult, TransportError> {
         let mut headers = self.run_header();
         headers.push((
@@ -743,7 +843,12 @@ impl HttpsTransport {
         ));
         let reply = self
             .http
-            .upload(Method::PUT, &path::attachment(sha256), &headers, bytes)
+            .upload(
+                Method::PUT,
+                &path::attachment(sha256),
+                &headers,
+                RequestBody::File(file),
+            )
             .await?;
         ok_json(reply)
     }
@@ -1134,9 +1239,9 @@ impl Transport for HttpsTransport {
     fn upload_attachment(
         &self,
         sha256: ContentHash,
-        bytes: Bytes,
+        file: UploadFile,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
-        Box::pin(HttpsTransport::upload_attachment(self, sha256, bytes))
+        Box::pin(HttpsTransport::upload_attachment(self, sha256, file))
     }
 
     fn write_workdir_file<'a>(
@@ -1150,6 +1255,7 @@ impl Transport for HttpsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::oneshot;
 
     #[test]
     fn content_range_parses() {
@@ -1363,7 +1469,11 @@ mod tests {
         let mut conn = Conn::open(client, written).await.unwrap();
         let req = Request::post("/v1/commands")
             .header(header::HOST, "srv")
-            .body(Full::new(Bytes::from(vec![b'x'; BODY])))
+            .body(
+                RequestBody::Bytes(Bytes::from(vec![b'x'; BODY]))
+                    .open()
+                    .unwrap(),
+            )
             .unwrap();
         let resp = conn
             .send(req, Some(STALL))
@@ -1396,6 +1506,108 @@ mod tests {
         // The last write fills the uplink the server's tenth read freed, at
         // 10 s.
         assert_eq!(started.elapsed(), Duration::from_secs(10) + STALL);
+    }
+
+    /// A server on `io` that reads one whole request, answers it `{}`, and
+    /// hands back the raw request bytes it read.
+    async fn echo_request(mut io: tokio::io::DuplexStream, got: oneshot::Sender<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut bytes = Vec::new();
+        let mut buf = vec![0u8; BODY * 2];
+        while request_end(&bytes).is_none_or(|end| bytes.len() < end) {
+            let n = io.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        io.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+            .await
+            .unwrap();
+        let _ = got.send(bytes);
+        std::future::pending::<()>().await;
+    }
+
+    /// A file body is its first `len` bytes, read a chunk at a time under an
+    /// exact `content-length`: the bytes after them are not sent.
+    #[tokio::test]
+    async fn a_file_body_streams_its_first_len_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload");
+        let len = 3 * FILE_CHUNK + 17;
+        let contents: Vec<u8> = (0..len + 100).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &contents).unwrap();
+        let (sent, got) = oneshot::channel();
+        let (client, far) = tokio::io::duplex(PIECE);
+        tokio::spawn(echo_request(far, sent));
+        let (client, written) = Metered::new(client);
+        let mut conn = Conn::open(client, written).await.unwrap();
+        let body = RequestBody::File(UploadFile {
+            path,
+            len: len as u64,
+        })
+        .open()
+        .unwrap();
+        let req = Request::put("/v1/attachments/x")
+            .header(header::HOST, "srv")
+            .body(body)
+            .unwrap();
+        let resp = conn.send(req, None).await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = got.await.unwrap();
+        let head_end = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = std::str::from_utf8(&got[..head_end]).unwrap();
+        assert!(
+            head.lines().any(|l| l == format!("content-length: {len}")),
+            "{head}"
+        );
+        assert_eq!(got.len() - head_end, len);
+        assert!(
+            got[head_end..] == contents[..len],
+            "the body is not the file's first {len} bytes"
+        );
+    }
+
+    /// A file that ends before its `len` fails the request: the body errors
+    /// rather than padding out the length.
+    #[tokio::test]
+    async fn a_file_shorter_than_its_len_fails_the_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short");
+        std::fs::write(&path, [7u8; 10]).unwrap();
+        let (sent, _got) = oneshot::channel();
+        let (client, far) = tokio::io::duplex(PIECE);
+        tokio::spawn(echo_request(far, sent));
+        let (client, written) = Metered::new(client);
+        let mut conn = Conn::open(client, written).await.unwrap();
+        let body = RequestBody::File(UploadFile { path, len: 20 })
+            .open()
+            .unwrap();
+        let req = Request::put("/v1/attachments/x")
+            .header(header::HOST, "srv")
+            .body(body)
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), conn.send(req, None))
+            .await
+            .expect("the send hung rather than failing");
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a short file must fail its request"
+        );
+    }
+
+    /// A file that cannot be opened is an I/O error, not a body.
+    #[test]
+    fn a_missing_upload_file_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = UploadFile {
+            path: dir.path().join("absent"),
+            len: 1,
+        };
+        assert!(matches!(
+            RequestBody::File(file).open(),
+            Err(TransportError::Io(_))
+        ));
     }
 
     /// How many bytes a socket to a peer that reads nothing and advertises
