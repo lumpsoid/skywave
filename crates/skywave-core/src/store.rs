@@ -575,7 +575,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
-    v31_to_v32, v32_to_v33, v33_to_v34,
+    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -676,6 +676,17 @@ fn v32_to_v33(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// `GET /v1/worktrees` answer and nothing that is stored, so nothing stored
 /// changes.
 fn v33_to_v34(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v34 to v35, as the server's step of the same name. v35 added
+/// `context_compacted` to `TurnUsage`, in `TurnUsage` events, `turns.usage`
+/// and `sessions.usage`: a new field, which v34 JSON lacks and reads as
+/// `false`, so nothing is rewritten and no v34 turn is marked. It also added
+/// `fills` to the `SessionUsage` in `sessions.usage`, which v34 JSON lacks
+/// and reads as empty, so a context switched back to shows unknown until its
+/// next turn reports a fill.
+fn v34_to_v35(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 

@@ -1210,11 +1210,14 @@ row (`finished · 1 step · 4.3s · ctx 12k`).
 - **Display only.** No warning threshold and no colour levels: the agent
   compacts on its own, and a level would be a guess at a limit it may not
   use.
-- **Unknown, not stale.** The fill shows unknown (`ctx ?`) once a context
-  starts or the session switches to another context, and after a turn that
-  reported no fill (a cleared context's turn, an interrupt while text
-  streamed), until a turn reports one. An automatic compaction needs no rule
-  of its own: its turn already reports the fill after it.
+- **Last known, per context.** Each context keeps the fill its newest
+  turn that reported one left. A turn that reports none (an interrupt
+  while text streamed) keeps it, and switching back to a context shows its
+  own. The fill is unknown (`ctx ?`) only in a context no turn has
+  reported one for, and after a `/compact`, whose turn reports none and is
+  marked `context_compacted`, until a turn reports one. An automatic
+  compaction needs no rule of its own: its turn already reports the fill
+  after it.
 - **A subagent's figures only when it finished.** A stopped subagent shows
   none, as its agent reports none. Figures logged as `SubagentUsage` by its
   call, at most once.
