@@ -21,7 +21,8 @@
 //!
 //! [`store`] writes the prepared bytes to `<data>/attachments/<sha256 hex>`.
 //! It lives in core so the TUI's future `/attach <path>` follows the same
-//! rules.
+//! rules. A file that is not an image is not prepared at all: [`store_file`]
+//! copies it there as it is.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -84,6 +85,17 @@ pub struct AttachedImage {
     pub size: u64,
     pub width: u32,
     pub height: u32,
+}
+
+/// A non-image file a draft or a queued message carries; its copy is at
+/// [`attachment_path`]. The sender writes it into the workdir root as `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedFile {
+    pub sha256: ContentHash,
+    pub name: String,
+    pub size: u64,
+    /// The hash of the file at `name` the user agreed to replace.
+    pub replace: Option<ContentHash>,
 }
 
 /// Why an image cannot be attached.
@@ -189,6 +201,53 @@ pub fn store(data_dir: &Path, prepared: &Prepared) -> io::Result<PathBuf> {
     }
     sync_dir(&dir)?;
     Ok(path)
+}
+
+/// Copies the non-image file `source` into the attachment directory under
+/// `data_dir`, by its sha256, and returns that hash and the bytes copied. The
+/// copy is streamed, never held whole in memory, and is written whole or not
+/// at all, as [`store`] writes an image. A copy already there is left alone.
+pub fn store_file(data_dir: &Path, source: &Path) -> io::Result<(ContentHash, u64)> {
+    let dir = attachment_dir(data_dir);
+    fs::create_dir_all(&dir)?;
+    let temp = dir.join(format!(".tmp-{}", Uuid::new_v4()));
+    let stored = copy_private(source, &temp).and_then(|size| {
+        let hash = ContentHash::read(fs::File::open(&temp)?)?;
+        let path = attachment_path(data_dir, hash);
+        if path.exists() {
+            fs::remove_file(&temp)?;
+        } else {
+            fs::rename(&temp, &path)?;
+        }
+        Ok((hash, size))
+    });
+    match stored {
+        Ok(stored) => {
+            sync_dir(&dir)?;
+            Ok(stored)
+        }
+        Err(err) => {
+            // Best effort: the copy's error is the one the caller needs.
+            let _ = fs::remove_file(&temp);
+            Err(err)
+        }
+    }
+}
+
+/// Copies `source` to a new file at `to`, readable only by its owner where
+/// the platform allows it, and flushes it. Returns the bytes copied.
+fn copy_private(source: &Path, to: &Path) -> io::Result<u64> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(to)?;
+    let size = io::copy(&mut fs::File::open(source)?, &mut file)?;
+    file.sync_all()?;
+    Ok(size)
 }
 
 /// Removes the file of the attachment `sha256` under `data_dir`. A file
@@ -534,5 +593,29 @@ mod tests {
         // Only the stored file is there: no temporary file was left behind.
         let entries = fs::read_dir(attachment_dir(dir.path())).unwrap().count();
         assert_eq!(entries, 1);
+    }
+
+    #[test]
+    fn store_file_copies_and_names_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("notes.txt");
+        let content = b"not an image, so it is copied as it is";
+        fs::write(&source, content).unwrap();
+
+        let (hash, size) = store_file(dir.path(), &source).unwrap();
+        assert_eq!(hash, ContentHash::of(content));
+        assert_eq!(size, content.len() as u64);
+        assert_eq!(
+            fs::read(attachment_path(dir.path(), hash)).unwrap(),
+            content
+        );
+
+        // The same content again: the same file, and no temporary file left.
+        assert_eq!(store_file(dir.path(), &source).unwrap(), (hash, size));
+        let names: Vec<String> = fs::read_dir(attachment_dir(dir.path()))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [hash.to_hex()]);
     }
 }

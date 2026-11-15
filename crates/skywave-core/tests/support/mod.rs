@@ -436,6 +436,7 @@ impl Client {
                 tries: row.get(3)?,
                 first_sent_at: time(row.get(4)?),
                 answered_at: time(row.get(5)?),
+                files: Vec::new(),
             })
         })
         .unwrap()

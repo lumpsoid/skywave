@@ -964,7 +964,14 @@ logs) an event that no longer decodes rather than failing.
   replica has not applied names it; this runs when the store opens (which
   also clears files without a row), and not after each batch: a detached
   image keeps its row and file until the next open, so attaching it again
-  in the meantime finds both. `workdir_snapshots` keeps the latest
+  in the meantime finds both. `draft_files` and `outbox_files` keep the
+  non-image files a draft or a queued message carries, in order, each as a
+  copy under `<data>/attachments/` (`store_file`, streamed, never in memory).
+  A draft holds one file per name; queuing a message moves its files onto
+  the outbox entry, and withdrawing it puts them back. A copy is kept while
+  a draft, or a message the server has not accepted (queued, or refused and
+  editable), names it; an accepted message's copy goes at the next open,
+  since the server holds it. `workdir_snapshots` keeps the latest
   stored answer per workdir read (session, kind, requested path), so a
   workdir already browsed reads offline; `workdir_blob_refs` names the
   blobs each answer holds. A refresh replaces the answer, and a blob row

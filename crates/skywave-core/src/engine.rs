@@ -2259,7 +2259,7 @@ mod tests {
              ALTER TABLE sessions DROP COLUMN worktree;",
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 6)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 7)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(
@@ -2553,7 +2553,7 @@ mod tests {
         };
         crate::client::lock(&seam.core.shared.state)
             .store
-            .enqueue(&command)
+            .enqueue(&command, &[])
             .unwrap();
         command
     }
@@ -3344,7 +3344,7 @@ mod tests {
             once.call_once(|| {
                 crate::client::lock(&taker.core.shared.state)
                     .store
-                    .withdraw(one, None, None)
+                    .withdraw(one, None, None, None)
                     .unwrap();
             });
         }));

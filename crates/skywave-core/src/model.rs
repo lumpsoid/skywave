@@ -1494,6 +1494,7 @@ impl Model {
             tries: 0,
             first_sent_at: None,
             answered_at: None,
+            files: Vec::new(),
         });
         vec![
             Effect::Enqueue(command),
@@ -4934,6 +4935,7 @@ mod tests {
             settings: Settings::default(),
             drafts: HashMap::new(),
             draft_images: HashMap::new(),
+            draft_files: HashMap::new(),
             attachments: HashMap::new(),
             composer_modes: HashMap::new(),
             read_marks: HashMap::new(),
@@ -9890,6 +9892,7 @@ mod tests {
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
             draft_images: model.draft_images.clone(),
+            draft_files: HashMap::new(),
             attachments: model.attachments.clone(),
             composer_modes: model.composer_modes.clone(),
             read_marks: model.read_marks.clone(),
