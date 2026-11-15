@@ -250,7 +250,8 @@ impl Staging {
     /// `offset`. At the partial's length, the file opens for appending. At 0,
     /// the partial restarts empty and the file opens for writing from there.
     /// Any other offset is a [`Resume::Mismatch`]: nothing is opened or
-    /// changed.
+    /// changed, unless the image is staged by now (a `HEAD` and a `PUT` raced),
+    /// which is a [`Resume::Staged`] with its answer.
     pub fn resume(&self, sha256: ContentHash, offset: u64) -> Result<Resume> {
         let have = self.partial_len(sha256)?;
         let path = self.partial(sha256);
@@ -270,6 +271,9 @@ impl Staging {
                 .open(&path)
                 .context(|| format!("opening {}", path.display()))?;
             return Ok(Resume::Append(file));
+        }
+        if let Some(stored) = self.existing(&self.path(sha256), sha256)? {
+            return Ok(Resume::Staged(stored));
         }
         Ok(Resume::Mismatch { have })
     }
@@ -296,6 +300,10 @@ impl Staging {
             remove(&partial)?;
             return Ok(UploadResult::HashMismatch);
         }
+        // Staging is ordered by modification time, and a partial appended to
+        // long ago must not look old to eviction or the sweep.
+        file.set_modified(SystemTime::now())
+            .context(|| format!("stamping {}", partial.display()))?;
         file.sync_all()
             .context(|| format!("syncing {}", partial.display()))?;
         fs::rename(&partial, &path).context(|| format!("staging {}", path.display()))?;
@@ -324,6 +332,9 @@ pub enum Resume {
     /// The `PUT` named another offset than the `have` bytes held; nothing
     /// was opened or changed.
     Mismatch { have: u64 },
+    /// The image was staged meanwhile, so the upload is done: the answer it
+    /// was finished with, and nothing is written.
+    Staged(UploadResult),
 }
 
 /// A `SendMessage`'s images, linked into the blob store before its
@@ -975,6 +986,52 @@ mod tests {
             }
         );
         assert_eq!(names(tmp.path()), [hash.to_hex()], "the partial is removed");
+    }
+
+    #[test]
+    fn a_resume_of_a_staged_image_answers_it_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = stage(&staging, &bytes);
+
+        let Resume::Staged(answer) = staging.resume(hash, 5).unwrap() else {
+            panic!("a PUT at an offset the partial lacks, of a staged image, is answered");
+        };
+        assert_eq!(
+            answer,
+            UploadResult::Stored {
+                size: bytes.len() as u64,
+            }
+        );
+        assert_eq!(names(tmp.path()), [hash.to_hex()], "nothing is written");
+    }
+
+    #[test]
+    fn finishing_stamps_the_staged_file_with_the_time_of_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = ContentHash::of(&bytes);
+
+        let Resume::Append(mut file) = staging.resume(hash, 0).unwrap() else {
+            panic!("a new upload appends");
+        };
+        file.write_all(&bytes).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        drop(file);
+        assert!(matches!(
+            staging.finish(hash).unwrap(),
+            UploadResult::Stored { .. }
+        ));
+        let modified = fs::metadata(staging.path(hash))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            modified.elapsed().unwrap() < Duration::from_secs(60),
+            "an old partial is staged as new"
+        );
     }
 
     #[test]
