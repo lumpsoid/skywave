@@ -62,6 +62,7 @@ dev_dependencies:
 
 # Vendored rinf 8.11.0 (minus example/) so its cargokit Gradle script can be
 # patched; see third_party/rinf. Drop once upstream fixes it.
+# Patched: cargokit/gradle/plugin.gradle compileSdk parse (AGP 9.3).
 dependency_overrides:
   rinf:
     path: third_party/rinf
