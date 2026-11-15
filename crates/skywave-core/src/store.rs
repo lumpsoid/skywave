@@ -29,7 +29,7 @@ use skywave_proto::{
 use uuid::Uuid;
 
 use crate::address::{ServerAddress, ServerAddresses};
-use crate::attachment::{self, AttachedImage};
+use crate::attachment::{self, AttachedFile, AttachedImage};
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::shell_history::SHELL_HISTORY_MAX;
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
@@ -519,6 +519,35 @@ INSERT INTO workdir_snapshots_with_download (session_id, kind, path, result)
 DROP TABLE workdir_snapshots;
 ALTER TABLE workdir_snapshots_with_download RENAME TO workdir_snapshots;
 "#),
+    // The non-image files a draft or a queued message carries (`OutboxFile`,
+    // `Store::attach_file_to_draft`). Each one's copy is its file under the
+    // data dir (`attachment_path`). `replace` is the hash of the file the user
+    // agreed to replace; `existing` is the hash of the file the sender found
+    // at `name`. Like `draft_attachments`, the draft's rows keep their order by
+    // `position`. `IF NOT EXISTS` as the attachment tables above: a rewind that
+    // only sets `user_version` leaves these tables in place.
+    Sql(r#"
+CREATE TABLE IF NOT EXISTS draft_files (
+    session_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    replace TEXT,
+    PRIMARY KEY (session_id, position),
+    UNIQUE (session_id, name)
+);
+CREATE TABLE IF NOT EXISTS outbox_files (
+    command_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    replace TEXT,
+    existing TEXT,
+    PRIMARY KEY (command_id, position)
+);
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -1000,6 +1029,18 @@ pub struct OutboxEntry {
     pub first_sent_at: Option<DateTime<Utc>>,
     /// When the server's answer, or its refusal of the request, was recorded.
     pub answered_at: Option<DateTime<Utc>>,
+    /// Non-image files the sender writes into the workdir root before
+    /// posting, in order.
+    pub files: Vec<OutboxFile>,
+}
+
+/// A non-image file a queued message carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxFile {
+    pub file: AttachedFile,
+    /// The hash of the file the sender found at `file.name`, when it found
+    /// one.
+    pub existing: Option<ContentHash>,
 }
 
 impl OutboxEntry {
@@ -1151,6 +1192,9 @@ pub struct Snapshot {
     /// The images each session's agent draft holds, in order
     /// ([`Store::draft_images`]).
     pub draft_images: HashMap<SessionId, Vec<AttachedImage>>,
+    /// The non-image files each session's agent draft holds, in order
+    /// ([`Store::draft_files`]).
+    pub draft_files: HashMap<SessionId, Vec<AttachedFile>>,
     /// Every known image's metadata, by its sha256 ([`Store::attachments`]).
     pub attachments: HashMap<ContentHash, AttachedImage>,
     /// Sessions whose composer does not write to the agent
@@ -1202,9 +1246,9 @@ impl Store {
     /// `MIGRATED_SINCE` is migrated to this build's; any other is refused
     /// with [`StoreError::ProtocolMismatch`] before anything reads it.
     ///
-    /// Then collects the images nothing needs any more, and the files without
-    /// a row ([`Store::collect_attachments`]). A failure there is logged and
-    /// the open goes on.
+    /// Then collects the images nothing needs any more
+    /// ([`Store::collect_attachments`]), and the files no image, draft or
+    /// outbox entry needs. A failure there is logged and the open goes on.
     pub fn open(data_dir: &Path) -> Result<Store, StoreError> {
         let store = Store::init(connect(data_dir)?)?;
         store.collect_image_files(data_dir);
@@ -1264,6 +1308,7 @@ impl Store {
             settings: self.settings()?,
             drafts: self.drafts()?,
             draft_images: self.draft_images()?,
+            draft_files: self.draft_files()?,
             attachments: self.attachments()?,
             composer_modes: self.composer_modes()?,
             read_marks: self.read_marks()?,
@@ -1644,6 +1689,7 @@ impl Store {
             "DELETE FROM draft_attachments WHERE session_id = ?1",
             [&session],
         )?;
+        tx.execute("DELETE FROM draft_files WHERE session_id = ?1", [&session])?;
         tx.execute(
             "DELETE FROM composer_modes WHERE session_id = ?1",
             [&session],
@@ -1688,6 +1734,7 @@ impl Store {
         tx.execute_batch(
             "DELETE FROM drafts;
              DELETE FROM draft_attachments;
+             DELETE FROM draft_files;
              DELETE FROM composer_modes;
              DELETE FROM read_marks;
              DELETE FROM deleted_sessions;
@@ -1726,8 +1773,9 @@ impl Store {
 
     // ---- outbox ---------------------------------------------------------
 
-    /// Persists a command as `Queued`. Enqueuing a [`CommandId`] that is
-    /// already in the outbox changes nothing.
+    /// Persists a command as `Queued`, with the non-image `files` it carries,
+    /// in order. Enqueuing a [`CommandId`] that is already in the outbox
+    /// changes nothing, the files included.
     ///
     /// A message also deletes its session's agent draft and the draft's
     /// images (their rows and files stay until nothing needs them, see
@@ -1735,7 +1783,7 @@ impl Store {
     /// shell run its shell draft, in the same transaction: a crash never
     /// leaves both the queued command and the draft it was written in, which
     /// would invite sending it twice.
-    pub fn enqueue(&self, command: &Command) -> Result<(), StoreError> {
+    pub fn enqueue(&self, command: &Command, files: &[AttachedFile]) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
         let written = match &command.kind {
@@ -1753,13 +1801,20 @@ impl Store {
                     "DELETE FROM draft_attachments WHERE session_id = ?1",
                     [session_id.0.to_string()],
                 )?;
+                tx.execute(
+                    "DELETE FROM draft_files WHERE session_id = ?1",
+                    [session_id.0.to_string()],
+                )?;
             }
         }
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO outbox (command_id, command) VALUES (?1, ?2)
              ON CONFLICT (command_id) DO NOTHING",
             params![command.id.0.to_string(), to_json(command)?],
         )?;
+        if inserted == 1 {
+            insert_outbox_files(&tx, command.id, files)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1800,6 +1855,26 @@ impl Store {
                 tries: row.get(3)?,
                 first_sent_at: opt_time_col(row, 4)?,
                 answered_at: opt_time_col(row, 5)?,
+                files: Vec::new(),
+            })
+        })?;
+        let mut entries: Vec<OutboxEntry> = rows.collect::<Result<_, _>>()?;
+        for entry in &mut entries {
+            entry.files = self.outbox_files(entry.command.id)?;
+        }
+        Ok(entries)
+    }
+
+    /// The non-image files of the outbox entry `id`, in order.
+    fn outbox_files(&self, id: CommandId) -> Result<Vec<OutboxFile>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256, name, size, replace, existing FROM outbox_files
+             WHERE command_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map([id.0.to_string()], |row| {
+            Ok(OutboxFile {
+                file: attached_file_cols(row, 0)?,
+                existing: opt_hash_col(row, 4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1876,12 +1951,15 @@ impl Store {
     /// transaction, so a crash keeps the text and the images in exactly one
     /// place. An accepted command stays and the call fails with
     /// [`StoreError::NotWithdrawable`], writing nothing. One already sent may
-    /// still reach the server ([`OutboxEntry::discardable`]).
+    /// still reach the server ([`OutboxEntry::discardable`]). With `files`,
+    /// the session's agent draft files become these, in order, as the images
+    /// do; the entry's own files go with it.
     pub fn withdraw(
         &self,
         id: CommandId,
         draft: Option<((SessionId, ComposerMode), &Draft)>,
         images: Option<(SessionId, &[ContentHash])>,
+        files: Option<(SessionId, &[AttachedFile])>,
     ) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
@@ -1895,6 +1973,10 @@ impl Store {
         if deleted == 0 {
             return Err(StoreError::NotWithdrawable(id));
         }
+        tx.execute(
+            "DELETE FROM outbox_files WHERE command_id = ?1",
+            [id.0.to_string()],
+        )?;
         if let Some((key, draft)) = draft {
             upsert_draft(&tx, key, draft)?;
         }
@@ -1909,6 +1991,24 @@ impl Store {
                     "INSERT INTO draft_attachments (session_id, mode, position, sha256)
                      VALUES (?1, 'agent', ?2, ?3)",
                     params![session, u64_sql(position as u64)?, hash.to_hex()],
+                )?;
+            }
+        }
+        if let Some((session_id, file_list)) = files {
+            let session = session_id.0.to_string();
+            tx.execute("DELETE FROM draft_files WHERE session_id = ?1", [&session])?;
+            for (position, file) in file_list.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO draft_files (session_id, position, sha256, name, size, replace)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        session,
+                        u64_sql(position as u64)?,
+                        file.sha256.to_hex(),
+                        file.name,
+                        u64_sql(file.size)?,
+                        file.replace.map(|hash| hash.to_hex()),
+                    ],
                 )?;
             }
         }
@@ -2339,6 +2439,64 @@ impl Store {
         Ok(())
     }
 
+    /// The files each session's agent draft holds, in the order they were
+    /// attached.
+    pub fn draft_files(&self) -> Result<HashMap<SessionId, Vec<AttachedFile>>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, sha256, name, size, replace FROM draft_files
+             ORDER BY session_id, position",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((SessionId(uuid_col(row, 0)?), attached_file_cols(row, 1)?))
+        })?;
+        let mut files: HashMap<SessionId, Vec<AttachedFile>> = HashMap::new();
+        for row in rows {
+            let (session_id, file) = row?;
+            files.entry(session_id).or_default().push(file);
+        }
+        Ok(files)
+    }
+
+    /// Attaches `file` to the session's agent draft, after its files. A draft
+    /// holds one file per name: a file it already holds under `file.name`
+    /// changes nothing.
+    pub fn attach_file_to_draft(
+        &self,
+        session_id: SessionId,
+        file: &AttachedFile,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO draft_files (session_id, position, sha256, name, size, replace)
+             VALUES (?1,
+                (SELECT COALESCE(MAX(position), -1) + 1 FROM draft_files WHERE session_id = ?1),
+                ?2, ?3, ?4, ?5)
+             ON CONFLICT (session_id, name) DO NOTHING",
+            params![
+                session_id.0.to_string(),
+                file.sha256.to_hex(),
+                file.name,
+                u64_sql(file.size)?,
+                file.replace.map(|hash| hash.to_hex()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Takes the file called `name` off the session's agent draft. The other
+    /// files keep their positions, and the file's copy stays until nothing
+    /// needs it.
+    pub fn detach_file_from_draft(
+        &self,
+        session_id: SessionId,
+        name: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM draft_files WHERE session_id = ?1 AND name = ?2",
+            params![session_id.0.to_string(), name],
+        )?;
+        Ok(())
+    }
+
     /// Deletes, in one transaction, the rows of the images nothing needs any
     /// more, and returns their hashes; their files are the caller's to remove.
     /// An image is still needed while one of these holds:
@@ -2384,11 +2542,12 @@ impl Store {
     }
 
     /// At open, with the data dir's lock held: removes the files of the
-    /// images [`Store::collect_attachments`] frees, then every file without
-    /// a row left, the `.tmp-*` files included. Only at open: a row-less
-    /// file may be a write whose row is still to come. A failure is logged;
-    /// the sweep runs only when the rows could be read, as they are its keep
-    /// set.
+    /// images [`Store::collect_attachments`] frees, forgets the file rows of
+    /// outbox entries that are gone, then removes every file nothing keeps
+    /// ([`Store::kept_file_copies`]), the `.tmp-*` files included. Only at
+    /// open: a file nothing keeps may be a write whose row is still to come.
+    /// A failure is logged; the sweep runs only when the keep set could be
+    /// read.
     fn collect_image_files(&self, data_dir: &Path) {
         match self.collect_attachments() {
             Ok(collected) => {
@@ -2398,13 +2557,32 @@ impl Store {
             }
             Err(error) => tracing::warn!(%error, "cannot collect the replica's images"),
         }
-        match self.attachments() {
-            Ok(rows) => {
-                let keep = rows.into_keys().collect::<HashSet<_>>();
-                attachment::sweep(data_dir, &keep);
-            }
-            Err(error) => tracing::warn!(%error, "cannot read the replica's images"),
+        if let Err(error) = self.conn.execute(
+            "DELETE FROM outbox_files WHERE command_id NOT IN (SELECT command_id FROM outbox)",
+            [],
+        ) {
+            tracing::warn!(%error, "cannot forget the files of gone outbox entries");
         }
+        match self.kept_file_copies() {
+            Ok(keep) => attachment::sweep(data_dir, &keep),
+            Err(error) => tracing::warn!(%error, "cannot read the replica's files"),
+        }
+    }
+
+    /// The sha256s of the file copies still needed: an image row's, a draft
+    /// file's, and those of an outbox entry not yet accepted. A file of an
+    /// accepted entry is not kept: the server has it.
+    fn kept_file_copies(&self) -> Result<HashSet<ContentHash>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256 FROM attachments
+             UNION SELECT sha256 FROM draft_files
+             UNION SELECT f.sha256 FROM outbox_files f JOIN outbox o ON o.command_id = f.command_id
+             WHERE o.result IS NULL
+                OR json_extract(o.result, '$.result')
+                    IN ('rejected', 'undeliverable', 'attachment_refused')",
+        )?;
+        let rows = stmt.query_map([], |row| hash_col(row, 0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // ---- composer modes -------------------------------------------------------
@@ -2837,6 +3015,7 @@ fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
          DELETE FROM sessions;
          UPDATE cursor SET seq = 0 WHERE id = 0;
          DELETE FROM outbox;
+         DELETE FROM outbox_files;
          DELETE FROM blobs;
          DELETE FROM blob_fates;
          DELETE FROM devices;
@@ -3072,6 +3251,51 @@ fn attached_image_cols(row: &Row<'_>, first: usize) -> rusqlite::Result<Attached
         width: u32_col(row, first + 3)?,
         height: u32_col(row, first + 4)?,
     })
+}
+
+/// An [`AttachedFile`] from the four columns of `draft_files` from `first`
+/// on: sha256, name, size, replace.
+fn attached_file_cols(row: &Row<'_>, first: usize) -> rusqlite::Result<AttachedFile> {
+    Ok(AttachedFile {
+        sha256: hash_col(row, first)?,
+        name: row.get(first + 1)?,
+        size: u64_col(row, first + 2)?,
+        replace: opt_hash_col(row, first + 3)?,
+    })
+}
+
+fn hash_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<ContentHash> {
+    let text: String = row.get(idx)?;
+    text.parse().map_err(|e| bad_value(idx, Type::Text, e))
+}
+
+fn opt_hash_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<ContentHash>> {
+    let text: Option<String> = row.get(idx)?;
+    text.map(|text| text.parse().map_err(|e| bad_value(idx, Type::Text, e)))
+        .transpose()
+}
+
+/// Writes `files` as the entry `id`'s files, in order, within `tx`.
+fn insert_outbox_files(
+    tx: &Transaction<'_>,
+    id: CommandId,
+    files: &[AttachedFile],
+) -> Result<(), StoreError> {
+    for (position, file) in files.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO outbox_files (command_id, position, sha256, name, size, replace, existing)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                id.0.to_string(),
+                u64_sql(position as u64)?,
+                file.sha256.to_hex(),
+                file.name,
+                u64_sql(file.size)?,
+                file.replace.map(|hash| hash.to_hex()),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn when_sql(when: RunWhen) -> &'static str {

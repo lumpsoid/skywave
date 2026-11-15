@@ -528,7 +528,7 @@ mod tests {
              ALTER TABLE sessions DROP COLUMN worktree;",
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 6)
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 7)
             .unwrap();
         drop(conn);
         legacy::write(dir.path(), legacy::DIR, &creds);

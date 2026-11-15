@@ -768,7 +768,7 @@ impl State {
     ) -> Result<(), CoreError> {
         for effect in effects {
             let done = match effect {
-                Effect::Enqueue(command) => self.store.enqueue(&command),
+                Effect::Enqueue(command) => self.store.enqueue(&command, &[]),
                 Effect::SaveBlobPolicy(policy) => self.store.set_blob_policy(policy),
                 Effect::SaveServerAddresses(addresses) => {
                     // The pairing record, not the store.
@@ -797,6 +797,7 @@ impl State {
                     images
                         .as_ref()
                         .map(|(session, hashes)| (*session, hashes.as_slice())),
+                    None,
                 ),
                 Effect::LoadSession(id) => self
                     .store
