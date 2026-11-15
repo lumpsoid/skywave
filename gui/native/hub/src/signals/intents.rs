@@ -444,6 +444,15 @@ pub enum ActionIntent {
         session_id: String,
         path: String,
     },
+    /// Push the device file `source` into the session's workdir at `path`.
+    /// `replace` is the sha256 (64 hex digits) of the file there, from the
+    /// row's `existing_sha256`, once the user chose to replace it.
+    PushWorkdirFile {
+        session_id: String,
+        source: String,
+        path: String,
+        replace: Option<String>,
+    },
     /// Delete a blob (a target's `blob_id`) from the server and every
     /// device. Sent only once its `delete_question` was confirmed.
     DeleteBlob {

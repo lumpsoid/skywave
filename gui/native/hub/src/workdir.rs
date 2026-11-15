@@ -8,10 +8,11 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use skywave_core::workdir::PushOutcome;
 use skywave_core::{
     BlobId, BlobState, BlobView, ChangedFile, ChangesResult, EntryKind, FileBody, FileChange,
-    FileResult, LinkTarget, ListResult, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane,
-    WorkdirView, read_head,
+    FileResult, LinkTarget, ListResult, PushState, WorkdirBody, WorkdirDownload, WorkdirFetch,
+    WorkdirPane, WorkdirPush, WorkdirView, read_head,
 };
 use skywave_present::format::bytes;
 use skywave_present::workdir::{
@@ -20,12 +21,12 @@ use skywave_present::workdir::{
     fetch_label, file_wording, head_label, list_truncated, list_wording, log_capped, log_label,
     log_wording, sorted_entries, taken_label,
 };
-use skywave_proto::LogResult;
+use skywave_proto::{LogResult, UploadResult, WriteFileResult};
 
 use crate::signals::{
     ScreenView, WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent,
     WorkdirDownloadRow, WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind,
-    WorkdirScreen,
+    WorkdirPushRow, WorkdirScreen,
 };
 use skywave_present::text::clean_line;
 
@@ -239,6 +240,7 @@ pub fn screen(view: &WorkdirView, text: Option<&Result<Text, String>>, wall_ms: 
             entries,
             content,
             downloads: view.downloads.iter().map(download_row).collect(),
+            pushes: view.pushes.iter().map(push_row).collect(),
         },
     }
 }
@@ -374,6 +376,101 @@ fn download_row(download: &WorkdirDownload) -> WorkdirDownloadRow {
         failed,
         blob,
         local_path,
+    }
+}
+
+/// A push into the workdir as the save flow reads it: where it stands. An
+/// `Exists` answer carries the sha256 of the file there, to resend the push
+/// with once the user agrees to replace it.
+fn push_row(push: &WorkdirPush) -> WorkdirPushRow {
+    let (label, pushing, done, existing_sha256, failed) = match &push.state {
+        PushState::Pushing => ("Sending\u{2026}".to_owned(), true, false, None, false),
+        PushState::Failed(reason) => (format!("Push failed: {reason}"), false, false, None, true),
+        PushState::Done(PushOutcome::Unreadable { reason }) => (
+            format!("Cannot read the file: {reason}"),
+            false,
+            false,
+            None,
+            true,
+        ),
+        PushState::Done(PushOutcome::UploadRefused(UploadResult::TooLarge)) => {
+            ("Too large to send".to_owned(), false, false, None, true)
+        }
+        PushState::Done(
+            PushOutcome::UploadRefused(UploadResult::DiskLow)
+            | PushOutcome::Written(WriteFileResult::DiskLow),
+        ) => (
+            "The server's disk is low".to_owned(),
+            false,
+            false,
+            None,
+            true,
+        ),
+        PushState::Done(PushOutcome::UploadRefused(UploadResult::HashMismatch)) => (
+            "The file changed while it was sent".to_owned(),
+            false,
+            false,
+            None,
+            true,
+        ),
+        PushState::Done(PushOutcome::UploadRefused(UploadResult::Stored { .. })) => {
+            ("Push failed".to_owned(), false, false, None, true)
+        }
+        PushState::Done(PushOutcome::Written(WriteFileResult::Written { size, .. })) => (
+            format!("Written \u{b7} {}", bytes(*size)),
+            false,
+            true,
+            None,
+            false,
+        ),
+        PushState::Done(PushOutcome::Written(WriteFileResult::Same { .. })) => {
+            ("Already there".to_owned(), false, true, None, false)
+        }
+        PushState::Done(PushOutcome::Written(WriteFileResult::Exists { sha256, size })) => (
+            format!("A file is already there ({})", bytes(*size)),
+            false,
+            false,
+            Some(sha256.to_string()),
+            false,
+        ),
+        PushState::Done(PushOutcome::Written(WriteFileResult::NotStaged)) => {
+            ("The upload was lost".to_owned(), false, false, None, true)
+        }
+        PushState::Done(PushOutcome::Written(WriteFileResult::IsADirectory)) => {
+            ("A directory is there".to_owned(), false, false, None, true)
+        }
+        PushState::Done(PushOutcome::Written(WriteFileResult::NotAFile)) => (
+            "Something other than a file is there".to_owned(),
+            false,
+            false,
+            None,
+            true,
+        ),
+        PushState::Done(PushOutcome::Written(WriteFileResult::UnknownSession)) => {
+            ("The session is gone".to_owned(), false, false, None, true)
+        }
+        PushState::Done(PushOutcome::Written(WriteFileResult::WorkdirGone)) => {
+            ("The workdir is gone".to_owned(), false, false, None, true)
+        }
+        PushState::Done(PushOutcome::Written(WriteFileResult::NotAllowed)) => {
+            ("Not allowed there".to_owned(), false, false, None, true)
+        }
+        PushState::Done(PushOutcome::Written(WriteFileResult::NotFound)) => (
+            "Its folder does not exist".to_owned(),
+            false,
+            false,
+            None,
+            true,
+        ),
+    };
+    WorkdirPushRow {
+        path: push.path.clone(),
+        source: push.source.display().to_string(),
+        label: clean_line(&label),
+        pushing,
+        done,
+        existing_sha256,
+        failed,
     }
 }
 

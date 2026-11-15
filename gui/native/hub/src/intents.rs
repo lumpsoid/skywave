@@ -1,9 +1,11 @@
 //! Plain intents as core [`Action`]s: ids parsed from the strings Dart
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
+use std::path::PathBuf;
+
 use skywave_core::{
-    Action, BlobPolicy, BlobUse, Decision, Effort, LineSpan, LoginCode, PermissionMode,
-    QuestionAnswer, Route, ServerAddress, TaskId, WorkdirPane,
+    Action, BlobPolicy, BlobUse, ContentHash, Decision, Effort, LineSpan, LoginCode,
+    PermissionMode, QuestionAnswer, Route, ServerAddress, TaskId, WorkdirPane,
 };
 use skywave_present::crop::normalise;
 use uuid::Uuid;
@@ -166,6 +168,22 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             session_id: id("session", &session_id)?,
             path,
         },
+        ActionIntent::PushWorkdirFile {
+            session_id,
+            source,
+            path,
+            replace,
+        } => {
+            let replace: Option<ContentHash> = replace
+                .map(|sha256| sha256.parse().map_err(|_| "bad file hash".to_owned()))
+                .transpose()?;
+            Action::PushWorkdirFile {
+                session_id: id("session", &session_id)?,
+                source: PathBuf::from(source),
+                path,
+                replace,
+            }
+        }
         ActionIntent::DeleteBlob { blob_id } => Action::DeleteBlob(id("blob", &blob_id)?),
         ActionIntent::CropBlob { blob_id, keep } => Action::CropBlob {
             blob: id("blob", &blob_id)?,
