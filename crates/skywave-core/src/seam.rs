@@ -469,6 +469,29 @@ impl Seam {
         })
     }
 
+    /// The workdir holds a file of the message `id` at its name with other
+    /// content: the device gives up on the message and keeps `existing`, the
+    /// hash found there, on that file ([`AttachmentRefusal::FileExists`]).
+    /// The message is never sent; a command already settled (or gone) stays
+    /// as it is.
+    pub fn command_file_exists(
+        &self,
+        id: CommandId,
+        position: usize,
+        existing: ContentHash,
+    ) -> Result<(), CoreError> {
+        let now = Utc::now();
+        self.update(|state, _| {
+            if state
+                .store
+                .record_file_exists(id, position, existing, now)?
+            {
+                state.model.command_file_exists(id, position, existing, now);
+            }
+            Ok(())
+        })
+    }
+
     /// Settles the command `id`, whose reply was unreadable (or which got
     /// [`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS) server errors), from the log:
     /// returns whether it is settled. `head` is the server's log head read

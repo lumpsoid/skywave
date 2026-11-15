@@ -947,8 +947,9 @@ pub enum LogCheck {
     Lost { seen: Seq },
 }
 
-/// Why the outbox gave up on a message's image before posting it: the
-/// server refused the upload, or the local file is gone.
+/// Why the outbox gave up on a message's image or file before posting it:
+/// the server refused the upload, the local file is gone, or the workdir
+/// refused a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentRefusal {
@@ -961,6 +962,13 @@ pub enum AttachmentRefusal {
     HashMismatch,
     /// The local file under the attachments directory is gone or unreadable.
     Missing,
+    /// A file of the message is already in the workdir with other content;
+    /// its hash is the file's `existing`.
+    FileExists,
+    /// The workdir refused a file of the message.
+    FileNotWritten,
+    /// The server was low on disk for a file of the message.
+    ServerDiskLow,
 }
 
 /// Delivery state of a queued command.
@@ -978,7 +986,7 @@ pub enum OutboxStatus {
     /// [`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS) server errors;
     /// final, never sent again.
     Undeliverable,
-    /// The message was never posted: its image could not be staged
+    /// The message was never posted: its image or file could not be staged
     /// ([`AttachmentRefusal`]). Final, never sent again.
     AttachmentRefused(AttachmentRefusal),
 }
@@ -1942,6 +1950,43 @@ impl Store {
             &Settled::Local(LocalResult::AttachmentRefused { reason }),
             now,
         )
+    }
+
+    /// Gives up on a message whose file `position` is already in the
+    /// workdir with other content, at `now` ([`AttachmentRefusal::FileExists`]),
+    /// and keeps `existing`, the hash found there, on that file. Settles the
+    /// entry as [`record_attachment_refused`](Store::record_attachment_refused)
+    /// does; `false` when nothing changed, and the file keeps its hash.
+    pub fn record_file_exists(
+        &self,
+        id: CommandId,
+        position: usize,
+        existing: ContentHash,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        let settled = settle_in(
+            &tx,
+            id,
+            &Settled::Local(LocalResult::AttachmentRefused {
+                reason: AttachmentRefusal::FileExists,
+            }),
+            now,
+        )?;
+        if settled {
+            tx.execute(
+                "UPDATE outbox_files SET existing = ?3
+                 WHERE command_id = ?1 AND position = ?2",
+                params![
+                    id.0.to_string(),
+                    u64_sql(position as u64)?,
+                    existing.to_hex()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(settled)
     }
 
     /// Takes a command back: deletes it from the outbox if the server has
