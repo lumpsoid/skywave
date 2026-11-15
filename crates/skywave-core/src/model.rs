@@ -10497,7 +10497,7 @@ mod tests {
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
             draft_images: model.draft_images.clone(),
-            draft_files: HashMap::new(),
+            draft_files: model.draft_files.clone(),
             attachments: model.attachments.clone(),
             composer_modes: model.composer_modes.clone(),
             read_marks: model.read_marks.clone(),
@@ -13458,13 +13458,13 @@ mod tests {
         use std::sync::mpsc::Receiver;
 
         use skywave_proto::{
-            BlobId as ProtoBlobId, BlobUse, ChangeSet, Commit, CommitLog, ContentHash, DirEntry,
-            EntryKind, LineSpan, ListResult, LogResult, ToolResult, WriteFileResult,
+            BlobId as ProtoBlobId, ChangeSet, Commit, CommitLog, DirEntry, EntryKind, ListResult,
+            LogResult, WriteFileResult,
         };
 
         use super::*;
         use crate::identity::PairedCredentials;
-        use crate::view::{PushState, WorkdirFetch, WorkdirPush, WorkdirView};
+        use crate::view::{PushState, WorkdirPush};
         use crate::{Core, Seam};
 
         fn blob(size: u64) -> BlobRef {
@@ -15151,7 +15151,6 @@ mod tests {
 
         mod crop {
             use super::*;
-            use crate::view::{CropContent, CropView};
 
             /// A tool output in the live session, opened on its crop page.
             fn opened(live: &Live, output: &BlobRef) {
