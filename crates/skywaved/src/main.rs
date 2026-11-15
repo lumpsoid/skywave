@@ -14,7 +14,9 @@ use skywaved::agent::{
 use skywaved::config::{Config, ProcessEnv};
 #[cfg(unix)]
 use skywaved::control::{Client, Confirm, Control, Reply, Request, When};
+use skywaved::control::{Work, active_work};
 use skywaved::data_dir::CONTROL_SOCKET_FILE;
+use skywaved::db::Db;
 use skywaved::devices::{self, Revoke};
 use skywaved::disk::{Disk, FsFreeSpace};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
@@ -361,6 +363,9 @@ async fn serve(
     // Always started: disabled, it still settles runs an enabled daemon
     // left, then ends.
     let mut shell = ShellRunner::start(config.data_dir.clone(), log, config.shell.clone()).await?;
+    // Made before "listening", so a signal sent once that line is logged is never lost.
+    let term = sigterm_listener();
+    let presses = ctrl_c_listener();
     tracing::info!(
         addr = %server.local_addr(),
         protocol_version = skywave_proto::PROTOCOL_VERSION,
@@ -384,9 +389,10 @@ async fn serve(
     };
     #[cfg(not(unix))]
     let requested = std::future::pending::<()>();
+    let db_path = storage.dir.db_path();
     let stop = async {
         tokio::select! {
-            () = shutdown_signal() => {}
+            () = stop_signal(&db_path, term, presses) => {}
             () = requested => {}
             () = shell.failed() => tracing::error!("shell runner failed; stopping the daemon"),
             () = supervisor.failed() => {
@@ -646,23 +652,133 @@ async fn shutdown_signal() {
             std::future::pending::<()>().await;
         }
     };
-    #[cfg(unix)]
-    let term = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "cannot listen for SIGTERM");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
     tokio::select! {
         () = ctrl_c => tracing::info!("received Ctrl-C"),
-        () = term => tracing::info!("received SIGTERM"),
+        () = sigterm_received(sigterm_listener()) => tracing::info!("received SIGTERM"),
     }
+}
+
+/// Completes when `serve` should stop: at once on SIGTERM, and on Ctrl-C at
+/// once when no work runs. Otherwise see `ctrl_c_stops`.
+async fn stop_signal(
+    db_path: &std::path::Path,
+    term: std::io::Result<SigtermListener>,
+    presses: std::io::Result<CtrlCListener>,
+) {
+    tokio::select! {
+        () = sigterm_received(term) => tracing::info!("received SIGTERM"),
+        () = ctrl_c_stops(db_path, presses) => {}
+    }
+}
+
+/// Completes on the Ctrl-C that stops `serve`. With work running it warns
+/// what would be lost, and completes on the next Ctrl-C instead.
+async fn ctrl_c_stops(db_path: &std::path::Path, presses: std::io::Result<CtrlCListener>) {
+    let mut presses = match presses {
+        Ok(presses) => presses,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot listen for Ctrl-C");
+            return std::future::pending().await;
+        }
+    };
+    presses.recv().await;
+    tracing::info!("received Ctrl-C");
+    match read_running_work(db_path).await {
+        Ok(work) if work.is_empty() => return,
+        Ok(work) => {
+            tracing::warn!(
+                work = work.len(),
+                "Ctrl-C with work running; a second one stops"
+            );
+            eprintln!("skywaved: Ctrl-C stops serve and loses what runs now:");
+            for item in &work {
+                eprintln!("  - {item}");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "cannot read the running work; a second Ctrl-C stops");
+            eprintln!("skywaved: Ctrl-C stops serve, and what runs now could not be read: {e}");
+        }
+    }
+    eprintln!(
+        "skywaved: press Ctrl-C again to stop anyway, or run `skywaved stop --after-work` \
+         to stop once it has ended"
+    );
+    // The same listener: a press that lands while the warning prints is kept.
+    presses.recv().await;
+    tracing::info!("received a second Ctrl-C");
+}
+
+/// The work a stop now would lose, read over a connection of its own on the
+/// blocking pool, so the signal wait does not hold the async thread.
+async fn read_running_work(db_path: &std::path::Path) -> skywaved::Result<Vec<Work>> {
+    let db_path = db_path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let db = Db::open(&db_path)?;
+        active_work(db.conn())
+    })
+    .await
+    .map_err(|e| skywaved::Error::Control(format!("database task failed: {e}")))?
+}
+
+/// The Ctrl-C listener: a signal stream on Unix.
+#[cfg(unix)]
+type CtrlCListener = tokio::signal::unix::Signal;
+/// The Ctrl-C listener: a console handler on Windows.
+#[cfg(not(unix))]
+type CtrlCListener = tokio::signal::windows::CtrlC;
+
+/// Makes the Ctrl-C listener. It subscribes when made, and a press it has
+/// not yet been asked for is kept. `tokio::signal::ctrl_c()` subscribes only
+/// on its first poll, so a press between two of its calls would be lost.
+#[cfg(unix)]
+fn ctrl_c_listener() -> std::io::Result<CtrlCListener> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+}
+
+/// Makes the Ctrl-C listener; see the Unix version.
+#[cfg(not(unix))]
+fn ctrl_c_listener() -> std::io::Result<CtrlCListener> {
+    tokio::signal::windows::ctrl_c()
+}
+
+/// The SIGTERM listener: a signal stream on Unix. Elsewhere SIGTERM never
+/// comes, so there is nothing to hold.
+#[cfg(unix)]
+type SigtermListener = tokio::signal::unix::Signal;
+/// The SIGTERM listener: nothing, as SIGTERM never comes elsewhere.
+#[cfg(not(unix))]
+type SigtermListener = ();
+
+/// Makes the SIGTERM listener, as `ctrl_c_listener` makes the Ctrl-C one.
+#[cfg(unix)]
+fn sigterm_listener() -> std::io::Result<SigtermListener> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+}
+
+/// Makes the SIGTERM listener; see the Unix version.
+#[cfg(not(unix))]
+fn sigterm_listener() -> std::io::Result<SigtermListener> {
+    Ok(())
+}
+
+/// Completes on SIGTERM as `listener` hears it. A listener that could not be
+/// made is logged, and then nothing completes.
+#[cfg(unix)]
+async fn sigterm_received(listener: std::io::Result<SigtermListener>) {
+    match listener {
+        Ok(mut term) => {
+            term.recv().await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "cannot listen for SIGTERM");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Completes on SIGTERM as `listener` hears it; never on other platforms.
+#[cfg(not(unix))]
+async fn sigterm_received(_listener: std::io::Result<SigtermListener>) {
+    std::future::pending::<()>().await;
 }
