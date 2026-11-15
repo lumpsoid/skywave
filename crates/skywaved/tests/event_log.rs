@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
-    ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, ImportOutcome,
-    ImportedItem, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
-    ScheduleId, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind, ToolCall,
-    ToolDisplay, ToolKind, ToolResult, limits,
+    ContentHash, ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind,
+    ImportOutcome, ImportedItem, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen,
+    Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind,
+    ToolCall, ToolDisplay, ToolKind, ToolResult, limits,
 };
 use skywaved::agent::fake::FakeOutside;
 use skywaved::agent::import::{self, IMPORT_DEADLINE, Prepared};
@@ -2445,6 +2445,44 @@ fn shell_events_carry_the_current_context() {
         f.storage.db.context_stamp_violations().unwrap(),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn file_written_logs_in_the_current_context_or_refuses() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let by = DeviceId::new();
+    let kind = EventKind::FileWritten {
+        path: "notes/a.txt".into(),
+        sha256: ContentHash::of(b"a"),
+        size: 1,
+        replaced: None,
+        by,
+    };
+    let seq = f
+        .log
+        .file_written(&mut f.storage.db, session, kind.clone())
+        .unwrap()
+        .expect("a known session logs the write");
+    let stored = f.all_events().pop().unwrap();
+    assert_eq!(f.log.head(), seq);
+    assert_eq!(stored.kind, kind);
+    assert_eq!(stored.session_id, session);
+    assert_eq!(stored.command_id, None);
+    assert_eq!(stored.context, ContextId::first_of(session));
+
+    let unknown = f
+        .log
+        .file_written(&mut f.storage.db, SessionId::new(), kind.clone())
+        .unwrap();
+    assert_eq!(unknown, None, "an unknown session logs nothing");
+    assert_eq!(f.log.head(), seq);
+
+    let wrong = f
+        .log
+        .file_written(&mut f.storage.db, session, EventKind::SessionStopped);
+    assert!(matches!(wrong, Err(Error::InvalidAppend(_))), "{wrong:?}");
+    assert_eq!(f.log.head(), seq, "a refused kind leaves no trace");
 }
 
 #[test]

@@ -25,7 +25,7 @@ use skywave_proto::{
     ListResult, LogResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason,
     RepoListing, RunId, RunsSince, Seq, SessionId, SessionOrigin, SessionState, ShellEnd,
     ShellRunStorage, StorageReport, ToolResult, UploadResult, UsageLimit, UsageLimitsResult,
-    Worktree, WorktreeList, limits, path,
+    Worktree, WorktreeList, WriteFileRequest, WriteFileResult, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -3974,6 +3974,271 @@ async fn workdir_download_serves_a_binary_file_as_a_blob() {
     else {
         panic!("expected binary, got {:?}", reply.body);
     };
+}
+
+/// Stages `bytes` with `PUT` as any file, not only an image; returns the hash.
+async fn stage_file(device: &mut Client, bytes: &[u8]) -> ContentHash {
+    let hash = ContentHash::of(bytes);
+    let reply = device
+        .send(
+            Method::PUT,
+            &path::attachment(hash),
+            &[],
+            Bytes::from(bytes.to_vec()),
+        )
+        .await;
+    assert!(matches!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { .. }
+    ));
+    hash
+}
+
+/// Posts `request` to the write route and returns its answer, which is a 200.
+async fn write_file(device: &mut Client, request: &WriteFileRequest) -> WriteFileResult {
+    let reply = device
+        .send(Method::POST, path::WORKDIR_WRITE, &[], json(request))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    reply.json()
+}
+
+/// A staged file is written where its path names and logged as `FileWritten`
+/// by the calling device, with the answer naming that event's seq. The same
+/// request again is `Same` and logs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_file_is_written_into_the_workdir_and_logged() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    std::fs::create_dir(workdir.join("notes")).unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let content = b"hello from the phone\n";
+    let hash = stage_file(&mut device, content).await;
+    let request = WriteFileRequest {
+        session,
+        path: "notes/a.txt".into(),
+        content: hash,
+        replace: None,
+    };
+
+    let before = f.log.head();
+    let WriteFileResult::Written {
+        path: written,
+        size,
+        seq,
+    } = write_file(&mut device, &request).await
+    else {
+        panic!("expected Written");
+    };
+    assert_eq!(written, "notes/a.txt");
+    assert_eq!(size, content.len() as u64);
+    assert!(seq > before);
+    assert_eq!(seq, f.log.head(), "the answer names the event just logged");
+    assert_eq!(std::fs::read(workdir.join("notes/a.txt")).unwrap(), content);
+
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let logged = batch
+        .iter()
+        .find(|(s, _)| *s == seq)
+        .map(|(_, e)| e.kind.clone());
+    assert_eq!(
+        logged,
+        Some(EventKind::FileWritten {
+            path: "notes/a.txt".into(),
+            sha256: hash,
+            size,
+            replaced: None,
+            by: creds.id,
+        })
+    );
+
+    let head = f.log.head();
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::Same {
+            path: "notes/a.txt".into(),
+            size,
+        }
+    );
+    assert_eq!(f.log.head(), head, "a same write logs nothing");
+}
+
+/// A file already at the path is replaced only when the request names its
+/// hash. Otherwise the answer is `Exists` with that hash and nothing changes;
+/// naming it writes the file, and the event records what it replaced.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_replaces_an_existing_file_only_with_its_hash() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let old = b"the old a\n";
+    std::fs::write(workdir.join("a.txt"), old).unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let new = b"the new a, longer than the old\n";
+    let new_hash = stage_file(&mut device, new).await;
+    let old_hash = ContentHash::of(old);
+    let mut request = WriteFileRequest {
+        session,
+        path: "a.txt".into(),
+        content: new_hash,
+        replace: None,
+    };
+
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::Exists {
+            sha256: old_hash,
+            size: old.len() as u64,
+        }
+    );
+    request.replace = Some(ContentHash::of(b"some other file\n"));
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::Exists {
+            sha256: old_hash,
+            size: old.len() as u64,
+        },
+        "a hash that is not the file's does not replace it"
+    );
+    assert_eq!(std::fs::read(workdir.join("a.txt")).unwrap(), old);
+
+    request.replace = Some(old_hash);
+    let WriteFileResult::Written { size, seq, .. } = write_file(&mut device, &request).await else {
+        panic!("expected Written");
+    };
+    assert_eq!(size, new.len() as u64);
+    assert_eq!(std::fs::read(workdir.join("a.txt")).unwrap(), new);
+
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let logged = batch
+        .iter()
+        .find(|(s, _)| *s == seq)
+        .map(|(_, e)| e.kind.clone());
+    assert_eq!(
+        logged,
+        Some(EventKind::FileWritten {
+            path: "a.txt".into(),
+            sha256: new_hash,
+            size,
+            replaced: Some(old_hash),
+            by: creds.id,
+        })
+    );
+}
+
+/// A write the server refuses is answered in the body with a 200 and changes
+/// neither the workdir nor the log. A body that is not a request is a 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_write_answers_200_and_writes_nothing() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let hash = stage_file(&mut device, b"staged\n").await;
+    let write = |path: &str, content: ContentHash| WriteFileRequest {
+        session,
+        path: path.into(),
+        content,
+        replace: None,
+    };
+    let head = f.log.head();
+
+    let refused = [
+        (write("../x", hash), WriteFileResult::NotAllowed),
+        (write(".git/config", hash), WriteFileResult::NotAllowed),
+        (
+            write("ghost.txt", ContentHash::of(b"never staged\n")),
+            WriteFileResult::NotStaged,
+        ),
+        (
+            WriteFileRequest {
+                session: SessionId::new(),
+                path: "x.txt".into(),
+                content: hash,
+                replace: None,
+            },
+            WriteFileResult::UnknownSession,
+        ),
+    ];
+    for (request, answer) in refused {
+        assert_eq!(
+            write_file(&mut device, &request).await,
+            answer,
+            "{request:?}"
+        );
+    }
+    let not_json = device
+        .send(
+            Method::POST,
+            path::WORKDIR_WRITE,
+            &[],
+            Bytes::from_static(b"{"),
+        )
+        .await;
+    assert_eq!(not_json.status, StatusCode::BAD_REQUEST);
+
+    assert_eq!(f.log.head(), head, "refused writes log nothing");
+    assert!(!f.root.join("x").exists(), "../x is not written");
+    assert!(!workdir.join("ghost.txt").exists());
+    assert!(!workdir.join(".git").exists());
+
+    // Control: the same route writes what is allowed.
+    assert!(matches!(
+        write_file(&mut device, &write("ok.txt", hash)).await,
+        WriteFileResult::Written { .. }
+    ));
+    assert_eq!(std::fs::read(workdir.join("ok.txt")).unwrap(), b"staged\n");
+}
+
+/// On a low disk a write is `DiskLow` and writes nothing; with room again the
+/// same write goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_on_a_low_disk_is_disk_low() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let f = Fixture::start_cropping(disk.clone(), None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let content = b"low disk\n";
+    let hash = stage_file(&mut device, content).await;
+    let request = WriteFileRequest {
+        session,
+        path: "low.txt".into(),
+        content: hash,
+        replace: None,
+    };
+    let head = f.log.head();
+
+    free.0.store(9, std::sync::atomic::Ordering::SeqCst);
+    assert!(disk.check());
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::DiskLow
+    );
+    assert!(!workdir.join("low.txt").exists());
+    assert_eq!(f.log.head(), head, "a refused write logs nothing");
+
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    assert!(!disk.check());
+    assert!(
+        matches!(
+            write_file(&mut device, &request).await,
+            WriteFileResult::Written { .. }
+        ),
+        "control: with room again the write lands"
+    );
+    assert_eq!(std::fs::read(workdir.join("low.txt")).unwrap(), content);
 }
 
 /// The content blob of the answer to reading file `name`.

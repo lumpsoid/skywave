@@ -48,7 +48,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use skywave_proto::{ContentHash, WriteFileRequest, WriteFileResult};
@@ -58,6 +58,10 @@ use crate::attachments::Staging;
 use crate::error::{Error, IoContext, Result};
 use crate::workdir::climbs_out;
 
+/// How long one write may run, counted from when its handler started, the
+/// lookup of the workdir included: as [`crate::workdir::DOWNLOAD_DEADLINE`], since a
+/// write copies a staged file of up to the upload cap.
+pub const WRITE_DEADLINE: Duration = Duration::from_secs(120);
 /// Prefix of the temp files a write is made in. One left by a crash stays in
 /// the workdir, listed like any dotfile.
 const TEMP_PREFIX: &str = ".skywave-write-";
