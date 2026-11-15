@@ -194,7 +194,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// ([`RepoWorktrees`], [`RepoListing`], [`WorktreeEntry`]) and [`limits::WORKTREES_MAX`].
 ///
 /// v35: `TurnUsage::context_compacted`, marking the turn of a `/compact`.
-pub const PROTOCOL_VERSION: u32 = 35;
+///
+/// v36: repository file download: `GET` [`path::WORKDIR_DOWNLOAD`] answering a
+/// [`FileResult`] whose content is any file, text or binary, as a blob.
+pub const PROTOCOL_VERSION: u32 = 36;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2853,7 +2856,7 @@ pub enum LimitSeverity {
     Warning,
 }
 
-/// Query string of `GET /v1/workdir/{changes,log,list,file}`. Names a session,
+/// Query string of `GET /v1/workdir/{changes,log,list,file,download}`. Names a session,
 /// not a raw path: the server resolves the root from the session's workdir,
 /// so a device reads only workdirs that sessions run in.
 ///
@@ -3175,6 +3178,8 @@ pub mod path {
     /// Every worktree of the repositories sessions' worktrees came from:
     /// [`crate::WorktreeList`].
     pub const WORKTREES: &str = "/v1/worktrees";
+    /// One file of a session's workdir to download, text or binary: [`crate::FileResult`].
+    pub const WORKDIR_DOWNLOAD: &str = "/v1/workdir/download";
     /// Route template for blob downloads; `{id}` is a [`BlobId`].
     pub const BLOB_ROUTE: &str = "/v1/blobs/{id}";
 

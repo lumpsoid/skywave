@@ -1906,8 +1906,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v35() {
-    assert_eq!(PROTOCOL_VERSION, 35);
+fn protocol_is_v36() {
+    assert_eq!(PROTOCOL_VERSION, 36);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -2152,6 +2152,7 @@ fn api_paths() {
     assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
     assert_eq!(path::WORKTREES, "/v1/worktrees");
+    assert_eq!(path::WORKDIR_DOWNLOAD, "/v1/workdir/download");
     assert_eq!(path::BLOB_ROUTE, "/v1/blobs/{id}");
     assert_eq!(
         path::blob(blob_id()),
