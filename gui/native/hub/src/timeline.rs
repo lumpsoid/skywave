@@ -360,6 +360,18 @@ fn row(
             RowKind::Archived,
             format!("worktree removed by {}", who(by)),
         ),
+        Entry::FileWritten {
+            path, replaced, by, ..
+        } => set(
+            &mut row,
+            RowKind::Archived,
+            format!(
+                "{} {} by {}",
+                clean_line(path),
+                if *replaced { "replaced" } else { "written" },
+                who(by)
+            ),
+        ),
         Entry::AgentSetting {
             setting,
             by,

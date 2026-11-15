@@ -1798,6 +1798,14 @@ pub enum Entry {
     Archived { archived: bool, by: DeviceRef },
     /// The session's git worktree and its branch were removed; its work is refused from here on.
     WorktreeRemoved { by: DeviceRef },
+    /// A device wrote a file into the session's workdir; `replaced` when a
+    /// file was there before.
+    FileWritten {
+        path: String,
+        size: u64,
+        replaced: bool,
+        by: DeviceRef,
+    },
     /// The agent reported an error.
     AgentErrored { message: String },
     /// The agent started as `version`, not `confirmed`, the version the
