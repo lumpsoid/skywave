@@ -510,7 +510,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// fail to compile. Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
-    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36,
+    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37,
 ];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
@@ -614,6 +614,13 @@ fn v34_to_v35(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// event `FileWritten`, which data stored before v36 never holds, so no stored
 /// event or command result changes.
 fn v35_to_v36(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v36 to v37. v37 made staging resumable: a header on `HEAD` and `PUT`
+/// `/v1/attachments/{sha256}` and the answer `OffsetMismatch`, none of
+/// which is stored, so no stored event or command result changes.
+fn v36_to_v37(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -1918,6 +1925,48 @@ mod tests {
             .query_row("SELECT kind FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kind, v35);
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::SessionCreated {
+                worktree: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn v37_reads_what_v36_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v36 = r#"{"type":"session_created","workdir":"/srv/code/skywave","context_name":"velvet walrus","from":null,"worktree":{"repo":"/srv/code/skywave","branch":"feature"}}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 36)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, 's', 't', 'c', ?1)",
+                [v36],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let kind: String = db
+            .conn()
+            .query_row("SELECT kind FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, v36);
         assert!(matches!(
             serde_json::from_str(&kind).unwrap(),
             EventKind::SessionCreated {

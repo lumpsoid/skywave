@@ -4,15 +4,18 @@
 //! A staged upload is the file `<data dir>/attachments/<sha256 hex>`, of any
 //! type. There is no table: the hash is the name, and a file already there is
 //! trusted only while it still hashes to its name. A message that names one as
-//! an image sniffs it then. The bytes go to a temp file in the same directory,
-//! which is synced and renamed into place, so a name never holds a partial
-//! file.
+//! an image sniffs it then. The bytes go to the partial `.part-<sha256 hex>` in
+//! the same directory, which is synced and renamed into place once it hashes
+//! to its name, so a name never holds a partial file. An interrupted upload's
+//! partial is kept, so the next `PUT` resumes it at [`Staging::resume`].
 //!
-//! Staging is a cache. [`Staging::stage_file`] keeps it under [`STAGING_MAX_BYTES`]
-//! by evicting the oldest files, and [`Staging::sweep`] removes files older
-//! than [`STAGING_MAX_AGE`] at startup. Eviction is garbage collection, not an
-//! outcome: a message naming an image that is no longer staged is refused as
-//! `UnknownAttachment` when its command arrives.
+//! Staging is a cache. [`Staging::finish`] keeps it under
+//! [`STAGING_MAX_BYTES`] by evicting the oldest files, and [`Staging::sweep`]
+//! removes files older than [`STAGING_MAX_AGE`] at startup, along with the
+//! temp files a server before v37 left behind (staging writes only partials
+//! now). Eviction is garbage collection, not an outcome: a message naming an
+//! image that is no longer staged is refused as `UnknownAttachment` when its
+//! command arrives.
 //!
 //! A `SendMessage` naming staged images takes each as a new blob: [`prepare`]
 //! hard-links every one into the blob store before the command's transaction
@@ -36,8 +39,12 @@ pub const STAGING_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Staged files last modified longer ago than this are removed at startup.
 pub const STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Prefix of the temp files a write is made in; never a staged image.
+/// Prefix of the temp files a server before v37 wrote uploads in; never a
+/// staged image. Nothing writes them since v37: the startup sweep removes them.
 const TEMP_PREFIX: &str = ".tmp-";
+/// Prefix of the file an interrupted upload left, followed by its sha256 hex;
+/// never a staged file.
+const PARTIAL_PREFIX: &str = ".part-";
 /// The bytes [`ImageType::sniff`] needs to tell all four types apart.
 const SNIFF_LEN: u64 = 12;
 
@@ -63,72 +70,41 @@ impl Staging {
         self.path(sha256).is_file()
     }
 
-    /// Stages `bytes` under `sha256` and answers what the upload route
-    /// answers: the bytes go to a temp file, which [`Staging::stage_file`]
-    /// stages. Nothing is left behind on any refusal.
+    /// Stages `bytes` under `sha256` as one complete upload, and answers what
+    /// the upload route answers. The partial restarts, is written and is
+    /// finished, as a `PUT` at offset 0 would. Takes no upload lock: a caller
+    /// must not race a `PUT` of the same hash (tests and tools only). Nothing
+    /// is left behind on any refusal.
     pub fn stage(&self, sha256: ContentHash, bytes: &[u8]) -> Result<UploadResult> {
-        let mut file = self
-            .temp()
-            .context(|| format!("staging in {}", self.dir.display()))?;
-        file.write_all(bytes)
-            .context(|| format!("staging in {}", self.dir.display()))?;
-        self.stage_file(sha256, file)
-    }
-
-    /// A temp file in the staging directory: never a staged file, and deleted
-    /// when dropped unless [`Staging::stage_file`] persists it.
-    pub fn temp(&self) -> io::Result<tempfile::NamedTempFile> {
-        tempfile::Builder::new()
-            .prefix(TEMP_PREFIX)
-            .tempfile_in(&self.dir)
-    }
-
-    /// Stages the temp file `file`, holding the bytes that `sha256` names, and
-    /// answers what the upload route answers. A file already staged under
-    /// `sha256` is answered as stored, and `file` is deleted unwritten.
-    /// Otherwise `file` must hash to `sha256`; it is then synced and renamed
-    /// to its name, and the oldest files evicted down to
-    /// [`STAGING_MAX_BYTES`]. A refused `file` is deleted.
-    pub fn stage_file(
-        &self,
-        sha256: ContentHash,
-        file: tempfile::NamedTempFile,
-    ) -> Result<UploadResult> {
-        let path = self.path(sha256);
-        if let Some(stored) = self.existing(&path, sha256)? {
-            return Ok(stored);
+        let mut file = match self.resume(sha256, 0)? {
+            Resume::Append(file) => file,
+            Resume::Staged(answer) => return Ok(answer),
+            Resume::Mismatch { .. } => {
+                return Err(io::Error::other("a restart at offset 0 was refused"))
+                    .context(|| format!("staging in {}", self.dir.display()));
+            }
+        };
+        let written = file
+            .write_all(bytes)
+            .context(|| format!("staging in {}", self.dir.display()));
+        drop(file);
+        if let Err(e) = written {
+            let _ = self.drop_partial(sha256);
+            return Err(e);
         }
-        let opened =
-            File::open(file.path()).context(|| format!("opening {}", file.path().display()))?;
-        let hash =
-            ContentHash::read(opened).context(|| format!("reading {}", file.path().display()))?;
-        if hash != sha256 {
-            return Ok(UploadResult::HashMismatch);
-        }
-        let size = file
-            .as_file()
-            .metadata()
-            .context(|| format!("reading {}", file.path().display()))?
-            .len();
-        file.as_file()
-            .sync_all()
-            .context(|| format!("syncing {}", file.path().display()))?;
-        file.persist(&path)
-            .map_err(|e| e.error)
-            .context(|| format!("staging {}", path.display()))?;
-        if let Err(e) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
-            let _ = fs::remove_file(&path);
-            return Err(e).context(|| format!("staging {}", path.display()));
-        }
-        self.evict(STAGING_MAX_BYTES)?;
-        Ok(UploadResult::Stored { size })
+        self.finish(sha256)
     }
 
     /// Removes the oldest staged files, by modification time, until they
     /// total at most `cap` bytes; returns how many were removed. Temp files
-    /// are not staged files: they are neither removed nor counted.
+    /// (left by a server before v37) and partials are not staged files: they
+    /// are neither removed nor counted.
     pub fn evict(&self, cap: u64) -> Result<usize> {
-        let mut staged: Vec<Entry> = self.files()?.into_iter().filter(|f| !f.temp).collect();
+        let mut staged: Vec<Entry> = self
+            .files()?
+            .into_iter()
+            .filter(|f| !f.temp && !f.partial)
+            .collect();
         let mut total: u64 = staged.iter().map(|f| f.size).sum();
         staged.sort_by(|a, b| (a.modified, &a.path).cmp(&(b.modified, &b.path)));
         let mut removed = 0;
@@ -144,10 +120,12 @@ impl Staging {
         Ok(removed)
     }
 
-    /// Removes the temp files and the files last modified more than
-    /// `max_age` ago; returns how many were removed. A missing directory has
-    /// nothing to remove. Startup only: a write in flight is a temp file, so
-    /// nothing may be staging meanwhile.
+    /// Removes the temp files a server before v37 left, and the files last
+    /// modified more than `max_age` ago; returns how many were removed. A
+    /// partial is kept until it is that old, so an upload resumes across a
+    /// restart. A missing directory has nothing to remove. Startup only: a
+    /// temp file is removed whatever its age, so nothing may be writing one
+    /// meanwhile (no server since v37 writes any).
     pub fn sweep(&self, max_age: Duration) -> Result<usize> {
         let now = SystemTime::now();
         let mut removed = 0;
@@ -207,8 +185,11 @@ impl Staging {
             let modified = meta
                 .modified()
                 .context(|| format!("reading {}", path.display()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             files.push(Entry {
-                temp: entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX),
+                temp: name.starts_with(TEMP_PREFIX),
+                partial: name.starts_with(PARTIAL_PREFIX),
                 path,
                 size: meta.len(),
                 modified,
@@ -216,6 +197,112 @@ impl Staging {
         }
         Ok(files)
     }
+
+    /// Where an interrupted upload of `sha256` is kept until it is complete.
+    pub fn partial(&self, sha256: ContentHash) -> PathBuf {
+        self.dir
+            .join(format!("{PARTIAL_PREFIX}{}", sha256.to_hex()))
+    }
+
+    /// The length of the partial of `sha256`; 0 when there is none.
+    pub fn partial_len(&self, sha256: ContentHash) -> Result<u64> {
+        let path = self.partial(sha256);
+        match fs::metadata(&path) {
+            Ok(meta) => Ok(meta.len()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e).context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Opens the partial of `sha256` for a `PUT` whose body starts at
+    /// `offset`. At the partial's length, the file opens for appending. At 0,
+    /// the partial restarts empty and the file opens for writing from there.
+    /// Any other offset is a [`Resume::Mismatch`]: nothing is opened or
+    /// changed, unless the image is staged by now (a `HEAD` and a `PUT` raced),
+    /// which is a [`Resume::Staged`] with its answer.
+    pub fn resume(&self, sha256: ContentHash, offset: u64) -> Result<Resume> {
+        let have = self.partial_len(sha256)?;
+        let path = self.partial(sha256);
+        if offset == have {
+            let file = File::options()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .context(|| format!("opening {}", path.display()))?;
+            return Ok(Resume::Append(file));
+        }
+        if offset == 0 {
+            let file = File::options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .context(|| format!("opening {}", path.display()))?;
+            return Ok(Resume::Append(file));
+        }
+        if let Some(stored) = self.existing(&self.path(sha256), sha256)? {
+            return Ok(Resume::Staged(stored));
+        }
+        Ok(Resume::Mismatch { have })
+    }
+
+    /// Stages the complete partial of `sha256` and answers what the upload
+    /// route answers. A file already staged under `sha256` is answered as
+    /// stored. Otherwise the partial must hash to `sha256`; it is then synced
+    /// and renamed to its name, and the oldest files evicted down to
+    /// [`STAGING_MAX_BYTES`]. The partial is gone after any answer.
+    pub fn finish(&self, sha256: ContentHash) -> Result<UploadResult> {
+        let path = self.path(sha256);
+        let partial = self.partial(sha256);
+        if let Some(stored) = self.existing(&path, sha256)? {
+            remove(&partial)?;
+            return Ok(stored);
+        }
+        let file = File::open(&partial).context(|| format!("opening {}", partial.display()))?;
+        let size = file
+            .metadata()
+            .context(|| format!("reading {}", partial.display()))?
+            .len();
+        let hash = ContentHash::read(&file).context(|| format!("reading {}", partial.display()))?;
+        if hash != sha256 {
+            remove(&partial)?;
+            return Ok(UploadResult::HashMismatch);
+        }
+        // Staging is ordered by modification time, and a partial appended to
+        // long ago must not look old to eviction or the sweep.
+        file.set_modified(SystemTime::now())
+            .context(|| format!("stamping {}", partial.display()))?;
+        file.sync_all()
+            .context(|| format!("syncing {}", partial.display()))?;
+        fs::rename(&partial, &path).context(|| format!("staging {}", path.display()))?;
+        if let Err(e) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(e).context(|| format!("staging {}", path.display()));
+        }
+        self.evict(STAGING_MAX_BYTES)?;
+        Ok(UploadResult::Stored { size })
+    }
+
+    /// Removes the partial of `sha256`, if there is one: for an upload refused
+    /// as too large or for a low disk.
+    pub fn drop_partial(&self, sha256: ContentHash) -> Result<()> {
+        remove(&self.partial(sha256))?;
+        Ok(())
+    }
+}
+
+/// Where a `PUT` of an upload starts writing, from [`Staging::resume`].
+#[derive(Debug)]
+pub enum Resume {
+    /// Write the body to this file, open for appending at the offset the
+    /// `PUT` named.
+    Append(File),
+    /// The `PUT` named another offset than the `have` bytes held; nothing
+    /// was opened or changed.
+    Mismatch { have: u64 },
+    /// The image was staged meanwhile, so the upload is done: the answer it
+    /// was finished with, and nothing is written.
+    Staged(UploadResult),
 }
 
 /// A `SendMessage`'s images, linked into the blob store before its
@@ -383,6 +470,7 @@ struct Entry {
     size: u64,
     modified: SystemTime,
     temp: bool,
+    partial: bool,
 }
 
 /// Removes `path`; whether it was there to remove.
@@ -499,6 +587,36 @@ mod tests {
             }
         );
         assert_eq!(fs::read(staging.path(hash)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn stage_leaves_no_partial_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = ContentHash::of(&bytes);
+        assert_eq!(
+            staging.stage(hash, &bytes).unwrap(),
+            UploadResult::Stored {
+                size: bytes.len() as u64,
+            },
+            "control: the image under its own hash is stored"
+        );
+        assert!(!staging.partial(hash).exists(), "the partial was renamed");
+
+        let wrong = ContentHash::of(b"other bytes");
+        assert_eq!(
+            staging.stage(wrong, &bytes).unwrap(),
+            UploadResult::HashMismatch
+        );
+        assert!(
+            !staging.partial(wrong).exists(),
+            "the refused partial is gone"
+        );
+        assert!(
+            !staging.contains(wrong),
+            "nothing is staged under the wrong hash"
+        );
     }
 
     #[test]
@@ -757,5 +875,176 @@ mod tests {
             !staging.contains(a) && !staging.contains(b),
             "staged files went"
         );
+    }
+
+    #[test]
+    fn a_partial_upload_resumes_from_its_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png().repeat(4);
+        let hash = ContentHash::of(&bytes);
+
+        let Resume::Append(mut first) = staging.resume(hash, 0).unwrap() else {
+            panic!("a new upload appends");
+        };
+        first.write_all(&bytes[..40]).unwrap();
+        drop(first);
+        assert_eq!(staging.partial_len(hash).unwrap(), 40);
+
+        let Resume::Append(mut rest) = staging.resume(hash, 40).unwrap() else {
+            panic!("a resume at the partial's length appends");
+        };
+        rest.write_all(&bytes[40..]).unwrap();
+        drop(rest);
+        assert_eq!(
+            staging.finish(hash).unwrap(),
+            UploadResult::Stored {
+                size: bytes.len() as u64,
+            }
+        );
+        assert_eq!(fs::read(staging.path(hash)).unwrap(), bytes);
+        assert_eq!(names(tmp.path()), [hash.to_hex()], "no partial is left");
+    }
+
+    #[test]
+    fn a_resume_from_another_offset_is_a_mismatch_and_zero_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = ContentHash::of(&bytes);
+
+        let Resume::Append(mut file) = staging.resume(hash, 0).unwrap() else {
+            panic!("a new upload appends");
+        };
+        file.write_all(&bytes[..10]).unwrap();
+        drop(file);
+
+        for offset in [5, 11] {
+            assert!(
+                matches!(
+                    staging.resume(hash, offset).unwrap(),
+                    Resume::Mismatch { have: 10 }
+                ),
+                "an offset that is neither 0 nor the length is a mismatch"
+            );
+        }
+        assert_eq!(staging.partial_len(hash).unwrap(), 10, "nothing changed");
+
+        let Resume::Append(_restart) = staging.resume(hash, 0).unwrap() else {
+            panic!("offset 0 restarts");
+        };
+        assert_eq!(staging.partial_len(hash).unwrap(), 0, "restarted empty");
+    }
+
+    #[test]
+    fn a_finished_partial_that_does_not_hash_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = ContentHash::of(&bytes);
+
+        let Resume::Append(mut file) = staging.resume(hash, 0).unwrap() else {
+            panic!("a new upload appends");
+        };
+        file.write_all(b"other bytes").unwrap();
+        drop(file);
+        assert_eq!(staging.finish(hash).unwrap(), UploadResult::HashMismatch);
+        assert!(names(tmp.path()).is_empty(), "the partial is removed");
+
+        let Resume::Append(mut file) = staging.resume(hash, 0).unwrap() else {
+            panic!("a new upload appends");
+        };
+        file.write_all(&bytes).unwrap();
+        drop(file);
+        assert_eq!(
+            staging.finish(hash).unwrap(),
+            UploadResult::Stored {
+                size: bytes.len() as u64,
+            },
+            "control: the same upload with its own bytes is stored"
+        );
+    }
+
+    #[test]
+    fn finishing_a_partial_of_a_staged_file_answers_stored_and_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = stage(&staging, &bytes);
+
+        let Resume::Append(mut file) = staging.resume(hash, 0).unwrap() else {
+            panic!("a new upload appends");
+        };
+        file.write_all(&bytes[..10]).unwrap();
+        drop(file);
+        assert_eq!(
+            staging.finish(hash).unwrap(),
+            UploadResult::Stored {
+                size: bytes.len() as u64,
+            }
+        );
+        assert_eq!(names(tmp.path()), [hash.to_hex()], "the partial is removed");
+    }
+
+    #[test]
+    fn a_resume_of_a_staged_image_answers_it_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = stage(&staging, &bytes);
+
+        let Resume::Staged(answer) = staging.resume(hash, 5).unwrap() else {
+            panic!("a PUT at an offset the partial lacks, of a staged image, is answered");
+        };
+        assert_eq!(
+            answer,
+            UploadResult::Stored {
+                size: bytes.len() as u64,
+            }
+        );
+        assert_eq!(names(tmp.path()), [hash.to_hex()], "nothing is written");
+    }
+
+    #[test]
+    fn finishing_stamps_the_staged_file_with_the_time_of_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = ContentHash::of(&bytes);
+
+        let Resume::Append(mut file) = staging.resume(hash, 0).unwrap() else {
+            panic!("a new upload appends");
+        };
+        file.write_all(&bytes).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        drop(file);
+        assert!(matches!(
+            staging.finish(hash).unwrap(),
+            UploadResult::Stored { .. }
+        ));
+        let modified = fs::metadata(staging.path(hash))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            modified.elapsed().unwrap() < Duration::from_secs(60),
+            "an old partial is staged as new"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_a_fresh_partial_and_eviction_never_counts_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let staging = Staging::new(dir);
+        fs::write(dir.join(".part-fresh"), [0u8; 100]).unwrap();
+        set_age(&dir.join(".part-fresh"), DAY * 6);
+        fs::write(dir.join(".part-stale"), b"x").unwrap();
+        set_age(&dir.join(".part-stale"), DAY * 8);
+
+        assert_eq!(staging.sweep(STAGING_MAX_AGE).unwrap(), 1);
+        assert_eq!(names(dir), [".part-fresh"]);
+        assert_eq!(staging.evict(0).unwrap(), 0, "a partial is not counted");
+        assert_eq!(names(dir), [".part-fresh"], "nor evicted");
     }
 }

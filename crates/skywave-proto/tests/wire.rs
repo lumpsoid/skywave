@@ -827,6 +827,7 @@ fn all_upload_results() -> Vec<UploadResult> {
         UploadResult::TooLarge,
         UploadResult::HashMismatch,
         UploadResult::DiskLow,
+        UploadResult::OffsetMismatch { have: 65_536 },
     ]
 }
 
@@ -1984,8 +1985,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v36() {
-    assert_eq!(PROTOCOL_VERSION, 36);
+fn protocol_is_v37() {
+    assert_eq!(PROTOCOL_VERSION, 37);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -2242,6 +2243,7 @@ fn api_paths() {
         path::attachment(ContentHash::of(b"")),
         "/v1/attachments/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
+    assert_eq!(UPLOAD_OFFSET_HEADER, "skywave-upload-offset");
 }
 
 #[test]

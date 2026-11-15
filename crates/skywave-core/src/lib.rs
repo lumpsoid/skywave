@@ -84,7 +84,8 @@ pub use store::{
     OutboxStatus, PendingCrop, ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
 };
 pub use transport::{
-    BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError, UploadFile,
+    BlobBody, BlobDownload, BoxFuture, ExpectedRun, StagedUpload, Transport, TransportError,
+    UploadFile,
 };
 pub use view::{
     AgentSetting, AgentView, AgentWork, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus,

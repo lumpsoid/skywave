@@ -29,7 +29,10 @@
 //! **Attachments** (`PUT` and `HEAD /v1/attachments/{sha256}`, v30): an image
 //! a device uploads before the message naming it ([`crate::attachments`]).
 //! `PUT` answers a 200 [`UploadResult`]; `HEAD` is 204 for a staged image,
-//! else 404. Neither takes a file-system permit, like blobs.
+//! else 404. Neither takes a file-system permit, like blobs. Since v37 an
+//! interrupted upload resumes: the 404 carries [`UPLOAD_OFFSET_HEADER`] with
+//! the bytes held, and a `PUT` naming that offset sends the rest (or gets
+//! `OffsetMismatch`).
 //!
 //! **Compression** (D45, [`crate::encoding`]): an event batch or blob body
 //! of at least `COMPRESS_MIN_BYTES` goes as one zstd frame when the request
@@ -151,8 +154,8 @@ use skywave_proto::{
     ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventKind, EventsQuery, Fingerprint,
     HelloQuery, HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult,
     LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId,
-    UploadResult, UsageLimit, UsageLimitsResult, WorkdirQuery, WriteFileRequest, WriteFileResult,
-    check_conversation_id, limits, path,
+    UPLOAD_OFFSET_HEADER, UploadResult, UsageLimit, UsageLimitsResult, WorkdirQuery,
+    WriteFileRequest, WriteFileResult, check_conversation_id, limits, path,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -163,7 +166,7 @@ use crate::agent::{
     self, AgentLogin, LimitsError, LoginState, LoginStatus, OutsideConversations, SourceError,
     UsageLimitsSource,
 };
-use crate::attachments::{self, Staging};
+use crate::attachments::{self, Resume, Staging};
 use crate::blobs::BlobStore;
 use crate::commands::Preparation;
 use crate::crop::{self, CropHook};
@@ -249,6 +252,10 @@ pub(crate) struct Api {
     blobs: BlobStore,
     /// Images staged for a message (`/v1/attachments/{sha256}`).
     staging: Staging,
+    /// The upload lock of each sha256 being uploaded: one `PUT` writes its
+    /// partial at a time. An entry lives while a `PUT` holds or waits for it
+    /// ([`UploadGuard`]).
+    uploads: Mutex<HashMap<ContentHash, UploadLock>>,
     /// Largest file an upload stages (`[files] upload_max`).
     upload_max: u64,
     server_id: ServerId,
@@ -316,6 +323,7 @@ impl Api {
             log: log.with_blobs(blobs.clone()),
             blobs,
             staging: Staging::new(dir.attachments_dir()),
+            uploads: Mutex::new(HashMap::new()),
             upload_max: options.upload_max,
             server_id,
             shutdown,
@@ -1390,7 +1398,9 @@ fn attachment_hash(
         .ok_or(StatusCode::BAD_REQUEST)
 }
 
-/// `HEAD /v1/attachments/{sha256}`: 204 if that image is staged, else 404.
+/// `HEAD /v1/attachments/{sha256}`: 204 if that image is staged. Else 404,
+/// with [`UPLOAD_OFFSET_HEADER`] naming the bytes of an interrupted upload
+/// the server holds, when it holds some.
 async fn attachment_staged(
     State(api): State<Arc<Api>>,
     sha256: std::result::Result<Path<String>, PathRejection>,
@@ -1400,9 +1410,26 @@ async fn attachment_staged(
         Err(status) => return status.into_response(),
     };
     let staging = api.staging.clone();
-    match tokio::task::spawn_blocking(move || staging.contains(hash)).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+    let found = tokio::task::spawn_blocking(move || {
+        if staging.contains(hash) {
+            Ok(None)
+        } else {
+            staging.partial_len(hash).map(Some)
+        }
+    })
+    .await;
+    match found {
+        Ok(Ok(None)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(Some(0))) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(Some(have))) => (
+            StatusCode::NOT_FOUND,
+            [(UPLOAD_OFFSET_HEADER, have.to_string())],
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "attachment lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "attachment lookup task failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1410,62 +1437,187 @@ async fn attachment_staged(
     }
 }
 
+/// The upload lock of one sha256, and how many `PUT`s hold or wait for it.
+struct UploadLock {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    users: usize,
+}
+
+/// A `PUT`'s place in its sha256's upload lock. Dropped, it lets the next
+/// writer in and removes the map's entry once no `PUT` is left on it. The
+/// count is taken before the wait, so a wait cut short (the client went
+/// away) still leaves the map tidy.
+struct UploadGuard {
+    api: Arc<Api>,
+    hash: ContentHash,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// Waits for the upload lock of `hash`: one `PUT` at a time writes its partial.
+async fn upload_lock(api: &Arc<Api>, hash: ContentHash) -> UploadGuard {
+    let mut held = UploadGuard {
+        api: Arc::clone(api),
+        hash,
+        guard: None,
+    };
+    let lock = {
+        let mut uploads = crate::lock(&api.uploads);
+        let entry = uploads.entry(hash).or_insert_with(|| UploadLock {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            users: 0,
+        });
+        entry.users += 1;
+        Arc::clone(&entry.lock)
+    };
+    held.guard = Some(lock.lock_owned().await);
+    held
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        // The lock goes first, so the next waiter can take it.
+        drop(self.guard.take());
+        let mut uploads = crate::lock(&self.api.uploads);
+        if let Some(entry) = uploads.get_mut(&self.hash) {
+            entry.users -= 1;
+            if entry.users == 0 {
+                uploads.remove(&self.hash);
+            }
+        }
+    }
+}
+
+/// The offset a `PUT` names in [`UPLOAD_OFFSET_HEADER`]: 0 when it names none,
+/// else a decimal `u64`, a malformed one being a 400.
+fn upload_offset(headers: &HeaderMap) -> std::result::Result<u64, StatusCode> {
+    match headers.get(UPLOAD_OFFSET_HEADER) {
+        None => Ok(0),
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(StatusCode::BAD_REQUEST),
+    }
+}
+
+/// Drops the partial of `hash` for an upload that is refused. A failed drop is
+/// logged; the refusal stands either way.
+async fn drop_partial_logged(api: &Api, hash: ContentHash) {
+    let staging = api.staging.clone();
+    match tokio::task::spawn_blocking(move || staging.drop_partial(hash)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = %e, "dropping an attachment's partial failed"),
+        Err(e) => tracing::error!(error = %e, "attachment partial task failed"),
+    }
+}
+
+/// Ends an upload refused as `result`: its partial is flushed, closed and
+/// dropped, then `result` is answered.
+async fn refuse_upload(
+    api: &Api,
+    hash: ContentHash,
+    mut out: tokio::fs::File,
+    result: UploadResult,
+) -> Response {
+    let _ = out.flush().await;
+    drop(out);
+    drop_partial_logged(api, hash).await;
+    Json(result).into_response()
+}
+
 /// `PUT /v1/attachments/{sha256}`: stages the body's file and answers an
-/// [`UploadResult`] with 200. The body streams to a temp file in the staging
-/// directory and is never held in memory. The answer is `TooLarge` as soon
-/// as the bytes received pass `upload_max` (the temp file is deleted with
-/// nothing staged). A low disk is `DiskLow`: checked before anything is
-/// written and again before each write, so an upload stops once the disk
-/// turns low.
+/// [`UploadResult`] with 200. The body streams to the upload's partial in the
+/// staging directory and is never held in memory. An optional
+/// [`UPLOAD_OFFSET_HEADER`] makes the body the file from that byte on: it must
+/// be the partial's length (the body appends), or 0 (the partial restarts),
+/// else the answer is `OffsetMismatch` with nothing written. An image staged
+/// meanwhile is answered as stored, its body unread. A body that ends early (a
+/// lost connection or a stall) keeps its partial, so the next `PUT` resumes
+/// it. The answer is `TooLarge` as soon as the bytes of the file, offset
+/// included, pass `upload_max`, and the partial goes. A low disk is `DiskLow`:
+/// checked before anything is written and again before each write, so an
+/// upload stops once the disk turns low. One `PUT` per sha256 writes at a
+/// time; the others wait for its lock. The lock is held until the file work
+/// ends, even if the client has gone away: that work runs on a task of its
+/// own ([`write_upload`]), so a later `PUT` never meets a partial still being
+/// written.
 async fn stage_attachment(
     State(api): State<Arc<Api>>,
     sha256: std::result::Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     let hash = match attachment_hash(sha256) {
         Ok(hash) => hash,
         Err(status) => return status.into_response(),
     };
+    let offset = match upload_offset(&headers) {
+        Ok(offset) => offset,
+        Err(status) => return status.into_response(),
+    };
     if api.log.disk().refresh() {
         return Json(UploadResult::DiskLow).into_response();
     }
+    let work = tokio::spawn(write_upload(api, hash, offset, body));
+    match work.await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!(error = %e, "attachment upload task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The file work of a `PUT` (see [`stage_attachment`]), on its own task: it
+/// takes the upload lock and holds it to its end. The lock comes first so that
+/// the partial is checked, resumed and written by one `PUT` at a time.
+async fn write_upload(api: Arc<Api>, hash: ContentHash, offset: u64, body: Body) -> Response {
+    let _upload = upload_lock(&api, hash).await;
+    if offset > api.upload_max {
+        // A partial left from before `upload_max` was lowered: it is over the
+        // cap already, and an empty body would stage it as it is.
+        drop_partial_logged(&api, hash).await;
+        return Json(UploadResult::TooLarge).into_response();
+    }
     let staging = api.staging.clone();
-    let (tmp, file) = match tokio::task::spawn_blocking(move || {
-        let tmp = staging.temp()?;
-        let file = tmp.reopen()?;
-        Ok::<_, std::io::Error>((tmp, file))
-    })
-    .await
-    {
-        Ok(Ok(opened)) => opened,
+    let resumed = tokio::task::spawn_blocking(move || staging.resume(hash, offset)).await;
+    let file = match resumed {
+        Ok(Ok(Resume::Append(file))) => file,
+        Ok(Ok(Resume::Mismatch { have })) => {
+            return Json(UploadResult::OffsetMismatch { have }).into_response();
+        }
+        Ok(Ok(Resume::Staged(result))) => return Json(result).into_response(),
         Ok(Err(e)) => {
-            tracing::error!(error = %e, "creating an attachment's temp file failed");
+            tracing::error!(error = %e, "opening an attachment's partial failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "attachment temp file task failed");
+            tracing::error!(error = %e, "attachment partial task failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let mut out = tokio::fs::File::from_std(file);
-    let mut received: u64 = 0;
+    let mut received = offset;
     let mut chunks = body.into_data_stream();
     while let Some(chunk) = chunks.next().await {
         let Ok(chunk) = chunk else {
+            // The partial keeps what arrived; the next `PUT` resumes it.
+            let _ = out.flush().await;
             return StatusCode::BAD_REQUEST.into_response();
         };
         received += chunk.len() as u64;
         if received > api.upload_max {
-            return Json(UploadResult::TooLarge).into_response();
+            return refuse_upload(&api, hash, out, UploadResult::TooLarge).await;
         }
         // Each upload may write up to `upload_max`, so the disk is checked
         // before every write, not only before the body: concurrent uploads
         // must not take the free space below the floor.
         if api.log.disk().refresh() {
-            return Json(UploadResult::DiskLow).into_response();
+            return refuse_upload(&api, hash, out, UploadResult::DiskLow).await;
         }
         if let Err(e) = out.write_all(&chunk).await {
             tracing::error!(error = %e, "writing an attachment failed");
+            let _ = out.flush().await;
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
@@ -1475,7 +1627,7 @@ async fn stage_attachment(
     }
     drop(out);
     let staging = api.staging.clone();
-    match tokio::task::spawn_blocking(move || staging.stage_file(hash, tmp)).await {
+    match tokio::task::spawn_blocking(move || staging.finish(hash)).await {
         Ok(Ok(result)) => Json(result).into_response(),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "staging an attachment failed");

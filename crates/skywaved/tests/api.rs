@@ -24,8 +24,8 @@ use skywave_proto::{
     FileResult, HelloResponse, ImageType, ImportOutcome, LimitSeverity, LimitWindow, LineSpan,
     ListResult, LogResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason,
     RepoListing, RunId, RunsSince, Seq, SessionId, SessionOrigin, SessionState, ShellEnd,
-    ShellRunStorage, StorageReport, ToolResult, UploadResult, UsageLimit, UsageLimitsResult,
-    Worktree, WorktreeList, WriteFileRequest, WriteFileResult, limits, path,
+    ShellRunStorage, StorageReport, ToolResult, UPLOAD_OFFSET_HEADER, UploadResult, UsageLimit,
+    UsageLimitsResult, Worktree, WorktreeList, WriteFileRequest, WriteFileResult, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -2145,6 +2145,264 @@ async fn a_bad_attachment_path_is_a_bad_request() {
     assert_eq!(put.status, StatusCode::BAD_REQUEST);
     let head = device.send(Method::HEAD, uri, &[], Bytes::new()).await;
     assert_eq!(head.status, StatusCode::BAD_REQUEST);
+}
+
+/// The header that names an upload's offset, in a `PUT` or a `HEAD` answer.
+fn upload_offset_header() -> header::HeaderName {
+    header::HeaderName::from_static(UPLOAD_OFFSET_HEADER)
+}
+
+/// The partial an interrupted upload of `hash` leaves in `f`'s staging.
+fn partial_of(f: &Fixture, hash: ContentHash) -> PathBuf {
+    f.storage
+        .dir
+        .attachments_dir()
+        .join(format!(".part-{}", hash.to_hex()))
+}
+
+/// An interrupted upload resumes: `HEAD` names the bytes held in the offset
+/// header, and a `PUT` from that offset completes the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_resumes_at_the_offset_head_reports() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(10_000);
+    let hash = ContentHash::of(&bytes);
+    let uri = path::attachment(hash);
+    std::fs::write(partial_of(&f, hash), &bytes[..4000]).unwrap();
+
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NOT_FOUND);
+    assert_eq!(head.header(upload_offset_header()), "4000");
+
+    let reply = device
+        .send(
+            Method::PUT,
+            &uri,
+            &[(upload_offset_header(), "4000")],
+            Bytes::from(bytes[4000..].to_vec()),
+        )
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: 10_000 }
+    );
+    let staged = f.storage.dir.attachments_dir().join(hash.to_hex());
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+    assert!(!partial_of(&f, hash).exists(), "the partial is gone");
+
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NO_CONTENT);
+    assert!(head.headers.get(upload_offset_header()).is_none());
+}
+
+/// A `PUT` naming an offset other than the partial's length is an
+/// `OffsetMismatch` and writes nothing; one naming no offset restarts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_at_another_offset_is_an_offset_mismatch_and_zero_restarts() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(10_000);
+    let hash = ContentHash::of(&bytes);
+    let uri = path::attachment(hash);
+    std::fs::write(partial_of(&f, hash), &bytes[..4000]).unwrap();
+
+    let reply = device
+        .send(
+            Method::PUT,
+            &uri,
+            &[(upload_offset_header(), "5000")],
+            Bytes::from(bytes[5000..].to_vec()),
+        )
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::OffsetMismatch { have: 4000 }
+    );
+    assert_eq!(
+        std::fs::read(partial_of(&f, hash)).unwrap(),
+        &bytes[..4000],
+        "the partial is as it was"
+    );
+
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: 10_000 }
+    );
+}
+
+/// A body cut off midway keeps the bytes that arrived, and the `PUT` from the
+/// offset `HEAD` then reports completes the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_cut_off_midway_keeps_its_partial_and_resumes() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(10_000);
+    let hash = ContentHash::of(&bytes);
+    let uri = path::attachment(hash);
+
+    let mut tls = tls_from(&f, LOCAL, Some(&creds), false).await.unwrap();
+    let request = format!("PUT {uri} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 10000\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+    tls.write_all(&bytes[..4000]).await.unwrap();
+    tls.flush().await.unwrap();
+    drop(tls);
+
+    // The server reads the body as it arrives, so poll until the bytes show.
+    let held = tokio::time::timeout(SOON, async {
+        loop {
+            let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+            if head.headers.get(upload_offset_header()) == Some(&HeaderValue::from_static("4000")) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(held.is_ok(), "the server holds the 4000 bytes that arrived");
+
+    let reply = tokio::time::timeout(
+        SOON,
+        device.send(
+            Method::PUT,
+            &uri,
+            &[(upload_offset_header(), "4000")],
+            Bytes::from(bytes[4000..].to_vec()),
+        ),
+    )
+    .await
+    .expect("the resumed PUT is answered");
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: 10_000 }
+    );
+    let staged = f.storage.dir.attachments_dir().join(hash.to_hex());
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+}
+
+/// An upload offset that is not a decimal number is a bad request, and
+/// writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_upload_offset_is_a_bad_request() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(1000);
+    let uri = path::attachment(ContentHash::of(&bytes));
+    let reply = device
+        .send(
+            Method::PUT,
+            &uri,
+            &[(upload_offset_header(), "x")],
+            Bytes::from(bytes.clone()),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(bytes))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: 1000 },
+        "control: the same upload without a malformed offset is stored"
+    );
+}
+
+/// A resumed upload counts its offset against `upload_max`: over the cap it is
+/// `TooLarge`, and its partial is dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_upload_over_the_cap_is_too_large_and_drops_its_partial() {
+    const CAP: u64 = 1 << 20;
+    let options = ServerOptions {
+        git: isolated_git(),
+        upload_max: CAP,
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_configured(|log| log, options).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let bytes = png(CAP as usize + 1);
+    let hash = ContentHash::of(&bytes);
+    let uri = path::attachment(hash);
+    let half = (CAP / 2) as usize;
+    std::fs::write(partial_of(&f, hash), &bytes[..half]).unwrap();
+
+    let offset = half.to_string();
+    let reply = device
+        .send(
+            Method::PUT,
+            &uri,
+            &[(upload_offset_header(), offset.as_str())],
+            Bytes::from(bytes[half..].to_vec()),
+        )
+        .await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::TooLarge);
+    assert!(
+        files_under(&f.storage.dir.attachments_dir()).is_empty(),
+        "nothing is left, the partial included"
+    );
+}
+
+/// A partial left over `upload_max` (from before the cap was lowered) is not
+/// staged by an empty `PUT` at its length: it is `TooLarge` and dropped. A
+/// partial of exactly the cap is still stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_past_the_cap_with_an_empty_body_is_too_large() {
+    const CAP: u64 = 1 << 20;
+    let options = ServerOptions {
+        git: isolated_git(),
+        upload_max: CAP,
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_configured(|log| log, options).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let over = png(CAP as usize + 1);
+    let hash = ContentHash::of(&over);
+    let uri = path::attachment(hash);
+    std::fs::write(partial_of(&f, hash), &over).unwrap();
+
+    let offset = over.len().to_string();
+    let reply = device
+        .send(
+            Method::PUT,
+            &uri,
+            &[(upload_offset_header(), offset.as_str())],
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(reply.json::<UploadResult>(), UploadResult::TooLarge);
+    assert!(
+        files_under(&f.storage.dir.attachments_dir()).is_empty(),
+        "nothing is left, the partial included"
+    );
+
+    let exact = png(CAP as usize);
+    let hash = ContentHash::of(&exact);
+    let uri = path::attachment(hash);
+    std::fs::write(partial_of(&f, hash), &exact).unwrap();
+    let offset = exact.len().to_string();
+    let reply = device
+        .send(
+            Method::PUT,
+            &uri,
+            &[(upload_offset_header(), offset.as_str())],
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: CAP },
+        "control: a partial of exactly the cap is stored"
+    );
 }
 
 /// Stages `bytes` as an image with `PUT`, as a device does before it sends
