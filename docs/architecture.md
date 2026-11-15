@@ -1267,8 +1267,9 @@ logs) an event that no longer decodes rather than failing.
   `blobs/<id>.part` when `Downloading` or `Stopped`; every other `<id>`
   or `<id>.part` goes, a `.part` beside a `NotDownloaded` or `Failed`
   row included (no recorded progress points into it, so a try would
-  truncate it anyway). Any other name in `blobs/` is left alone and
-  logged.
+  truncate it anyway), and so does a `<id>.own` (the device's own image,
+  which only a crash before its batch applied leaves). Any other name in
+  `blobs/` is left alone and logged.
 
   **Local crop.** A crop of a blob this device *holds* (its row
   `available`, or itself the `into` of a pending crop: a crop of a crop)
