@@ -8,7 +8,7 @@
 //! which is synced and renamed into place, so a name never holds a partial
 //! file.
 //!
-//! Staging is a cache. [`Staging::stage`] keeps it under [`STAGING_MAX_BYTES`]
+//! Staging is a cache. [`Staging::stage_file`] keeps it under [`STAGING_MAX_BYTES`]
 //! by evicting the oldest files, and [`Staging::sweep`] removes files older
 //! than [`STAGING_MAX_AGE`] at startup. Eviction is garbage collection, not an
 //! outcome: a message naming an image that is no longer staged is refused as
@@ -64,27 +64,64 @@ impl Staging {
     }
 
     /// Stages `bytes` under `sha256` and answers what the upload route
-    /// answers. A file already staged under `sha256` is answered as stored
-    /// and not rewritten. Otherwise the bytes must be at most
-    /// [`limits::ATTACHMENT_MAX_BYTES`] and hash to `sha256`; then they are
-    /// written, and the oldest files evicted down to [`STAGING_MAX_BYTES`].
-    /// Nothing is written on any refusal.
+    /// answers: the bytes go to a temp file, which [`Staging::stage_file`]
+    /// stages. Nothing is left behind on any refusal.
     pub fn stage(&self, sha256: ContentHash, bytes: &[u8]) -> Result<UploadResult> {
-        if bytes.len() as u64 > limits::ATTACHMENT_MAX_BYTES {
-            return Ok(UploadResult::TooLarge);
-        }
+        let mut file = self
+            .temp()
+            .context(|| format!("staging in {}", self.dir.display()))?;
+        file.write_all(bytes)
+            .context(|| format!("staging in {}", self.dir.display()))?;
+        self.stage_file(sha256, file)
+    }
+
+    /// A temp file in the staging directory: never a staged file, and deleted
+    /// when dropped unless [`Staging::stage_file`] persists it.
+    pub fn temp(&self) -> io::Result<tempfile::NamedTempFile> {
+        tempfile::Builder::new()
+            .prefix(TEMP_PREFIX)
+            .tempfile_in(&self.dir)
+    }
+
+    /// Stages the temp file `file`, holding the bytes that `sha256` names, and
+    /// answers what the upload route answers. A file already staged under
+    /// `sha256` is answered as stored, and `file` is deleted unwritten.
+    /// Otherwise `file` must hash to `sha256`; it is then synced and renamed
+    /// to its name, and the oldest files evicted down to
+    /// [`STAGING_MAX_BYTES`]. A refused `file` is deleted.
+    pub fn stage_file(
+        &self,
+        sha256: ContentHash,
+        file: tempfile::NamedTempFile,
+    ) -> Result<UploadResult> {
         let path = self.path(sha256);
         if let Some(stored) = self.existing(&path, sha256)? {
             return Ok(stored);
         }
-        if ContentHash::of(bytes) != sha256 {
+        let opened =
+            File::open(file.path()).context(|| format!("opening {}", file.path().display()))?;
+        let hash =
+            ContentHash::read(opened).context(|| format!("reading {}", file.path().display()))?;
+        if hash != sha256 {
             return Ok(UploadResult::HashMismatch);
         }
-        write_file(&self.dir, &path, bytes).context(|| format!("staging {}", path.display()))?;
+        let size = file
+            .as_file()
+            .metadata()
+            .context(|| format!("reading {}", file.path().display()))?
+            .len();
+        file.as_file()
+            .sync_all()
+            .context(|| format!("syncing {}", file.path().display()))?;
+        file.persist(&path)
+            .map_err(|e| e.error)
+            .context(|| format!("staging {}", path.display()))?;
+        if let Err(e) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(e).context(|| format!("staging {}", path.display()));
+        }
         self.evict(STAGING_MAX_BYTES)?;
-        Ok(UploadResult::Stored {
-            size: bytes.len() as u64,
-        })
+        Ok(UploadResult::Stored { size })
     }
 
     /// Removes the oldest staged files, by modification time, until they
@@ -335,23 +372,6 @@ struct Entry {
     temp: bool,
 }
 
-/// Writes `bytes` to `path` the way a blob is written: to a temp file in
-/// `dir`, synced and renamed into place, then `dir` synced. On error nothing
-/// is left at `path`.
-fn write_file(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut out = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
-        .tempfile_in(dir)?;
-    out.write_all(bytes)?;
-    out.as_file().sync_all()?;
-    out.persist(path).map_err(|e| e.error)?;
-    if let Err(e) = File::open(dir).and_then(|dir| dir.sync_all()) {
-        let _ = fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(())
-}
-
 /// Removes `path`; whether it was there to remove.
 fn remove(path: &Path) -> Result<bool> {
     match fs::remove_file(path) {
@@ -450,17 +470,6 @@ mod tests {
             ),
             "control: the same image under its own hash is stored"
         );
-    }
-
-    #[test]
-    fn an_oversize_body_is_too_large_and_nothing_is_written() {
-        let tmp = tempfile::tempdir().unwrap();
-        let staging = Staging::new(tmp.path());
-        let mut bytes = png();
-        bytes.resize(limits::ATTACHMENT_MAX_BYTES as usize + 1, 0);
-        let hash = ContentHash::of(&bytes);
-        assert_eq!(staging.stage(hash, &bytes).unwrap(), UploadResult::TooLarge);
-        assert!(names(tmp.path()).is_empty());
     }
 
     #[test]

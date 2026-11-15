@@ -146,6 +146,7 @@ min_free = "1GiB"       # below this free on the data dir's disk, agents
 
 [files]
 download_max = "64MiB"  # largest repository file a device can download
+upload_max = "64MiB"    # largest file a device can upload; at most 256MiB
 ```
 
 ```sh

@@ -153,7 +153,7 @@ use skywave_proto::{
     PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId, UploadResult,
     UsageLimit, UsageLimitsResult, WorkdirQuery, check_conversation_id, limits, path,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::agent::import::{self, Prepared};
@@ -247,6 +247,8 @@ pub(crate) struct Api {
     blobs: BlobStore,
     /// Images staged for a message (`/v1/attachments/{sha256}`).
     staging: Staging,
+    /// Largest file an upload stages (`[files] upload_max`).
+    upload_max: u64,
     server_id: ServerId,
     /// Becomes `true` when the server shuts down, ending long-poll waits.
     shutdown: watch::Receiver<bool>,
@@ -312,6 +314,7 @@ impl Api {
             log: log.with_blobs(blobs.clone()),
             blobs,
             staging: Staging::new(dir.attachments_dir()),
+            upload_max: options.upload_max,
             server_id,
             shutdown,
             outside: options.outside,
@@ -1336,11 +1339,13 @@ async fn attachment_staged(
     }
 }
 
-/// `PUT /v1/attachments/{sha256}`: stages the body's image and answers an
-/// [`UploadResult`] with 200. The body is read in memory, and the answer is
-/// `TooLarge` as soon as it passes [`limits::ATTACHMENT_MAX_BYTES`], without
-/// reading the rest. A low disk is `DiskLow`, checked before anything is
-/// written.
+/// `PUT /v1/attachments/{sha256}`: stages the body's file and answers an
+/// [`UploadResult`] with 200. The body streams to a temp file in the staging
+/// directory and is never held in memory. The answer is `TooLarge` as soon
+/// as the bytes received pass `upload_max` (the temp file is deleted with
+/// nothing staged). A low disk is `DiskLow`: checked before anything is
+/// written and again before each write, so an upload stops once the disk
+/// turns low.
 async fn stage_attachment(
     State(api): State<Arc<Api>>,
     sha256: std::result::Result<Path<String>, PathRejection>,
@@ -1350,22 +1355,56 @@ async fn stage_attachment(
         Ok(hash) => hash,
         Err(status) => return status.into_response(),
     };
-    let mut bytes = Vec::new();
+    if api.log.disk().refresh() {
+        return Json(UploadResult::DiskLow).into_response();
+    }
+    let staging = api.staging.clone();
+    let (tmp, file) = match tokio::task::spawn_blocking(move || {
+        let tmp = staging.temp()?;
+        let file = tmp.reopen()?;
+        Ok::<_, std::io::Error>((tmp, file))
+    })
+    .await
+    {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "creating an attachment's temp file failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "attachment temp file task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut out = tokio::fs::File::from_std(file);
+    let mut received: u64 = 0;
     let mut chunks = body.into_data_stream();
     while let Some(chunk) = chunks.next().await {
         let Ok(chunk) = chunk else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        if (bytes.len() + chunk.len()) as u64 > limits::ATTACHMENT_MAX_BYTES {
+        received += chunk.len() as u64;
+        if received > api.upload_max {
             return Json(UploadResult::TooLarge).into_response();
         }
-        bytes.extend_from_slice(&chunk);
+        // Each upload may write up to `upload_max`, so the disk is checked
+        // before every write, not only before the body: concurrent uploads
+        // must not take the free space below the floor.
+        if api.log.disk().refresh() {
+            return Json(UploadResult::DiskLow).into_response();
+        }
+        if let Err(e) = out.write_all(&chunk).await {
+            tracing::error!(error = %e, "writing an attachment failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
-    if api.log.disk().refresh() {
-        return Json(UploadResult::DiskLow).into_response();
+    if let Err(e) = out.flush().await {
+        tracing::error!(error = %e, "writing an attachment failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    drop(out);
     let staging = api.staging.clone();
-    match tokio::task::spawn_blocking(move || staging.stage(hash, &bytes)).await {
+    match tokio::task::spawn_blocking(move || staging.stage_file(hash, tmp)).await {
         Ok(Ok(result)) => Json(result).into_response(),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "staging an attachment failed");
