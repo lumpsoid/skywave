@@ -1313,7 +1313,15 @@ async fn write_one(
             return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
         }
     };
-    if ContentHash::of(&bytes) != file.sha256 {
+    let copy = bytes.clone();
+    let hash = match tokio::task::spawn_blocking(move || ContentHash::of(&copy)).await {
+        Ok(hash) => hash,
+        Err(error) => {
+            tracing::warn!(%error, name = %file.name, "message file cannot be hashed");
+            return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
+        }
+    };
+    if hash != file.sha256 {
         tracing::warn!(name = %file.name, "message file no longer holds its content");
         return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
     }
@@ -1386,7 +1394,7 @@ pub(crate) async fn push_workdir_file(
         }
     }
     let bytes = match tokio::fs::read(source).await {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Bytes::from(bytes),
         Err(error) => {
             tracing::warn!(%error, "workdir push file cannot be read");
             return Ok(PushOutcome::Unreadable {
@@ -1394,9 +1402,18 @@ pub(crate) async fn push_workdir_file(
             });
         }
     };
-    let sha = ContentHash::of(&bytes);
+    let copy = bytes.clone();
+    let sha = match tokio::task::spawn_blocking(move || ContentHash::of(&copy)).await {
+        Ok(sha) => sha,
+        Err(error) => {
+            tracing::warn!(%error, "workdir push file cannot be hashed");
+            return Ok(PushOutcome::Unreadable {
+                reason: error.to_string(),
+            });
+        }
+    };
     if !transport.attachment_staged(sha).await? {
-        let answer = transport.upload_attachment(sha, Bytes::from(bytes)).await?;
+        let answer = transport.upload_attachment(sha, bytes).await?;
         if !matches!(answer, UploadResult::Stored { .. }) {
             return Ok(PushOutcome::UploadRefused(answer));
         }
