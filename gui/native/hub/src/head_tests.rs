@@ -9,8 +9,8 @@ use skywave_proto::{CommandId, CommandKind, DirsResult, Event, EventBatch, Event
 use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
-    ActionIntent, CreatePrompt, ListKindView, LoginFlowState, PastedCode, RouteView, RowKind,
-    ScreenView, ShellPromptView, ToolState,
+    ActionIntent, ComposerFile, CreatePrompt, ListKindView, LoginFlowState, PastedCode, RouteView,
+    RowKind, ScreenView, ShellPromptView, ToolState,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -772,7 +772,7 @@ impl Rig {
         for out in outs {
             match out {
                 Out::Prepare { session_id, source } => {
-                    let result = crate::attach::prepare_image(self._dir.path(), source);
+                    let result = crate::attach::prepare_attachment(self._dir.path(), source);
                     let outs = self.head.on_prepared(session_id, result, self.clock);
                     rest.extend(self.apply(outs));
                 }
@@ -854,6 +854,8 @@ impl Rig {
                 Action::UseSnippet(_) => "use snippet",
                 Action::Attach { .. } => "attach",
                 Action::Detach { .. } => "detach",
+                Action::AttachFile { .. } => "attach file",
+                Action::DetachFile { .. } => "detach file",
                 _ => "other",
             })
             .collect()
@@ -1397,15 +1399,110 @@ fn sending_waits_for_an_image_being_prepared() {
     assert_eq!(rig.kinds().last(), Some(&"send"));
 }
 
+/// The intent to attach the file `name`, written with `bytes` into the rig's
+/// directory, as the picker or a drop names it.
+fn file_intent(rig: &mut Rig, name: &str, bytes: &[u8]) -> Vec<Out> {
+    let path = rig._dir.path().join(name);
+    std::fs::write(&path, bytes).unwrap();
+    rig.intent(GuiIntent::AttachFile {
+        session_id: rig.session.0.to_string(),
+        path: path.display().to_string(),
+    })
+}
+
 #[test]
-fn a_pdf_is_refused_with_a_note() {
+fn a_non_image_file_is_attached_as_a_file() {
+    let mut rig = Rig::new();
+    let bytes = b"%PDF-1.4 not a picture";
+    let outs = file_intent(&mut rig, "notes.pdf", bytes);
+    assert_eq!(rig.composer().preparing, 1);
+    let outs = rig.prepare(outs);
+    assert!(notices(&outs).is_empty(), "{:?}", notices(&outs));
+    assert_eq!(rig.kinds().last(), Some(&"attach file"));
+    assert_eq!(rig.composer().preparing, 0);
+
+    rig.results();
+    rig.view();
+    let composer = rig.composer();
+    assert!(composer.images.is_empty(), "{:?}", composer.images);
+    assert_eq!(
+        composer.files,
+        [ComposerFile {
+            name: "notes.pdf".into(),
+            size_label: format::bytes(u64::try_from(bytes.len()).unwrap()),
+            replaces: false,
+        }]
+    );
+    let stored = attachment::attachment_path(rig._dir.path(), ContentHash::of(bytes));
+    assert_eq!(std::fs::read(stored).unwrap(), bytes);
+}
+
+#[test]
+fn pasted_bytes_that_are_not_an_image_are_still_refused() {
     let mut rig = Rig::new();
     let outs = attach_intent(&mut rig, b"%PDF-1.4 not a picture");
-    assert_eq!(rig.composer().preparing, 1);
     let outs = rig.prepare(outs);
     assert_eq!(notices(&outs), ["not an image"]);
     assert!(!rig.kinds().contains(&"attach"), "{:?}", rig.kinds());
     assert_eq!(rig.composer().preparing, 0);
+}
+
+#[test]
+fn an_image_file_is_still_attached_as_an_image() {
+    let mut rig = Rig::new();
+    let bytes = png(5);
+    let sha = attachment::prepare(&bytes).unwrap().sha256;
+    let outs = file_intent(&mut rig, "photo.png", &bytes);
+    rig.prepare(outs);
+    assert_eq!(rig.kinds().last(), Some(&"attach"));
+    rig.results();
+    rig.view();
+    let composer = rig.composer();
+    assert_eq!(composer.images.len(), 1);
+    assert_eq!(composer.images[0].sha256, sha.to_string());
+    assert!(composer.files.is_empty(), "{:?}", composer.files);
+}
+
+#[test]
+fn a_second_file_with_the_same_name_is_refused_with_a_note() {
+    let mut rig = Rig::new();
+    let outs = file_intent(&mut rig, "notes.pdf", b"%PDF-1.4 first");
+    rig.prepare(outs);
+    rig.results();
+    rig.view();
+    assert_eq!(rig.composer().files.len(), 1);
+
+    rig.actions.clear();
+    let outs = file_intent(&mut rig, "notes.pdf", b"%PDF-1.4 second");
+    let outs = rig.prepare(outs);
+    assert_eq!(
+        notices(&outs),
+        ["a file named notes.pdf is already attached"]
+    );
+    assert!(!rig.kinds().contains(&"attach file"), "{:?}", rig.kinds());
+    rig.results();
+    rig.view();
+    assert_eq!(rig.composer().files.len(), 1);
+}
+
+#[test]
+fn detaching_a_file_removes_it() {
+    let mut rig = Rig::new();
+    let outs = file_intent(&mut rig, "notes.pdf", b"%PDF-1.4 a file");
+    rig.prepare(outs);
+    rig.results();
+    rig.view();
+    assert_eq!(rig.composer().files.len(), 1);
+
+    rig.actions.clear();
+    rig.intent(GuiIntent::DetachFile {
+        session_id: rig.session.0.to_string(),
+        name: "notes.pdf".into(),
+    });
+    assert_eq!(rig.kinds().last(), Some(&"detach file"));
+    rig.results();
+    rig.view();
+    assert!(rig.composer().files.is_empty());
 }
 
 #[test]

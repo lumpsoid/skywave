@@ -27,6 +27,7 @@ ComposerView _draft({
       : null,
   canStop: false,
   images: const [],
+  files: const [],
   preparing: 0,
   historySearch: search,
 );

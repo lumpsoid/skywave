@@ -96,6 +96,24 @@ pub struct TimelineRow {
     /// A message's images in the order attached: a queued message's, or a
     /// logged message's; empty for every other row.
     pub images: Vec<RowImage>,
+    /// A queued message's non-image files, in order; empty for every other
+    /// row.
+    pub files: Vec<RowFile>,
+    /// The message was refused because a file it writes is already in the
+    /// workdir with other content: `ResendReplacing` sends it again, replacing
+    /// that file.
+    pub can_resend_replacing: bool,
+}
+
+/// A non-image file on a queued message's row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct RowFile {
+    /// The name it is written as in the workdir root.
+    pub name: String,
+    /// `812 B`, `1.2 MiB`.
+    pub size_label: String,
+    /// The sender found another file at that name in the workdir.
+    pub found: bool,
 }
 
 /// An image on a message's row.

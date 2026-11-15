@@ -172,12 +172,13 @@ class ComposerState extends State<Composer> {
     _attachFiles(paths);
   }
 
-  /// Attaches each file to the draft, in order. The hub refuses what is not
-  /// an image, with a notice.
+  /// Attaches each file to the draft, in order. An image is attached as an
+  /// image; any other file is attached as a file, written into the workdir
+  /// when the message is sent.
   void _attachFiles(List<String> paths) {
     for (final path in paths) {
       widget.send(
-        GuiIntentAttachImageFile(sessionId: widget.sessionId, path: path),
+        GuiIntentAttachFile(sessionId: widget.sessionId, path: path),
       );
     }
   }

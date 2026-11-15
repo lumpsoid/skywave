@@ -239,6 +239,9 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::RemoveWorktree { session_id } => Action::RemoveWorktree {
             session_id: id("session", &session_id)?,
         },
+        ActionIntent::ResendReplacing { command_id } => {
+            Action::ResendReplacing(id("command", &command_id)?)
+        }
     })
 }
 
@@ -479,6 +482,23 @@ mod tests {
                 answers: vec![answer(vec![300], None)],
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn resending_replacing_names_the_refused_command() {
+        let command = skywave_core::CommandId::new();
+        assert_eq!(
+            action(ActionIntent::ResendReplacing {
+                command_id: command.0.to_string(),
+            }),
+            Ok(Action::ResendReplacing(command))
+        );
+        assert_eq!(
+            action(ActionIntent::ResendReplacing {
+                command_id: "nope".into(),
+            }),
+            Err("not a command id: \"nope\"".to_owned())
         );
     }
 }
