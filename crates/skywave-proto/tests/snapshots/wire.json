@@ -1,7 +1,7 @@
 {
-  "protocol_version": 34,
+  "protocol_version": 35,
   "hello": {
-    "protocol_version": 34,
+    "protocol_version": 35,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -732,7 +732,8 @@
           "cost_usd": 0.04,
           "model": "model-a",
           "context_tokens": 19337,
-          "context_window": 1000000
+          "context_window": 1000000,
+          "context_compacted": false
         }
       },
       {
@@ -748,7 +749,8 @@
           "cost_usd": null,
           "model": null,
           "context_tokens": null,
-          "context_window": null
+          "context_window": null,
+          "context_compacted": true
         }
       },
       {

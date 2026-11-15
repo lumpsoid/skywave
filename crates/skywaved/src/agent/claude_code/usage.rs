@@ -43,6 +43,7 @@ pub fn turn_usage(result: &Value, model: Option<&str>) -> TurnUsage {
         context_window: model
             .and_then(|m| models?.get(m)?.get("contextWindow")?.as_u64())
             .filter(|&w| w > 0),
+        context_compacted: result.get("local_command").and_then(Value::as_str) == Some("compact"),
     }
 }
 
@@ -166,7 +167,21 @@ mod tests {
         });
         let usage = turn_usage(&result, Some("main-model"));
         assert_eq!(usage.context_tokens, None);
+        assert!(!usage.context_compacted);
         assert_eq!(usage.duration_ms, Some(30000));
+    }
+
+    #[test]
+    fn a_compact_turn_is_marked_compacted() {
+        let result = json!({
+            "duration_ms": 30000,
+            "local_command": "compact",
+            "usage": { "input_tokens": 0, "output_tokens": 0, "iterations": [] },
+            "model_usage_since_last_result": {}
+        });
+        let usage = turn_usage(&result, Some("main-model"));
+        assert!(usage.context_compacted);
+        assert_eq!(usage.context_tokens, None);
     }
 
     #[test]

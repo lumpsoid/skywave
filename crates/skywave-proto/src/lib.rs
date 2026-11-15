@@ -192,7 +192,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v34: the worktree list: `GET` [`path::WORKTREES`] answering [`WorktreeList`]
 /// ([`RepoWorktrees`], [`RepoListing`], [`WorktreeEntry`]) and [`limits::WORKTREES_MAX`].
-pub const PROTOCOL_VERSION: u32 = 34;
+///
+/// v35: `TurnUsage::context_compacted`, marking the turn of a `/compact`.
+pub const PROTOCOL_VERSION: u32 = 35;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -1894,10 +1896,16 @@ pub struct TurnUsage {
     pub model: Option<String>,
     /// How full the context is as the turn ends: the tokens the next request
     /// will read. Not a sum over the turn. `None` when the agent reported no
-    /// fill (a cleared context's turn, an interrupt while text streamed).
+    /// fill (a `/compact`'s turn, see `context_compacted`; an interrupt while
+    /// text streamed).
     pub context_tokens: Option<u64>,
     /// How many tokens the context of the turn's model holds.
     pub context_window: Option<u64>,
+    /// The turn compacted the context, so a fill reported before it no longer
+    /// holds. Set only by a turn that did nothing else (a `/compact`); an
+    /// automatic compaction within a turn needs none, as the turn's own fill
+    /// is taken after it.
+    pub context_compacted: bool,
 }
 
 impl TurnUsage {
