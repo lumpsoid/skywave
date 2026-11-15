@@ -27,6 +27,13 @@ The hub crate's package name is `hub`, not `skywave-hub`: rinf 8.11's
 cargokit looks for `lib<package name>.so`, while its gradle, CMake and pod
 setups link `libhub`.
 
+The rinf Dart package is vendored in `third_party/rinf` (8.11.0 minus
+`example/`) and wired in through `dependency_overrides` in `pubspec.yaml`.
+It carries one patch: the cargokit `gradle/plugin.gradle` compileSdk parse,
+which AGP 9.3 needs (it reports `android-37.0`). On a rinf upgrade, re-vendor
+the package, then re-apply the patch or drop it if rinf fixes it; otherwise
+keep the copy verbatim.
+
 ## Linux (verified)
 
 Needs the usual Flutter Linux desktop packages (clang, cmake, ninja,
@@ -50,6 +57,9 @@ from Gradle.
 ```shell
 flutter build apk --debug    # or: flutter run -d <device>
 ```
+
+Gradle needs JDK 21–25: `flutter config --jdk-dir=/path/to/jdk` points
+Flutter at one (Android Studio's bundled `jbr` works).
 
 This is skywave's Android app (D28); its id is `dev.skywave.gui`. At
 launch it asks for ACCESS_LOCAL_NETWORK (API 37+, until granted) and
