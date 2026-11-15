@@ -459,6 +459,7 @@ impl EventLog {
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
             | EventKind::WorktreeRemoved { .. }
+            | EventKind::FileWritten { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
@@ -989,6 +990,7 @@ pub(crate) fn append_in(
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
         | EventKind::WorktreeRemoved { .. }
+        | EventKind::FileWritten { .. }
         | EventKind::TurnUsage(_)
         | EventKind::SubagentUsage(_)
         | EventKind::ModelsOffered { .. }
@@ -1685,6 +1687,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ImportFinished { .. } => "ImportFinished",
         EventKind::BlobDeleted { .. } => "BlobDeleted",
         EventKind::BlobCropped { .. } => "BlobCropped",
+        EventKind::FileWritten { .. } => "FileWritten",
     }
 }
 

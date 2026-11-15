@@ -1451,6 +1451,34 @@
       {
         "session_id": "01920000-0000-7000-8000-000000000001",
         "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "file_written",
+          "path": "notes/todo.md",
+          "sha256": "dd843daec16b78c754e78d4fbf9324654efef0322c3c74bf373df1f898799f7f",
+          "size": 9,
+          "replaced": null,
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "file_written",
+          "path": "notes/todo.md",
+          "sha256": "0b4ea44d728c46dffc15a2e2a42964f9b11404e5e877d2c9ae8109bdd438f997",
+          "size": 12,
+          "replaced": "dd843daec16b78c754e78d4fbf9324654efef0322c3c74bf373df1f898799f7f",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
         "command_id": "01920000-0000-7000-8000-000000000002",
         "context": "01920000-0000-7000-8000-000000000008",
         "kind": {
@@ -2257,6 +2285,54 @@
     {
       "at": "2026-10-29T12:00:00Z",
       "repos": []
+    }
+  ],
+  "write_file_request": {
+    "session": "01920000-0000-7000-8000-000000000001",
+    "path": "notes/todo.md",
+    "content": "0b4ea44d728c46dffc15a2e2a42964f9b11404e5e877d2c9ae8109bdd438f997",
+    "replace": "dd843daec16b78c754e78d4fbf9324654efef0322c3c74bf373df1f898799f7f"
+  },
+  "write_results": [
+    {
+      "result": "written",
+      "path": "notes/todo.md",
+      "size": 9,
+      "seq": 17
+    },
+    {
+      "result": "same",
+      "path": "notes/todo.md",
+      "size": 9
+    },
+    {
+      "result": "exists",
+      "sha256": "14bfe7b837d4188cea0cd08854da77db5aaa5fa855bc82e8a8469f9c61468a2d",
+      "size": 10
+    },
+    {
+      "result": "not_staged"
+    },
+    {
+      "result": "is_a_directory"
+    },
+    {
+      "result": "not_a_file"
+    },
+    {
+      "result": "unknown_session"
+    },
+    {
+      "result": "workdir_gone"
+    },
+    {
+      "result": "not_allowed"
+    },
+    {
+      "result": "not_found"
+    },
+    {
+      "result": "disk_low"
     }
   ],
   "conversations": [

@@ -199,7 +199,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`FileResult`] whose content is any file, text or binary, as a blob.
 /// Staging (`PUT` [`path::ATTACHMENT_ROUTE`]) takes any file:
 /// [`UploadResult::Stored`] lost `media_type` and `NotAnImage` is gone; a
-/// message's image is checked when the message names it.
+/// message's image is checked when the message names it. `POST`
+/// [`path::WORKDIR_WRITE`] writes a staged upload into a workdir
+/// ([`WriteFileResult`]), logged as the event [`EventKind::FileWritten`].
 pub const PROTOCOL_VERSION: u32 = 36;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
@@ -800,6 +802,16 @@ pub enum EventKind {
         holds: BlobUse,
         by: DeviceId,
     },
+    /// `by` wrote the file at `path` (relative to the session's workdir) through
+    /// `POST` [`path::WORKDIR_WRITE`]: `sha256` and `size` are what it holds now,
+    /// `replaced` the sha256 of the file it replaced, if any.
+    FileWritten {
+        path: String,
+        sha256: ContentHash,
+        size: u64,
+        replaced: Option<ContentHash>,
+        by: DeviceId,
+    },
     /// `by`'s `CropBlob` replaced the event blob `blob` with `into`, a new
     /// blob holding only the lines `kept` names ([`crop::crop`]); `blob` is
     /// gone from the server. `holds` is what both hold (`ToolOutput` or
@@ -909,6 +921,7 @@ impl EventKind {
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
             | EventKind::WorktreeRemoved { by }
+            | EventKind::FileWritten { by, .. }
             | EventKind::PermissionModeRequested { by, .. }
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
@@ -1009,6 +1022,7 @@ impl EventKind {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
+            | EventKind::FileWritten { .. }
             | EventKind::Imported { .. } => false,
         }
     }
@@ -1063,7 +1077,8 @@ impl EventKind {
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
-            | EventKind::BlobCropped { .. } => None,
+            | EventKind::BlobCropped { .. }
+            | EventKind::FileWritten { .. } => None,
         }
     }
 
@@ -1146,7 +1161,8 @@ impl EventKind {
             | EventKind::ShellOutput { .. }
             | EventKind::ImportFinished { .. }
             // It names a blob it deleted; it references none.
-            | EventKind::BlobDeleted { .. } => (None, None),
+            | EventKind::BlobDeleted { .. }
+            | EventKind::FileWritten { .. } => (None, None),
         };
         let attachments: &[Attachment] = match self {
             EventKind::UserMessage { attachments, .. } => attachments,
@@ -3152,6 +3168,59 @@ pub enum FileBody {
     TooLarge,
 }
 
+/// Body of `POST` [`path::WORKDIR_WRITE`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WriteFileRequest {
+    pub session: SessionId,
+    /// Relative to the session's workdir, `/` separated; the file to write.
+    pub path: String,
+    /// The staged upload (`PUT` [`path::ATTACHMENT_ROUTE`]) to write there.
+    pub content: ContentHash,
+    /// The sha256 of the file now at `path`, when the user chose to replace
+    /// it; `None` writes only where no file is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<ContentHash>,
+}
+
+/// Response to `POST` [`path::WORKDIR_WRITE`], always 200: every outcome is
+/// a domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum WriteFileResult {
+    /// Written; logged as [`EventKind::FileWritten`] at `seq`. `path` is
+    /// canonical, relative to the workdir.
+    Written {
+        path: String,
+        size: u64,
+        seq: Seq,
+    },
+    /// The file at `path` already holds `content`; nothing written. A retry
+    /// of a write that landed answers this.
+    Same {
+        path: String,
+        size: u64,
+    },
+    /// A different file is at `path` and `replace` is not its sha256;
+    /// nothing written. Resend with `replace: Some(sha256)` to replace it.
+    Exists {
+        sha256: ContentHash,
+        size: u64,
+    },
+    /// `content` is not staged (never uploaded, or evicted): upload it again.
+    NotStaged,
+    IsADirectory,
+    /// A FIFO, socket or device is at `path`.
+    NotAFile,
+    UnknownSession,
+    WorkdirGone,
+    /// Absolute, climbing out of the workdir, or resolving outside it.
+    NotAllowed,
+    /// The directory `path` names does not exist.
+    NotFound,
+    /// The server's disk is low; nothing written.
+    DiskLow,
+}
+
 /// HTTP paths of the v1 API.
 pub mod path {
     use crate::{BlobId, ContentHash};
@@ -3185,6 +3254,9 @@ pub mod path {
     pub const WORKTREES: &str = "/v1/worktrees";
     /// One file of a session's workdir to download, text or binary: [`crate::FileResult`].
     pub const WORKDIR_DOWNLOAD: &str = "/v1/workdir/download";
+    /// Writes a staged upload into a session's workdir: `POST` a
+    /// [`crate::WriteFileRequest`], answered by a [`crate::WriteFileResult`].
+    pub const WORKDIR_WRITE: &str = "/v1/workdir/write";
     /// Route template for blob downloads; `{id}` is a [`BlobId`].
     pub const BLOB_ROUTE: &str = "/v1/blobs/{id}";
 

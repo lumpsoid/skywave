@@ -3874,6 +3874,8 @@ impl Model {
                 // Nothing in the timeline: what it changes is the content of
                 // the event that referenced the blob.
                 EventKind::BlobDeleted { .. } | EventKind::BlobCropped { .. } => None,
+                // Temporary: a later step adds its timeline entry.
+                EventKind::FileWritten { .. } => None,
                 EventKind::Imported { at, item } => self
                     .imported(&mut items, &mut imported_calls, *at, item)
                     .map(|entry| Entry::Imported {

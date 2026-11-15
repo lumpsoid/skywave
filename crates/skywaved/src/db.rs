@@ -610,8 +610,9 @@ fn v34_to_v35(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 }
 
 /// v35 to v36. v36 added the route `GET /v1/workdir/download` and nothing
-/// stored; staging answers that are not stored either, so no stored event or
-/// command result changes.
+/// stored; staging answers that are not stored either. It also added the
+/// event `FileWritten`, which data stored before v36 never holds, so no stored
+/// event or command result changes.
 fn v35_to_v36(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }

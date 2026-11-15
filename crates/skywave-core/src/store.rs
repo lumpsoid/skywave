@@ -707,8 +707,9 @@ fn v34_to_v35(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 }
 
 /// v35 to v36, as the server's step of the same name. v36 added the route
-/// `GET /v1/workdir/download` and staging answers that are not stored either;
-/// no stored event or command result changes.
+/// `GET /v1/workdir/download` and staging answers that are not stored either.
+/// It also added the event `FileWritten`, which data stored before v36 never
+/// holds; no stored event or command result changes.
 fn v35_to_v36(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
