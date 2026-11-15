@@ -143,7 +143,7 @@ use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
 use crate::store::{AttachmentRefusal, LogCheck, OutboxEntry, StoreError};
-use crate::transport::{ExpectedRun, Transport, TransportError, UploadFile};
+use crate::transport::{ExpectedRun, StagedUpload, Transport, TransportError, UploadFile};
 use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
 use crate::workdir::{
     PUSH_MAX_BYTES, PushOutcome, WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected,
@@ -1204,7 +1204,7 @@ async fn stage_one(
     data_dir: &Path,
     sha: ContentHash,
 ) -> Result<ImageStaging, TransportError> {
-    if transport.attachment_staged(sha).await? {
+    if transport.attachment_staged(sha).await? == StagedUpload::Staged {
         return Ok(ImageStaging::Staged);
     }
     let path = attachment_path(data_dir, sha);
@@ -1226,7 +1226,7 @@ async fn stage_one(
         return Ok(ImageStaging::Refused(AttachmentRefusal::TooLarge));
     }
     let answer = transport
-        .upload_attachment(sha, UploadFile { path, len: size })
+        .upload_attachment(sha, UploadFile { path, len: size }, 0)
         .await?;
     Ok(match answer {
         UploadResult::Stored { .. } => ImageStaging::Staged,
@@ -1355,12 +1355,12 @@ async fn write_one(
     let sha = file.sha256;
     let mut round = 1;
     loop {
-        if round > 1 || !transport.attachment_staged(sha).await? {
+        if round > 1 || transport.attachment_staged(sha).await? != StagedUpload::Staged {
             let file = UploadFile {
                 path: path.clone(),
                 len,
             };
-            match transport.upload_attachment(sha, file).await? {
+            match transport.upload_attachment(sha, file, 0).await? {
                 UploadResult::Stored { .. } => {}
                 UploadResult::TooLarge => {
                     return Ok(FileWrite::Refused(AttachmentRefusal::TooLarge));
@@ -1437,12 +1437,12 @@ pub(crate) async fn push_workdir_file(
             });
         }
     };
-    if !transport.attachment_staged(sha).await? {
+    if transport.attachment_staged(sha).await? != StagedUpload::Staged {
         let file = UploadFile {
             path: source.to_path_buf(),
             len,
         };
-        let answer = transport.upload_attachment(sha, file).await?;
+        let answer = transport.upload_attachment(sha, file, 0).await?;
         if !matches!(answer, UploadResult::Stored { .. }) {
             return Ok(PushOutcome::UploadRefused(answer));
         }
@@ -3249,10 +3249,14 @@ mod tests {
         fn attachment_staged(
             &self,
             sha256: ContentHash,
-        ) -> BoxFuture<'_, Result<bool, TransportError>> {
+        ) -> BoxFuture<'_, Result<StagedUpload, TransportError>> {
             Box::pin(async move {
                 self.record(head_call(sha256));
-                Ok(self.staged.lock().unwrap().contains(&sha256))
+                if self.staged.lock().unwrap().contains(&sha256) {
+                    Ok(StagedUpload::Staged)
+                } else {
+                    Ok(StagedUpload::Missing { held: 0 })
+                }
             })
         }
 
@@ -3260,8 +3264,10 @@ mod tests {
             &self,
             sha256: ContentHash,
             file: UploadFile,
+            from: u64,
         ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
             Box::pin(async move {
+                assert_eq!(from, 0, "the engine sends from 0 until it resumes");
                 self.record(put_call(sha256));
                 self.uploads.lock().unwrap().push(file.clone());
                 if let Some(on_put) = &self.on_put {
