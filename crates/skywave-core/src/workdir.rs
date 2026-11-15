@@ -26,6 +26,11 @@ use crate::view::WorkdirFetch;
 /// and its siblings and the engine's outer bound on a read.
 pub const WORKDIR_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longest a write into the workdir may take on the device, connecting
+/// included: the server's own 120 s bound on the write plus the link, as
+/// [`WORKDIR_TIMEOUT`] allows for a read. The server gives up first, with 503.
+pub const WORKDIR_WRITE_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// One read of a session's workdir, and the key its stored answer is kept
 /// under: a refresh of the same ask replaces it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
