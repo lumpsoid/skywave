@@ -7618,6 +7618,7 @@ fn two_turns(id: SessionId) -> Vec<Event> {
         model: None,
         context_tokens: Some(19_337),
         context_window: Some(1_000_000),
+        context_compacted: false,
     };
     turn(1, first).into_iter().chain(turn(2, second)).collect()
 }
