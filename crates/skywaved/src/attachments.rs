@@ -215,12 +215,18 @@ impl Staging {
     }
 
     /// Opens the partial of `sha256` for a `PUT` whose body starts at
-    /// `offset`. At the partial's length, the file opens for appending. At 0,
-    /// the partial restarts empty and the file opens for writing from there.
-    /// Any other offset is a [`Resume::Mismatch`]: nothing is opened or
-    /// changed, unless the image is staged by now (a `HEAD` and a `PUT` raced),
-    /// which is a [`Resume::Staged`] with its answer.
+    /// `offset`. A file already staged under `sha256` comes first, at any
+    /// offset (a `HEAD` and a `PUT` raced, or a re-send): it is a
+    /// [`Resume::Staged`] with its answer, nothing is written, and a leftover
+    /// partial is removed. Otherwise, at the partial's length, the file opens
+    /// for appending. At 0, the partial restarts empty and the file opens for
+    /// writing from there. Any other offset is a [`Resume::Mismatch`]: nothing
+    /// is opened or changed.
     pub fn resume(&self, sha256: ContentHash, offset: u64) -> Result<Resume> {
+        if let Some(stored) = self.existing(&self.path(sha256), sha256)? {
+            remove(&self.partial(sha256))?;
+            return Ok(Resume::Staged(stored));
+        }
         let have = self.partial_len(sha256)?;
         let path = self.partial(sha256);
         if offset == have {
@@ -239,9 +245,6 @@ impl Staging {
                 .open(&path)
                 .context(|| format!("opening {}", path.display()))?;
             return Ok(Resume::Append(file));
-        }
-        if let Some(stored) = self.existing(&self.path(sha256), sha256)? {
-            return Ok(Resume::Staged(stored));
         }
         Ok(Resume::Mismatch { have })
     }
@@ -972,11 +975,7 @@ mod tests {
         let bytes = png();
         let hash = stage(&staging, &bytes);
 
-        let Resume::Append(mut file) = staging.resume(hash, 0).unwrap() else {
-            panic!("a new upload appends");
-        };
-        file.write_all(&bytes[..10]).unwrap();
-        drop(file);
+        fs::write(staging.partial(hash), &bytes[..10]).unwrap();
         assert_eq!(
             staging.finish(hash).unwrap(),
             UploadResult::Stored {
@@ -993,16 +992,37 @@ mod tests {
         let bytes = png();
         let hash = stage(&staging, &bytes);
 
-        let Resume::Staged(answer) = staging.resume(hash, 5).unwrap() else {
-            panic!("a PUT at an offset the partial lacks, of a staged image, is answered");
-        };
+        for offset in [5, 0, bytes.len() as u64] {
+            let Resume::Staged(answer) = staging.resume(hash, offset).unwrap() else {
+                panic!("a PUT at offset {offset} of a staged image is answered");
+            };
+            assert_eq!(
+                answer,
+                UploadResult::Stored {
+                    size: bytes.len() as u64,
+                }
+            );
+            assert_eq!(names(tmp.path()), [hash.to_hex()], "nothing is written");
+        }
+    }
+
+    #[test]
+    fn a_resume_of_a_staged_image_removes_a_leftover_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::new(tmp.path());
+        let bytes = png();
+        let hash = stage(&staging, &bytes);
+        fs::write(staging.partial(hash), &bytes[..10]).unwrap();
+
+        assert!(matches!(
+            staging.resume(hash, 0).unwrap(),
+            Resume::Staged(UploadResult::Stored { .. })
+        ));
         assert_eq!(
-            answer,
-            UploadResult::Stored {
-                size: bytes.len() as u64,
-            }
+            names(tmp.path()),
+            [hash.to_hex()],
+            "the leftover partial is removed"
         );
-        assert_eq!(names(tmp.path()), [hash.to_hex()], "nothing is written");
     }
 
     #[test]
