@@ -159,6 +159,7 @@ class ScreenNavigator extends StatelessWidget {
         ),
         ScreenViewWorkdir(:final workdir) => WorkdirPage(
           screen: workdir,
+          text: holders.workdirText,
           canGoBack: update.canGoBack,
           send: send,
         ),

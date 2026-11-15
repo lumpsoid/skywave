@@ -449,6 +449,7 @@ fn perform(
             Out::Shell(update) => update.send_signal_to_dart(),
             Out::Search(update) => update.send_signal_to_dart(),
             Out::CropLines(update) => update.send_signal_to_dart(),
+            Out::WorkdirText(update) => update.send_signal_to_dart(),
             Out::Effect(effect) => effect.send_signal_to_dart(),
             Out::Dispatch(tag, action) => {
                 tracing::debug!(tag, ?action, "dispatch");
