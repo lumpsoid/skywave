@@ -1182,7 +1182,8 @@ logs) an event that no longer decodes rather than failing.
   whose hash is an attachment this device holds (the image of its own
   message, D50) is not downloaded, under any policy: after the batch commits it
   is hard-linked (copied, and synced, where linking fails) from `attachments/`
-  to `blobs/<id>` and marked available, so a replica rebuilt from the log
+  to `blobs/<id>.own` outside the state lock, renamed onto `blobs/<id>`, and
+  marked available, so a replica rebuilt from the log
   while those files exist reads them too. A hard link outlives the
   attachment's file, which only the next store open removes.
   A wrong hash deletes the file; the first
