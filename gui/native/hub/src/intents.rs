@@ -1,9 +1,11 @@
 //! Plain intents as core [`Action`]s: ids parsed from the strings Dart
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
+use std::path::PathBuf;
+
 use skywave_core::{
-    Action, BlobPolicy, BlobUse, Decision, Effort, LineSpan, LoginCode, PermissionMode,
-    QuestionAnswer, Route, ServerAddress, TaskId, WorkdirPane,
+    Action, BlobPolicy, BlobUse, ContentHash, Decision, Effort, LineSpan, LoginCode,
+    PermissionMode, QuestionAnswer, Route, ServerAddress, TaskId, WorkdirPane,
 };
 use skywave_present::crop::normalise;
 use uuid::Uuid;
@@ -162,6 +164,26 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::RefreshWorkdir => Action::RefreshWorkdir,
         ActionIntent::OpenNextApproval => Action::OpenNextApproval,
         ActionIntent::DownloadBlob { blob_id } => Action::DownloadBlob(id("blob", &blob_id)?),
+        ActionIntent::DownloadWorkdirFile { session_id, path } => Action::DownloadWorkdirFile {
+            session_id: id("session", &session_id)?,
+            path,
+        },
+        ActionIntent::PushWorkdirFile {
+            session_id,
+            source,
+            path,
+            replace,
+        } => {
+            let replace: Option<ContentHash> = replace
+                .map(|sha256| sha256.parse().map_err(|_| "bad file hash".to_owned()))
+                .transpose()?;
+            Action::PushWorkdirFile {
+                session_id: id("session", &session_id)?,
+                source: PathBuf::from(source),
+                path,
+                replace,
+            }
+        }
         ActionIntent::DeleteBlob { blob_id } => Action::DeleteBlob(id("blob", &blob_id)?),
         ActionIntent::CropBlob { blob_id, keep } => Action::CropBlob {
             blob: id("blob", &blob_id)?,
@@ -217,6 +239,9 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::RemoveWorktree { session_id } => Action::RemoveWorktree {
             session_id: id("session", &session_id)?,
         },
+        ActionIntent::ResendReplacing { command_id } => {
+            Action::ResendReplacing(id("command", &command_id)?)
+        }
     })
 }
 
@@ -457,6 +482,23 @@ mod tests {
                 answers: vec![answer(vec![300], None)],
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn resending_replacing_names_the_refused_command() {
+        let command = skywave_core::CommandId::new();
+        assert_eq!(
+            action(ActionIntent::ResendReplacing {
+                command_id: command.0.to_string(),
+            }),
+            Ok(Action::ResendReplacing(command))
+        );
+        assert_eq!(
+            action(ActionIntent::ResendReplacing {
+                command_id: "nope".into(),
+            }),
+            Err("not a command id: \"nope\"".to_owned())
         );
     }
 }

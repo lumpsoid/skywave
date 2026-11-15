@@ -8,23 +8,34 @@
 //!
 //! [`Store::put_workdir`]: crate::Store::put_workdir
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use skywave_proto::{
-    BlobRef, ChangesResult, DiffBody, FileBody, FileResult, ListResult, LogResult, SessionId,
-    WorkdirQuery,
+    BlobRef, ChangesResult, ContentHash, DiffBody, FileBody, FileResult, ListResult, LogResult,
+    SessionId, UploadResult, WorkdirQuery, WriteFileResult,
 };
 
 use crate::seam::Request;
 use crate::transport::TransportError;
-use crate::view::WorkdirFetch;
+use crate::view::{PushState, WorkdirFetch, WorkdirPush};
 
 /// Longest a workdir read may take on the device, connecting included: the
 /// server's own 20 s bound on the read plus the link. Both the request
 /// timeout of [`Transport::workdir_changes`](crate::Transport::workdir_changes)
 /// and its siblings and the engine's outer bound on a read.
 pub const WORKDIR_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest a write into the workdir may take on the device, connecting
+/// included: the server's own 120 s bound on the write plus the link, as
+/// [`WORKDIR_TIMEOUT`] allows for a read. The server gives up first, with 503.
+pub const WORKDIR_WRITE_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// The largest file a push into a workdir reads; a bigger one is refused on
+/// the device, without reading it. The server's own `[files] upload_max`
+/// decides below this.
+pub const PUSH_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// One read of a session's workdir, and the key its stored answer is kept
 /// under: a refresh of the same ask replaces it.
@@ -37,6 +48,9 @@ pub enum WorkdirAsk {
     List { session: SessionId, path: String },
     /// One file; `path` as requested, relative to the workdir.
     File { session: SessionId, path: String },
+    /// One file to save on the device, text or binary
+    /// (`GET /v1/workdir/download`); answered by [`WorkdirAnswer::File`].
+    Download { session: SessionId, path: String },
     /// The newest commits on `HEAD`.
     Log { session: SessionId },
 }
@@ -47,7 +61,8 @@ impl WorkdirAsk {
             WorkdirAsk::Changes { session }
             | WorkdirAsk::Log { session }
             | WorkdirAsk::List { session, .. }
-            | WorkdirAsk::File { session, .. } => *session,
+            | WorkdirAsk::File { session, .. }
+            | WorkdirAsk::Download { session, .. } => *session,
         }
     }
 
@@ -56,17 +71,21 @@ impl WorkdirAsk {
     pub fn path(&self) -> &str {
         match self {
             WorkdirAsk::Changes { .. } | WorkdirAsk::Log { .. } => "",
-            WorkdirAsk::List { path, .. } | WorkdirAsk::File { path, .. } => path,
+            WorkdirAsk::List { path, .. }
+            | WorkdirAsk::File { path, .. }
+            | WorkdirAsk::Download { path, .. } => path,
         }
     }
 
-    /// `changes`, `list`, `file` or `log`: the replica's `kind` column.
+    /// `changes`, `list`, `file`, `log` or `download`: the replica's `kind`
+    /// column.
     pub fn kind(&self) -> &'static str {
         match self {
             WorkdirAsk::Changes { .. } => "changes",
             WorkdirAsk::List { .. } => "list",
             WorkdirAsk::File { .. } => "file",
             WorkdirAsk::Log { .. } => "log",
+            WorkdirAsk::Download { .. } => "download",
         }
     }
 
@@ -78,6 +97,7 @@ impl WorkdirAsk {
             "list" => Some(WorkdirAsk::List { session, path }),
             "file" => Some(WorkdirAsk::File { session, path }),
             "log" => Some(WorkdirAsk::Log { session }),
+            "download" => Some(WorkdirAsk::Download { session, path }),
             _ => None,
         }
     }
@@ -130,9 +150,22 @@ impl WorkdirAnswer {
             (WorkdirAnswer::Changes(_), WorkdirAsk::Changes { .. })
                 | (WorkdirAnswer::List(_), WorkdirAsk::List { .. })
                 | (WorkdirAnswer::File(_), WorkdirAsk::File { .. })
+                | (WorkdirAnswer::File(_), WorkdirAsk::Download { .. })
                 | (WorkdirAnswer::Log(_), WorkdirAsk::Log { .. })
         )
     }
+}
+
+/// What became of pushing a device file into a session's workdir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The device file could not be read; nothing was sent.
+    Unreadable { reason: String },
+    /// The upload was refused (`TooLarge`, `DiskLow`, `HashMismatch`);
+    /// nothing was written.
+    UploadRefused(UploadResult),
+    /// The server's answer to the write.
+    Written(WriteFileResult),
 }
 
 /// The model's workdir reads: the latest stored answer per ask, as the
@@ -149,6 +182,17 @@ pub(crate) struct Workdirs {
     pending: HashMap<WorkdirAsk, u64>,
     /// Why the last ask failed, until it is asked again or answered.
     failed: HashMap<WorkdirAsk, String>,
+    /// The latest push into each workdir path, in memory only.
+    pushes: BTreeMap<(SessionId, String), Push>,
+}
+
+/// One push into a session's workdir, as the model holds it.
+#[derive(Debug, Clone, PartialEq)]
+struct Push {
+    /// The request the push waits on; an answer to any other is stale.
+    req: u64,
+    source: PathBuf,
+    state: PushState,
 }
 
 /// Why a side request (a workdir read, a listing) fails at once while
@@ -207,12 +251,15 @@ impl Workdirs {
         self.stored.retain(|ask, _| ask.session() != session);
         self.pending.retain(|ask, _| ask.session() != session);
         self.failed.retain(|ask, _| ask.session() != session);
+        self.pushes.retain(|(id, _), _| *id != session);
     }
 
-    /// The replica was reset: nothing asked before is awaited any more.
+    /// The replica was reset: nothing asked before is awaited any more, and
+    /// no push is either, so an answer to one of them is dropped.
     pub(crate) fn reset(&mut self) {
         self.pending.clear();
         self.failed.clear();
+        self.pushes.clear();
     }
 
     pub(crate) fn fetch(&self, ask: &WorkdirAsk) -> WorkdirFetch {
@@ -223,6 +270,112 @@ impl Workdirs {
         } else {
             WorkdirFetch::Idle
         }
+    }
+
+    /// The paths of `session`'s download asks that are stored, in flight or
+    /// failed: each once, sorted.
+    pub(crate) fn download_paths(&self, session: SessionId) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .stored
+            .keys()
+            .chain(self.pending.keys())
+            .chain(self.failed.keys())
+            .filter(|ask| ask.session() == session)
+            .filter_map(|ask| match ask {
+                WorkdirAsk::Download { path, .. } => Some(path.clone()),
+                WorkdirAsk::Changes { .. }
+                | WorkdirAsk::List { .. }
+                | WorkdirAsk::File { .. }
+                | WorkdirAsk::Log { .. } => None,
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Pushes `source` into `session`'s workdir at `path`, replacing the
+    /// path's last push. Nothing happens while that push is in flight.
+    /// Offline it fails at once, and is not queued.
+    pub(crate) fn push(
+        &mut self,
+        session: SessionId,
+        source: PathBuf,
+        path: String,
+        replace: Option<ContentHash>,
+        online: bool,
+    ) -> Option<Request> {
+        let key = (session, path.clone());
+        if self
+            .pushes
+            .get(&key)
+            .is_some_and(|push| push.state == PushState::Pushing)
+        {
+            return None;
+        }
+        self.req += 1;
+        if !online {
+            let state = PushState::Failed(not_connected().to_string());
+            self.pushes.insert(
+                key,
+                Push {
+                    req: self.req,
+                    source,
+                    state,
+                },
+            );
+            return None;
+        }
+        self.pushes.insert(
+            key,
+            Push {
+                req: self.req,
+                source: source.clone(),
+                state: PushState::Pushing,
+            },
+        );
+        Some(Request::PushWorkdirFile {
+            req: self.req,
+            session,
+            source,
+            path,
+            replace,
+        })
+    }
+
+    /// The answer to the push `req` to `path` of `session`. An answer whose
+    /// `req` is no longer the path's push (it was replaced, or the replica
+    /// was reset) is dropped.
+    pub(crate) fn pushed(
+        &mut self,
+        req: u64,
+        session: SessionId,
+        path: String,
+        result: Result<PushOutcome, TransportError>,
+    ) {
+        let Some(push) = self.pushes.get_mut(&(session, path)) else {
+            return;
+        };
+        if push.req != req {
+            return;
+        }
+        push.state = match result {
+            Ok(outcome) => PushState::Done(outcome),
+            Err(error) => PushState::Failed(error.to_string()),
+        };
+    }
+
+    /// `session`'s pushes, sorted by path.
+    pub(crate) fn pushes(&self, session: SessionId) -> Vec<WorkdirPush> {
+        self.pushes
+            .iter()
+            .filter(|((id, _), _)| *id == session)
+            .map(|((_, path), push)| WorkdirPush {
+                path: path.clone(),
+                source: push.source.clone(),
+                state: push.state.clone(),
+            })
+            .collect()
     }
 }
 

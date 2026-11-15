@@ -1,8 +1,10 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
+use std::path::PathBuf;
+
 use skywave_proto::ContentHash;
 
-use crate::attachment::AttachedImage;
+use crate::attachment::{AttachedFile, AttachedImage};
 use crate::login::LoginCode;
 use crate::store::BlobPolicy;
 use crate::view::{
@@ -114,11 +116,13 @@ pub enum Action {
     /// Queue a message, written for the session view's
     /// [`context`](crate::SessionView::context), with the session's draft
     /// images ([`SessionView::draft_images`](crate::SessionView::draft_images))
-    /// as its attachments, in order. Sent when the text is not blank or the
-    /// draft holds images, so a blank message with images goes as it is.
-    /// Past either cap the draft's images allow (see [`Action::Attach`]) it
-    /// queues nothing. Queuing drops the session's agent draft, text and
-    /// images.
+    /// as its attachments, in order. The draft's files
+    /// ([`SessionView::draft_files`](crate::SessionView::draft_files)) add one
+    /// `Attached file: ./<name>` line each to the text. Sent when the text is
+    /// not blank or the draft holds images or files, so a blank message with
+    /// images or files goes as it is. Past either cap the draft's images allow
+    /// (see [`Action::Attach`]) it queues nothing. Queuing drops the session's
+    /// agent draft: its text, images and files.
     SendMessage {
         session_id: SessionId,
         text: String,
@@ -178,6 +182,21 @@ pub enum Action {
         session_id: SessionId,
         sha256: ContentHash,
     },
+    /// Add a non-image file to the session's agent draft, after the files it
+    /// holds. The head copies it first (`attachment::store_file`); the sender
+    /// writes it into the workdir root as `file.name` before posting. A
+    /// no-op for an unknown session, for a name the draft already holds, and
+    /// for a name that is not a single plain path component.
+    AttachFile {
+        session_id: SessionId,
+        file: AttachedFile,
+    },
+    /// Take the file called `name` off the session's agent draft. A no-op
+    /// when the draft does not hold it.
+    DetachFile {
+        session_id: SessionId,
+        name: String,
+    },
     /// Keep `text` on this device as a snippet of `kind`, to use again in
     /// any session, named `name` (blank for none; normalised as a session
     /// name). It lists first. Saving a text saved already as that kind
@@ -210,6 +229,10 @@ pub enum Action {
     /// into the shell draft, with its `when`. The session view's
     /// `draft_rev` changes so heads refill their composer.
     EditQueued(CommandId),
+    /// Send again a message the outbox refused because a file it writes is
+    /// already in the workdir with other content, replacing that file this
+    /// time. The head asks the user first. A no-op for any other entry.
+    ResendReplacing(CommandId),
     /// Answer an approval. `rule` grants the prompt's suggestion with that
     /// index along with an approval; with a denial, or an index the prompt
     /// does not offer, the action is a no-op.
@@ -383,6 +406,27 @@ pub enum Action {
     /// Read again what the workdir pane on screen shows (a diff: the
     /// changes). Offline it fails at once, and is not queued.
     RefreshWorkdir,
+    /// Download a file of the session's workdir, whatever pane is on screen:
+    /// the server is asked for the file as it is now, unless that download is
+    /// already in flight (then nothing is asked). Once the answer carries the
+    /// content as a blob, the blob is downloaded whatever is on screen. A no-op
+    /// for an unknown session. Its state is [`WorkdirView::downloads`](crate::WorkdirView::downloads).
+    DownloadWorkdirFile {
+        session_id: SessionId,
+        path: String,
+    },
+    /// Push a device file into the session's workdir at `path`: it is read,
+    /// uploaded unless the server holds it, and written there. `replace` is the
+    /// sha256 of the file now at `path` (from a `WriteFileResult::Exists`), when
+    /// the user chose to replace it; `None` writes only where no file is.
+    /// Nothing happens while a push to the same path is in flight, or for an
+    /// unknown session. Its state is [`WorkdirView::pushes`](crate::WorkdirView::pushes).
+    PushWorkdirFile {
+        session_id: SessionId,
+        source: PathBuf,
+        path: String,
+        replace: Option<ContentHash>,
+    },
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
     /// Delete a blob from the server and from every device. Queued in the

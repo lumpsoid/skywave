@@ -21,7 +21,7 @@ use skywave_proto::{
 
 use crate::action::{Action, Route};
 use crate::address::{ServerAddress, ServerAddresses};
-use crate::attachment::AttachedImage;
+use crate::attachment::{AttachedFile, AttachedImage};
 use crate::completion::Completer;
 use crate::conversations::Conversations;
 use crate::identity::{Identity, Pairing};
@@ -36,8 +36,8 @@ use crate::snippets::Snippets;
 use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
-    AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark,
-    ServerFacts, Settings, Snapshot,
+    AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxFile, OutboxStatus,
+    ReadMark, ServerFacts, Settings, Snapshot,
 };
 use crate::tls;
 use crate::transport::TransportError;
@@ -54,18 +54,19 @@ use crate::view::{
     SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
     ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
     SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
-    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
-    WorkdirView, WorktreeSession, WorktreesView,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload,
+    WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
-use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
+use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
 
 /// Work the core must do for an action, in order. Persistence effects come
 /// before the requests that make the action visible to the network.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Effect {
-    /// Write the command to the outbox.
-    Enqueue(Command),
+    /// Write the command to the outbox, with the files it carries (the
+    /// session's draft files it was written from, in order).
+    Enqueue(Command, Vec<AttachedFile>),
     SaveBlobPolicy(BlobPolicy),
     /// Store the pairing's addresses as these, after a switch or a forget.
     SaveServerAddresses(ServerAddresses),
@@ -75,6 +76,10 @@ pub(crate) enum Effect {
     AttachToDraft(SessionId, AttachedImage),
     /// Take the image with this hash off the session's agent draft.
     DetachFromDraft(SessionId, ContentHash),
+    /// Add the file to the session's agent draft, after the files it holds.
+    AttachFileToDraft(SessionId, AttachedFile),
+    /// Take the file called this off the session's agent draft.
+    DetachFileFromDraft(SessionId, String),
     SaveComposerMode(SessionId, ComposerMode),
     SaveReadMark(SessionId, ReadMark),
     SaveSnippet(Snippet),
@@ -87,6 +92,16 @@ pub(crate) enum Effect {
         /// The session's agent draft images after the withdrawal, in order,
         /// written with the rest; `None` leaves them as they are.
         images: Option<(SessionId, Vec<ContentHash>)>,
+        /// The session's agent draft files after the withdrawal, in order,
+        /// written with the rest; `None` leaves them as they are.
+        files: Option<(SessionId, Vec<AttachedFile>)>,
+    },
+    /// Requeue a message refused for a file already in the workdir, replacing
+    /// those files: each `(position, hash)` is the `replace` of that file
+    /// ([`Store::requeue_replacing`](crate::Store::requeue_replacing)).
+    Requeue {
+        id: CommandId,
+        replaces: Vec<(usize, ContentHash)>,
     },
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
@@ -306,6 +321,9 @@ pub(crate) struct Model {
     drafts: HashMap<(SessionId, ComposerMode), Draft>,
     /// The images of each session's agent draft, in order, as stored.
     draft_images: HashMap<SessionId, Vec<AttachedImage>>,
+    /// The non-image files of each session's agent draft, in order, as
+    /// stored.
+    draft_files: HashMap<SessionId, Vec<AttachedFile>>,
     /// Every known image's metadata, as stored: a queued message's
     /// attachments are looked up here when it is taken back into a draft.
     attachments: HashMap<ContentHash, AttachedImage>,
@@ -415,6 +433,7 @@ impl Model {
             blobs_disk_full: false,
             drafts: HashMap::new(),
             draft_images: HashMap::new(),
+            draft_files: HashMap::new(),
             attachments: HashMap::new(),
             composer_modes: HashMap::new(),
             draft_rev: 0,
@@ -458,6 +477,7 @@ impl Model {
         self.fates = snapshot.fates;
         self.drafts = snapshot.drafts;
         self.draft_images = snapshot.draft_images;
+        self.draft_files = snapshot.draft_files;
         self.attachments = snapshot.attachments;
         self.composer_modes = snapshot.composer_modes;
         self.read_marks = snapshot.read_marks;
@@ -626,11 +646,14 @@ impl Model {
                     .map(str::trim)
                     .filter(|w| !w.is_empty())
                     .map(str::to_owned);
-                self.enqueue(CommandKind::CreateSession {
-                    workdir: workdir.to_owned(),
-                    conversation,
-                    worktree,
-                })
+                self.enqueue(
+                    CommandKind::CreateSession {
+                        workdir: workdir.to_owned(),
+                        conversation,
+                        worktree,
+                    },
+                    Vec::new(),
+                )
             }
             Action::CreateSessionLike(from) => {
                 let Some(at) = self.opening_from().filter(|at| match at {
@@ -642,12 +665,15 @@ impl Model {
                 let Some(workdir) = self.summary(from).and_then(|s| s.workdir.clone()) else {
                     return Vec::new();
                 };
-                let effects = self.enqueue(CommandKind::CreateSession {
-                    workdir,
-                    conversation: None,
-                    worktree: None,
-                });
-                if let Some(Effect::Enqueue(command)) = effects.first() {
+                let effects = self.enqueue(
+                    CommandKind::CreateSession {
+                        workdir,
+                        conversation: None,
+                        worktree: None,
+                    },
+                    Vec::new(),
+                );
+                if let Some(Effect::Enqueue(command, _)) = effects.first() {
                     self.opening = Some((command.id, at));
                 }
                 effects
@@ -772,29 +798,36 @@ impl Model {
                 let Some(summary) = self.summary(session_id) else {
                     return Vec::new();
                 };
-                // The draft's images are the message's attachments: core
-                // owns them, so the head sends only the text.
+                // The draft's images and files are the message's attachments:
+                // core owns them, so the head sends only the text.
                 let images = self.draft_images_of(session_id);
-                if text.trim().is_empty() && images.is_empty() {
+                let files = self.draft_files_of(session_id).to_vec();
+                if text.trim().is_empty() && images.is_empty() && files.is_empty() {
                     return Vec::new();
                 }
                 if !within_attachment_caps(images) {
                     return Vec::new();
                 }
                 let attachments = images.iter().map(|image| image.sha256).collect();
+                let text = with_file_lines(&text, &files);
                 // The message goes where this device's own clear or switch
                 // on its way leads, so it is not refused for that.
                 let context = self.target_context(summary);
-                let effects = self.enqueue(CommandKind::SendMessage {
-                    session_id,
-                    context,
-                    text,
-                    attachments,
-                });
-                // The store drops the draft and its images with the enqueue.
+                let effects = self.enqueue(
+                    CommandKind::SendMessage {
+                        session_id,
+                        context,
+                        text,
+                        attachments,
+                    },
+                    files,
+                );
+                // The store drops the draft, its images and its files with
+                // the enqueue.
                 if !effects.is_empty() {
                     self.drafts.remove(&(session_id, ComposerMode::Agent));
                     self.draft_images.remove(&session_id);
+                    self.draft_files.remove(&session_id);
                 }
                 effects
             }
@@ -808,11 +841,14 @@ impl Model {
                 if self.summary(session_id).is_none() || command.trim().is_empty() {
                     return Vec::new();
                 }
-                let effects = self.enqueue(CommandKind::RunShell {
-                    session_id,
-                    command,
-                    when,
-                });
+                let effects = self.enqueue(
+                    CommandKind::RunShell {
+                        session_id,
+                        command,
+                        when,
+                    },
+                    Vec::new(),
+                );
                 // The store drops the shell draft with the enqueue.
                 if !effects.is_empty() {
                     self.drafts.remove(&(session_id, ComposerMode::Shell));
@@ -823,7 +859,7 @@ impl Model {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::StopShell { session_id, run })
+                self.enqueue(CommandKind::StopShell { session_id, run }, Vec::new())
             }
             Action::SetComposerMode { session_id, mode } => {
                 if self.summary(session_id).is_none() || self.composer_mode(session_id) == mode {
@@ -871,6 +907,31 @@ impl Model {
                 self.set_draft_images(session_id, images);
                 vec![Effect::DetachFromDraft(session_id, sha256)]
             }
+            Action::AttachFile { session_id, file } => {
+                if self.summary(session_id).is_none() || !plain_file_name(&file.name) {
+                    return Vec::new();
+                }
+                let mut files = self.draft_files_of(session_id).to_vec();
+                if files.iter().any(|held| held.name == file.name) {
+                    return Vec::new();
+                }
+                files.push(file.clone());
+                self.set_draft_files(session_id, files);
+                vec![
+                    Effect::AttachFileToDraft(session_id, file),
+                    Effect::Request(Request::DraftImagesChanged),
+                ]
+            }
+            Action::DetachFile { session_id, name } => {
+                let mut files = self.draft_files_of(session_id).to_vec();
+                let held = files.len();
+                files.retain(|file| file.name != name);
+                if files.len() == held {
+                    return Vec::new();
+                }
+                self.set_draft_files(session_id, files);
+                vec![Effect::DetachFileFromDraft(session_id, name)]
+            }
             Action::SaveSnippet { name, text, kind } => self
                 .snippets
                 .save(&name, text, kind)
@@ -900,6 +961,7 @@ impl Model {
             }
             Action::Discard(id) => self.withdraw(id, false),
             Action::EditQueued(id) => self.withdraw(id, true),
+            Action::ResendReplacing(id) => self.resend_replacing(id),
             Action::ResolveApproval { id, decision, rule } => {
                 let granted = |rule| decision == Decision::Approve && self.offers(id, rule);
                 // A question takes answers; only a denial declines it.
@@ -907,7 +969,10 @@ impl Model {
                 if !self.can_answer(id) || asks || rule.is_some_and(|rule| !granted(rule)) {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::ResolveApproval { id, decision, rule })
+                self.enqueue(
+                    CommandKind::ResolveApproval { id, decision, rule },
+                    Vec::new(),
+                )
             }
             Action::AnswerQuestion { id, answers } => {
                 let fits = self
@@ -916,19 +981,19 @@ impl Model {
                 if !self.can_answer(id) || !fits {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::AnswerQuestion { id, answers })
+                self.enqueue(CommandKind::AnswerQuestion { id, answers }, Vec::new())
             }
             Action::Interrupt { session_id } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::Interrupt { session_id })
+                self.enqueue(CommandKind::Interrupt { session_id }, Vec::new())
             }
             Action::StopSession { session_id } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::StopSession { session_id })
+                self.enqueue(CommandKind::StopSession { session_id }, Vec::new())
             }
             Action::ClearContext { session_id } => self.clear_context(session_id),
             Action::SwitchContext {
@@ -938,10 +1003,13 @@ impl Model {
                 if self.summary(session_id).is_none() || self.moved(session_id, context) {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::SwitchContext {
-                    session_id,
-                    context,
-                })
+                self.enqueue(
+                    CommandKind::SwitchContext {
+                        session_id,
+                        context,
+                    },
+                    Vec::new(),
+                )
             }
             Action::MoveContext {
                 session_id,
@@ -974,7 +1042,7 @@ impl Model {
                 }
                 // As the server will log it, so the title shows it unchanged.
                 let name = skywave_proto::normalise_session_name(&name);
-                self.enqueue(CommandKind::RenameSession { session_id, name })
+                self.enqueue(CommandKind::RenameSession { session_id, name }, Vec::new())
             }
             Action::SetSessionArchived {
                 session_id,
@@ -983,10 +1051,13 @@ impl Model {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::SetSessionArchived {
-                    session_id,
-                    archived,
-                })
+                self.enqueue(
+                    CommandKind::SetSessionArchived {
+                        session_id,
+                        archived,
+                    },
+                    Vec::new(),
+                )
             }
             Action::RemoveWorktree { session_id } => {
                 let has_worktree = self
@@ -995,19 +1066,22 @@ impl Model {
                 if !has_worktree {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::RemoveWorktree { session_id })
+                self.enqueue(CommandKind::RemoveWorktree { session_id }, Vec::new())
             }
             Action::SetPermissionMode { session_id, mode } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::SetPermissionMode { session_id, mode })
+                self.enqueue(
+                    CommandKind::SetPermissionMode { session_id, mode },
+                    Vec::new(),
+                )
             }
             Action::StopTask { session_id, task } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::StopTask { session_id, task })
+                self.enqueue(CommandKind::StopTask { session_id, task }, Vec::new())
             }
             Action::SetModel { session_id, model } => {
                 // As the server will log it, so the switch shows it unchanged.
@@ -1017,13 +1091,13 @@ impl Model {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::SetModel { session_id, model })
+                self.enqueue(CommandKind::SetModel { session_id, model }, Vec::new())
             }
             Action::SetEffort { session_id, effort } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::SetEffort { session_id, effort })
+                self.enqueue(CommandKind::SetEffort { session_id, effort }, Vec::new())
             }
             Action::DeleteSessionLocally { session_id } => {
                 if !self.summary(session_id).is_some_and(|s| self.deletable(s)) {
@@ -1091,6 +1165,40 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::DownloadWorkdirFile { session_id, path } => {
+                if self.device().is_none() || self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                let ask = WorkdirAsk::Download {
+                    session: session_id,
+                    path,
+                };
+                if self.workdirs.fetch(&ask) == WorkdirFetch::Loading {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.workdirs
+                    .ask(ask, online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::PushWorkdirFile {
+                session_id,
+                source,
+                path,
+                replace,
+            } => {
+                if self.device().is_none() || self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.workdirs
+                    .push(session_id, source, path, replace, online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
             Action::DownloadBlob(id) => match self.blobs.get(&id).map(|b| &b.status) {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
@@ -1109,12 +1217,12 @@ impl Model {
             // The server decides whether the blob may go (its refusals
             // show as the view's `pending`): this replica may not know of
             // a delete or crop another device sent.
-            Action::DeleteBlob(blob) => self.enqueue(CommandKind::DeleteBlob { blob }),
+            Action::DeleteBlob(blob) => self.enqueue(CommandKind::DeleteBlob { blob }, Vec::new()),
             // Sent from its own crop page, the page goes where back goes:
             // left open, it would turn to `Gone` once the crop lands.
             Action::CropBlob { blob, keep } => {
                 let from_page = matches!(&self.place, Place::Crop(page) if page.blob == blob);
-                let mut effects = self.enqueue(CommandKind::CropBlob { blob, keep });
+                let mut effects = self.enqueue(CommandKind::CropBlob { blob, keep }, Vec::new());
                 if from_page
                     && !effects.is_empty()
                     && let Some(back) = self.back()
@@ -1392,6 +1500,12 @@ impl Model {
     /// after a failure is [`Action::DownloadBlob`]'s).
     fn want_shown_blob(&mut self) -> Option<Request> {
         let id = self.shown_blob()?.id;
+        self.want_blob(id)
+    }
+
+    /// Asks for blob `id`, once: if it is not downloaded and not asked for
+    /// yet. Whether it is on screen does not matter here.
+    fn want_blob(&mut self, id: BlobId) -> Option<Request> {
         let record = self.blobs.get(&id)?;
         let not_here = matches!(
             record.status,
@@ -1438,9 +1552,10 @@ impl Model {
         })]
     }
 
-    /// Queues a command under a fresh UUIDv7 id. Commands need a paired
-    /// device: without one there is nobody to send them to.
-    fn enqueue(&mut self, kind: CommandKind) -> Vec<Effect> {
+    /// Queues a command under a fresh UUIDv7 id, carrying `files`, which the
+    /// sender writes into the workdir root before posting. Commands need a
+    /// paired device: without one there is nobody to send them to.
+    fn enqueue(&mut self, kind: CommandKind, files: Vec<AttachedFile>) -> Vec<Effect> {
         if self.device().is_none() {
             return Vec::new();
         }
@@ -1454,9 +1569,16 @@ impl Model {
             tries: 0,
             first_sent_at: None,
             answered_at: None,
+            files: files
+                .iter()
+                .map(|file| OutboxFile {
+                    file: file.clone(),
+                    existing: None,
+                })
+                .collect(),
         });
         vec![
-            Effect::Enqueue(command),
+            Effect::Enqueue(command, files),
             Effect::Request(Request::OutboxChanged),
         ]
     }
@@ -1469,11 +1591,14 @@ impl Model {
         }
         let used = self.context_names(session_id);
         let name = fresh_context_name(&used, skywave_proto::context_name::random);
-        self.enqueue(CommandKind::ClearContext {
-            session_id,
-            context: ContextId::new(),
-            name,
-        })
+        self.enqueue(
+            CommandKind::ClearContext {
+                session_id,
+                context: ContextId::new(),
+                name,
+            },
+            Vec::new(),
+        )
     }
 
     /// Queues the move of a context the open session lists as movable,
@@ -1498,14 +1623,17 @@ impl Model {
         if context == target {
             effects = self.clear_context(session_id);
             // One wake-up, after the move.
-            effects.retain(|effect| matches!(effect, Effect::Enqueue(_)));
+            effects.retain(|effect| matches!(effect, Effect::Enqueue(..)));
         }
-        let moved = self.enqueue(CommandKind::MoveContext {
-            session_id,
-            context,
-            name,
-        });
-        if let Some(Effect::Enqueue(command)) = moved.first() {
+        let moved = self.enqueue(
+            CommandKind::MoveContext {
+                session_id,
+                context,
+                name,
+            },
+            Vec::new(),
+        );
+        if let Some(Effect::Enqueue(command, _)) = moved.first() {
             self.opening = Some((command.id, OpeningFrom::Session(session_id)));
         }
         effects.extend(moved);
@@ -1607,7 +1735,14 @@ impl Model {
             return Vec::new();
         };
         // A message is set off from the draft by a blank line, a shell
-        // command by a line break: the next line is the next command.
+        // command by a line break: the next line is the next command. The
+        // file lines a message added to its text are not the user's, so
+        // they come off again.
+        let files: Vec<AttachedFile> = self.outbox[index]
+            .files
+            .iter()
+            .map(|held| held.file.clone())
+            .collect();
         let (key, text, when, separator, attachments) = match &self.outbox[index].command.kind {
             CommandKind::SendMessage {
                 session_id,
@@ -1616,7 +1751,7 @@ impl Model {
                 ..
             } if edit => (
                 (*session_id, ComposerMode::Agent),
-                text,
+                without_file_lines(text, &files),
                 RunWhen::Always,
                 "\n\n",
                 attachments.as_slice(),
@@ -1627,7 +1762,7 @@ impl Model {
                 when,
             } if edit => (
                 (*session_id, ComposerMode::Shell),
-                command,
+                command.clone(),
                 *when,
                 "\n",
                 &[][..],
@@ -1640,6 +1775,7 @@ impl Model {
                         id,
                         draft: None,
                         images: None,
+                        files: None,
                     },
                     Effect::Request(Request::OutboxChanged),
                 ];
@@ -1658,6 +1794,7 @@ impl Model {
             when,
         };
         let restored = (!attachments.is_empty()).then(|| self.restored_images(key.0, attachments));
+        let restored_files = (!files.is_empty()).then(|| self.restored_files(key.0, &files));
         self.outbox.remove(index);
         self.drafts.insert(key, draft.clone());
         self.draft_rev += 1;
@@ -1666,19 +1803,54 @@ impl Model {
             self.set_draft_images(key.0, images);
             (key.0, hashes)
         });
-        let restored_images = images.is_some();
+        let files = restored_files.map(|files| {
+            self.set_draft_files(key.0, files.clone());
+            (key.0, files)
+        });
+        let restored_any = images.is_some() || files.is_some();
         let mut effects = vec![
             Effect::Withdraw {
                 id,
                 draft: Some((key, draft)),
                 images,
+                files,
             },
             Effect::Request(Request::OutboxChanged),
         ];
-        if restored_images {
+        if restored_any {
             effects.push(Effect::Request(Request::DraftImagesChanged));
         }
         effects
+    }
+
+    /// Requeues the message `id` for the files its refusal found in the
+    /// workdir: each such file's `replace` becomes the hash found there, and
+    /// the message goes out next, keeping its place. Its `tries` and
+    /// `first_sent_at` stay. A no-op unless the entry is a message refused
+    /// with [`AttachmentRefusal::FileExists`] that found a file.
+    fn resend_replacing(&mut self, id: CommandId) -> Vec<Effect> {
+        let Some(entry) = self.outbox_entry(id) else {
+            return Vec::new();
+        };
+        let refused =
+            entry.status == OutboxStatus::AttachmentRefused(AttachmentRefusal::FileExists);
+        let is_message = matches!(entry.command.kind, CommandKind::SendMessage { .. });
+        if !refused || !is_message || entry.files.iter().all(|held| held.existing.is_none()) {
+            return Vec::new();
+        }
+        let mut replaces = Vec::new();
+        for (position, held) in entry.files.iter_mut().enumerate() {
+            if let Some(existing) = held.existing.take() {
+                held.file.replace = Some(existing);
+                replaces.push((position, existing));
+            }
+        }
+        entry.status = OutboxStatus::Queued;
+        entry.answered_at = None;
+        vec![
+            Effect::Requeue { id, replaces },
+            Effect::Request(Request::OutboxChanged),
+        ]
     }
 
     /// The images an edited message puts back into `session_id`'s agent
@@ -1702,6 +1874,19 @@ impl Model {
         own.into_iter().chain(kept).collect()
     }
 
+    /// The files an edited message puts back into `session_id`'s agent
+    /// draft: its own, in order, then the draft's that it does not hold by
+    /// name.
+    fn restored_files(&self, session_id: SessionId, own: &[AttachedFile]) -> Vec<AttachedFile> {
+        let kept: Vec<AttachedFile> = self
+            .draft_files_of(session_id)
+            .iter()
+            .filter(|held| !own.iter().any(|file| file.name == held.name))
+            .cloned()
+            .collect();
+        own.iter().cloned().chain(kept).collect()
+    }
+
     /// The images the session's agent draft holds, in order.
     fn draft_images_of(&self, session_id: SessionId) -> &[AttachedImage] {
         self.draft_images
@@ -1715,6 +1900,22 @@ impl Model {
             self.draft_images.remove(&session_id);
         } else {
             self.draft_images.insert(session_id, images);
+        }
+    }
+
+    /// The non-image files the session's agent draft holds, in order.
+    fn draft_files_of(&self, session_id: SessionId) -> &[AttachedFile] {
+        self.draft_files
+            .get(&session_id)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Sets the session's agent draft files; none removes the entry.
+    fn set_draft_files(&mut self, session_id: SessionId, files: Vec<AttachedFile>) {
+        if files.is_empty() {
+            self.draft_files.remove(&session_id);
+        } else {
+            self.draft_files.insert(session_id, files);
         }
     }
 
@@ -2055,6 +2256,7 @@ impl Model {
         self.turns.retain(|t| t.session_id != id);
         self.drafts.retain(|(session, _), _| *session != id);
         self.draft_images.remove(&id);
+        self.draft_files.remove(&id);
         self.composer_modes.remove(&id);
         self.read_marks.remove(&id);
         self.outbox
@@ -2133,6 +2335,23 @@ impl Model {
         if let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) {
             entry.status = OutboxStatus::AttachmentRefused(reason);
             entry.answered_at = Some(now);
+        }
+    }
+
+    /// Mirrors [`Store::record_file_exists`](crate::Store::record_file_exists).
+    pub(crate) fn command_file_exists(
+        &mut self,
+        id: CommandId,
+        position: usize,
+        existing: ContentHash,
+        now: DateTime<Utc>,
+    ) {
+        if let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) {
+            entry.status = OutboxStatus::AttachmentRefused(AttachmentRefusal::FileExists);
+            entry.answered_at = Some(now);
+            if let Some(file) = entry.files.get_mut(position) {
+                file.existing = Some(existing);
+            }
         }
     }
 
@@ -2244,11 +2463,24 @@ impl Model {
         self.workdirs.dropped(ask);
     }
 
+    /// The answer to the push `req` to `path` of `session`: kept only if it
+    /// is still that push's.
+    pub(crate) fn workdir_pushed(
+        &mut self,
+        req: u64,
+        session: SessionId,
+        path: String,
+        result: Result<PushOutcome, TransportError>,
+    ) {
+        self.workdirs.pushed(req, session, path, result);
+    }
+
     /// Mirrors [`Store::put_workdir`](crate::Store::put_workdir), which
     /// stored the awaited `answer` to `ask`: the answer replaces the last
     /// one, the blobs it registered join the blob map and those it purged
-    /// leave it. Returns the download of the blob the pane on screen now
-    /// shows, if it is wanted.
+    /// leave it. Returns the downloads of the blobs wanted now: a download
+    /// ask's content, whatever is on screen, then the blob the pane on
+    /// screen shows.
     pub(crate) fn workdir_stored(
         &mut self,
         ask: WorkdirAsk,
@@ -2272,8 +2504,22 @@ impl Model {
         for blob in &stored.purged {
             self.forget_blob(*blob);
         }
+        let download = match (&ask, &answer) {
+            (
+                WorkdirAsk::Download { .. },
+                WorkdirAnswer::File(FileResult::File {
+                    content: FileBody::Blob(blob),
+                    ..
+                }),
+            ) => Some(blob.id),
+            _ => None,
+        };
         self.workdirs.answered(ask, answer);
-        self.want_shown_blob().into_iter().collect()
+        let downloaded = download.and_then(|id| self.want_blob(id));
+        downloaded
+            .into_iter()
+            .chain(self.want_shown_blob())
+            .collect()
     }
 
     /// Mirrors [`Store::reset_for_server`](crate::Store::reset_for_server),
@@ -2638,7 +2884,43 @@ impl Model {
             last_dir: last_dir.to_owned(),
             fetch: self.workdirs.fetch(&ask),
             body,
+            downloads: self.workdir_downloads(id),
+            pushes: self.workdirs.pushes(id),
         })
+    }
+
+    /// The downloads of session `id`'s files, one per path, sorted: each
+    /// one's read, its stored answer and, if the answer carries a blob, the
+    /// blob's view.
+    fn workdir_downloads(&self, id: SessionId) -> Vec<WorkdirDownload> {
+        self.workdirs
+            .download_paths(id)
+            .into_iter()
+            .map(|path| {
+                let ask = WorkdirAsk::Download {
+                    session: id,
+                    path: path.clone(),
+                };
+                let fetch = self.workdirs.fetch(&ask);
+                let result = match self.workdirs.stored.get(&ask) {
+                    Some(WorkdirAnswer::File(result)) => Some(result.clone()),
+                    _ => None,
+                };
+                let blob = match &result {
+                    Some(FileResult::File {
+                        content: FileBody::Blob(blob),
+                        ..
+                    }) => Some(self.blob_view(blob)),
+                    _ => None,
+                };
+                WorkdirDownload {
+                    path,
+                    fetch,
+                    result,
+                    blob,
+                }
+            })
+            .collect()
     }
 
     fn pairing_view(&self) -> PairingView {
@@ -2674,6 +2956,7 @@ impl Model {
                     pending_approvals: s.pending_approvals.len(),
                     last_activity: s.last_activity,
                     has_draft: !self.draft_images_of(s.id).is_empty()
+                        || !self.draft_files_of(s.id).is_empty()
                         || [ComposerMode::Agent, ComposerMode::Shell]
                             .iter()
                             .any(|mode| {
@@ -2994,6 +3277,7 @@ impl Model {
             mode: self.composer_mode(id),
             draft: self.drafts.get(&(id, ComposerMode::Agent)).cloned(),
             draft_images: self.draft_images_of(id).to_vec(),
+            draft_files: self.draft_files_of(id).to_vec(),
             shell_draft: self.drafts.get(&(id, ComposerMode::Shell)).cloned(),
             draft_rev: self.draft_rev,
             shell: self.shell_view(id, events),
@@ -3800,6 +4084,18 @@ impl Model {
                 // Nothing in the timeline: what it changes is the content of
                 // the event that referenced the blob.
                 EventKind::BlobDeleted { .. } | EventKind::BlobCropped { .. } => None,
+                EventKind::FileWritten {
+                    path,
+                    size,
+                    replaced,
+                    by,
+                    ..
+                } => Some(Entry::FileWritten {
+                    path: path.clone(),
+                    size: *size,
+                    replaced: replaced.is_some(),
+                    by: self.device_ref(*by),
+                }),
                 EventKind::Imported { at, item } => self
                     .imported(&mut items, &mut imported_calls, *at, item)
                     .map(|entry| Entry::Imported {
@@ -3970,6 +4266,7 @@ impl Model {
                             .iter()
                             .filter_map(|sha256| self.attachments.get(sha256).cloned())
                             .collect(),
+                        files: e.files.clone(),
                         outgoing: Outgoing::from(&e.status),
                         discardable: e.discardable(),
                         delivery: Delivery::of(e),
@@ -4576,6 +4873,51 @@ fn within_attachment_caps(images: &[AttachedImage]) -> bool {
     images.len() <= ATTACHMENTS_MAX && bytes <= ATTACHMENTS_MAX_TOTAL_BYTES
 }
 
+/// Whether `name` is a single plain path component the sender may write
+/// into the workdir root: not blank, not `.`, `..` or `.git`, and without a
+/// separator or NUL.
+fn plain_file_name(name: &str) -> bool {
+    !name.is_empty() && !matches!(name, "." | ".." | ".git") && !name.contains(['/', '\\', '\0'])
+}
+
+/// The line one attached file adds to a message: where the sender puts it.
+fn file_lines(files: &[AttachedFile]) -> String {
+    files
+        .iter()
+        .map(|file| format!("Attached file: ./{}", file.name))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The text a message is sent with: `text`, then a blank line and one line
+/// per file (the user's text unchanged). Blank text is the lines alone.
+fn with_file_lines(text: &str, files: &[AttachedFile]) -> String {
+    if files.is_empty() {
+        return text.to_owned();
+    }
+    let lines = file_lines(files);
+    if text.trim().is_empty() {
+        lines
+    } else {
+        format!("{text}\n\n{lines}")
+    }
+}
+
+/// The text a message was written with, taking off the lines
+/// [`with_file_lines`] added for `files`. A message with no such lines, or
+/// none of its own, keeps its text.
+fn without_file_lines(text: &str, files: &[AttachedFile]) -> String {
+    if files.is_empty() {
+        return text.to_owned();
+    }
+    let lines = file_lines(files);
+    if text == lines {
+        return String::new();
+    }
+    text.strip_suffix(&format!("\n\n{lines}"))
+        .map_or_else(|| text.to_owned(), str::to_owned)
+}
+
 /// The session a command names, if it names one. An answer names its
 /// approval only; its session is pending that approval meanwhile.
 fn command_session(kind: &CommandKind) -> Option<SessionId> {
@@ -4819,6 +5161,7 @@ mod tests {
             settings: Settings::default(),
             drafts: HashMap::new(),
             draft_images: HashMap::new(),
+            draft_files: HashMap::new(),
             attachments: HashMap::new(),
             composer_modes: HashMap::new(),
             read_marks: HashMap::new(),
@@ -4838,7 +5181,7 @@ mod tests {
     fn queued(effects: &[Effect]) -> Command {
         match effects {
             [
-                Effect::Enqueue(command),
+                Effect::Enqueue(command, _),
                 Effect::Request(Request::OutboxChanged),
             ] => command.clone(),
             other => panic!("expected enqueue + outbox wake-up, got {other:?}"),
@@ -5039,6 +5382,7 @@ mod tests {
                 context: skywave_proto::ContextId::first_of(sid),
                 text: "hello".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 outgoing,
                 discardable: matches!(outgoing, Outgoing::Queued | Outgoing::Sending),
                 delivery: Some(delivery),
@@ -6732,6 +7076,55 @@ mod tests {
     }
 
     #[test]
+    fn a_written_file_has_a_timeline_entry() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        let by = f.me;
+        f.log(
+            sid,
+            vec![
+                EventKind::FileWritten {
+                    path: "docs/a.txt".into(),
+                    sha256: ContentHash::of(b"a"),
+                    size: 1,
+                    replaced: None,
+                    by,
+                },
+                EventKind::FileWritten {
+                    path: "docs/a.txt".into(),
+                    sha256: ContentHash::of(b"b"),
+                    size: 1,
+                    replaced: Some(ContentHash::of(b"old")),
+                    by,
+                },
+            ],
+        );
+        f.open(sid);
+        let by = DeviceRef {
+            id: f.me,
+            name: None,
+            me: true,
+        };
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::FileWritten {
+                    path: "docs/a.txt".into(),
+                    size: 1,
+                    replaced: false,
+                    by: by.clone(),
+                },
+                Entry::FileWritten {
+                    path: "docs/a.txt".into(),
+                    size: 1,
+                    replaced: true,
+                    by,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_failed_archive_reverts() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/app");
@@ -7610,6 +8003,7 @@ mod tests {
                     id: first.id,
                     draft: Some(((sid, ComposerMode::Agent), draft.clone())),
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -7641,6 +8035,7 @@ mod tests {
                         }
                     )),
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -7657,6 +8052,7 @@ mod tests {
                     id: third.id,
                     draft: None,
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -8075,6 +8471,7 @@ mod tests {
                         }
                     )),
                     images: Some((sid, vec![a.sha256, b.sha256, c.sha256])),
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
                 Effect::Request(Request::DraftImagesChanged),
@@ -8114,6 +8511,7 @@ mod tests {
                     }
                 )),
                 images: Some((other, vec![a.sha256, b.sha256])),
+                files: None,
             }
         );
         assert_eq!(draft_images(&f), vec![a.clone(), b.clone()]);
@@ -8128,11 +8526,381 @@ mod tests {
                     id: third.id,
                     draft: None,
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
         );
         assert!(draft_images(&f).is_empty());
+    }
+
+    /// A non-image file called `name`, its content tagged `tag`.
+    fn draft_file(name: &str, tag: u8) -> AttachedFile {
+        AttachedFile {
+            sha256: ContentHash::of(&[tag]),
+            name: name.into(),
+            size: 10,
+            replace: None,
+        }
+    }
+
+    /// The files the open session's agent draft shows.
+    fn draft_files(f: &Fixture) -> Vec<AttachedFile> {
+        f.session_view().draft_files
+    }
+
+    #[test]
+    fn attach_and_detach_change_the_draft_files() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let a = draft_file("a.txt", 1);
+
+        assert_eq!(
+            f.dispatch(Action::AttachFile {
+                session_id: sid,
+                file: a.clone(),
+            }),
+            vec![
+                Effect::AttachFileToDraft(sid, a.clone()),
+                Effect::Request(Request::DraftImagesChanged),
+            ]
+        );
+        assert_eq!(draft_files(&f), vec![a.clone()]);
+        assert_eq!(
+            f.dispatch(Action::DetachFile {
+                session_id: sid,
+                name: "a.txt".into(),
+            }),
+            vec![Effect::DetachFileFromDraft(sid, "a.txt".into())]
+        );
+        assert!(draft_files(&f).is_empty());
+        assert!(
+            f.dispatch(Action::DetachFile {
+                session_id: sid,
+                name: "a.txt".into(),
+            })
+            .is_empty(),
+            "already off the draft"
+        );
+        let unknown = SessionId::new();
+        assert!(
+            f.dispatch(Action::AttachFile {
+                session_id: unknown,
+                file: a,
+            })
+            .is_empty(),
+            "no draft for an unknown session"
+        );
+    }
+
+    #[test]
+    fn a_draft_refuses_a_second_file_name_or_a_path() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let a = draft_file("a.txt", 1);
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: a.clone(),
+        });
+
+        assert!(
+            f.dispatch(Action::AttachFile {
+                session_id: sid,
+                file: draft_file("a.txt", 2),
+            })
+            .is_empty(),
+            "one target per name"
+        );
+        for name in ["a/b", "a\\b", ".", "..", ".git", ""] {
+            assert!(
+                f.dispatch(Action::AttachFile {
+                    session_id: sid,
+                    file: draft_file(name, 3),
+                })
+                .is_empty(),
+                "{name:?} is not a plain file name"
+            );
+        }
+        assert_eq!(draft_files(&f), vec![a]);
+    }
+
+    #[test]
+    fn a_message_names_its_files_after_the_text() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let (a, b) = (draft_file("a.txt", 1), draft_file("b.bin", 2));
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: a.clone(),
+        });
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: b.clone(),
+        });
+
+        let effects = f.dispatch(Action::SendMessage {
+            session_id: sid,
+            text: "look".into(),
+        });
+        let [
+            Effect::Enqueue(command, files),
+            Effect::Request(Request::OutboxChanged),
+        ] = &effects[..]
+        else {
+            panic!("expected enqueue + outbox wake-up, got {effects:?}");
+        };
+        let CommandKind::SendMessage { text, .. } = &command.kind else {
+            panic!("expected a message: {:?}", command.kind);
+        };
+        assert_eq!(
+            text,
+            "look\n\nAttached file: ./a.txt\nAttached file: ./b.bin"
+        );
+        assert_eq!(files, &vec![a, b]);
+        assert!(draft_files(&f).is_empty(), "sending takes the files");
+    }
+
+    #[test]
+    fn a_file_only_draft_can_be_sent() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let a = draft_file("a.txt", 1);
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: a.clone(),
+        });
+
+        let command = queued(&f.dispatch(Action::SendMessage {
+            session_id: sid,
+            text: " ".into(),
+        }));
+        let CommandKind::SendMessage { text, .. } = &command.kind else {
+            panic!("expected a message: {:?}", command.kind);
+        };
+        assert_eq!(text, "Attached file: ./a.txt");
+        assert!(draft_files(&f).is_empty());
+
+        // Taken back, the file is the draft's again and its line is off the
+        // text, which is left empty.
+        assert_eq!(
+            f.dispatch(Action::EditQueued(command.id)),
+            vec![
+                Effect::Withdraw {
+                    id: command.id,
+                    draft: Some((
+                        (sid, ComposerMode::Agent),
+                        Draft {
+                            text: String::new(),
+                            cursor: 0,
+                            when: RunWhen::Always,
+                        }
+                    )),
+                    images: None,
+                    files: Some((sid, vec![a.clone()])),
+                },
+                Effect::Request(Request::OutboxChanged),
+                Effect::Request(Request::DraftImagesChanged),
+            ]
+        );
+        assert_eq!(draft_files(&f), vec![a]);
+    }
+
+    #[test]
+    fn editing_a_queued_message_puts_its_files_back() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let (a, b) = (draft_file("a.txt", 1), draft_file("b.txt", 2));
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: a.clone(),
+        });
+        let first = send(&mut f, sid, "look");
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: b.clone(),
+        });
+
+        // The message's file goes ahead of the draft's, and its line comes
+        // off the text so a resend does not name it twice.
+        assert_eq!(
+            f.dispatch(Action::EditQueued(first.id)),
+            vec![
+                Effect::Withdraw {
+                    id: first.id,
+                    draft: Some((
+                        (sid, ComposerMode::Agent),
+                        Draft {
+                            text: "look".into(),
+                            cursor: 4,
+                            when: RunWhen::Always,
+                        }
+                    )),
+                    images: None,
+                    files: Some((sid, vec![a.clone(), b.clone()])),
+                },
+                Effect::Request(Request::OutboxChanged),
+                Effect::Request(Request::DraftImagesChanged),
+            ]
+        );
+        assert_eq!(draft_files(&f), vec![a, b]);
+    }
+
+    /// The files and outgoing state of the open session's pending message
+    /// `command`.
+    fn pending_item(f: &Fixture, command: CommandId) -> (Vec<OutboxFile>, Outgoing) {
+        f.session_view()
+            .timeline
+            .into_iter()
+            .find_map(|item| match item {
+                TimelineItem::Pending {
+                    command_id,
+                    files,
+                    outgoing,
+                    ..
+                } if command_id == command => Some((files, outgoing)),
+                _ => None,
+            })
+            .expect("the message is pending")
+    }
+
+    #[test]
+    fn a_found_file_is_kept_on_the_entry() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: draft_file("a.txt", 1),
+        });
+        let command = send(&mut f, sid, "look");
+        let found = ContentHash::of(b"what the workdir holds");
+
+        f.model
+            .command_file_exists(command.id, 0, found, Utc::now());
+
+        let (files, outgoing) = pending_item(&f, command.id);
+        assert_eq!(files[0].existing, Some(found));
+        assert_eq!(
+            outgoing,
+            Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::FileExists))
+        );
+    }
+
+    #[test]
+    fn resending_replacing_requeues_with_the_found_hash() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: draft_file("a.txt", 1),
+        });
+        let command = send(&mut f, sid, "look");
+        let found = ContentHash::of(b"what the workdir holds");
+        f.model
+            .command_file_exists(command.id, 0, found, Utc::now());
+
+        assert_eq!(
+            f.dispatch(Action::ResendReplacing(command.id)),
+            vec![
+                Effect::Requeue {
+                    id: command.id,
+                    replaces: vec![(0, found)],
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        let (files, outgoing) = pending_item(&f, command.id);
+        assert_eq!(outgoing, Outgoing::Queued);
+        assert_eq!(files[0].file.replace, Some(found));
+        assert_eq!(files[0].existing, None);
+        // Requeued, it is no longer a refusal to resend.
+        assert!(f.dispatch(Action::ResendReplacing(command.id)).is_empty());
+    }
+
+    #[test]
+    fn resending_replacing_is_a_no_op_otherwise() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let queued_message = send(&mut f, sid, "queued");
+        let missing = send(&mut f, sid, "missing");
+        f.model
+            .command_attachment_refused(missing.id, AttachmentRefusal::Missing, Utc::now());
+
+        assert!(
+            f.dispatch(Action::ResendReplacing(queued_message.id))
+                .is_empty()
+        );
+        assert!(f.dispatch(Action::ResendReplacing(missing.id)).is_empty());
+        assert!(
+            f.dispatch(Action::ResendReplacing(CommandId::new()))
+                .is_empty()
+        );
+        assert_eq!(
+            pending_item(&f, missing.id).1,
+            Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::Missing))
+        );
+    }
+
+    #[test]
+    fn a_pending_message_shows_its_files() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let a = draft_file("a.txt", 1);
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: a.clone(),
+        });
+        send(&mut f, sid, "look");
+
+        let files = f
+            .session_view()
+            .timeline
+            .into_iter()
+            .find_map(|item| match item {
+                TimelineItem::Pending { files, .. } => Some(files),
+                TimelineItem::Logged { .. } => None,
+            });
+        assert_eq!(
+            files,
+            Some(vec![OutboxFile {
+                file: a,
+                existing: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_file_only_draft_marks_the_session() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let a = draft_file("a.txt", 1);
+        let has_draft = |f: &Fixture| {
+            f.list_view()
+                .sessions
+                .iter()
+                .find(|r| r.id == sid)
+                .unwrap()
+                .has_draft
+        };
+        assert!(!has_draft(&f));
+        f.dispatch(Action::AttachFile {
+            session_id: sid,
+            file: a,
+        });
+        assert!(has_draft(&f), "a file with no text is a draft");
+        f.dispatch(Action::DetachFile {
+            session_id: sid,
+            name: "a.txt".into(),
+        });
+        assert!(!has_draft(&f));
     }
 
     #[test]
@@ -8162,6 +8930,7 @@ mod tests {
                         }
                     )),
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -8268,6 +9037,7 @@ mod tests {
                     id: command.id,
                     draft: None,
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -8815,6 +9585,7 @@ mod tests {
                     id: refused.id,
                     draft: None,
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -9726,6 +10497,7 @@ mod tests {
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
             draft_images: model.draft_images.clone(),
+            draft_files: model.draft_files.clone(),
             attachments: model.attachments.clone(),
             composer_modes: model.composer_modes.clone(),
             read_marks: model.read_marks.clone(),
@@ -10955,6 +11727,7 @@ mod tests {
                     id: delete.id,
                     draft: None,
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -11073,6 +11846,7 @@ mod tests {
                     id: cropped.id,
                     draft: None,
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -11874,8 +12648,8 @@ mod tests {
 
         let effects = f.dispatch(move_context(sid, start));
         let [
-            Effect::Enqueue(clear),
-            Effect::Enqueue(moved),
+            Effect::Enqueue(clear, _),
+            Effect::Enqueue(moved, _),
             Effect::Request(Request::OutboxChanged),
         ] = &effects[..]
         else {
@@ -12162,7 +12936,7 @@ mod tests {
         f.log(sid, vec![message("fix it"), working()]);
         f.open(sid);
         let effects = f.dispatch(move_context(sid, start));
-        let [Effect::Enqueue(clear), Effect::Enqueue(moved), _] = &effects[..] else {
+        let [Effect::Enqueue(clear, _), Effect::Enqueue(moved, _), _] = &effects[..] else {
             panic!("{effects:?}");
         };
         let fresh = context_of(clear);
@@ -12202,6 +12976,7 @@ mod tests {
                     id: moved.id,
                     draft: None,
                     images: None,
+                    files: None,
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -12683,13 +13458,13 @@ mod tests {
         use std::sync::mpsc::Receiver;
 
         use skywave_proto::{
-            BlobId as ProtoBlobId, BlobUse, ChangeSet, Commit, CommitLog, DirEntry, EntryKind,
-            LineSpan, ListResult, LogResult, ToolResult,
+            BlobId as ProtoBlobId, ChangeSet, Commit, CommitLog, DirEntry, EntryKind, ListResult,
+            LogResult, WriteFileResult,
         };
 
         use super::*;
         use crate::identity::PairedCredentials;
-        use crate::view::{WorkdirFetch, WorkdirView};
+        use crate::view::{PushState, WorkdirPush};
         use crate::{Core, Seam};
 
         fn blob(size: u64) -> BlobRef {
@@ -13016,6 +13791,231 @@ mod tests {
             f.model.set_link(ONLINE);
             asked(f.dispatch(Action::RefreshWorkdir));
             assert_eq!(view(&f).fetch, WorkdirFetch::Loading);
+        }
+
+        #[test]
+        fn workdir_download_asks_afresh_and_wants_its_blob_off_screen() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let other = f.session("/srv/b");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let download = |path: &str| WorkdirAsk::Download {
+                session: id,
+                path: path.into(),
+            };
+
+            // Asked for, and in flight: a second dispatch asks nothing.
+            let (req, ask) = asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "big.bin".into(),
+            }));
+            assert_eq!(ask, download("big.bin"));
+            assert!(
+                f.dispatch(Action::DownloadWorkdirFile {
+                    session_id: id,
+                    path: "big.bin".into(),
+                })
+                .is_empty(),
+                "in flight"
+            );
+            let shown = view(&f);
+            assert_eq!(shown.downloads.len(), 1);
+            assert_eq!(shown.downloads[0].path, "big.bin");
+            assert_eq!(shown.downloads[0].fetch, WorkdirFetch::Loading);
+            assert_eq!(shown.downloads[0].result, None);
+
+            // The content is wanted though the Changes pane is on screen.
+            let big = blob(4);
+            assert_eq!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("big.bin", FileBody::Blob(big.clone()))
+                ),
+                vec![Request::DownloadBlob(big.id)]
+            );
+            let shown = view(&f);
+            assert_eq!(shown.downloads[0].fetch, WorkdirFetch::Idle);
+            assert_eq!(
+                shown.downloads[0].blob.as_ref().map(|b| &b.state),
+                Some(&BlobState::Requested { size: 4 })
+            );
+
+            // Asked afresh once more; the blob is wanted already, so nothing.
+            let (req, ask) = asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "big.bin".into(),
+            }));
+            assert_eq!(ask, download("big.bin"));
+            assert!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("big.bin", FileBody::Blob(big.clone()))
+                )
+                .is_empty(),
+                "already wanted"
+            );
+
+            // Over the cap: no blob is wanted, and the entry says so. Listed
+            // by path, not by when it was asked for.
+            let (req, ask) = asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "a.bin".into(),
+            }));
+            assert!(answer(&mut f, req, ask, file("a.bin", FileBody::TooLarge)).is_empty());
+            let shown = view(&f);
+            let paths: Vec<&str> = shown.downloads.iter().map(|d| d.path.as_str()).collect();
+            assert_eq!(paths, ["a.bin", "big.bin"]);
+            assert!(matches!(
+                shown.downloads[0].result,
+                Some(FileResult::File {
+                    content: FileBody::TooLarge,
+                    ..
+                })
+            ));
+            assert_eq!(shown.downloads[0].blob, None);
+
+            // Another session's download is not this session's.
+            asked(f.dispatch(Action::DownloadWorkdirFile {
+                session_id: other,
+                path: "other.bin".into(),
+            }));
+            assert_eq!(view(&f).downloads.len(), 2);
+
+            // An unknown session: nothing.
+            assert!(
+                f.dispatch(Action::DownloadWorkdirFile {
+                    session_id: SessionId::new(),
+                    path: "big.bin".into(),
+                })
+                .is_empty()
+            );
+
+            // Offline: asked for nothing, and the entry fails at once.
+            f.model.set_link(offline());
+            assert!(
+                f.dispatch(Action::DownloadWorkdirFile {
+                    session_id: id,
+                    path: "offline.bin".into(),
+                })
+                .is_empty()
+            );
+            let shown = view(&f);
+            let entry = shown
+                .downloads
+                .iter()
+                .find(|d| d.path == "offline.bin")
+                .expect("listed");
+            assert_eq!(entry.fetch, WorkdirFetch::Failed(not_connected()));
+            assert_eq!(entry.result, None);
+        }
+
+        /// The one push `effects` ask for, with its `req`.
+        fn push_asked(effects: Vec<Effect>) -> (u64, Request) {
+            match &requests(effects)[..] {
+                [request @ Request::PushWorkdirFile { req, .. }] => (*req, request.clone()),
+                other => panic!("expected one push, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn workdir_push_asks_once_per_path_and_keeps_its_outcome() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let other = f.session("/srv/b");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let push = |session: SessionId, path: &str| Action::PushWorkdirFile {
+                session_id: session,
+                source: PathBuf::from("/home/me/notes.md"),
+                path: path.into(),
+                replace: None,
+            };
+            let pushing = |path: &str| WorkdirPush {
+                path: path.into(),
+                source: PathBuf::from("/home/me/notes.md"),
+                state: PushState::Pushing,
+            };
+
+            // Asked for once, naming the file, the path and the session.
+            let (req, request) = push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_eq!(
+                request,
+                Request::PushWorkdirFile {
+                    req,
+                    session: id,
+                    source: PathBuf::from("/home/me/notes.md"),
+                    path: "docs/notes.md".into(),
+                    replace: None,
+                }
+            );
+
+            // In flight: a second push to the path asks nothing.
+            assert!(
+                f.dispatch(push(id, "docs/notes.md")).is_empty(),
+                "in flight"
+            );
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // An answer to another req is stale: nothing changes.
+            f.model.workdir_pushed(
+                req + 100,
+                id,
+                "docs/notes.md".into(),
+                Err(TransportError::Timeout),
+            );
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // The awaited answer is kept.
+            let written = PushOutcome::Written(WriteFileResult::Exists {
+                sha256: ContentHash::of(b"old"),
+                size: 3,
+            });
+            f.model
+                .workdir_pushed(req, id, "docs/notes.md".into(), Ok(written.clone()));
+            assert_eq!(
+                view(&f).pushes,
+                [WorkdirPush {
+                    state: PushState::Done(written),
+                    ..pushing("docs/notes.md")
+                }]
+            );
+
+            // Pushed again once done: asked afresh, and the old req's answer
+            // is dropped.
+            let (again, _) = push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_ne!(again, req);
+            f.model.workdir_pushed(
+                req,
+                id,
+                "docs/notes.md".into(),
+                Err(TransportError::Timeout),
+            );
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // Another session's push is not in this view.
+            push_asked(f.dispatch(push(other, "other.md")));
+            assert_eq!(view(&f).pushes, [pushing("docs/notes.md")]);
+
+            // An unknown session: nothing.
+            assert!(
+                f.dispatch(push(SessionId::new(), "x.md")).is_empty(),
+                "unknown"
+            );
+
+            // Offline: asked for nothing, and the entry fails at once.
+            f.model.set_link(offline());
+            assert!(f.dispatch(push(id, "offline.md")).is_empty());
+            let shown = view(&f).pushes;
+            let entry = shown
+                .iter()
+                .find(|p| p.path == "offline.md")
+                .expect("listed");
+            assert_eq!(entry.state, PushState::Failed(not_connected()));
         }
 
         #[test]
@@ -14151,7 +15151,6 @@ mod tests {
 
         mod crop {
             use super::*;
-            use crate::view::{CropContent, CropView};
 
             /// A tool output in the live session, opened on its crop page.
             fn opened(live: &Live, output: &BlobRef) {

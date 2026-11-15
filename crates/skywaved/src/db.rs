@@ -475,6 +475,22 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo, branch)
     ) STRICT;
     "#,
+    // v25: a download answer (protocol v36, `GET /v1/workdir/download`) names its blob too.
+    // Made again as in v23: SQLite cannot change a CHECK in place.
+    r#"
+    CREATE TABLE workdir_answer_blobs_v25 (
+        session_id TEXT NOT NULL,
+        kind       TEXT NOT NULL CHECK (kind IN ('changes', 'file', 'download')),
+        path       TEXT NOT NULL,
+        blob_id    TEXT NOT NULL REFERENCES blobs (id),
+        PRIMARY KEY (session_id, kind, path, blob_id)
+    ) STRICT;
+    INSERT INTO workdir_answer_blobs_v25 (session_id, kind, path, blob_id)
+        SELECT session_id, kind, path, blob_id FROM workdir_answer_blobs;
+    DROP TABLE workdir_answer_blobs;
+    ALTER TABLE workdir_answer_blobs_v25 RENAME TO workdir_answer_blobs;
+    CREATE INDEX workdir_answer_blobs_by_blob ON workdir_answer_blobs (blob_id);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -494,7 +510,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// fail to compile. Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
-    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35,
+    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36,
 ];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
@@ -590,6 +606,14 @@ fn v33_to_v34(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// lacks and reads as `false`: no v34 turn is marked, so nothing stored
 /// changes.
 fn v34_to_v35(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v35 to v36. v36 added the route `GET /v1/workdir/download` and nothing
+/// stored; staging answers that are not stored either. It also added the
+/// event `FileWritten`, which data stored before v36 never holds, so no stored
+/// event or command result changes.
+fn v35_to_v36(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -1300,6 +1324,82 @@ mod tests {
         assert!(insert("r2", "b").is_ok());
     }
 
+    /// v25 lets a download answer name its blob: the table made again keeps
+    /// v24's `file` row and its `workdir_answer_blobs_by_blob` index.
+    #[test]
+    fn v25_schema_lets_a_download_answer_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..24] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 24).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, ?1)",
+                [PROTOCOL_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs (id, size, sha256) VALUES ('b1', 1, 'h')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workdir_answer_blobs (session_id, kind, path, blob_id)
+                 VALUES ('s', 'file', 'a.txt', 'b1')",
+                [],
+            )
+            .unwrap();
+            // v24 refuses a download's answer.
+            assert!(
+                conn.execute(
+                    "INSERT INTO workdir_answer_blobs (session_id, kind, path, blob_id)
+                     VALUES ('s', 'download', 'a.txt', 'b1')",
+                    [],
+                )
+                .is_err()
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows: Vec<(String, String, String, String)> = db
+            .conn()
+            .prepare("SELECT session_id, kind, path, blob_id FROM workdir_answer_blobs")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "s".to_owned(),
+                "file".to_owned(),
+                "a.txt".to_owned(),
+                "b1".to_owned()
+            )]
+        );
+        let index: String = db
+            .conn()
+            .query_row(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'workdir_answer_blobs_by_blob'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, "workdir_answer_blobs_by_blob");
+        db.conn()
+            .execute(
+                "INSERT INTO workdir_answer_blobs (session_id, kind, path, blob_id)
+                 VALUES ('s', 'download', 'a.txt', 'b1')",
+                [],
+            )
+            .unwrap();
+    }
+
     /// The turn usage v24 wrote (its wire snapshot's) reads once v25's
     /// step ran, with no context fill: a v24 turn reported none.
     #[test]
@@ -1782,6 +1882,48 @@ mod tests {
                 context_compacted: false,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn v36_reads_what_v35_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v35 = r#"{"type":"session_created","workdir":"/srv/code/skywave","context_name":"velvet walrus","from":null,"worktree":{"repo":"/srv/code/skywave","branch":"feature"}}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 35)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, 's', 't', 'c', ?1)",
+                [v35],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let kind: String = db
+            .conn()
+            .query_row("SELECT kind FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, v35);
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::SessionCreated {
+                worktree: Some(_),
+                ..
+            }
         ));
     }
 

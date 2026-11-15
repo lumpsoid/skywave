@@ -15,8 +15,8 @@ use skywave_core::{
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     ConversationsResult, DirEntry, DirsResult, EntryKind, EventKind, EventsQuery, FileBody,
-    FileResult, HelloResponse, ImageType, ListResult, LogResult, OutsideConversation,
-    PROTOCOL_VERSION, Seq, SessionId, UploadResult, WorkdirQuery,
+    FileResult, HelloResponse, ListResult, LogResult, OutsideConversation, PROTOCOL_VERSION, Seq,
+    SessionId, UploadResult, WorkdirQuery, WriteFileRequest, WriteFileResult,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, Rng, seed};
 use skywaved::agent::fake::FakeOutside;
@@ -447,13 +447,13 @@ async fn conversations_are_listed_by_a_real_server() {
 
 /// `HEAD` and `PUT /v1/attachments/{sha256}` against a real server: an
 /// image is staged under its hash, a hash that does not match its bytes is
-/// refused and stages nothing, and a non-image is refused.
+/// refused and stages nothing, and a non-image is staged like any file.
 #[tokio::test(flavor = "multi_thread")]
 async fn attachments_stage_on_a_real_server() {
     let fx = Fixture::start().await;
     let transport = paired_transport(&fx).await;
-    // The server sniffs only the magic bytes, so a PNG header and padding
-    // are an image to it.
+    // The server checks only that a body hashes to its name, so a PNG header
+    // and padding stage like any bytes.
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend_from_slice(&[0u8; 64]);
     let sha = ContentHash::of(&png);
@@ -466,7 +466,6 @@ async fn attachments_stage_on_a_real_server() {
             .unwrap(),
         UploadResult::Stored {
             size: png.len() as u64,
-            media_type: ImageType::Png,
         }
     );
     assert!(transport.attachment_staged(sha).await.unwrap());
@@ -491,7 +490,9 @@ async fn attachments_stage_on_a_real_server() {
             .upload_attachment(ContentHash::of(text), Bytes::from_static(text))
             .await
             .unwrap(),
-        UploadResult::NotAnImage
+        UploadResult::Stored {
+            size: text.len() as u64,
+        }
     );
 }
 
@@ -783,6 +784,20 @@ async fn workdir_reads_default_to_not_found() {
         Old.workdir_file(&query).await,
         Err(TransportError::NotFound)
     );
+    assert_eq!(
+        Old.workdir_download(&query).await,
+        Err(TransportError::NotFound)
+    );
+    let write = WriteFileRequest {
+        session: query.session,
+        path: "notes.txt".into(),
+        content: ContentHash::of(b"hello\n"),
+        replace: None,
+    };
+    assert_eq!(
+        Old.write_workdir_file(&write).await,
+        Err(TransportError::NotFound)
+    );
 }
 
 /// A transport that cannot read the worktree list answers `NotFound`, as a
@@ -914,6 +929,165 @@ async fn worktrees_reach_a_real_server() {
 
     let list = transport.worktrees().await.unwrap();
     assert!(list.repos.is_empty());
+}
+
+/// The download read against a real server: a binary file comes back as a
+/// blob of its own bytes, where the file read refuses it as binary.
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_download_reaches_a_real_server() {
+    let fx = Fixture::start().await;
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let identity = paired.credentials;
+    let transport =
+        HttpsTransport::new(&paired.address, &identity, config(), ExpectedRun::default()).unwrap();
+
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: fx.workdir(),
+            conversation: None,
+            worktree: None,
+        },
+    };
+    let accepted = transport.send_command(&create).await.unwrap();
+    assert!(matches!(accepted, CommandResult::Accepted { .. }));
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    let session = batch.events[0].session_id;
+    let bytes = b"\x89PNG\0\x01\x02";
+    std::fs::write(std::path::Path::new(&fx.workdir()).join("logo.bin"), bytes).unwrap();
+    let query = WorkdirQuery {
+        session,
+        path: "logo.bin".into(),
+    };
+
+    let FileResult::File {
+        size,
+        content: FileBody::Blob(blob),
+        ..
+    } = transport.workdir_download(&query).await.unwrap()
+    else {
+        panic!("expected the file as a blob");
+    };
+    assert_eq!(size, 7);
+    let content = transport.blob(blob.id, 0).await.unwrap();
+    assert_eq!(read_all(content).await, bytes);
+
+    // The file read of the same path is the control: binary, no blob.
+    assert!(matches!(
+        transport.workdir_file(&query).await.unwrap(),
+        FileResult::File {
+            content: FileBody::Binary,
+            ..
+        }
+    ));
+}
+
+/// The write against a real server: a staged upload is written into the
+/// workdir; the same content again is `Same`; other content at the path is
+/// `Exists` until its hash is named as `replace`.
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_write_reaches_a_real_server() {
+    let fx = Fixture::start().await;
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let identity = paired.credentials;
+    let transport =
+        HttpsTransport::new(&paired.address, &identity, config(), ExpectedRun::default()).unwrap();
+
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: fx.workdir(),
+            conversation: None,
+            worktree: None,
+        },
+    };
+    let accepted = transport.send_command(&create).await.unwrap();
+    assert!(matches!(accepted, CommandResult::Accepted { .. }));
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    let session = batch.events[0].session_id;
+    let file = std::path::Path::new(&fx.workdir()).join("notes.txt");
+
+    let hello = b"hello\n";
+    let staged = ContentHash::of(hello);
+    assert!(matches!(
+        transport
+            .upload_attachment(staged, Bytes::from_static(hello))
+            .await
+            .unwrap(),
+        UploadResult::Stored { .. }
+    ));
+    let write = WriteFileRequest {
+        session,
+        path: "notes.txt".into(),
+        content: staged,
+        replace: None,
+    };
+
+    let WriteFileResult::Written { path, size: 6, .. } =
+        transport.write_workdir_file(&write).await.unwrap()
+    else {
+        panic!("expected the file written");
+    };
+    assert_eq!(path, "notes.txt");
+    assert_eq!(std::fs::read(&file).unwrap(), hello);
+
+    assert!(matches!(
+        transport.write_workdir_file(&write).await.unwrap(),
+        WriteFileResult::Same { size: 6, .. }
+    ));
+
+    let other = b"other\n";
+    let other_hash = ContentHash::of(other);
+    assert!(matches!(
+        transport
+            .upload_attachment(other_hash, Bytes::from_static(other))
+            .await
+            .unwrap(),
+        UploadResult::Stored { .. }
+    ));
+    let other_write = WriteFileRequest {
+        session,
+        path: "notes.txt".into(),
+        content: other_hash,
+        replace: None,
+    };
+    let WriteFileResult::Exists { sha256, size: 6 } =
+        transport.write_workdir_file(&other_write).await.unwrap()
+    else {
+        panic!("expected the other file to be refused");
+    };
+    assert_eq!(sha256, staged);
+    assert_eq!(std::fs::read(&file).unwrap(), hello);
+
+    let replacing = WriteFileRequest {
+        replace: Some(staged),
+        ..other_write
+    };
+    assert!(matches!(
+        transport.write_workdir_file(&replacing).await.unwrap(),
+        WriteFileResult::Written { size: 6, .. }
+    ));
+    assert_eq!(std::fs::read(&file).unwrap(), other);
 }
 
 /// A wrong fingerprint fails the TLS handshake, so the code never reaches

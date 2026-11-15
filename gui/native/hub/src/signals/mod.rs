@@ -42,7 +42,7 @@ pub use intents::{
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView,
-    CompletionPopup, ComposerImage, ComposerModeView, ComposerView, ContextRow,
+    CompletionPopup, ComposerFile, ComposerImage, ComposerModeView, ComposerView, ContextRow,
     ConversationRowView, ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView,
     HistoryRowView, HistorySearchView, InfoFieldView, InfoSectionView, LimitRowView, LimitsView,
     ListKindView, LoginFlowState, ModeOption, ModelOption, PairForm, PairingState,
@@ -56,10 +56,11 @@ pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};
 pub use timeline::{
     BlobFacts, BlobStateKind, LineStyle, MarkdownAlign, MarkdownBlock, MarkdownCell, MarkdownKind,
-    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowImage, RowKind, SectionFormat,
-    SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
+    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowFile, RowImage, RowKind,
+    SectionFormat, SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView,
+    ToolState,
 };
 pub use workdir::{
-    WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent, WorkdirEntryRow,
-    WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
+    WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent, WorkdirDownloadRow,
+    WorkdirEntryRow, WorkdirLine, WorkdirLineKind, WorkdirPaneKind, WorkdirPushRow, WorkdirScreen,
 };

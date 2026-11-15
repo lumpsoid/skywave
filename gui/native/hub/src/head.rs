@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use skywave_core::attachment::{self, AttachedImage};
+use skywave_core::attachment::{self, AttachedFile, AttachedImage};
 use skywave_core::search::BlobText;
 use skywave_core::{
     Action, BlobState, BlobView, CallId, CommandId, ComposerMode, ContentHash, Entry, PairUri,
@@ -29,7 +29,7 @@ use skywave_present::usage::{Grouping, Span};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 use skywave_proto::limits::{ATTACHMENTS_MAX, ATTACHMENTS_MAX_TOTAL_BYTES};
 
-use crate::attach::ImageSource;
+use crate::attach::{AttachSource, Prepared};
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
 use crate::crop::CropLines;
 use crate::dispatcher::{Dispatched, Tag};
@@ -40,10 +40,10 @@ use crate::notify::{Kind, NotificationIds};
 use crate::prefs::Prefs;
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
-    ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate, GuiIntent,
-    HistoryRowView, HistorySearchView, LinkUpdate, PairForm, PlatformEffect, RenamePrompt,
-    ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView, TimelineRow,
-    TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range,
+    ComposerFile, ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate,
+    GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, PairForm, PlatformEffect,
+    RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
+    TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
 use crate::workdir::{WorkdirText, shown_blob};
@@ -106,11 +106,11 @@ pub enum Out {
     Effect(PlatformEffect),
     /// Hand `action` to the dispatcher with `tag`.
     Dispatch(Tag, Action),
-    /// Prepare `source` as an image for `session_id`'s draft, off the hub
-    /// task; the result comes back to [`Head::on_prepared`].
+    /// Prepare `source` (an image or a file) for `session_id`'s draft, off
+    /// the hub task; the result comes back to [`Head::on_prepared`].
     Prepare {
         session_id: SessionId,
-        source: ImageSource,
+        source: AttachSource,
     },
     /// Pause the engine's network loops (`Core::suspend`).
     Suspend,
@@ -165,6 +165,7 @@ impl Composer {
                 prompt: None,
                 can_stop: false,
                 images: Vec::new(),
+                files: Vec::new(),
                 preparing: 0,
             },
             text,
@@ -363,8 +364,8 @@ pub struct Head {
     /// The core's data dir, where the attachments are stored; set by `run`
     /// once the core is open.
     data_dir: PathBuf,
-    /// Images being prepared for each session's draft, not yet answered by
-    /// [`Head::on_prepared`].
+    /// Images and files being prepared for each session's draft, not yet
+    /// answered by [`Head::on_prepared`].
     preparing: HashMap<SessionId, u32>,
     /// Only the conversation shows, in every session until switched off:
     /// each snapshot of the open session is narrowed as it arrives.
@@ -612,12 +613,12 @@ impl Head {
     }
 
     /// The result of the preparation [`Out::Prepare`] asked for: the image
-    /// is attached to `session_id`'s draft, or the words for why not are
-    /// shown. The session need not be open: the draft belongs to it.
+    /// or file is attached to `session_id`'s draft, or the words for why not
+    /// are shown. The session need not be open: the draft belongs to it.
     pub fn on_prepared(
         &mut self,
         session_id: SessionId,
-        result: Result<AttachedImage, String>,
+        result: Result<Prepared, String>,
         clock: Clock,
     ) -> Vec<Out> {
         let mut out = Vec::new();
@@ -625,7 +626,12 @@ impl Head {
         *count = count.saturating_sub(1);
         match result {
             Err(text) => out.push(Out::Effect(PlatformEffect::Notice { text })),
-            Ok(image) => self.attach_prepared(session_id, image, clock, &mut out),
+            Ok(Prepared::Image(image)) => {
+                self.attach_prepared(session_id, image, clock, &mut out);
+            }
+            Ok(Prepared::File(file)) => {
+                self.attach_file_prepared(session_id, file, clock, &mut out);
+            }
         }
         self.after(clock, &mut out);
         out
@@ -732,9 +738,9 @@ impl Head {
                         when: session.when,
                     }
                 } else if self.preparing_of(id) > 0 {
-                    // The message would go without the image being prepared.
+                    // The message would go without the attachment being prepared.
                     out.push(Out::Effect(PlatformEffect::Notice {
-                        text: "an image is still being prepared".to_owned(),
+                        text: "an attachment is still being prepared".to_owned(),
                     }));
                     return Ok(());
                 } else if let Some(text) = message_refusal(&text) {
@@ -934,8 +940,8 @@ impl Head {
                 // Saving the draft first keeps the inserted text too.
                 self.dispatch_user(Action::UseSnippet(id), Purpose::Plain, clock, out);
             }
-            GuiIntent::AttachImageFile { session_id, path } => {
-                self.prepare_attach(&session_id, ImageSource::File(PathBuf::from(path)), out);
+            GuiIntent::AttachFile { session_id, path } => {
+                self.prepare_attach(&session_id, AttachSource::File(PathBuf::from(path)), out);
             }
             GuiIntent::AttachImageBytes {
                 session_id,
@@ -943,7 +949,7 @@ impl Head {
                 mime,
             } => {
                 tracing::debug!(%mime, bytes = bytes.len(), "image bytes to attach");
-                self.prepare_attach(&session_id, ImageSource::Bytes(bytes), out);
+                self.prepare_attach(&session_id, AttachSource::Bytes(bytes), out);
             }
             GuiIntent::DetachImage { session_id, sha256 } => {
                 let sha256: ContentHash =
@@ -953,6 +959,16 @@ impl Head {
                     let action = Action::Detach {
                         session_id: id,
                         sha256,
+                    };
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
+                }
+            }
+            GuiIntent::DetachFile { session_id, name } => {
+                if let Some(session) = self.open_head(&session_id) {
+                    let id = session.id;
+                    let action = Action::DetachFile {
+                        session_id: id,
+                        name,
                     };
                     self.dispatch_user(action, Purpose::Plain, clock, out);
                 }
@@ -1570,6 +1586,18 @@ impl Head {
                         .collect(),
                     _ => Vec::new(),
                 },
+                files: match open.filter(|view| view.id == s.id) {
+                    Some(view) if !s.shell() => view
+                        .draft_files
+                        .iter()
+                        .map(|file| ComposerFile {
+                            name: file.name.clone(),
+                            size_label: format::bytes(file.size),
+                            replaces: file.replace.is_some(),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
                 preparing: self.preparing_of(s.id),
                 ..s.composer.shown.clone()
             }
@@ -1715,24 +1743,52 @@ impl Head {
         self.preparing.get(&id).copied().unwrap_or(0)
     }
 
-    /// Asks for `source` to be prepared as an image of the open session's
-    /// draft, unless the draft and the preparations in flight fill its cap:
-    /// then the cap is said, and nothing is prepared.
-    fn prepare_attach(&mut self, session_id: &str, source: ImageSource, out: &mut Vec<Out>) {
+    /// Asks for `source` to be prepared for the open session's draft. Bytes
+    /// are always an image, so when the draft and the preparations in flight
+    /// fill the image cap, the cap is said and nothing is prepared. A file
+    /// may turn out to be an image: `attach_prepared` enforces the cap then.
+    fn prepare_attach(&mut self, session_id: &str, source: AttachSource, out: &mut Vec<Out>) {
         let Some(id) = self.open_head(session_id).map(|session| session.id) else {
             return;
         };
-        let held = self.view_of(id).map_or(0, |view| view.draft_images.len());
-        let preparing = usize::try_from(self.preparing_of(id)).unwrap_or(usize::MAX);
-        if held.saturating_add(preparing) >= ATTACHMENTS_MAX {
-            out.push(images_full());
-            return;
+        if matches!(source, AttachSource::Bytes(_)) {
+            let held = self.view_of(id).map_or(0, |view| view.draft_images.len());
+            let preparing = usize::try_from(self.preparing_of(id)).unwrap_or(usize::MAX);
+            if held.saturating_add(preparing) >= ATTACHMENTS_MAX {
+                out.push(images_full());
+                return;
+            }
         }
         *self.preparing.entry(id).or_insert(0) += 1;
         out.push(Out::Prepare {
             session_id: id,
             source,
         });
+    }
+
+    /// Attaches a prepared non-image `file` to `id`'s draft, unless the draft
+    /// holds a file of that name already: a note says so, as the core would
+    /// keep the one held and drop this one without a word.
+    fn attach_file_prepared(
+        &mut self,
+        id: SessionId,
+        file: AttachedFile,
+        clock: Clock,
+        out: &mut Vec<Out>,
+    ) {
+        if let Some(view) = self.view_of(id)
+            && view.draft_files.iter().any(|held| held.name == file.name)
+        {
+            out.push(Out::Effect(PlatformEffect::Notice {
+                text: format!("a file named {} is already attached", file.name),
+            }));
+            return;
+        }
+        let action = Action::AttachFile {
+            session_id: id,
+            file,
+        };
+        self.dispatch_user(action, Purpose::Plain, clock, out);
     }
 
     /// Attaches a prepared `image` to `id`'s draft, unless the draft holds

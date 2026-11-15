@@ -34,7 +34,7 @@ use crate::view::{
     ApprovalId, BlobId, CommandId, DeviceId, PairedLink, Seq, SessionId, UsageLimitsResult,
     UsageLimitsUnavailable,
 };
-use crate::workdir::{WorkdirAnswer, WorkdirAsk};
+use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk};
 
 /// The bytes a local crop is made from ([`Seam::local_crop`]).
 #[derive(Debug, Clone)]
@@ -106,6 +106,16 @@ pub enum Request {
     Workdir {
         req: u64,
         ask: WorkdirAsk,
+    },
+    /// Push the device file `source` into the session's workdir at `path`
+    /// (see [`Action::PushWorkdirFile`](crate::Action::PushWorkdirFile)).
+    /// Answer with [`Seam::workdir_pushed`], naming `req`.
+    PushWorkdirFile {
+        req: u64,
+        session: SessionId,
+        source: PathBuf,
+        path: String,
+        replace: Option<ContentHash>,
     },
     /// Ask the server for its agent's usage limits, for the usage limits
     /// page, within [`USAGE_LIMITS_TIMEOUT`](crate::USAGE_LIMITS_TIMEOUT).
@@ -459,6 +469,29 @@ impl Seam {
         })
     }
 
+    /// The workdir holds a file of the message `id` at its name with other
+    /// content: the device gives up on the message and keeps `existing`, the
+    /// hash found there, on that file ([`AttachmentRefusal::FileExists`]).
+    /// The message is never sent; a command already settled (or gone) stays
+    /// as it is.
+    pub fn command_file_exists(
+        &self,
+        id: CommandId,
+        position: usize,
+        existing: ContentHash,
+    ) -> Result<(), CoreError> {
+        let now = Utc::now();
+        self.update(|state, _| {
+            if state
+                .store
+                .record_file_exists(id, position, existing, now)?
+            {
+                state.model.command_file_exists(id, position, existing, now);
+            }
+            Ok(())
+        })
+    }
+
     /// Settles the command `id`, whose reply was unreadable (or which got
     /// [`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS) server errors), from the log:
     /// returns whether it is settled. `head` is the server's log head read
@@ -552,6 +585,22 @@ impl Seam {
                 requests.push(Request::BlobsPurged(stored.purged));
             }
             requests.extend(wanted);
+            Ok(())
+        })
+    }
+
+    /// The answer to [`Request::PushWorkdirFile`] `req`, for the push to
+    /// `path` of `session`. In one update: the model keeps it only if `req`
+    /// is still the push's latest. Nothing is stored; a push is in memory.
+    pub fn workdir_pushed(
+        &self,
+        req: u64,
+        session: SessionId,
+        path: String,
+        result: Result<PushOutcome, TransportError>,
+    ) -> Result<(), CoreError> {
+        self.update(|state, _requests| {
+            state.model.workdir_pushed(req, session, path, result);
             Ok(())
         })
     }

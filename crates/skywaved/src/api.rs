@@ -75,8 +75,9 @@
 //! logged or stored. Each `hello` drops a flow left open too long.
 //!
 //! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/log`,
-//! `/v1/workdir/list` and `/v1/workdir/file`, D36): reads of a session's
-//! workdir, every outcome a 200 [`ChangesResult`](skywave_proto::ChangesResult),
+//! `/v1/workdir/list`, `/v1/workdir/file` and `/v1/workdir/download`, D36):
+//! reads of a session's workdir, every outcome a 200
+//! [`ChangesResult`](skywave_proto::ChangesResult),
 //! [`LogResult`](skywave_proto::LogResult),
 //! [`ListResult`](skywave_proto::ListResult) or
 //! [`FileResult`](skywave_proto::FileResult). They run on a blocking thread
@@ -84,10 +85,12 @@
 //! and one snapshot at a time. Each request takes its deadline
 //! ([`workdir::SNAPSHOT_DEADLINE`]) when the handler starts; a snapshot that
 //! gets the lock only after it does nothing and the reply is a 503. One that
-//! reaches it while running stops: a 503 for list and file, and the 200
+//! reaches it while running stops: a 503 for list, file and download, and the 200
 //! `Failed { "timed out" }` for changes, whose git children are killed then.
 //! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
-//! future, and the deadline is what stops the abandoned work.
+//! future, and the deadline is what stops the abandoned work. A download
+//! takes [`workdir::DOWNLOAD_DEADLINE`] instead, with its outer bound 5 s
+//! longer, and its copy runs outside the lock (module docs of `workdir`).
 //!
 //! **Blocking file-system work** (dirs, the conversations scan, workdir
 //! reads and storage reports) first takes one of [`FS_PERMITS`] permits,
@@ -145,12 +148,13 @@ use futures_util::StreamExt;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContentHash,
-    ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery,
-    HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult, LoginStartResult,
-    PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId, UploadResult,
-    UsageLimit, UsageLimitsResult, WorkdirQuery, check_conversation_id, limits, path,
+    ConversationsResult, DeviceId, DeviceInfo, DirsQuery, EventKind, EventsQuery, Fingerprint,
+    HelloQuery, HelloResponse, ImportOutcome, LineSpan, LoginFinish, LoginFinishResult,
+    LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RejectReason, RunId, ServerId, SessionId,
+    UploadResult, UsageLimit, UsageLimitsResult, WorkdirQuery, WriteFileRequest, WriteFileResult,
+    check_conversation_id, limits, path,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::agent::import::{self, Prepared};
@@ -174,6 +178,7 @@ use crate::login::LoginFlows;
 use crate::server::{JoinedHook, ServerOptions};
 use crate::storage::{self, StorageReader};
 use crate::workdir::{self, Git, Snapshot, WorkdirReader};
+use crate::workdir_write::{self, WRITE_DEADLINE, WriteOutcome};
 use crate::worktree;
 use crate::{EventLog, lock};
 
@@ -244,6 +249,8 @@ pub(crate) struct Api {
     blobs: BlobStore,
     /// Images staged for a message (`/v1/attachments/{sha256}`).
     staging: Staging,
+    /// Largest file an upload stages (`[files] upload_max`).
+    upload_max: u64,
     server_id: ServerId,
     /// Becomes `true` when the server shuts down, ending long-poll waits.
     shutdown: watch::Receiver<bool>,
@@ -301,13 +308,15 @@ impl Api {
                 blobs.clone(),
                 log.roots().to_vec(),
             )
-            .with_git(options.git),
+            .with_git(options.git)
+            .with_download_max(options.download_max),
             storage: StorageReader::new(Db::open(&dir.db_path())?, dir.clone(), options.log_file),
             // A `DeleteBlob` removes the file from the store served here
             // (a `CropBlob` its own preparation's, the same store).
             log: log.with_blobs(blobs.clone()),
             blobs,
             staging: Staging::new(dir.attachments_dir()),
+            upload_max: options.upload_max,
             server_id,
             shutdown,
             outside: options.outside,
@@ -383,6 +392,8 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::WORKTREES, get(worktrees))
+        .route(path::WORKDIR_DOWNLOAD, get(workdir_download))
+        .route(path::WORKDIR_WRITE, post(workdir_write))
         .route(path::BLOB_ROUTE, get(blob))
         .route(
             path::ATTACHMENT_ROUTE,
@@ -1235,6 +1246,77 @@ async fn workdir_file(
     workdir_snapshot(&api, deadline, move |s| s.file(&query)).await
 }
 
+async fn workdir_download(
+    State(api): State<Arc<Api>>,
+    query: std::result::Result<Query<WorkdirQuery>, QueryRejection>,
+) -> Response {
+    let deadline = Instant::now() + workdir::DOWNLOAD_DEADLINE;
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    workdir_blocking(
+        &api,
+        workdir::DOWNLOAD_DEADLINE + Duration::from_secs(5),
+        move |w| w.download(&query, deadline),
+    )
+    .await
+}
+
+/// `POST /v1/workdir/write`: writes a staged upload into a session's workdir
+/// and answers a [`WriteFileResult`] with 200, whatever the outcome. The
+/// rules are in the docs of [`mod@crate::workdir_write`]. A write that lands
+/// is logged as `FileWritten` by the calling device and answered `Written`
+/// with that event's seq. A low disk is checked first; a body that is not a
+/// request is a 400, and a write past [`WRITE_DEADLINE`] a 503.
+async fn workdir_write(
+    State(api): State<Arc<Api>>,
+    Extension(Caller(device)): Extension<Caller>,
+    body: std::result::Result<Json<WriteFileRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(req)) = body else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if api.log.disk().refresh() {
+        return Json(WriteFileResult::DiskLow).into_response();
+    }
+    let deadline = Instant::now() + WRITE_DEADLINE;
+    let session = req.session;
+    let staging = api.staging.clone();
+    let outcome = workdir_task(&api, WRITE_DEADLINE + Duration::from_secs(5), move |w| {
+        let workdir = match w.workdir_of(req.session, deadline)? {
+            Ok(workdir) => workdir,
+            Err(answer) => return Ok(WriteOutcome::Answer(answer)),
+        };
+        workdir_write::write(&workdir, &staging, &req, deadline)
+    })
+    .await;
+    let (path, sha256, size, replaced) = match outcome {
+        Ok(WriteOutcome::Wrote {
+            path,
+            sha256,
+            size,
+            replaced,
+        }) => (path, sha256, size, replaced),
+        Ok(WriteOutcome::Answer(answer)) => return Json(answer).into_response(),
+        Err(response) => return response,
+    };
+    let kind = EventKind::FileWritten {
+        path: path.clone(),
+        sha256,
+        size,
+        replaced,
+        by: device,
+    };
+    let logged = api
+        .blocking(move |api, db| api.log.file_written(db, session, kind))
+        .await;
+    match logged {
+        Ok(Some(seq)) => Json(WriteFileResult::Written { path, size, seq }).into_response(),
+        Ok(None) => Json(WriteFileResult::UnknownSession).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
 /// Runs `f` as one workdir snapshot on a blocking thread (module docs,
 /// "Workdir"): its answer is a 200, a passed deadline, [`WORKDIR_TIMEOUT`]
 /// or no file-system permit a 503, any other error a 500.
@@ -1243,32 +1325,56 @@ async fn workdir_snapshot<T: serde::Serialize + Send + 'static>(
     deadline: Instant,
     f: impl FnOnce(&mut Snapshot<'_>) -> Result<T> + Send + 'static,
 ) -> Response {
+    workdir_blocking(api, WORKDIR_TIMEOUT, move |w| w.snapshot(deadline, f)).await
+}
+
+/// Runs `f` with the workdir reader on a blocking thread, under a
+/// file-system permit: its answer is a 200, a passed deadline, `timeout` or
+/// no permit a 503, any other error a 500.
+async fn workdir_blocking<T: serde::Serialize + Send + 'static>(
+    api: &Arc<Api>,
+    timeout: Duration,
+    f: impl FnOnce(&WorkdirReader) -> Result<T> + Send + 'static,
+) -> Response {
+    match workdir_task(api, timeout, f).await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// [`workdir_blocking`] up to its answer: what `f` returned, or the response
+/// to send instead (a 503 or a 500).
+async fn workdir_task<T: Send + 'static>(
+    api: &Arc<Api>,
+    timeout: Duration,
+    f: impl FnOnce(&WorkdirReader) -> Result<T> + Send + 'static,
+) -> std::result::Result<T, Response> {
     let permit = match api.fs_permit().await {
         Ok(permit) => permit,
-        Err(status) => return status.into_response(),
+        Err(status) => return Err(status.into_response()),
     };
     let api = api.clone();
     let work = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        api.workdir.snapshot(deadline, f)
+        f(&api.workdir)
     });
-    match tokio::time::timeout(WORKDIR_TIMEOUT, work).await {
-        Ok(Ok(Ok(answer))) => Json(answer).into_response(),
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(Ok(answer))) => Ok(answer),
         Ok(Ok(Err(Error::WorkdirDeadline))) => {
             tracing::warn!("workdir snapshot passed its deadline");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }
         Ok(Ok(Err(e))) => {
             tracing::error!(error = %e, "workdir read failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Ok(Err(e)) => {
             tracing::error!(error = %e, "workdir task failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(_) => {
             tracing::warn!("workdir read timed out");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }
     }
 }
@@ -1304,11 +1410,13 @@ async fn attachment_staged(
     }
 }
 
-/// `PUT /v1/attachments/{sha256}`: stages the body's image and answers an
-/// [`UploadResult`] with 200. The body is read in memory, and the answer is
-/// `TooLarge` as soon as it passes [`limits::ATTACHMENT_MAX_BYTES`], without
-/// reading the rest. A low disk is `DiskLow`, checked before anything is
-/// written.
+/// `PUT /v1/attachments/{sha256}`: stages the body's file and answers an
+/// [`UploadResult`] with 200. The body streams to a temp file in the staging
+/// directory and is never held in memory. The answer is `TooLarge` as soon
+/// as the bytes received pass `upload_max` (the temp file is deleted with
+/// nothing staged). A low disk is `DiskLow`: checked before anything is
+/// written and again before each write, so an upload stops once the disk
+/// turns low.
 async fn stage_attachment(
     State(api): State<Arc<Api>>,
     sha256: std::result::Result<Path<String>, PathRejection>,
@@ -1318,22 +1426,56 @@ async fn stage_attachment(
         Ok(hash) => hash,
         Err(status) => return status.into_response(),
     };
-    let mut bytes = Vec::new();
+    if api.log.disk().refresh() {
+        return Json(UploadResult::DiskLow).into_response();
+    }
+    let staging = api.staging.clone();
+    let (tmp, file) = match tokio::task::spawn_blocking(move || {
+        let tmp = staging.temp()?;
+        let file = tmp.reopen()?;
+        Ok::<_, std::io::Error>((tmp, file))
+    })
+    .await
+    {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "creating an attachment's temp file failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "attachment temp file task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut out = tokio::fs::File::from_std(file);
+    let mut received: u64 = 0;
     let mut chunks = body.into_data_stream();
     while let Some(chunk) = chunks.next().await {
         let Ok(chunk) = chunk else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        if (bytes.len() + chunk.len()) as u64 > limits::ATTACHMENT_MAX_BYTES {
+        received += chunk.len() as u64;
+        if received > api.upload_max {
             return Json(UploadResult::TooLarge).into_response();
         }
-        bytes.extend_from_slice(&chunk);
+        // Each upload may write up to `upload_max`, so the disk is checked
+        // before every write, not only before the body: concurrent uploads
+        // must not take the free space below the floor.
+        if api.log.disk().refresh() {
+            return Json(UploadResult::DiskLow).into_response();
+        }
+        if let Err(e) = out.write_all(&chunk).await {
+            tracing::error!(error = %e, "writing an attachment failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
-    if api.log.disk().refresh() {
-        return Json(UploadResult::DiskLow).into_response();
+    if let Err(e) = out.flush().await {
+        tracing::error!(error = %e, "writing an attachment failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    drop(out);
     let staging = api.staging.clone();
-    match tokio::task::spawn_blocking(move || staging.stage(hash, &bytes)).await {
+    match tokio::task::spawn_blocking(move || staging.stage_file(hash, tmp)).await {
         Ok(Ok(result)) => Json(result).into_response(),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "staging an attachment failed");

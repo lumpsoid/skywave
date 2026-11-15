@@ -24,6 +24,15 @@ pub enum Error {
         path.display()
     )]
     BypassInAgentArgs { path: PathBuf, arg: String },
+    /// `[files] upload_max` is over the staging cap, the most staging keeps
+    /// in all (D55).
+    #[error(
+        "config {}: `[files] upload_max` is {max} bytes, over the staging cap of {} bytes; \
+         it must be at most that",
+        path.display(),
+        crate::attachments::STAGING_MAX_BYTES
+    )]
+    UploadMaxTooLarge { path: PathBuf, max: u64 },
     #[error("no config directory: neither XDG_CONFIG_HOME nor HOME is set")]
     NoConfigDir,
     #[error("no data directory: set `data_dir` in the config, XDG_DATA_HOME or HOME")]

@@ -9,10 +9,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use skywave_core::attachment::{AttachedImage, attachment_path};
+use skywave_core::store::OutboxFile;
 use skywave_core::{
-    Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, DeviceRef, Entry,
-    FullView, ImportedEntry, MessageImage, Outgoing, QUESTION_TOOL, RuleSuggestion, Seq, SessionId,
-    SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
+    Answer, ApprovalStatus, AttachmentRefusal, BlobId, BlobState, BlobView, BodyFormat, Decision,
+    DeviceRef, Entry, FailReason, FullView, ImportedEntry, MessageImage, Outgoing, QUESTION_TOOL,
+    RuleSuggestion, Seq, SessionId, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    read_head,
 };
 use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
@@ -31,8 +33,9 @@ use skywave_present::text::{clean_line, clean_text};
 use crate::crop::target_view;
 use crate::signals::{
     BlobFacts, BlobStateKind, LineStyle, MarkdownAlign, MarkdownBlock, MarkdownCell, MarkdownKind,
-    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowImage, RowKind, SectionFormat,
-    SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
+    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowFile, RowImage, RowKind,
+    SectionFormat, SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView,
+    ToolState,
 };
 
 /// Most of a blob an expanded section shows.
@@ -215,12 +218,15 @@ fn row(
         sections: Vec::new(),
         blob_target: None,
         images: Vec::new(),
+        files: Vec::new(),
+        can_resend_replacing: false,
     };
     let (at, entry) = match item {
         TimelineItem::Pending {
             command_id,
             text,
             images,
+            files,
             outgoing,
             discardable,
             ..
@@ -235,6 +241,11 @@ fn row(
                 .iter()
                 .map(|image| pending_image(image, data_dir))
                 .collect();
+            row.files = files.iter().map(pending_file).collect();
+            row.can_resend_replacing = matches!(
+                outgoing,
+                Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::FileExists))
+            ) && files.iter().any(|file| file.existing.is_some());
             return row;
         }
         TimelineItem::Logged {
@@ -360,6 +371,18 @@ fn row(
             RowKind::Archived,
             format!("worktree removed by {}", who(by)),
         ),
+        Entry::FileWritten {
+            path, replaced, by, ..
+        } => set(
+            &mut row,
+            RowKind::Archived,
+            format!(
+                "{} {} by {}",
+                clean_line(path),
+                if *replaced { "replaced" } else { "written" },
+                who(by)
+            ),
+        ),
         Entry::AgentSetting {
             setting,
             by,
@@ -447,6 +470,16 @@ fn pending_image(image: &AttachedImage, data_dir: &Path) -> RowImage {
         ),
         label: bytes(image.size),
         can_download: false,
+    }
+}
+
+/// A queued message's non-image file: its name and size, and whether the
+/// sender found another file at that name.
+fn pending_file(file: &OutboxFile) -> RowFile {
+    RowFile {
+        name: file.file.name.clone(),
+        size_label: bytes(file.file.size),
+        found: file.existing.is_some(),
     }
 }
 
@@ -1013,6 +1046,7 @@ pub fn content_lines(text: &str) -> Vec<&str> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use skywave_core::attachment::AttachedFile;
     use skywave_core::{
         AgentSetting, AgentView, CommandId, ContentHash, ContextId, DeviceId, FullView, ImageType,
         Pause, PermissionMode, SessionId, SessionState,
@@ -1050,6 +1084,7 @@ mod tests {
             mode: skywave_core::ComposerMode::Agent,
             draft: None,
             draft_images: Vec::new(),
+            draft_files: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
@@ -1077,6 +1112,7 @@ mod tests {
             context: ContextId::new(),
             text: text.into(),
             images: Vec::new(),
+            files: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: None,
@@ -1592,6 +1628,7 @@ mod tests {
                 width: 1,
                 height: 1,
             }],
+            files: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: None,
@@ -1617,6 +1654,97 @@ mod tests {
                 can_download: false,
             }]
         );
+    }
+
+    /// A queued message of `files`, in `outgoing` state.
+    fn queued_files(files: Vec<OutboxFile>, outgoing: Outgoing) -> TimelineItem {
+        TimelineItem::Pending {
+            command_id: CommandId::new(),
+            context: ContextId::new(),
+            text: "files".into(),
+            images: Vec::new(),
+            files,
+            outgoing,
+            discardable: true,
+            delivery: None,
+        }
+    }
+
+    /// A file of a queued message called `name` of `size` bytes, with the
+    /// sender's `existing` file at that name when it found one.
+    fn file_named(name: &str, size: u64, existing: Option<ContentHash>) -> OutboxFile {
+        OutboxFile {
+            file: AttachedFile {
+                sha256: ContentHash::of(name.as_bytes()),
+                name: name.into(),
+                size,
+                replace: None,
+            },
+            existing,
+        }
+    }
+
+    #[test]
+    fn a_queued_message_lists_its_files() {
+        let item = queued_files(
+            vec![
+                file_named("notes.pdf", 2_048, None),
+                file_named("data.csv", 512, None),
+            ],
+            Outgoing::Queued,
+        );
+        let row = rows_of(vec![item]).rows.remove(0);
+        assert_eq!(
+            row.files,
+            [
+                RowFile {
+                    name: "notes.pdf".into(),
+                    size_label: bytes(2_048),
+                    found: false,
+                },
+                RowFile {
+                    name: "data.csv".into(),
+                    size_label: bytes(512),
+                    found: false,
+                },
+            ]
+        );
+        assert!(!row.can_resend_replacing);
+    }
+
+    #[test]
+    fn a_message_refused_for_a_found_file_can_be_resent_replacing() {
+        let file_exists =
+            Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::FileExists));
+        let old = ContentHash::of(b"old");
+        let found = rows_of(vec![queued_files(
+            vec![file_named("notes.pdf", 4_096, Some(old))],
+            file_exists,
+        )])
+        .rows
+        .remove(0);
+        assert!(found.files[0].found);
+        assert!(found.can_resend_replacing);
+
+        // Control: the same refusal, with nothing found at the name.
+        let nothing_found = rows_of(vec![queued_files(
+            vec![file_named("notes.pdf", 4_096, None)],
+            Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::FileExists)),
+        )])
+        .rows
+        .remove(0);
+        assert!(!nothing_found.files[0].found);
+        assert!(!nothing_found.can_resend_replacing);
+
+        // Control: a file found, but refused for another reason.
+        let missing = rows_of(vec![queued_files(
+            vec![file_named("notes.pdf", 4_096, Some(old))],
+            Outgoing::Failed(FailReason::AttachmentRefused(AttachmentRefusal::Missing)),
+        )])
+        .rows
+        .remove(0);
+        assert!(missing.files[0].found);
+        assert!(!missing.can_resend_replacing);
     }
 
     #[test]

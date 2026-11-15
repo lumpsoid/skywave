@@ -1327,8 +1327,9 @@ is what the log keeps.
   upload is not posted: the outbox checks before each image and again right
   before posting.
 - **Device refusals settle the message.** A refusal on the device (`TooLarge`,
-  `NotAnImage`, `HashMismatch`, or a missing local file) settles the message
-  `AttachmentRefused`: never posted, discardable.
+  `HashMismatch`, or a missing local file) settles the message
+  `AttachmentRefused`: never posted, discardable. An outbox entry stored before
+  v36 may carry `NotAnImage`, which the server no longer answers (D55).
 - **A low disk refuses, never waits.** A low disk refuses an image message with
   `DiskLow`, as it does text (D40). The outbox posts it anyway instead of
   waiting, so control commands keep moving.
@@ -1437,3 +1438,93 @@ explain. Deriving the history from the replicated log keeps it device-local,
 like prompt history, and needs no protocol change. Ctrl-R is the bash, zsh
 and fzf history key, and retry stays a press away (focus outside the field,
 or the banner). **Rejected:** a modal dialog, and scored matching.
+
+## D54. Repository files download as workdir blobs
+A head saves any workdir file through `GET /v1/workdir/download` (v36). It
+answers a `FileResult` like `file`, but serves binary content too and has
+its own cap (`[files] download_max`, 64 MiB by default). The bytes travel as a
+workdir blob over `GET /v1/blobs/{id}`, so a download resumes, is
+hash-checked and compressed like every blob, and no second transport
+exists. A download is not fetched on open; the head asks for it. Its
+answer is recorded under its own kind (`download`) for GC, so a file-view
+answer and a download answer for the same path never replace each other's
+blobs; schema v25 widens the CHECK on `workdir_answer_blobs` to allow it.
+**Why:** the user wanted repository files, binary ones included, saved to
+the device without a second transport. Reusing the workdir read and the
+blob route gives resume, hashing and compression for free. **Rejected:** a
+raw streaming route (no hash up front, and the file can change between
+resumed ranges).
+
+## D55. Staging takes any file (v36)
+`PUT /v1/attachments/{sha256}` stages any file, not only an image. Staging no
+longer sniffs: image-ness is decided where a staged file is used as an image,
+a message's attachment, which is refused `UnknownAttachment` when the file is
+not one. One staging then serves a message's images and the files a workdir
+write names. An existing staged file is trusted only while it still hashes to
+its name. Nothing stored changes: `UploadResult` is an HTTP answer, not stored
+on either side.
+**Why:** the check that matters is where the bytes are used as an image, not
+where they arrive, and one cache of uploads is simpler to evict and sweep than
+one per kind of file.
+
+The upload cap is `[files] upload_max` (64 MiB by default, at most the 256 MiB
+staging cap, and refused at load when larger). The PUT streams its body to a
+temp file in the staging directory and never buffers it; a body over the cap
+is `TooLarge` and leaves no file. `ATTACHMENT_MAX_BYTES` stays the per-image
+limit for images on a message.
+
+## D56. Writing a file into a workdir (v36)
+`POST /v1/workdir/write` writes a staged upload into a session's workdir. It
+is a route with a typed answer, not a command: a `RejectReason` carries no
+data, but a replace must say which file it replaces, and the answer
+`Exists` carries the sha256 the file holds now. A retry is definitive: a
+write that already landed answers `Same`, so a device that lost the reply
+settles from the answer, not from a guess.
+**Why:** the user confirms a replace against the file they saw. A `replace`
+flag would replace whatever is there when the write runs, which can be a
+file the user never looked at.
+
+The replace rule is a hash, not a flag. `replace` names the sha256 of the
+file the user saw, and the write replaces only that file. A file that changed
+after the user looked answers `Exists` again, with its new hash.
+
+The path rules: no `.git` component anywhere in the path, since git's own
+directory runs hooks and a device must never write into it; nothing outside
+the workdir (an absolute path, or one climbing out with `..`). Both are
+refused as `NotAllowed` before the file system is touched. A symlink at
+the target is refused when the file is opened (`O_NOFOLLOW`), never followed,
+and a parent that resolves outside the workdir is `NotAllowed`.
+
+Two callers use this route: the GUI's push action in the directory pane, and
+the outbox sender, which writes a composer's non-image file at
+`<workdir root>/<file name>`, the path the user sees (D57).
+
+## D57. Composer files go into the workdir root at send (v36)
+The agent only sees the session's workdir, so a non-image file attached in a
+composer is put there before the message that names it is posted. The
+message's text says where it is: one `Attached file: ./<name>` line per file.
+Images are not written: they stay native image blocks (D50).
+
+**Decided:** "Composer non-image file: one rule, no setting, no user-chosen
+target. It is written at the ROOT of the session's workdir as `<file name>`,
+then the message names that path for the agent. Same collision guard as
+push-to-workdir (an existing file is refused unless the head resends with
+`replace` = its current sha256 after the user confirms)."
+
+- "Written at SEND time by the outbox sender (works queued offline), not at
+  attach." Writing at attach time fails offline, and writes for a draft that
+  may never be sent.
+- "Same file name twice in one draft: second attach is a no-op - root/<name>
+  is one target."
+- **Collision.** The sender uploads the file (`PUT /v1/attachments/{sha256}`,
+  D55) and writes it with the write route. A file already there settles the
+  entry `AttachmentRefused(FileExists)`, and keeps the hash found on it.
+  `Action::ResendReplacing(CommandId)`, which the GUI asks the user about
+  first, requeues the same command with `replace` set to that hash. A file
+  changed again meanwhile is refused again.
+
+**Rejected:**
+- Copying the file into a server-side path outside the repo. The agent would
+  see a path the user does not.
+- A configurable default directory. It is a setting for one rule.
+- Writing at attach time. See above.

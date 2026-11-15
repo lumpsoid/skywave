@@ -768,7 +768,7 @@ impl State {
     ) -> Result<(), CoreError> {
         for effect in effects {
             let done = match effect {
-                Effect::Enqueue(command) => self.store.enqueue(&command),
+                Effect::Enqueue(command, files) => self.store.enqueue(&command, &files),
                 Effect::SaveBlobPolicy(policy) => self.store.set_blob_policy(policy),
                 Effect::SaveServerAddresses(addresses) => {
                     // The pairing record, not the store.
@@ -785,19 +785,40 @@ impl State {
                     self.store.attach_to_draft(id, &image, Utc::now())
                 }
                 Effect::DetachFromDraft(id, sha256) => self.store.detach_from_draft(id, sha256),
+                Effect::AttachFileToDraft(id, file) => self.store.attach_file_to_draft(id, &file),
+                Effect::DetachFileFromDraft(id, name) => {
+                    self.store.detach_file_from_draft(id, &name)
+                }
                 Effect::SaveComposerMode(id, mode) => self.store.set_composer_mode(id, mode),
                 Effect::SaveReadMark(id, mark) => self.store.set_read_mark(id, mark),
                 Effect::SaveSnippet(snippet) => self.store.set_snippet(&snippet),
                 Effect::DeleteSnippet(id) => self.store.delete_snippet(id),
                 // Refused when the store disagrees with the model; the
                 // resync below then shows what the store holds.
-                Effect::Withdraw { id, draft, images } => self.store.withdraw(
+                Effect::Withdraw {
+                    id,
+                    draft,
+                    images,
+                    files,
+                } => self.store.withdraw(
                     id,
                     draft.as_ref().map(|(key, d)| (*key, d)),
                     images
                         .as_ref()
                         .map(|(session, hashes)| (*session, hashes.as_slice())),
+                    files
+                        .as_ref()
+                        .map(|(session, files)| (*session, files.as_slice())),
                 ),
+                // Refused when the store disagrees with the model; the
+                // resync below then shows what the store holds.
+                Effect::Requeue { id, replaces } => {
+                    match self.store.requeue_replacing(id, &replaces) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(StoreError::NotResendable(id)),
+                        Err(err) => Err(err),
+                    }
+                }
                 Effect::LoadSession(id) => self
                     .store
                     .session_events(id)
@@ -1085,6 +1106,7 @@ mod tests {
                 id: CommandId::new(),
                 draft: None,
                 images: None,
+                files: None,
             },
             Effect::Request(Request::RetryNow),
         ];

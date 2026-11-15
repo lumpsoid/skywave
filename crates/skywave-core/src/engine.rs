@@ -128,13 +128,14 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
 use skywave_proto::limits::ATTACHMENT_MAX_BYTES;
 use skywave_proto::{
-    Command, CommandKind, CommandResult, ContentHash, EventsQuery, Seq, UploadResult,
+    Command, CommandKind, CommandResult, ContentHash, EventsQuery, Seq, SessionId, UploadResult,
+    WriteFileRequest, WriteFileResult,
 };
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::address::ServerAddress;
-use crate::attachment::attachment_path;
+use crate::attachment::{AttachedFile, attachment_path};
 use crate::backoff::Backoff;
 use crate::blobs::{BlobCtx, BlobQueue, run_downloader};
 use crate::client::CoreError;
@@ -145,7 +146,9 @@ use crate::seam::{Request, Seam};
 use crate::store::{AttachmentRefusal, LogCheck, OutboxEntry, StoreError};
 use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::{CommandId, LinkFailure, LinkRejection, PairedLink};
-use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
+use crate::workdir::{
+    PUSH_MAX_BYTES, PushOutcome, WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected,
+};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
 pub const DEFAULT_WAIT_SECS: u32 = 30;
@@ -546,6 +549,25 @@ impl Engine {
                     answer_workdir(&seam, req, ask, result);
                 });
             }
+            Request::PushWorkdirFile {
+                req,
+                session,
+                source,
+                path,
+                replace,
+            } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    answer_push(&seam, req, session, path, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a workdir push", async move {
+                    let result =
+                        push_workdir_file(&*transport, &source, session, path.clone(), replace)
+                            .await;
+                    answer_push(&seam, req, session, path, result);
+                });
+            }
             Request::CountLines { req, path } => {
                 let seam = self.seam.clone();
                 self.seam.spawn("a line count", async move {
@@ -665,6 +687,10 @@ async fn read_workdir(
             .workdir_file(&query)
             .await
             .map(WorkdirAnswer::File),
+        WorkdirAsk::Download { .. } => transport
+            .workdir_download(&query)
+            .await
+            .map(WorkdirAnswer::File),
     }
 }
 
@@ -676,6 +702,18 @@ fn answer_workdir(
 ) {
     if let Err(error) = seam.workdir_answered(req, ask, result) {
         tracing::warn!(%error, "cannot keep a workdir answer");
+    }
+}
+
+fn answer_push(
+    seam: &Seam,
+    req: u64,
+    session: SessionId,
+    path: String,
+    result: Result<PushOutcome, TransportError>,
+) {
+    if let Err(error) = seam.workdir_pushed(req, session, path, result) {
+        tracing::warn!(%error, "cannot keep a workdir push");
     }
 }
 
@@ -1082,15 +1120,21 @@ async fn send(
     }
 }
 
-/// What staging a message's images came to.
+/// What staging a message's images and files came to.
 enum Staged {
     /// Post the message: its images are staged, or a low disk stopped the
-    /// uploads.
+    /// uploads, and its files are in the workdir.
     Post,
     /// The message cannot be posted, and why.
     Refused(AttachmentRefusal),
     /// The user took the message back meanwhile: it is not posted.
     Withdrawn,
+    /// The workdir holds other content at file `position`'s name, with the
+    /// hash `existing`: the message cannot be posted.
+    Exists {
+        position: usize,
+        existing: ContentHash,
+    },
 }
 
 /// Uploads the images a `SendMessage` names, in order, so the server holds
@@ -1188,9 +1232,183 @@ async fn stage_one(
         UploadResult::Stored { .. } => ImageStaging::Staged,
         UploadResult::DiskLow => ImageStaging::DiskLow,
         UploadResult::TooLarge => ImageStaging::Refused(AttachmentRefusal::TooLarge),
-        UploadResult::NotAnImage => ImageStaging::Refused(AttachmentRefusal::NotAnImage),
         UploadResult::HashMismatch => ImageStaging::Refused(AttachmentRefusal::HashMismatch),
     })
+}
+
+/// Writes the files a message carries into the workdir root, in order, so
+/// they are there when it is posted. [`Staged::Post`] means post now: every
+/// file is written, or the message has none. A file the workdir already holds
+/// with other content stops the message as [`Staged::Exists`], and a file
+/// that cannot be written as [`Staged::Refused`]. The user taking the message
+/// back is checked as [`stage_attachments`] checks it. A transport error is
+/// returned for [`send_entry`] to handle.
+async fn write_files(
+    ctx: &LinkCtx,
+    transport: &dyn Transport,
+    entry: &OutboxEntry,
+) -> Result<Staged, LinkError> {
+    let CommandKind::SendMessage { session_id, .. } = &entry.command.kind else {
+        return Ok(Staged::Post);
+    };
+    if entry.files.is_empty() {
+        return Ok(Staged::Post);
+    }
+    let data_dir = ctx.seam.data_dir();
+    for (position, file) in entry.files.iter().enumerate() {
+        if !still_pending(ctx, entry.command.id)? {
+            return Ok(Staged::Withdrawn);
+        }
+        match write_one(transport, &data_dir, *session_id, &file.file).await? {
+            FileWrite::Written => {}
+            FileWrite::Exists(existing) => return Ok(Staged::Exists { position, existing }),
+            FileWrite::Refused(reason) => return Ok(Staged::Refused(reason)),
+        }
+    }
+    if !still_pending(ctx, entry.command.id)? {
+        return Ok(Staged::Withdrawn);
+    }
+    Ok(Staged::Post)
+}
+
+/// What writing one file of a message came to.
+enum FileWrite {
+    /// The workdir holds the file's content at its name.
+    Written,
+    /// The workdir holds other content at its name, with this hash.
+    Exists(ContentHash),
+    /// The file cannot be written, and why.
+    Refused(AttachmentRefusal),
+}
+
+/// Writes one file of a message into the workdir root as its name. The device
+/// copy must still hash to the file's hash; it is staged the way an image is
+/// (a HEAD, then a PUT unless the server holds it), then written with the
+/// file's `replace`. A `NotStaged` answer uploads the file once more and
+/// writes it again; a second one refuses it. A write that finds the same
+/// content already there counts as written, so a resend after a lost answer
+/// carries on. A transport error is returned to the caller.
+async fn write_one(
+    transport: &dyn Transport,
+    data_dir: &Path,
+    session: SessionId,
+    file: &AttachedFile,
+) -> Result<FileWrite, TransportError> {
+    let path = attachment_path(data_dir, file.sha256);
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.len() > PUSH_MAX_BYTES => {
+            tracing::warn!(name = %file.name, "message file is over the upload limit");
+            return Ok(FileWrite::Refused(AttachmentRefusal::TooLarge));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, name = %file.name, "message file cannot be read");
+            return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
+        }
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(error) => {
+            tracing::warn!(%error, name = %file.name, "message file cannot be read");
+            return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
+        }
+    };
+    if ContentHash::of(&bytes) != file.sha256 {
+        tracing::warn!(name = %file.name, "message file no longer holds its content");
+        return Ok(FileWrite::Refused(AttachmentRefusal::Missing));
+    }
+    let sha = file.sha256;
+    let mut round = 1;
+    loop {
+        if round > 1 || !transport.attachment_staged(sha).await? {
+            match transport.upload_attachment(sha, bytes.clone()).await? {
+                UploadResult::Stored { .. } => {}
+                UploadResult::TooLarge => {
+                    return Ok(FileWrite::Refused(AttachmentRefusal::TooLarge));
+                }
+                UploadResult::HashMismatch => {
+                    return Ok(FileWrite::Refused(AttachmentRefusal::HashMismatch));
+                }
+                UploadResult::DiskLow => {
+                    return Ok(FileWrite::Refused(AttachmentRefusal::ServerDiskLow));
+                }
+            }
+        }
+        let request = WriteFileRequest {
+            session,
+            path: file.name.clone(),
+            content: sha,
+            replace: file.replace,
+        };
+        let answer = transport.write_workdir_file(&request).await?;
+        if matches!(answer, WriteFileResult::NotStaged) && round == 1 {
+            tracing::debug!(
+                name = %file.name,
+                "workdir write found the file unstaged; uploading it again"
+            );
+            round += 1;
+            continue;
+        }
+        return Ok(match answer {
+            WriteFileResult::Written { .. } | WriteFileResult::Same { .. } => FileWrite::Written,
+            WriteFileResult::Exists { sha256, .. } if sha256 == sha => FileWrite::Written,
+            WriteFileResult::Exists { sha256, .. } => FileWrite::Exists(sha256),
+            WriteFileResult::DiskLow => FileWrite::Refused(AttachmentRefusal::ServerDiskLow),
+            _ => FileWrite::Refused(AttachmentRefusal::FileNotWritten),
+        });
+    }
+}
+
+/// Pushes one device file into a session's workdir. The file is read where
+/// it is, not copied into the data dir; the hash is of the bytes read, so the
+/// content sent is the content named. A HEAD, then, unless the server holds
+/// the bytes, a PUT, then the write at `path`. A file that is missing,
+/// unreadable or over [`PUSH_MAX_BYTES`] is refused without an upload. A
+/// transport error is returned to the caller.
+pub(crate) async fn push_workdir_file(
+    transport: &dyn Transport,
+    source: &Path,
+    session: SessionId,
+    path: String,
+    replace: Option<ContentHash>,
+) -> Result<PushOutcome, TransportError> {
+    match tokio::fs::metadata(source).await {
+        Ok(meta) if meta.len() > PUSH_MAX_BYTES => {
+            tracing::warn!("workdir push file is over the upload limit");
+            return Ok(PushOutcome::UploadRefused(UploadResult::TooLarge));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "workdir push file cannot be read");
+            return Ok(PushOutcome::Unreadable {
+                reason: error.to_string(),
+            });
+        }
+    }
+    let bytes = match tokio::fs::read(source).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "workdir push file cannot be read");
+            return Ok(PushOutcome::Unreadable {
+                reason: error.to_string(),
+            });
+        }
+    };
+    let sha = ContentHash::of(&bytes);
+    if !transport.attachment_staged(sha).await? {
+        let answer = transport.upload_attachment(sha, Bytes::from(bytes)).await?;
+        if !matches!(answer, UploadResult::Stored { .. }) {
+            return Ok(PushOutcome::UploadRefused(answer));
+        }
+    }
+    let request = WriteFileRequest {
+        session,
+        path,
+        content: sha,
+        replace,
+    };
+    let answer = transport.write_workdir_file(&request).await?;
+    Ok(PushOutcome::Written(answer))
 }
 
 /// The background stager for agent drafts: uploads the images a draft
@@ -1293,8 +1511,9 @@ async fn stage_drafts(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infall
 /// user may take it back while it waits ([`resend_after`]); an answer to a
 /// request still out then settles nothing.
 ///
-/// Before the request, a message's images are staged ([`stage_attachments`]).
-/// An image that cannot be staged settles the message as
+/// Before the request, a message's images are staged ([`stage_attachments`]),
+/// then its files are written into the workdir ([`write_files`]). An image or
+/// file that cannot be staged or written settles the message as
 /// `AttachmentRefused`, final and never posted, and the link stays up. A
 /// transport error while staging is handled as the same error from the
 /// request itself, and the staging runs again on the resend. A message the
@@ -1311,20 +1530,35 @@ async fn send_entry(
     if !ctx.seam.command_sending(id)? {
         return Ok(false);
     }
-    let sent: Result<Result<CommandResult, AttachmentRefusal>, LinkError> =
-        match stage_attachments(ctx, transport, &entry.command).await {
-            Ok(Staged::Post) => transport
-                .send_command(&entry.command)
-                .await
-                .map(Ok)
-                .map_err(LinkError::Transport),
-            Ok(Staged::Refused(reason)) => Ok(Err(reason)),
-            Ok(Staged::Withdrawn) => {
-                tracing::debug!(?id, "withdrawn while its images uploaded; not posting it");
-                return Ok(false);
-            }
-            Err(error) => Err(error),
-        };
+    let staged = match stage_attachments(ctx, transport, &entry.command).await {
+        Ok(Staged::Post) => write_files(ctx, transport, entry).await,
+        other => other,
+    };
+    let sent: Result<Result<CommandResult, AttachmentRefusal>, LinkError> = match staged {
+        Ok(Staged::Post) => transport
+            .send_command(&entry.command)
+            .await
+            .map(Ok)
+            .map_err(LinkError::Transport),
+        Ok(Staged::Refused(reason)) => Ok(Err(reason)),
+        Ok(Staged::Exists { position, existing }) => {
+            tracing::warn!(
+                ?id,
+                position,
+                "a message file is in the workdir with other content; giving up on the message"
+            );
+            ctx.seam.command_file_exists(id, position, existing)?;
+            return Ok(true);
+        }
+        Ok(Staged::Withdrawn) => {
+            tracing::debug!(
+                ?id,
+                "withdrawn while its attachments uploaded; not posting it"
+            );
+            return Ok(false);
+        }
+        Err(error) => Err(error),
+    };
     match sent {
         Ok(Ok(result)) => {
             ctx.seam.command_result(id, &result)?;
@@ -1334,7 +1568,7 @@ async fn send_entry(
             tracing::warn!(
                 ?reason,
                 ?id,
-                "the outbox could not stage an image; giving up on the message"
+                "the outbox could not stage an attachment; giving up on the message"
             );
             ctx.seam.command_attachment_refused(id, reason)?;
             Ok(true)
@@ -1433,7 +1667,7 @@ mod tests {
     use skywave_proto::{
         Attachment, BlobId as ProtoBlobId, BlobRef, Command, CommandId, CommandKind, CommandResult,
         ContentHash, EventBatch, EventKind, HelloResponse, ImageType, PROTOCOL_VERSION, ServerId,
-        SessionId, UploadResult,
+        SessionId, UploadResult, WriteFileRequest, WriteFileResult,
     };
 
     use super::*;
@@ -2170,7 +2404,7 @@ mod tests {
              ALTER TABLE sessions DROP COLUMN worktree;",
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 5)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 7)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(
@@ -2453,6 +2687,15 @@ mod tests {
     }
 
     fn enqueue_with(seam: &Seam, text: &str, attachments: Vec<ContentHash>) -> Command {
+        enqueue_with_files(seam, text, attachments, Vec::new())
+    }
+
+    fn enqueue_with_files(
+        seam: &Seam,
+        text: &str,
+        attachments: Vec<ContentHash>,
+        files: Vec<AttachedFile>,
+    ) -> Command {
         let command = Command {
             id: CommandId::new(),
             kind: CommandKind::SendMessage {
@@ -2464,7 +2707,7 @@ mod tests {
         };
         crate::client::lock(&seam.core.shared.state)
             .store
-            .enqueue(&command)
+            .enqueue(&command, &files)
             .unwrap();
         command
     }
@@ -2850,6 +3093,13 @@ mod tests {
         check_staged: bool,
         /// Runs on every PUT, after it is recorded and before it answers.
         on_put: Option<Box<dyn Fn() + Send + Sync>>,
+        /// Every workdir write, in the order it came.
+        writes: Mutex<Vec<WriteFileRequest>>,
+        /// When set, every write answers this; otherwise it writes.
+        write_answer: Option<WriteFileResult>,
+        /// The first this many writes answer `NotStaged` and unstage the
+        /// file's content, as a server that lost it does.
+        write_not_staged: Mutex<u32>,
     }
 
     impl StagingServer {
@@ -2862,6 +3112,9 @@ mod tests {
                 put_failures: Mutex::new(0),
                 check_staged: true,
                 on_put: None,
+                writes: Mutex::new(Vec::new()),
+                write_answer: None,
+                write_not_staged: Mutex::new(0),
             }
         }
 
@@ -2884,6 +3137,10 @@ mod tests {
 
     fn put_call(sha256: ContentHash) -> String {
         format!("put {}", &sha256.to_hex()[..8])
+    }
+
+    fn write_call(sha256: ContentHash) -> String {
+        format!("write {}", &sha256.to_hex()[..8])
     }
 
     fn post_call(text: &str) -> String {
@@ -2977,12 +3234,49 @@ mod tests {
                         self.staged.lock().unwrap().insert(sha256);
                         Ok(UploadResult::Stored {
                             size: bytes.len() as u64,
-                            media_type: ImageType::Png,
                         })
                     }
                 }
             })
         }
+
+        fn write_workdir_file<'a>(
+            &'a self,
+            request: &'a WriteFileRequest,
+        ) -> BoxFuture<'a, Result<WriteFileResult, TransportError>> {
+            Box::pin(async move {
+                self.record(write_call(request.content));
+                self.writes.lock().unwrap().push(request.clone());
+                let unstaged = {
+                    let mut left = self.write_not_staged.lock().unwrap();
+                    if *left > 0 {
+                        *left -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if unstaged {
+                    self.staged.lock().unwrap().remove(&request.content);
+                    return Ok(WriteFileResult::NotStaged);
+                }
+                Ok(match &self.write_answer {
+                    Some(answer) => answer.clone(),
+                    None => WriteFileResult::Written {
+                        path: request.path.clone(),
+                        size: 0,
+                        seq: Seq(1),
+                    },
+                })
+            })
+        }
+    }
+
+    /// Writes `bytes` to `dir/device.bin`, the way a picked file sits on disk.
+    fn source_file(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join("device.bin");
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 
     /// Writes `bytes` where the outbox looks for the image they hash to.
@@ -2991,6 +3285,16 @@ mod tests {
         std::fs::create_dir_all(attachment_dir(dir)).unwrap();
         std::fs::write(attachment_path(dir, sha256), bytes).unwrap();
         sha256
+    }
+
+    /// A file of a message named `name` whose device copy holds `bytes`.
+    fn outbox_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> AttachedFile {
+        AttachedFile {
+            sha256: put_file(dir, bytes),
+            name: name.into(),
+            size: bytes.len() as u64,
+            replace: None,
+        }
     }
 
     /// Runs the sender until the outbox is drained. The sender only ends on
@@ -3130,7 +3434,7 @@ mod tests {
         let seam = paired_seam(dir.path());
         let a = put_file(dir.path(), b"not really a picture");
         let mut server = StagingServer::new();
-        server.put_answer = Some(UploadResult::NotAnImage);
+        server.put_answer = Some(UploadResult::HashMismatch);
         enqueue_with(&seam, "one", vec![a]);
         enqueue(&seam, "two");
 
@@ -3143,7 +3447,7 @@ mod tests {
         assert_eq!(
             entries.iter().map(|e| e.status.clone()).collect::<Vec<_>>(),
             [
-                OutboxStatus::AttachmentRefused(AttachmentRefusal::NotAnImage),
+                OutboxStatus::AttachmentRefused(AttachmentRefusal::HashMismatch),
                 OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
             ]
         );
@@ -3221,7 +3525,7 @@ mod tests {
             once.call_once(|| {
                 crate::client::lock(&taker.core.shared.state)
                     .store
-                    .withdraw(one, None, None)
+                    .withdraw(one, None, None, None)
                     .unwrap();
             });
         }));
@@ -3234,6 +3538,322 @@ mod tests {
         assert_eq!(
             statuses(&seam),
             [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// A message's image is staged, then its file is uploaded and written into
+    /// the workdir root, and only then is the message posted.
+    #[tokio::test(start_paused = true)]
+    async fn files_are_written_before_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let img = put_file(dir.path(), b"image a");
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let server = StagingServer::new();
+        enqueue_with_files(&seam, "m", vec![img], vec![file.clone()]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(img),
+                put_call(img),
+                head_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                post_call("m"),
+            ]
+        );
+        let writes = server.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].path, "notes.txt");
+        assert_eq!(writes[0].content, file.sha256);
+        assert_eq!(writes[0].replace, None);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// The file's `replace` goes with its write, so the server may overwrite
+    /// the file it names.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_replace_is_sent_with_its_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let old = ContentHash::of(b"the old notes");
+        let mut file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        file.replace = Some(old);
+        let server = StagingServer::new();
+        enqueue_with_files(&seam, "m", Vec::new(), vec![file]);
+
+        drain(&seam, &server).await;
+        let writes = server.writes.lock().unwrap().clone();
+        assert_eq!(writes[0].replace, Some(old));
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// The workdir holds other content at the file's name: the message fails
+    /// unposted, keeping the hash found there on the file, and the message
+    /// behind it goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_found_in_the_workdir_fails_the_message_with_its_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let other = ContentHash::of(b"other notes");
+        let mut server = StagingServer::new();
+        server.write_answer = Some(WriteFileResult::Exists {
+            sha256: other,
+            size: 1,
+        });
+        enqueue_with_files(&seam, "one", Vec::new(), vec![file.clone()]);
+        enqueue(&seam, "two");
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                post_call("two"),
+            ]
+        );
+        let entries = outbox(&seam);
+        assert_eq!(
+            entries.iter().map(|e| e.status.clone()).collect::<Vec<_>>(),
+            [
+                OutboxStatus::AttachmentRefused(AttachmentRefusal::FileExists),
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
+            ]
+        );
+        assert_eq!(entries[0].files[0].existing, Some(other));
+        assert!(entries[0].discardable());
+    }
+
+    /// The user resends a message refused for a file the workdir holds, now
+    /// replacing that file: the same command goes out, and its write carries
+    /// the hash found.
+    #[tokio::test(start_paused = true)]
+    async fn a_resent_message_replaces_the_found_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let other = ContentHash::of(b"other notes");
+        let mut server = StagingServer::new();
+        server.write_answer = Some(WriteFileResult::Exists {
+            sha256: other,
+            size: 1,
+        });
+        let command = enqueue_with_files(&seam, "one", Vec::new(), vec![file.clone()]);
+        drain(&seam, &server).await;
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(
+                AttachmentRefusal::FileExists
+            )]
+        );
+
+        // This entry went into the store past the model, so the model is
+        // reloaded from the store, as opening the core would do.
+        crate::client::lock(&seam.core.shared.state).resync();
+        // The user confirms: the write from now on replaces the file.
+        server.write_answer = None;
+        seam.core
+            .dispatch(crate::Action::ResendReplacing(command.id))
+            .unwrap();
+        drain(&seam, &server).await;
+
+        let replaces: Vec<Option<ContentHash>> = server
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|write| write.replace)
+            .collect();
+        assert_eq!(replaces, [None, Some(other)]);
+        assert_eq!(server.calls().last(), Some(&post_call("one")));
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// The workdir already holds this file's content, from a write whose
+    /// answer was lost: the write counts as landed and the message is posted.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_already_written_by_us_counts_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let mut server = StagingServer::new();
+        server.write_answer = Some(WriteFileResult::Exists {
+            sha256: file.sha256,
+            size: file.size,
+        });
+        enqueue_with_files(&seam, "m", Vec::new(), vec![file.clone()]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                post_call("m"),
+            ]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// A write the workdir refuses fails the message: `NotAllowed` as
+    /// `FileNotWritten`, a low server disk as `ServerDiskLow`. The message
+    /// behind it still goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_file_write_fails_the_message() {
+        for (answer, reason) in [
+            (
+                WriteFileResult::NotAllowed,
+                AttachmentRefusal::FileNotWritten,
+            ),
+            (WriteFileResult::DiskLow, AttachmentRefusal::ServerDiskLow),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let seam = paired_seam(dir.path());
+            let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+            let mut server = StagingServer::new();
+            server.write_answer = Some(answer);
+            enqueue_with_files(&seam, "one", Vec::new(), vec![file.clone()]);
+            enqueue(&seam, "two");
+
+            drain(&seam, &server).await;
+            assert_eq!(
+                server.calls(),
+                [
+                    head_call(file.sha256),
+                    put_call(file.sha256),
+                    write_call(file.sha256),
+                    post_call("two"),
+                ]
+            );
+            assert_eq!(
+                statuses(&seam),
+                [
+                    OutboxStatus::AttachmentRefused(reason),
+                    OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
+                ]
+            );
+        }
+    }
+
+    /// A `NotStaged` write uploads the file again and writes it once more.
+    #[tokio::test(start_paused = true)]
+    async fn a_not_staged_write_uploads_again_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let server = StagingServer::new();
+        *server.write_not_staged.lock().unwrap() = 1;
+        enqueue_with_files(&seam, "m", Vec::new(), vec![file.clone()]);
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                post_call("m"),
+            ]
+        );
+        assert_eq!(server.writes.lock().unwrap().len(), 2);
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) })]
+        );
+    }
+
+    /// A second `NotStaged` after the upload again fails the file, and the
+    /// message behind it goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_not_staged_write_fails_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        let server = StagingServer::new();
+        *server.write_not_staged.lock().unwrap() = 2;
+        enqueue_with_files(&seam, "one", Vec::new(), vec![file.clone()]);
+        enqueue(&seam, "two");
+
+        drain(&seam, &server).await;
+        assert_eq!(
+            server.calls(),
+            [
+                head_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                put_call(file.sha256),
+                write_call(file.sha256),
+                post_call("two"),
+            ]
+        );
+        assert_eq!(
+            statuses(&seam),
+            [
+                OutboxStatus::AttachmentRefused(AttachmentRefusal::FileNotWritten),
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(1) }),
+            ]
+        );
+    }
+
+    /// A file whose device copy was never written is refused without any
+    /// request to the server.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_file_copy_fails_without_uploading() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = AttachedFile {
+            sha256: ContentHash::of(b"never written"),
+            name: "gone.txt".into(),
+            size: 13,
+            replace: None,
+        };
+        let server = StagingServer::new();
+        enqueue_with_files(&seam, "m", Vec::new(), vec![file]);
+
+        drain(&seam, &server).await;
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(AttachmentRefusal::Missing)]
+        );
+    }
+
+    /// A device copy that no longer hashes to the file's hash is refused
+    /// without any request to the server.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_copy_that_changed_fails_without_uploading() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let file = outbox_file(dir.path(), "notes.txt", b"the notes");
+        std::fs::write(attachment_path(dir.path(), file.sha256), b"edited").unwrap();
+        let server = StagingServer::new();
+        enqueue_with_files(&seam, "m", Vec::new(), vec![file]);
+
+        drain(&seam, &server).await;
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+        assert_eq!(
+            statuses(&seam),
+            [OutboxStatus::AttachmentRefused(AttachmentRefusal::Missing)]
         );
     }
 
@@ -3396,6 +4016,148 @@ mod tests {
         assert!(staged.is_err(), "the stager only ends on an error");
     }
 
+    /// A device file is staged, then written at its path: a HEAD, a PUT, then
+    /// the write, which names the staged hash.
+    #[tokio::test(start_paused = true)]
+    async fn push_uploads_then_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let server = StagingServer::new();
+        let session = SessionId::new();
+        let sha = ContentHash::of(b"device bytes");
+
+        let outcome = push_workdir_file(&server, &source, session, "docs/a.txt".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.calls(),
+            [head_call(sha), put_call(sha), write_call(sha)]
+        );
+        assert!(
+            matches!(
+                outcome,
+                PushOutcome::Written(WriteFileResult::Written { .. })
+            ),
+            "{outcome:?}"
+        );
+        let writes = server.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            [WriteFileRequest {
+                session,
+                path: "docs/a.txt".into(),
+                content: sha,
+                replace: None,
+            }]
+        );
+    }
+
+    /// A file the server already holds is only written: no upload, and the
+    /// `replace` the user chose goes along with the write.
+    #[tokio::test(start_paused = true)]
+    async fn push_of_a_staged_file_only_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let server = StagingServer::new();
+        let sha = ContentHash::of(b"device bytes");
+        server.staged.lock().unwrap().insert(sha);
+        let session = SessionId::new();
+        let old = ContentHash::of(b"old");
+
+        push_workdir_file(&server, &source, session, "a.txt".into(), Some(old))
+            .await
+            .unwrap();
+
+        assert_eq!(server.calls(), [head_call(sha), write_call(sha)]);
+        let writes = server.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            [WriteFileRequest {
+                session,
+                path: "a.txt".into(),
+                content: sha,
+                replace: Some(old),
+            }]
+        );
+    }
+
+    /// A file that is not there is refused on the device: nothing is sent.
+    #[tokio::test(start_paused = true)]
+    async fn push_of_a_missing_file_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = StagingServer::new();
+        let missing = dir.path().join("gone.bin");
+
+        let outcome = push_workdir_file(&server, &missing, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, PushOutcome::Unreadable { .. }),
+            "{outcome:?}"
+        );
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+    }
+
+    /// A file over [`PUSH_MAX_BYTES`] is refused without being read or sent.
+    #[tokio::test(start_paused = true)]
+    async fn push_of_an_oversized_file_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("big.bin");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(PUSH_MAX_BYTES + 1).unwrap();
+        let server = StagingServer::new();
+
+        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, PushOutcome::UploadRefused(UploadResult::TooLarge));
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+    }
+
+    /// A refused upload stops the push: nothing is written.
+    #[tokio::test(start_paused = true)]
+    async fn push_stops_at_a_refused_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let sha = ContentHash::of(b"device bytes");
+        let server = StagingServer {
+            put_answer: Some(UploadResult::DiskLow),
+            ..StagingServer::new()
+        };
+
+        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(server.calls(), [head_call(sha), put_call(sha)]);
+        assert_eq!(outcome, PushOutcome::UploadRefused(UploadResult::DiskLow));
+        assert!(server.writes.lock().unwrap().is_empty());
+    }
+
+    /// The server's answer to the write is the push's answer, whatever it is.
+    #[tokio::test(start_paused = true)]
+    async fn push_passes_the_write_answer_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let answer = WriteFileResult::Exists {
+            sha256: ContentHash::of(b"old"),
+            size: 3,
+        };
+        let server = StagingServer {
+            write_answer: Some(answer.clone()),
+            ..StagingServer::new()
+        };
+
+        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, PushOutcome::Written(answer));
+    }
+
     /// A draft image is uploaded as soon as it is attached, and only once
     /// per link: a local one is PUT, one the server holds is only checked,
     /// and nothing repeats while the draft stays as it is.
@@ -3464,7 +4226,7 @@ mod tests {
         let seam = paired_seam(dir.path());
         let a = put_file(dir.path(), b"not really a picture");
         let mut server = StagingServer::new();
-        server.put_answer = Some(UploadResult::NotAnImage);
+        server.put_answer = Some(UploadResult::HashMismatch);
         attach_draft_image(&seam, SessionId::new(), b"not really a picture");
 
         stage_for_a_minute(&sender_ctx(&seam), &server).await;
