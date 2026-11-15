@@ -71,8 +71,9 @@ impl Staging {
     }
 
     /// Stages `bytes` under `sha256` as one complete upload, and answers what
-    /// the upload route answers. The partial restarts, is written and is
-    /// finished, as a `PUT` at offset 0 would. Takes no upload lock: a caller
+    /// the upload route answers, as a `PUT` at offset 0 would: a file already
+    /// staged is answered with nothing written; otherwise the partial
+    /// restarts, is written and is finished. Takes no upload lock: a caller
     /// must not race a `PUT` of the same hash (tests and tools only). Nothing
     /// is left behind on any refusal.
     pub fn stage(&self, sha256: ContentHash, bytes: &[u8]) -> Result<UploadResult> {
