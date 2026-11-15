@@ -227,7 +227,7 @@ use chrono::Utc;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
     BlobId, BlobRef, ContentHash, DirEntry, EntryKind, FileBody, FileResult, LinkTarget,
-    ListResult, SessionId, WorkdirQuery, limits,
+    ListResult, SessionId, WorkdirQuery, WriteFileResult, limits,
 };
 
 use crate::blobs::{BlobMeta, BlobStore};
@@ -341,6 +341,25 @@ impl WorkdirReader {
         };
         let copied = copy_download(&self.blobs, &target, &path, self.download_max, deadline)?;
         self.snapshot(deadline, move |s| s.finish_download(query, &path, copied))
+    }
+
+    /// The canonical workdir of `session`, or the write answer that names why
+    /// it has none. The lock is held for this lookup only, never a copy.
+    pub fn workdir_of(
+        &self,
+        session: SessionId,
+        deadline: Instant,
+    ) -> Result<std::result::Result<PathBuf, WriteFileResult>> {
+        self.snapshot(deadline, |s| {
+            Ok(match s.workdir(session)? {
+                Ok(workdir) => Ok(workdir),
+                Err(Located::UnknownSession) => Err(WriteFileResult::UnknownSession),
+                Err(Located::WorkdirGone) => Err(WriteFileResult::WorkdirGone),
+                Err(Located::NotAllowed) => Err(WriteFileResult::NotAllowed),
+                Err(Located::NotFound) => Err(WriteFileResult::NotFound),
+                Err(Located::Found { .. }) => unreachable!("`workdir` answers steps 1 and 2 only"),
+            })
+        })
     }
 }
 
@@ -791,7 +810,7 @@ fn remove_files(blobs: &BlobStore, ids: &[BlobId]) {
 }
 
 /// Whether a relative `path` has a `..` that climbs above where it starts.
-fn climbs_out(path: &Path) -> bool {
+pub(crate) fn climbs_out(path: &Path) -> bool {
     let mut depth = 0usize;
     for component in path.components() {
         match component {
@@ -1698,6 +1717,18 @@ mod tests {
         ] {
             assert_eq!(climbs_out(Path::new(path)), out, "{path}");
         }
+    }
+
+    #[test]
+    fn workdir_of_gives_the_workdir_or_the_write_answer() {
+        let t = Tree::new();
+        let known = t.reader.workdir_of(t.session, Tree::later()).unwrap();
+        assert_eq!(known, Ok(t.workdir.clone()));
+        let unknown = t
+            .reader
+            .workdir_of(SessionId::new(), Tree::later())
+            .unwrap();
+        assert_eq!(unknown, Err(WriteFileResult::UnknownSession));
     }
 
     fn mkfifo(path: &Path) {
