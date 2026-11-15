@@ -170,7 +170,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, OnceCell};
 
 use crate::address::ServerAddress;
-use crate::client::{BlobLease, CoreError, lock};
+use crate::client::{BlobLease, CoreError, blocking, lock};
 use crate::engine::EngineConfig;
 use crate::identity::Identity;
 use crate::seam::Seam;
@@ -973,7 +973,7 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
             if error.is_purged() {
                 // Whatever this try wrote may have outlived the deletion.
                 tracing::debug!(?id, "blob purged during its download");
-                remove_blob_files(&ctx.seam.data_dir(), id);
+                blocking(|| remove_blob_files(&ctx.seam.data_dir(), id));
                 break claim.finish();
             }
             if error.is_disk_full() {
@@ -1136,26 +1136,28 @@ pub(crate) fn remove_all_blob_files(data_dir: &Path) {
 enum BlobFile {
     Complete(BlobId),
     Part(BlobId),
+    /// A device's own image being made, `<id>.own`; only a crash leaves one
+    /// behind (`apply_events` renames or removes it within the batch).
+    Own(BlobId),
 }
 
 impl BlobFile {
     fn parse(name: &str) -> Option<BlobFile> {
-        let (stem, part) = match name.strip_suffix(".part") {
-            Some(stem) => (stem, true),
-            None => (name, false),
-        };
+        let (stem, kind): (&str, fn(BlobId) -> BlobFile) =
+            if let Some(stem) = name.strip_suffix(".part") {
+                (stem, BlobFile::Part)
+            } else if let Some(stem) = name.strip_suffix(".own") {
+                (stem, BlobFile::Own)
+            } else {
+                (name, BlobFile::Complete)
+            };
         let id = uuid::Uuid::try_parse(stem).ok()?;
         // Only the exact spelling we write: `try_parse` also takes the
         // simple, braced and URN forms, and upper case.
         if id.to_string() != stem {
             return None;
         }
-        let id = BlobId(id);
-        Some(if part {
-            BlobFile::Part(id)
-        } else {
-            BlobFile::Complete(id)
-        })
+        Some(kind(BlobId(id)))
     }
 
     /// Whether a row in `status` owns this file: an `Available` blob its
@@ -1165,7 +1167,8 @@ impl BlobFile {
     /// left beside them (a disk-full pause before the first report, a crash
     /// before a failure's delete) holds nothing anybody resumes from. A
     /// complete file whose row is not `Available` (a crash between the
-    /// rename and the report) is fetched again over.
+    /// rename and the report) is fetched again over. A `.own` file is owned
+    /// by no row: the sweep always removes it.
     fn owned_by(self, status: &BlobStatus) -> bool {
         matches!(
             (self, status),
@@ -1215,7 +1218,7 @@ pub(crate) fn sweep_blob_files(data_dir: &Path, blobs: &[BlobRecord]) -> usize {
             continue;
         };
         let id = match file {
-            BlobFile::Complete(id) | BlobFile::Part(id) => id,
+            BlobFile::Complete(id) | BlobFile::Part(id) | BlobFile::Own(id) => id,
         };
         if statuses
             .get(&id)
@@ -1261,7 +1264,7 @@ async fn crop_locally(ctx: &BlobCtx, crop: PendingCrop) -> bool {
         Err(error) if error.is_purged() => {
             // Whatever it wrote may have outlived the purge.
             tracing::debug!(?crop, "cropped blob purged during its local crop");
-            remove_blob_files(&ctx.seam.data_dir(), crop.into);
+            blocking(|| remove_blob_files(&ctx.seam.data_dir(), crop.into));
             true
         }
         Err(error) => {
@@ -3603,6 +3606,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(sweep_blob_files(dir.path(), &[]), 0);
         assert!(!blob_dir(dir.path()).exists());
+    }
+
+    /// A crash while `apply_events` makes its own image leaves `<id>.own`;
+    /// no row owns it, even an `Available` blob's, whose complete file stays.
+    #[test]
+    fn sweep_removes_a_leftover_own_image_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = blob_dir(dir.path());
+        std::fs::create_dir_all(&blobs).unwrap();
+        let id = BlobId::new();
+        let own = blobs.join(format!("{}.own", id.0));
+        let complete = blobs.join(id.0.to_string());
+        std::fs::write(&own, b"own").unwrap();
+        std::fs::write(&complete, b"done").unwrap();
+        let record = BlobRecord {
+            id,
+            size: 4,
+            sha256: ContentHash::of(b"done"),
+            status: BlobStatus::Available {
+                path: complete.clone(),
+            },
+            workdir: false,
+        };
+        assert_eq!(sweep_blob_files(dir.path(), &[record]), 1);
+        assert!(!own.exists());
+        assert!(complete.exists());
     }
 
     impl Fixture {
