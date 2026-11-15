@@ -9,8 +9,8 @@ use skywave_proto::{CommandId, CommandKind, DirsResult, Event, EventBatch, Event
 use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
-    ActionIntent, CreatePrompt, ListKindView, LoginFlowState, PastedCode, RouteView, RowKind,
-    ScreenView, ShellPromptView, ToolState,
+    ActionIntent, ComposerFile, CreatePrompt, ListKindView, LoginFlowState, PastedCode, RouteView,
+    RowKind, ScreenView, ShellPromptView, ToolState,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -772,7 +772,7 @@ impl Rig {
         for out in outs {
             match out {
                 Out::Prepare { session_id, source } => {
-                    let result = crate::attach::prepare_image(self._dir.path(), source);
+                    let result = crate::attach::prepare_attachment(self._dir.path(), source);
                     let outs = self.head.on_prepared(session_id, result, self.clock);
                     rest.extend(self.apply(outs));
                 }
@@ -854,6 +854,8 @@ impl Rig {
                 Action::UseSnippet(_) => "use snippet",
                 Action::Attach { .. } => "attach",
                 Action::Detach { .. } => "detach",
+                Action::AttachFile { .. } => "attach file",
+                Action::DetachFile { .. } => "detach file",
                 _ => "other",
             })
             .collect()
@@ -1379,7 +1381,7 @@ fn an_image_is_prepared_before_it_is_attached() {
 }
 
 #[test]
-fn sending_waits_for_an_image_being_prepared() {
+fn sending_waits_for_an_attachment_being_prepared() {
     let mut rig = Rig::new();
     rig.edit("look at this");
     let attaching = attach_intent(&mut rig, &png(2));
@@ -1387,7 +1389,7 @@ fn sending_waits_for_an_image_being_prepared() {
     assert!(rig.actions.is_empty(), "{:?}", rig.kinds());
     assert_eq!(
         notices(&outs),
-        ["an image is still being prepared"],
+        ["an attachment is still being prepared"],
         "the message waits"
     );
     assert_eq!(rig.text(), "look at this", "the text stays");
@@ -1397,15 +1399,110 @@ fn sending_waits_for_an_image_being_prepared() {
     assert_eq!(rig.kinds().last(), Some(&"send"));
 }
 
+/// The intent to attach the file `name`, written with `bytes` into the rig's
+/// directory, as the picker or a drop names it.
+fn file_intent(rig: &mut Rig, name: &str, bytes: &[u8]) -> Vec<Out> {
+    let path = rig._dir.path().join(name);
+    std::fs::write(&path, bytes).unwrap();
+    rig.intent(GuiIntent::AttachFile {
+        session_id: rig.session.0.to_string(),
+        path: path.display().to_string(),
+    })
+}
+
 #[test]
-fn a_pdf_is_refused_with_a_note() {
+fn a_non_image_file_is_attached_as_a_file() {
+    let mut rig = Rig::new();
+    let bytes = b"%PDF-1.4 not a picture";
+    let outs = file_intent(&mut rig, "notes.pdf", bytes);
+    assert_eq!(rig.composer().preparing, 1);
+    let outs = rig.prepare(outs);
+    assert!(notices(&outs).is_empty(), "{:?}", notices(&outs));
+    assert_eq!(rig.kinds().last(), Some(&"attach file"));
+    assert_eq!(rig.composer().preparing, 0);
+
+    rig.results();
+    rig.view();
+    let composer = rig.composer();
+    assert!(composer.images.is_empty(), "{:?}", composer.images);
+    assert_eq!(
+        composer.files,
+        [ComposerFile {
+            name: "notes.pdf".into(),
+            size_label: format::bytes(u64::try_from(bytes.len()).unwrap()),
+            replaces: false,
+        }]
+    );
+    let stored = attachment::attachment_path(rig._dir.path(), ContentHash::of(bytes));
+    assert_eq!(std::fs::read(stored).unwrap(), bytes);
+}
+
+#[test]
+fn pasted_bytes_that_are_not_an_image_are_still_refused() {
     let mut rig = Rig::new();
     let outs = attach_intent(&mut rig, b"%PDF-1.4 not a picture");
-    assert_eq!(rig.composer().preparing, 1);
     let outs = rig.prepare(outs);
     assert_eq!(notices(&outs), ["not an image"]);
     assert!(!rig.kinds().contains(&"attach"), "{:?}", rig.kinds());
     assert_eq!(rig.composer().preparing, 0);
+}
+
+#[test]
+fn an_image_file_is_still_attached_as_an_image() {
+    let mut rig = Rig::new();
+    let bytes = png(5);
+    let sha = attachment::prepare(&bytes).unwrap().sha256;
+    let outs = file_intent(&mut rig, "photo.png", &bytes);
+    rig.prepare(outs);
+    assert_eq!(rig.kinds().last(), Some(&"attach"));
+    rig.results();
+    rig.view();
+    let composer = rig.composer();
+    assert_eq!(composer.images.len(), 1);
+    assert_eq!(composer.images[0].sha256, sha.to_string());
+    assert!(composer.files.is_empty(), "{:?}", composer.files);
+}
+
+#[test]
+fn a_second_file_with_the_same_name_is_refused_with_a_note() {
+    let mut rig = Rig::new();
+    let outs = file_intent(&mut rig, "notes.pdf", b"%PDF-1.4 first");
+    rig.prepare(outs);
+    rig.results();
+    rig.view();
+    assert_eq!(rig.composer().files.len(), 1);
+
+    rig.actions.clear();
+    let outs = file_intent(&mut rig, "notes.pdf", b"%PDF-1.4 second");
+    let outs = rig.prepare(outs);
+    assert_eq!(
+        notices(&outs),
+        ["a file named notes.pdf is already attached"]
+    );
+    assert!(!rig.kinds().contains(&"attach file"), "{:?}", rig.kinds());
+    rig.results();
+    rig.view();
+    assert_eq!(rig.composer().files.len(), 1);
+}
+
+#[test]
+fn detaching_a_file_removes_it() {
+    let mut rig = Rig::new();
+    let outs = file_intent(&mut rig, "notes.pdf", b"%PDF-1.4 a file");
+    rig.prepare(outs);
+    rig.results();
+    rig.view();
+    assert_eq!(rig.composer().files.len(), 1);
+
+    rig.actions.clear();
+    rig.intent(GuiIntent::DetachFile {
+        session_id: rig.session.0.to_string(),
+        name: "notes.pdf".into(),
+    });
+    assert_eq!(rig.kinds().last(), Some(&"detach file"));
+    rig.results();
+    rig.view();
+    assert!(rig.composer().files.is_empty());
 }
 
 #[test]
@@ -2524,6 +2621,42 @@ fn a_removed_worktree_is_an_archive_style_row() {
     assert_eq!(
         rows,
         [(RowKind::Archived, "worktree removed by you".to_owned())]
+    );
+}
+
+#[test]
+fn a_written_file_is_a_notice() {
+    let mut rig = Rig::new();
+    let me = rig.seam.pairing().unwrap().credentials.device_id;
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let events = vec![Event {
+        session_id: rig.session,
+        at,
+        command_id: Some(CommandId::new()),
+        context: skywave_proto::ContextId::first_of(rig.session),
+        kind: EventKind::FileWritten {
+            path: "docs/a.txt".into(),
+            sha256: ContentHash::of(b"a"),
+            size: 1,
+            replaced: None,
+            by: me,
+        },
+    }];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.view();
+    let rows: Vec<_> = rig
+        .rows()
+        .iter()
+        .map(|row| (row.kind, row.text.clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        [(RowKind::Archived, "docs/a.txt written by you".to_owned())]
     );
 }
 
@@ -5204,13 +5337,18 @@ fn an_expanded_run_without_a_blob_shows_its_own_text_and_what_is_missing() {
 }
 
 mod workdir {
+    use std::path::PathBuf;
+
+    use skywave_core::workdir::PushOutcome;
     use skywave_core::{
         BlobId, BlobState, BlobView, ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry,
-        EntryKind, FileBody, FileChange, FileResult, LinkTarget, ListResult, Screen, WorkdirBody,
-        WorkdirFetch, WorkdirPane, WorkdirView,
+        EntryKind, FileBody, FileChange, FileResult, LinkTarget, ListResult, PushState, Screen,
+        WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirPush, WorkdirView,
     };
     use skywave_present::workdir::NOT_FETCHED;
-    use skywave_proto::{BlobRef, Commit, CommitLog, LogResult};
+    use skywave_proto::{
+        BlobRef, Commit, CommitLog, LogResult, Seq, UploadResult, WriteFileResult,
+    };
 
     use super::*;
     use crate::signals::{
@@ -5230,6 +5368,19 @@ mod workdir {
         fetch: WorkdirFetch,
         body: WorkdirBody,
     ) -> WorkdirScreen {
+        shown_with(rig, pane, fetch, body, Vec::new(), Vec::new())
+    }
+
+    /// [`shown`] with the files asked for download, `downloads`, and the
+    /// device files pushed into the workdir, `pushes`.
+    fn shown_with(
+        rig: &mut Rig,
+        pane: WorkdirPane,
+        fetch: WorkdirFetch,
+        body: WorkdirBody,
+        downloads: Vec<WorkdirDownload>,
+        pushes: Vec<WorkdirPush>,
+    ) -> WorkdirScreen {
         rig.clock.wall_ms = (taken() + chrono::Duration::hours(1)).timestamp_millis();
         let mut view = rig.core.view();
         view.screen = Screen::Workdir(WorkdirView {
@@ -5240,6 +5391,8 @@ mod workdir {
             last_dir: "src".into(),
             fetch,
             body,
+            downloads,
+            pushes,
         });
         let outs = rig.head.on_view(view, rig.clock);
         rig.apply(outs);
@@ -5731,13 +5884,39 @@ mod workdir {
         rig.intent(GuiIntent::Act {
             action: ActionIntent::RefreshWorkdir,
         });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::DownloadWorkdirFile {
+                session_id: rig.session.0.to_string(),
+                path: "bin/app".into(),
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::PushWorkdirFile {
+                session_id: rig.session.0.to_string(),
+                source: "/home/me/notes.txt".into(),
+                path: "docs/notes.txt".into(),
+                replace: None,
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::PushWorkdirFile {
+                session_id: rig.session.0.to_string(),
+                source: "/home/me/notes.txt".into(),
+                path: "docs/notes.txt".into(),
+                replace: Some(ContentHash::of(b"old").to_string()),
+            },
+        });
         let workdir: Vec<_> = rig
             .actions
             .iter()
             .filter(|a| {
                 matches!(
                     a,
-                    Action::OpenWorkdir { .. } | Action::ShowWorkdir(_) | Action::RefreshWorkdir
+                    Action::OpenWorkdir { .. }
+                        | Action::ShowWorkdir(_)
+                        | Action::RefreshWorkdir
+                        | Action::DownloadWorkdirFile { .. }
+                        | Action::PushWorkdirFile { .. }
                 )
             })
             .cloned()
@@ -5755,6 +5934,255 @@ mod workdir {
                 }),
                 Action::ShowWorkdir(WorkdirPane::Dir { path: "src".into() }),
                 Action::RefreshWorkdir,
+                Action::DownloadWorkdirFile {
+                    session_id: rig.session,
+                    path: "bin/app".into(),
+                },
+                Action::PushWorkdirFile {
+                    session_id: rig.session,
+                    source: "/home/me/notes.txt".into(),
+                    path: "docs/notes.txt".into(),
+                    replace: None,
+                },
+                Action::PushWorkdirFile {
+                    session_id: rig.session,
+                    source: "/home/me/notes.txt".into(),
+                    path: "docs/notes.txt".into(),
+                    replace: Some(ContentHash::of(b"old")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_workdir_screen_lists_each_download_with_its_state() {
+        let mut rig = Rig::new();
+        let ready = available(&rig, "x");
+        let BlobState::Available { path } = &ready.state else {
+            panic!("the blob is not available: {:?}", ready.state)
+        };
+        let ready_path = path.display().to_string();
+        let downloading = BlobId::new();
+        let sha256 = skywave_proto::ContentHash::of(b"");
+        let downloads = vec![
+            WorkdirDownload {
+                path: "a.log".into(),
+                fetch: WorkdirFetch::Loading,
+                result: None,
+                blob: None,
+            },
+            WorkdirDownload {
+                path: "b.bin".into(),
+                fetch: WorkdirFetch::Failed("timed out".into()),
+                result: None,
+                blob: None,
+            },
+            WorkdirDownload {
+                path: "c.iso".into(),
+                fetch: WorkdirFetch::Idle,
+                result: Some(FileResult::File {
+                    at: taken(),
+                    path: "c.iso".into(),
+                    size: 200 * 1024 * 1024,
+                    content: FileBody::TooLarge,
+                }),
+                blob: None,
+            },
+            WorkdirDownload {
+                path: "d.mp4".into(),
+                fetch: WorkdirFetch::Idle,
+                result: Some(FileResult::File {
+                    at: taken(),
+                    path: "d.mp4".into(),
+                    size: 4096,
+                    content: FileBody::Blob(BlobRef {
+                        id: downloading,
+                        size: 4096,
+                        sha256,
+                    }),
+                }),
+                blob: Some(BlobView {
+                    id: downloading,
+                    state: BlobState::Downloading {
+                        got: 1024,
+                        size: 4096,
+                        paused: None,
+                    },
+                    change: None,
+                    pending: None,
+                }),
+            },
+            WorkdirDownload {
+                path: "e.txt".into(),
+                fetch: WorkdirFetch::Idle,
+                result: Some(FileResult::File {
+                    at: taken(),
+                    path: "e.txt".into(),
+                    size: 1,
+                    content: FileBody::Blob(BlobRef {
+                        id: ready.id,
+                        size: 1,
+                        sha256,
+                    }),
+                }),
+                blob: Some(ready.clone()),
+            },
+        ];
+        let screen = shown_with(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Idle,
+            WorkdirBody::Nothing,
+            downloads,
+            Vec::new(),
+        );
+        let rows = &screen.downloads;
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            ["a.log", "b.bin", "c.iso", "d.mp4", "e.txt"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Asking the server\u{2026}",
+                "Download failed: timed out",
+                "Too large to download: 200.0 MiB",
+                "downloading \u{b7} 1.0 KiB of 4.0 KiB (25%)",
+                "downloaded",
+            ]
+        );
+        let flags: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.failed,
+                    row.blob.as_ref().map(|blob| blob.state),
+                    row.local_path.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (false, None, None),
+                (true, None, None),
+                (true, None, None),
+                (false, Some(BlobStateKind::Downloading), None),
+                (false, Some(BlobStateKind::Available), Some(ready_path)),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_workdir_screen_lists_each_push_with_its_state() {
+        let mut rig = Rig::new();
+        let source = |path: &str| PathBuf::from(format!("/home/me/{path}"));
+        let pushes = vec![
+            WorkdirPush {
+                path: "a.bin".into(),
+                source: source("a.bin"),
+                state: PushState::Pushing,
+            },
+            WorkdirPush {
+                path: "b.bin".into(),
+                source: source("b.bin"),
+                state: PushState::Failed("timed out".into()),
+            },
+            WorkdirPush {
+                path: "c.bin".into(),
+                source: source("c.bin"),
+                state: PushState::Done(PushOutcome::Written(WriteFileResult::Written {
+                    path: "c.bin".into(),
+                    size: 2048,
+                    seq: Seq(7),
+                })),
+            },
+            WorkdirPush {
+                path: "d.bin".into(),
+                source: source("d.bin"),
+                state: PushState::Done(PushOutcome::Written(WriteFileResult::Same {
+                    path: "d.bin".into(),
+                    size: 1,
+                })),
+            },
+            WorkdirPush {
+                path: "e.bin".into(),
+                source: source("e.bin"),
+                state: PushState::Done(PushOutcome::Written(WriteFileResult::Exists {
+                    sha256: ContentHash::of(b"old"),
+                    size: 3,
+                })),
+            },
+            WorkdirPush {
+                path: "f.bin".into(),
+                source: source("f.bin"),
+                state: PushState::Done(PushOutcome::UploadRefused(UploadResult::TooLarge)),
+            },
+            WorkdirPush {
+                path: "g.bin".into(),
+                source: source("g.bin"),
+                state: PushState::Done(PushOutcome::Unreadable {
+                    reason: "gone".into(),
+                }),
+            },
+        ];
+        let screen = shown_with(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Idle,
+            WorkdirBody::Nothing,
+            Vec::new(),
+            pushes,
+        );
+        let rows = &screen.pushes;
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            [
+                "a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin", "g.bin"
+            ]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Sending\u{2026}",
+                "Push failed: timed out",
+                "Written \u{b7} 2.0 KiB",
+                "Already there",
+                "A file is already there (3 B)",
+                "Too large to send",
+                "Cannot read the file: gone",
+            ]
+        );
+        let flags: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.pushing,
+                    row.done,
+                    row.existing_sha256.clone(),
+                    row.failed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (true, false, None, false),
+                (false, false, None, true),
+                (false, true, None, false),
+                (false, true, None, false),
+                (
+                    false,
+                    false,
+                    Some(ContentHash::of(b"old").to_string()),
+                    false
+                ),
+                (false, false, None, true),
+                (false, false, None, true),
             ]
         );
     }

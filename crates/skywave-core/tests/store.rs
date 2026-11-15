@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use skywave_core::attachment::{AttachedImage, attachment_dir};
+use skywave_core::attachment::{
+    AttachedFile, AttachedImage, attachment_dir, attachment_path, store_file,
+};
+use skywave_core::store::OutboxFile;
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, AttachmentRefusal, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError,
@@ -461,7 +464,9 @@ fn reopen_restores_state() {
                 },
             )
             .unwrap();
-        store.enqueue(&send(log.b, "queued while offline")).unwrap();
+        store
+            .enqueue(&send(log.b, "queued while offline"), &[])
+            .unwrap();
         (store.load().unwrap(), store.session_events(log.a).unwrap())
     };
 
@@ -497,10 +502,10 @@ fn outbox_survives_restart() {
     {
         let store = Store::open(&dir).unwrap();
         for command in &commands {
-            store.enqueue(command).unwrap();
+            store.enqueue(command, &[]).unwrap();
         }
         // Re-enqueuing the same id is a no-op.
-        store.enqueue(&commands[0]).unwrap();
+        store.enqueue(&commands[0], &[]).unwrap();
         assert!(store.claim_send(commands[0].id, Utc::now()).unwrap());
         assert!(store.claim_send(commands[1].id, Utc::now()).unwrap());
         store
@@ -575,7 +580,7 @@ fn claim_send_counts_tries_and_keeps_first_time() {
     let (_tmp, dir) = data_dir();
     let store = Store::open(&dir).unwrap();
     let command = send(SessionId::new(), "hi");
-    store.enqueue(&command).unwrap();
+    store.enqueue(&command, &[]).unwrap();
     let entry = &store.outbox().unwrap()[0];
     assert_eq!(
         (entry.tries, entry.first_sent_at, entry.answered_at),
@@ -610,7 +615,7 @@ fn claim_send_refuses_answered_or_missing_rows() {
     let (_tmp, dir) = data_dir();
     let store = Store::open(&dir).unwrap();
     let command = send(SessionId::new(), "hi");
-    store.enqueue(&command).unwrap();
+    store.enqueue(&command, &[]).unwrap();
     assert!(store.claim_send(command.id, at(1)).unwrap());
     let rejected = CommandResult::Rejected {
         reason: RejectReason::UnknownSession,
@@ -630,7 +635,7 @@ fn tries_survive_restart() {
     let command = send(SessionId::new(), "hi");
     {
         let store = Store::open(&dir).unwrap();
-        store.enqueue(&command).unwrap();
+        store.enqueue(&command, &[]).unwrap();
         assert!(store.claim_send(command.id, at(1)).unwrap());
     }
     // `Sending` goes back to `Queued`, but the attempt is remembered.
@@ -651,8 +656,8 @@ fn migration_marks_existing_rows_attempted() {
     let (queued, answered) = (send(session, "one"), send(session, "two"));
     {
         let store = Store::open(&dir).unwrap();
-        store.enqueue(&queued).unwrap();
-        store.enqueue(&answered).unwrap();
+        store.enqueue(&queued, &[]).unwrap();
+        store.enqueue(&answered, &[]).unwrap();
         store
             .record_result(answered.id, &CommandResult::Accepted { seq: Seq(1) }, at(1))
             .unwrap();
@@ -891,7 +896,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 19);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -1022,7 +1027,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 19);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 21);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1349,7 +1354,7 @@ fn events_settle_the_commands_they_name() {
     let session_id = SessionId::new();
     let [lost, answered] = [send(session_id, "lost"), send(session_id, "answered")];
     for command in [&lost, &answered] {
-        store.enqueue(command).unwrap();
+        store.enqueue(command, &[]).unwrap();
         assert!(store.claim_send(command.id, at(1)).unwrap());
     }
     let rejected = CommandResult::Rejected {
@@ -1707,7 +1712,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -2064,6 +2069,47 @@ fn v35_opens_a_v34_replica_unchanged() {
     assert_eq!(events, [created, message]);
 }
 
+/// A v35 replica opens as v36 with its stored events read back unchanged:
+/// v36 added the workdir download route, which stores nothing.
+#[test]
+fn v36_opens_a_v35_replica_unchanged() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/x".into(),
+        context_name: "start".into(),
+        from: None,
+        worktree: None,
+    };
+    let message = EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "look".into(),
+        attachments: Vec::new(),
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![event(id, 0, created.clone()), event(id, 1, message.clone())],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+    // What v35 left: stamped 35.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 35", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events, [created, message]);
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
@@ -2126,7 +2172,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2271,7 +2317,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
     drop(store);
 
     // A replica from before the column: the migration derives it from the log.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
     let store = Store::open(&dir).unwrap();
     assert_eq!(order(&store), vec![c, b, a]);
     assert_eq!(store.session(c).unwrap().unwrap().last_message_seq, Seq(5));
@@ -2282,29 +2328,35 @@ const SHELL: ComposerMode = ComposerMode::Shell;
 
 /// Rewinds the schema to `version`. A rewind past the list-order column's
 /// migration reruns it, a rewind past the worktree column's reruns it, and
-/// one past the last migration's (the worktree removal) reruns that too, so
-/// this undoes each of them here: the last column first. The four between
-/// them, moving the server facts, canonicalizing the server addresses,
-/// creating the attachment tables and rebuilding the workdir snapshots,
-/// rerun over a current schema as is.
+/// one past the worktree removal's reruns that too, so this undoes each of
+/// them here: the last column first. The four between them, moving the
+/// server facts, canonicalizing the server addresses, creating the
+/// attachment tables and rebuilding the workdir snapshots, rerun over a
+/// current schema as is, and so does the download's rebuild after them. The
+/// file tables, the newest migration, are dropped below it, so their rerun
+/// does not find them.
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     if version < skywave_core::store::SCHEMA_VERSION {
+        conn.execute_batch("DROP TABLE draft_files; DROP TABLE outbox_files;")
+            .unwrap();
+    }
+    if version < skywave_core::store::SCHEMA_VERSION - 2 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN worktree_removed;")
             .unwrap();
     }
-    if version < skywave_core::store::SCHEMA_VERSION - 1 {
+    if version < skywave_core::store::SCHEMA_VERSION - 3 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN worktree;")
             .unwrap();
     }
-    if version < skywave_core::store::SCHEMA_VERSION - 6 {
+    if version < skywave_core::store::SCHEMA_VERSION - 8 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN last_message_seq;")
             .unwrap();
     }
     conn.pragma_update(None, "user_version", version).unwrap();
 }
 
-/// Pins the `SCHEMA_VERSION - 6` threshold in `set_user_version` to the
+/// Pins the `SCHEMA_VERSION - 8` threshold in `set_user_version` to the
 /// `last_message_seq` migration: a rewind below it drops the column, and the
 /// reopen must rerun the migration that adds it back.
 #[test]
@@ -2320,8 +2372,8 @@ fn set_user_version_drops_the_list_order_column_exactly_below_its_migration() {
             > 0
     };
     for (version, present) in [
-        (skywave_core::store::SCHEMA_VERSION - 7, false),
-        (skywave_core::store::SCHEMA_VERSION - 6, true),
+        (skywave_core::store::SCHEMA_VERSION - 9, false),
+        (skywave_core::store::SCHEMA_VERSION - 8, true),
     ] {
         let (_tmp, dir) = data_dir();
         drop(Store::open(&dir).unwrap());
@@ -2354,7 +2406,7 @@ fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
         ))
         .unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 6);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 8);
     };
     let settings_keys = |dir: &Path| -> Vec<String> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2416,7 +2468,7 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
         conn.execute_batch(rows).unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 5);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 7);
     };
     let stored = |dir: &Path| -> Vec<(String, String)> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2527,10 +2579,13 @@ fn enqueue_message_clears_its_draft_atomically() {
 
     // Other commands leave drafts alone.
     store
-        .enqueue(&Command {
-            id: CommandId::new(),
-            kind: CommandKind::Interrupt { session_id: a },
-        })
+        .enqueue(
+            &Command {
+                id: CommandId::new(),
+                kind: CommandKind::Interrupt { session_id: a },
+            },
+            &[],
+        )
         .unwrap();
     assert_eq!(store.drafts().unwrap().len(), 2);
 
@@ -2541,12 +2596,12 @@ fn enqueue_message_clears_its_draft_atomically() {
         "CREATE TRIGGER full BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
     )
     .unwrap();
-    assert!(store.enqueue(&send(a, "to a")).is_err());
+    assert!(store.enqueue(&send(a, "to a"), &[]).is_err());
     assert_eq!(store.drafts().unwrap().len(), 2);
     assert_eq!(store.pending_outbox().unwrap().len(), 1);
 
     conn.execute_batch("DROP TRIGGER full").unwrap();
-    store.enqueue(&send(a, "to a")).unwrap();
+    store.enqueue(&send(a, "to a"), &[]).unwrap();
     assert_eq!(
         store.drafts().unwrap().keys().collect::<Vec<_>>(),
         [&(b, AGENT)]
@@ -2617,7 +2672,7 @@ fn sending_a_message_drops_its_draft_images() {
     store.attach_to_draft(b, &image("to b"), at(1)).unwrap();
     assert_eq!(store.draft_images().unwrap()[&a], [image("to a")]);
 
-    store.enqueue(&send(a, "with a picture")).unwrap();
+    store.enqueue(&send(a, "with a picture"), &[]).unwrap();
     let images = store.draft_images().unwrap();
     assert!(!images.contains_key(&a));
     assert_eq!(images[&b], [image("to b")]);
@@ -2659,7 +2714,7 @@ fn the_attachment_tables_come_with_the_migration() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());
     drop_attachments(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
 
     let store = Store::open(&dir).unwrap();
     store
@@ -2690,7 +2745,7 @@ fn withdraw_anything_not_accepted() {
         &undeliverable,
         &accepted,
     ] {
-        store.enqueue(command).unwrap();
+        store.enqueue(command, &[]).unwrap();
     }
     for command in [&claimed, &requeued, &refused, &undeliverable, &accepted] {
         assert!(store.claim_send(command.id, at(1)).unwrap());
@@ -2732,15 +2787,15 @@ fn withdraw_anything_not_accepted() {
 
     // Only what was accepted stays.
     assert!(matches!(
-        store.withdraw(accepted.id, None, None),
+        store.withdraw(accepted.id, None, None, None),
         Err(StoreError::NotWithdrawable(id)) if id == accepted.id
     ));
     assert!(matches!(
-        store.withdraw(CommandId::new(), None, None),
+        store.withdraw(CommandId::new(), None, None, None),
         Err(StoreError::NotWithdrawable(_))
     ));
     for command in [&fresh, &claimed, &requeued, &refused, &undeliverable] {
-        store.withdraw(command.id, None, None).unwrap();
+        store.withdraw(command.id, None, None, None).unwrap();
     }
     let left: Vec<CommandId> = store
         .outbox()
@@ -2774,12 +2829,12 @@ fn withdraw_anything_not_accepted() {
             session_id: session,
         },
     };
-    store.enqueue(&create).unwrap();
-    store.enqueue(&interrupt).unwrap();
+    store.enqueue(&create, &[]).unwrap();
+    store.enqueue(&interrupt, &[]).unwrap();
     let outbox = store.outbox().unwrap();
     assert!(outbox[1].discardable());
     assert!(!outbox[2].discardable());
-    store.withdraw(create.id, None, None).unwrap();
+    store.withdraw(create.id, None, None, None).unwrap();
 }
 
 #[test]
@@ -2787,7 +2842,7 @@ fn attachment_refused_settles_and_withdraws() {
     let (_tmp, dir) = data_dir();
     let store = Store::open(&dir).unwrap();
     let command = send(SessionId::new(), "with an image");
-    store.enqueue(&command).unwrap();
+    store.enqueue(&command, &[]).unwrap();
 
     assert!(
         store
@@ -2824,7 +2879,7 @@ fn attachment_refused_settles_and_withdraws() {
     );
     drop(conn);
 
-    store.withdraw(command.id, None, None).unwrap();
+    store.withdraw(command.id, None, None, None).unwrap();
     assert!(store.outbox().unwrap().is_empty());
 }
 
@@ -2844,7 +2899,7 @@ fn withdraw_into_draft_is_one_transaction() {
         when: RunWhen::Always,
     };
     let store = Store::open(&dir).unwrap();
-    store.enqueue(&command).unwrap();
+    store.enqueue(&command, &[]).unwrap();
     store.set_draft(session, AGENT, Some(&older)).unwrap();
 
     // A draft write that fails after the delete keeps the message queued:
@@ -2856,7 +2911,7 @@ fn withdraw_into_draft_is_one_transaction() {
     .unwrap();
     assert!(
         store
-            .withdraw(command.id, Some(((session, AGENT), &draft)), None)
+            .withdraw(command.id, Some(((session, AGENT), &draft)), None, None)
             .is_err()
     );
     assert_eq!(store.pending_outbox().unwrap().len(), 1);
@@ -2865,7 +2920,7 @@ fn withdraw_into_draft_is_one_transaction() {
     // Once it succeeds the text is in the draft only, never in both.
     conn.execute_batch("DROP TRIGGER full").unwrap();
     store
-        .withdraw(command.id, Some(((session, AGENT), &draft)), None)
+        .withdraw(command.id, Some(((session, AGENT), &draft)), None, None)
         .unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
@@ -2876,7 +2931,7 @@ fn withdraw_into_draft_is_one_transaction() {
     let other = SessionId::new();
     assert!(
         store
-            .withdraw(command.id, Some(((other, AGENT), &draft)), None)
+            .withdraw(command.id, Some(((other, AGENT), &draft)), None, None)
             .is_err()
     );
     assert!(!store.drafts().unwrap().contains_key(&(other, AGENT)));
@@ -2905,7 +2960,7 @@ fn withdrawing_a_message_puts_its_images_back_in_one_transaction() {
     let store = Store::open(&dir).unwrap();
     store.attach_to_draft(session, &a, at(0)).unwrap();
     store.attach_to_draft(session, &b, at(1)).unwrap();
-    store.enqueue(&command).unwrap();
+    store.enqueue(&command, &[]).unwrap();
     assert!(!store.draft_images().unwrap().contains_key(&session));
     store.attach_to_draft(session, &c, at(2)).unwrap();
 
@@ -2921,7 +2976,8 @@ fn withdrawing_a_message_puts_its_images_back_in_one_transaction() {
             .withdraw(
                 command.id,
                 Some(((session, AGENT), &draft)),
-                Some((session, &hashes))
+                Some((session, &hashes)),
+                None,
             )
             .is_err()
     );
@@ -2939,6 +2995,7 @@ fn withdrawing_a_message_puts_its_images_back_in_one_transaction() {
             command.id,
             Some(((session, AGENT), &draft)),
             Some((session, &hashes)),
+            None,
         )
         .unwrap();
     assert!(store.outbox().unwrap().is_empty());
@@ -2963,19 +3020,19 @@ fn a_refused_withdraw_writes_no_images() {
     let store = Store::open(&dir).unwrap();
     store.attach_to_draft(session, &a, at(0)).unwrap();
     store.attach_to_draft(session, &b, at(1)).unwrap();
-    store.enqueue(&fresh).unwrap();
+    store.enqueue(&fresh, &[]).unwrap();
 
     // Positive control: the same call writes the images of a command it may
     // take back.
     store
-        .withdraw(fresh.id, None, Some((session, &[a.sha256, b.sha256])))
+        .withdraw(fresh.id, None, Some((session, &[a.sha256, b.sha256])), None)
         .unwrap();
     assert_eq!(
         store.draft_images().unwrap()[&session],
         [a.clone(), b.clone()]
     );
 
-    store.enqueue(&accepted).unwrap();
+    store.enqueue(&accepted, &[]).unwrap();
     assert!(store.claim_send(accepted.id, at(1)).unwrap());
     store
         .record_result(accepted.id, &CommandResult::Accepted { seq: Seq(1) }, at(2))
@@ -2983,7 +3040,7 @@ fn a_refused_withdraw_writes_no_images() {
     store.attach_to_draft(session, &c, at(3)).unwrap();
 
     assert!(matches!(
-        store.withdraw(accepted.id, None, Some((session, &[a.sha256]))),
+        store.withdraw(accepted.id, None, Some((session, &[a.sha256])), None),
         Err(StoreError::NotWithdrawable(id)) if id == accepted.id
     ));
     assert_eq!(store.draft_images().unwrap()[&session], [c]);
@@ -3003,7 +3060,7 @@ fn load_returns_every_attachment_even_after_it_is_detached() {
     // A queued message still names `a`, so its row outlives the detach; an
     // image nothing names is collected when the store opens.
     store
-        .enqueue(&send_with_images(other, vec![a.sha256]))
+        .enqueue(&send_with_images(other, vec![a.sha256]), &[])
         .unwrap();
     drop(store);
 
@@ -3013,6 +3070,305 @@ fn load_returns_every_attachment_even_after_it_is_detached() {
     assert_eq!(snapshot.attachments[&a.sha256], a);
     assert_eq!(snapshot.attachments[&b.sha256], b);
     assert_eq!(store.attachments().unwrap(), snapshot.attachments);
+}
+
+/// A non-image file for a draft or a queued message: its content is `seed`,
+/// so its hash is `ContentHash::of(seed)`, and its name is `seed.txt`.
+fn draft_file(seed: &str) -> AttachedFile {
+    AttachedFile {
+        sha256: ContentHash::of(seed.as_bytes()),
+        name: format!("{seed}.txt"),
+        size: seed.len() as u64,
+        replace: None,
+    }
+}
+
+#[test]
+fn draft_files_keep_their_order_over_a_reopen() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, mut b) = (draft_file("a"), draft_file("b"));
+    b.replace = Some(ContentHash::of(b"the b it replaces"));
+    {
+        let store = Store::open(&dir).unwrap();
+        store.attach_file_to_draft(session, &a).unwrap();
+        store.attach_file_to_draft(session, &b).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.draft_files().unwrap()[&session],
+        [a.clone(), b.clone()]
+    );
+    assert_eq!(store.load().unwrap().draft_files[&session], [a, b]);
+}
+
+#[test]
+fn a_second_file_with_the_same_name_is_ignored() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let first = draft_file("notes");
+    let second = AttachedFile {
+        sha256: ContentHash::of(b"other notes"),
+        size: 11,
+        ..first.clone()
+    };
+    let store = Store::open(&dir).unwrap();
+    store.attach_file_to_draft(session, &first).unwrap();
+    store.attach_file_to_draft(session, &second).unwrap();
+    assert_eq!(
+        store.draft_files().unwrap()[&session],
+        std::slice::from_ref(&first)
+    );
+
+    // Another name in the same draft is not a clash.
+    let other = draft_file("other");
+    store.attach_file_to_draft(session, &other).unwrap();
+    assert_eq!(store.draft_files().unwrap()[&session], [first, other]);
+}
+
+#[test]
+fn detaching_a_file_drops_it_from_the_draft() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b, c) = (draft_file("a"), draft_file("b"), draft_file("c"));
+    let store = Store::open(&dir).unwrap();
+    for file in [&a, &b, &c] {
+        store.attach_file_to_draft(session, file).unwrap();
+    }
+    store.detach_file_from_draft(session, &b.name).unwrap();
+    assert_eq!(
+        store.draft_files().unwrap()[&session],
+        [a.clone(), c.clone()]
+    );
+
+    // A detached file comes back after the others, not in its old place.
+    store.attach_file_to_draft(session, &b).unwrap();
+    assert_eq!(store.draft_files().unwrap()[&session], [a, c, b]);
+}
+
+#[test]
+fn enqueuing_moves_draft_files_onto_the_outbox_entry() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (a, b) = (draft_file("a"), draft_file("b"));
+    let store = Store::open(&dir).unwrap();
+    store.attach_file_to_draft(session, &a).unwrap();
+    store.attach_file_to_draft(session, &b).unwrap();
+    let command = send(session, "with files");
+    store.enqueue(&command, &[a.clone(), b.clone()]).unwrap();
+    assert!(!store.draft_files().unwrap().contains_key(&session));
+
+    let expected = [a, b].map(|file| OutboxFile {
+        file,
+        existing: None,
+    });
+    let pending = store.pending_outbox().unwrap();
+    assert_eq!(pending[0].files, expected);
+    // The files survive a restart with their entry.
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.pending_outbox().unwrap()[0].files, expected);
+}
+
+#[test]
+fn withdrawing_puts_files_back_in_the_draft() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let mut b = draft_file("b");
+    b.replace = Some(ContentHash::of(b"the b it replaces"));
+    let files = [draft_file("a"), b];
+    let store = Store::open(&dir).unwrap();
+    let command = send(session, "with files");
+    store.enqueue(&command, &files).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let count_outbox_files = || -> i64 {
+        conn.query_row("SELECT count(*) FROM outbox_files", [], |row| row.get(0))
+            .unwrap()
+    };
+    // Positive control: the entry holds its files before the withdraw.
+    assert_eq!(count_outbox_files(), 2);
+    store
+        .withdraw(command.id, None, None, Some((session, &files)))
+        .unwrap();
+
+    assert_eq!(store.draft_files().unwrap()[&session], files);
+    assert!(store.outbox().unwrap().is_empty());
+    assert_eq!(
+        count_outbox_files(),
+        0,
+        "the entry's own files went with it"
+    );
+}
+
+#[test]
+fn record_file_exists_settles_and_keeps_the_hash() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let files = [draft_file("a"), draft_file("b")];
+    let store = Store::open(&dir).unwrap();
+    let command = send(session, "with files");
+    store.enqueue(&command, &files).unwrap();
+    let found = ContentHash::of(b"what the workdir holds");
+
+    assert!(
+        store
+            .record_file_exists(command.id, 1, found, at(1))
+            .unwrap()
+    );
+    // The first refusal is kept, hash and all.
+    assert!(
+        !store
+            .record_file_exists(command.id, 0, ContentHash::of(b"later"), at(2))
+            .unwrap()
+    );
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(
+        entry.status,
+        OutboxStatus::AttachmentRefused(AttachmentRefusal::FileExists)
+    );
+    assert!(entry.status.is_settled());
+    assert_eq!(entry.files[0].existing, None);
+    assert_eq!(entry.files[1].existing, Some(found));
+    // Settled, so it is never claimed for sending.
+    assert!(!store.claim_send(command.id, at(3)).unwrap());
+
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.outbox().unwrap()[0].files[1].existing, Some(found));
+}
+
+#[test]
+fn requeue_replacing_clears_the_refusal_and_sets_replace() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let store = Store::open(&dir).unwrap();
+    let command = send(session, "with a file");
+    store.enqueue(&command, &[draft_file("a")]).unwrap();
+    let found = ContentHash::of(b"what the workdir holds");
+    assert!(
+        store
+            .record_file_exists(command.id, 0, found, at(1))
+            .unwrap()
+    );
+
+    assert!(store.requeue_replacing(command.id, &[(0, found)]).unwrap());
+    let pending = store.pending_outbox().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status, OutboxStatus::Queued);
+    assert_eq!(pending[0].answered_at, None);
+    assert_eq!(pending[0].files[0].file.replace, Some(found));
+    assert_eq!(pending[0].files[0].existing, None);
+    // The same entry is claimable for sending again.
+    assert!(store.claim_send(command.id, at(2)).unwrap());
+
+    // Nothing is refused any more, so a second requeue changes nothing.
+    assert!(!store.requeue_replacing(command.id, &[(0, found)]).unwrap());
+}
+
+#[test]
+fn requeue_replacing_leaves_other_refusals() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let store = Store::open(&dir).unwrap();
+    let command = send(session, "with a file");
+    store.enqueue(&command, &[draft_file("a")]).unwrap();
+    assert!(
+        store
+            .record_attachment_refused(command.id, AttachmentRefusal::Missing, at(1))
+            .unwrap()
+    );
+
+    let found = ContentHash::of(b"what the workdir holds");
+    assert!(!store.requeue_replacing(command.id, &[(0, found)]).unwrap());
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(
+        entry.status,
+        OutboxStatus::AttachmentRefused(AttachmentRefusal::Missing)
+    );
+    assert_eq!(entry.answered_at, Some(at(1)));
+    assert_eq!(entry.files[0].file.replace, None);
+}
+
+#[test]
+fn the_file_tables_come_with_the_migration() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    // A rewind below the migration drops both file tables.
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let store = Store::open(&dir).unwrap();
+    store
+        .attach_file_to_draft(SessionId::new(), &draft_file("a"))
+        .unwrap();
+    assert_eq!(store.draft_files().unwrap().len(), 1);
+}
+
+#[test]
+fn opening_the_store_keeps_file_copies_still_needed() {
+    let (tmp, dir) = data_dir();
+    let (drafting, session) = (SessionId::new(), SessionId::new());
+    let (a, b, c, d) = (
+        draft_file("a"),
+        draft_file("b"),
+        draft_file("c"),
+        draft_file("d"),
+    );
+    let (queued, withdrawn, accepted) = (
+        send(session, "queued"),
+        send(session, "withdrawn"),
+        send(session, "accepted"),
+    );
+    let store = Store::open(&dir).unwrap();
+    let source = tmp.path().join("source");
+    for seed in ["a", "b", "c", "d"] {
+        std::fs::write(&source, seed).unwrap();
+        store_file(&dir, &source).unwrap();
+    }
+    // (a) in a draft; (b) in an unsettled message; (c) in a withdrawn one;
+    // (d) in an accepted one.
+    store.attach_file_to_draft(drafting, &a).unwrap();
+    store.enqueue(&queued, std::slice::from_ref(&b)).unwrap();
+    store.enqueue(&withdrawn, std::slice::from_ref(&c)).unwrap();
+    store.withdraw(withdrawn.id, None, None, None).unwrap();
+    store.enqueue(&accepted, std::slice::from_ref(&d)).unwrap();
+    assert!(store.claim_send(accepted.id, at(1)).unwrap());
+    store
+        .record_result(accepted.id, &CommandResult::Accepted { seq: Seq(1) }, at(2))
+        .unwrap();
+    drop(store);
+
+    let present = |file: &AttachedFile| attachment_path(&dir, file.sha256).exists();
+    assert!(
+        [&a, &b, &c, &d].into_iter().all(present),
+        "written, before the open"
+    );
+
+    let _store = Store::open(&dir).unwrap();
+    assert!(present(&a), "a draft's file stays");
+    assert!(present(&b), "an unsettled message's file stays");
+    assert!(!present(&c), "a withdrawn message's file goes");
+    assert!(
+        !present(&d),
+        "an accepted message's file goes: the server has it"
+    );
+}
+
+#[test]
+fn deleting_a_session_or_resetting_drops_its_draft_files() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store.attach_file_to_draft(a, &draft_file("to a")).unwrap();
+    store.attach_file_to_draft(b, &draft_file("to b")).unwrap();
+    assert!(store.draft_files().unwrap().contains_key(&a));
+
+    store.delete_session_locally(a, at(2)).unwrap();
+    let files = store.draft_files().unwrap();
+    assert!(!files.contains_key(&a));
+    assert_eq!(files[&b], [draft_file("to b")]);
+
+    store.reset_for_server().unwrap();
+    assert!(store.draft_files().unwrap().is_empty());
 }
 
 // ---- local delete ---------------------------------------------------------------
@@ -3035,7 +3391,7 @@ fn replica_with_both_sessions(dir: &Path, log: &Log) -> (Store, [Command; 4]) {
         send(log.b, "waiting b"),
     ];
     for (i, command) in commands.iter().enumerate() {
-        store.enqueue(command).unwrap();
+        store.enqueue(command, &[]).unwrap();
         if i % 2 == 0 {
             let result = CommandResult::Accepted { seq: Seq(1) };
             store.record_result(command.id, &result, at(1)).unwrap();
@@ -3258,7 +3614,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
             },
         )
         .unwrap();
-    store.enqueue(&send(log.b, "queued")).unwrap();
+    store.enqueue(&send(log.b, "queued"), &[]).unwrap();
     let draft = Draft {
         text: "unsent".into(),
         cursor: 0,
@@ -3589,7 +3945,7 @@ fn a_v8_replica_moves_into_first_contexts() {
         };
         store.apply_batch(&batch, Utc::now()).unwrap();
         for command in [&queued, &finished, &rename] {
-            store.enqueue(command).unwrap();
+            store.enqueue(command, &[]).unwrap();
         }
         store
             .record_result(finished.id, &CommandResult::Accepted { seq: Seq(4) }, at(1))
@@ -3618,7 +3974,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 20);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 22);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -3951,7 +4307,7 @@ fn a_queued_run_drops_the_shell_draft_and_a_message_the_agent_draft() {
     store.set_draft(session, SHELL, Some(&draft("ls"))).unwrap();
 
     store
-        .enqueue(&run_shell(session, "ls", RunWhen::OnSuccess))
+        .enqueue(&run_shell(session, "ls", RunWhen::OnSuccess), &[])
         .unwrap();
     assert_eq!(
         store.drafts().unwrap().keys().collect::<Vec<_>>(),
@@ -3961,7 +4317,7 @@ fn a_queued_run_drops_the_shell_draft_and_a_message_the_agent_draft() {
     store
         .set_draft(session, SHELL, Some(&draft("pwd")))
         .unwrap();
-    store.enqueue(&send(session, "a message")).unwrap();
+    store.enqueue(&send(session, "a message"), &[]).unwrap();
     assert_eq!(
         store.drafts().unwrap().keys().collect::<Vec<_>>(),
         [&(session, SHELL)]
@@ -3998,9 +4354,9 @@ fn withdrawing_a_run_keeps_it_as_the_shell_draft() {
     };
     let store = Store::open(&dir).unwrap();
     store.set_draft(session, AGENT, Some(&agent)).unwrap();
-    store.enqueue(&run).unwrap();
+    store.enqueue(&run, &[]).unwrap();
     store
-        .withdraw(run.id, Some(((session, SHELL), &draft)), None)
+        .withdraw(run.id, Some(((session, SHELL), &draft)), None, None)
         .unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
@@ -4391,7 +4747,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 18);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 20);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -4624,6 +4980,40 @@ fn a_workdir_log_answer_is_stored_and_read_back() {
     assert_eq!(store.load().unwrap().workdirs[&ask], answer);
 }
 
+/// A saved download and a file view of one path are two answers: each ask
+/// reads back its own, and the download's blob is a workdir one. Runs on a
+/// fresh database, so the CHECK on `kind` is the one the migrations build.
+#[test]
+fn a_download_answer_is_kept_apart_from_the_file_answer() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let view = WorkdirAnswer::File(FileResult::File {
+        at: Utc.with_ymd_and_hms(2026, 11, 3, 9, 0, 0).unwrap(),
+        path: "logo.bin".into(),
+        size: 7,
+        content: FileBody::Binary,
+    });
+    let blob = diff_blob(7);
+    let download = file("logo.bin", &blob);
+    let download_ask = WorkdirAsk::Download {
+        session: log.a,
+        path: "logo.bin".into(),
+    };
+    put(&mut store, &file_ask(log.a, "logo.bin"), &view);
+    let (registered, _) = put(&mut store, &download_ask, &download);
+    assert_eq!(registered, [blob.id]);
+    assert!(store.blob(blob.id).unwrap().unwrap().workdir);
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    let workdirs = store.load().unwrap().workdirs;
+    assert_eq!(workdirs.len(), 2);
+    assert_eq!(workdirs[&file_ask(log.a, "logo.bin")], view);
+    assert_eq!(workdirs[&download_ask], download);
+}
+
 #[test]
 fn two_sessions_on_one_workdir_share_a_blob_and_deleting_one_keeps_it() {
     let (_tmp, dir) = data_dir();
@@ -4720,7 +5110,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 18);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -4775,7 +5165,7 @@ fn the_workdir_log_migration_keeps_the_stored_answers() {
     assert!(insert("log").is_err(), "and refuses a log");
     drop(tx);
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
 
     let mut store = Store::open(&dir).unwrap();
     let loaded = store.load().unwrap().workdirs;
@@ -4905,7 +5295,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 15);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -4944,7 +5334,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -4986,7 +5376,7 @@ fn the_worktree_migration_backfills_from_the_session_created() {
 
     // The rewind drops the column; the migration re-adds it empty and must
     // backfill it from the stored `session_created` events.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!(
         store.session(in_worktree).unwrap().unwrap().worktree,
@@ -5060,7 +5450,7 @@ fn the_worktree_removed_migration_backfills_from_the_log() {
 
     // The rewind drops the column; the migration re-adds it and must
     // backfill it from the stored `worktree_removed` events.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
     let store = Store::open(&dir).unwrap();
     assert!(
         store.session(removed).unwrap().unwrap().worktree_removed,
@@ -5199,7 +5589,7 @@ fn the_server_log_is_checked_against_what_the_replica_has_seen() {
         id: CommandId::new(),
         kind: CommandKind::StopSession { session_id: log.a },
     };
-    store.enqueue(&command).unwrap();
+    store.enqueue(&command, &[]).unwrap();
     store
         .record_result(
             command.id,
@@ -5503,7 +5893,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -5631,7 +6021,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);
@@ -5667,7 +6057,7 @@ fn send_with_images(session_id: SessionId, attachments: Vec<ContentHash>) -> Com
 fn queue_with_image(store: &Store, session_id: SessionId, image: &AttachedImage) -> CommandId {
     store.attach_to_draft(session_id, image, at(0)).unwrap();
     let command = send_with_images(session_id, vec![image.sha256]);
-    store.enqueue(&command).unwrap();
+    store.enqueue(&command, &[]).unwrap();
     command.id
 }
 

@@ -151,9 +151,10 @@ class ComposerState extends State<Composer> {
 
   bool get _shell => widget.composer.mode == ComposerModeView.shell;
 
-  /// Nothing to send: no text and no image. The hub refuses it, so the
-  /// button is off and Enter does nothing.
-  bool get _nothingToSend => _blank && widget.composer.images.isEmpty;
+  /// Nothing to send: no text, no image and no file. The hub refuses it, so
+  /// the button is off and Enter does nothing.
+  bool get _nothingToSend =>
+      _blank && widget.composer.images.isEmpty && widget.composer.files.isEmpty;
 
   /// An image is still being prepared (agent mode): the hub refuses Send
   /// until it is ready.
@@ -165,20 +166,19 @@ class ComposerState extends State<Composer> {
     widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
   }
 
-  /// Picks images and attaches each one to the draft, in the order picked.
+  /// Picks files and attaches each one to the draft, in the order picked.
   Future<void> _attach() async {
-    final paths = await pickImages(context);
+    final paths = await pickAttachments(context);
     if (!mounted) return;
     _attachFiles(paths);
   }
 
-  /// Attaches each file to the draft, in order. The hub refuses what is not
-  /// an image, with a notice.
+  /// Attaches each file to the draft, in order. An image is attached as an
+  /// image; any other file is attached as a file, written into the workdir
+  /// when the message is sent.
   void _attachFiles(List<String> paths) {
     for (final path in paths) {
-      widget.send(
-        GuiIntentAttachImageFile(sessionId: widget.sessionId, path: path),
-      );
+      widget.send(GuiIntentAttachFile(sessionId: widget.sessionId, path: path));
     }
   }
 
@@ -406,6 +406,12 @@ class ComposerState extends State<Composer> {
                   preparing: composer.preparing,
                   send: widget.send,
                 ),
+              if (!shell && composer.files.isNotEmpty)
+                _FileChips(
+                  sessionId: widget.sessionId,
+                  files: composer.files,
+                  send: widget.send,
+                ),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
@@ -419,9 +425,9 @@ class ComposerState extends State<Composer> {
                       ),
                       if (!shell)
                         _InputAction(
-                          key: const Key('attach-image'),
-                          icon: Icons.image_outlined,
-                          title: 'Attach image',
+                          key: const Key('attach-file'),
+                          icon: Icons.attach_file,
+                          title: 'Attach file',
                           onTap: () => _attach(),
                         ),
                       _InputAction(
@@ -584,6 +590,47 @@ class _ImageChips extends StatelessWidget {
                 child: const Center(
                   child: CircularProgressIndicator(strokeWidth: 2),
                 ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Above the field: the draft's files, each a chip with a ✕ that takes it
+/// off the draft. A file that replaces one in the workdir says so.
+class _FileChips extends StatelessWidget {
+  const _FileChips({
+    required this.sessionId,
+    required this.files,
+    required this.send,
+  });
+
+  final String sessionId;
+  final List<ComposerFile> files;
+  final SendIntent send;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 4, 4, 2),
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 6,
+        children: [
+          for (final file in files)
+            InputChip(
+              key: Key('file-chip-${file.name}'),
+              avatar: const Icon(Icons.insert_drive_file_outlined),
+              label: Text(
+                '${file.name} · ${file.sizeLabel}'
+                '${file.replaces ? ' · replaces' : ''}',
+              ),
+              deleteIcon: const Icon(Icons.close),
+              deleteButtonTooltipMessage: 'Remove file',
+              onDeleted: () => send(
+                GuiIntentDetachFile(sessionId: sessionId, name: file.name),
               ),
             ),
         ],

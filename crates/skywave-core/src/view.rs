@@ -29,8 +29,9 @@ pub use skywave_proto::{LimitSeverity, LimitWindow, UsageLimit, UsageLimitsResul
 pub use crate::projection::{SessionUsage, TurnRecord};
 
 use crate::address::ServerAddress;
-use crate::attachment::AttachedImage;
-use crate::store::{AttachmentRefusal, BlobPolicy, OutboxEntry, OutboxStatus};
+use crate::attachment::{AttachedFile, AttachedImage};
+use crate::store::{AttachmentRefusal, BlobPolicy, OutboxEntry, OutboxFile, OutboxStatus};
+use crate::workdir::PushOutcome;
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.
@@ -635,6 +636,44 @@ pub struct WorkdirView {
     /// This pane's read (a diff's is the changes').
     pub fetch: WorkdirFetch,
     pub body: WorkdirBody,
+    /// The files of the session asked for download
+    /// ([`Action::DownloadWorkdirFile`](crate::Action::DownloadWorkdirFile))
+    /// that are stored, in flight or failed, sorted by path.
+    pub downloads: Vec<WorkdirDownload>,
+    /// The pushes into this session's workdir ([`Action::PushWorkdirFile`](crate::Action::PushWorkdirFile)), sorted by path.
+    pub pushes: Vec<WorkdirPush>,
+}
+
+/// A file of the workdir asked for download ([`Action::DownloadWorkdirFile`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkdirDownload {
+    pub path: String,
+    /// The read of the download ask: loading, failed, or idle.
+    pub fetch: WorkdirFetch,
+    /// The server's answer, once stored (`FileBody::TooLarge` = over the cap).
+    pub result: Option<FileResult>,
+    /// The content, when the answer carries a blob: its progress, and
+    /// `BlobState::Available { path }` once it is on the device.
+    pub blob: Option<BlobView>,
+}
+
+/// A device file pushed into the session's workdir.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkdirPush {
+    /// The workdir path written to, relative, `/` separated.
+    pub path: String,
+    /// The device file sent.
+    pub source: PathBuf,
+    pub state: PushState,
+}
+
+/// Where a push stands. Nothing is stored: a push lives as long as the model.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PushState {
+    Pushing,
+    /// A transport failure, or offline; nothing is known to be written.
+    Failed(String),
+    Done(PushOutcome),
 }
 
 /// The state of the read a workdir pane shows.
@@ -1259,6 +1298,10 @@ pub struct SessionView {
     /// ([`Action::Attach`](crate::Action::Attach)). The files are at
     /// [`attachment::attachment_path`](crate::attachment::attachment_path).
     pub draft_images: Vec<AttachedImage>,
+    /// This device's non-image files for the next message, in order
+    /// ([`Action::AttachFile`](crate::Action::AttachFile)). The copies are at
+    /// [`attachment::attachment_path`](crate::attachment::attachment_path).
+    pub draft_files: Vec<AttachedFile>,
     /// This device's unsent shell command, as last saved, with the
     /// condition picked for it ([`Draft::when`]). Kept even with blank
     /// text when a condition other than [`RunWhen::Always`] was picked.
@@ -1623,6 +1666,8 @@ pub enum TimelineItem {
         /// The images it carries, in order; each file is at
         /// [`attachment_path`](crate::attachment::attachment_path).
         images: Vec<AttachedImage>,
+        /// The non-image files it writes into the workdir root, in order.
+        files: Vec<OutboxFile>,
         outgoing: Outgoing,
         /// [`Action::Discard`](crate::Action::Discard) and
         /// [`Action::EditQueued`](crate::Action::EditQueued) take it back:
@@ -1759,6 +1804,14 @@ pub enum Entry {
     Archived { archived: bool, by: DeviceRef },
     /// The session's git worktree and its branch were removed; its work is refused from here on.
     WorktreeRemoved { by: DeviceRef },
+    /// A device wrote a file into the session's workdir; `replaced` when a
+    /// file was there before.
+    FileWritten {
+        path: String,
+        size: u64,
+        replaced: bool,
+        by: DeviceRef,
+    },
     /// The agent reported an error.
     AgentErrored { message: String },
     /// The agent started as `version`, not `confirmed`, the version the
@@ -2090,6 +2143,7 @@ mod tests {
             context: ContextId::new(),
             text: text.into(),
             images: Vec::new(),
+            files: Vec::new(),
             outgoing: Outgoing::Queued,
             discardable: true,
             delivery: None,
@@ -2141,6 +2195,7 @@ mod tests {
             mode: ComposerMode::Agent,
             draft: None,
             draft_images: Vec::new(),
+            draft_files: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: ShellView::default(),

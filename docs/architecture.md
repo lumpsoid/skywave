@@ -161,8 +161,8 @@ every version.
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
-| `HEAD /v1/attachments/{sha256}` | 204 if an image with that sha256 is staged, else 404; lets a device skip a re-upload across reconnects. Since v30. |
-| `PUT /v1/attachments/{sha256}` | Stages an image (raw bytes, at most `limits::ATTACHMENT_MAX_BYTES`) for a later `SendMessage` to name, answering an `UploadResult` with 200: `Stored { size, media_type }`, `TooLarge`, `NotAnImage`, `HashMismatch` or `DiskLow`. The file is `attachments/<sha256 hex>`, with no table; staging is a cache, capped at 256 MiB (the oldest evicted on each upload) and swept of files older than 7 days at startup. A lost upload surfaces as `UnknownAttachment`. Since v30. |
+| `HEAD /v1/attachments/{sha256}` | 204 if a file with that sha256 is staged, else 404; lets a device skip a re-upload across reconnects. Since v30. |
+| `PUT /v1/attachments/{sha256}` | Stages a file of any type (raw bytes, at most the server's `[files] upload_max`, default 64 MiB; streamed to a temp file, never held in memory) for a later `SendMessage` to name, answering an `UploadResult` with 200: `Stored { size }`, `TooLarge`, `HashMismatch` or `DiskLow`. `DiskLow` is checked before the body and again before each write. The file is `attachments/<sha256 hex>`, with no table, kept only while it hashes to its name; staging is a cache, capped at 256 MiB (the oldest evicted on each upload) and swept of files older than 7 days at startup. A lost upload surfaces as `UnknownAttachment`. Since v30. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
@@ -174,6 +174,8 @@ every version.
 | `GET /v1/worktrees` | The git worktrees of every repository a session's worktree was made from (D52, read from `SessionCreated`), as a `WorktreeList` read when asked: per repo a `RepoListing`, `Worktrees { worktrees, more }` with the main working tree first and at most `limits::WORKTREES_MAX` entries (`more` past them), each with its branch (`None` when detached), head, `main`, `missing`, `dirty` (`None` when its status was not read: missing, or outside the roots) and `merged`; `Gone` when the repo's directory is gone or is not its own top level, `Failed { reason }` when git fails for that repo alone. Always 200. Since v34. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
+| `GET /v1/workdir/download?session=&path=` | One file of a session's workdir to save on the device (D54), text or binary, as a `FileResult` whose content is a blob up to the server's download cap (`[files] download_max`, 64 MiB by default), else `TooLarge`. Recorded apart from `file`, so neither frees the other's blob. Since v36. |
+| `POST /v1/workdir/write` | Writes a staged upload (`PUT /v1/attachments/{sha256}`) to `path` in a session's workdir, a `WriteFileRequest { session, path, content, replace }` answered with a `WriteFileResult`, always 200. The parent directory must exist. Refused as `NotAllowed` before the file system is touched: an absolute path, one climbing out of the workdir, any `.git` component. A symlink at the target is `NotAllowed` too, found when the file is opened and never followed. `Same` when the file already holds the content, and nothing is written. `Exists { sha256, size }` when another file is there and `replace` does not name its sha256; naming it replaces it, and a new file is never created over one made meanwhile. A replaced file keeps its mode, a new one is 0644. The staged upload is kept. A write that lands is logged as `FileWritten` by the calling device and answered `Written` with that event's seq. `DiskLow` is checked first; a write past 120 s is a 503. Since v36. |
 
 - **Seqs** are global and contiguous: the first event is 1, 0 is "before
   everything". Events carry no seq on the wire; the batch carries `from`.
@@ -373,9 +375,12 @@ the daemon's appends, which would otherwise stop `serve` (below).
   Refusals, in order: `ServerStopping`, `DiskLow` (nothing is linked),
   `UnknownSession`, `ContextChanged`, `MessageTooLong`, then
   `TooManyAttachments` (more than `ATTACHMENTS_MAX` names), then
-  `AttachmentsTooLarge` (the images total over `ATTACHMENTS_MAX_TOTAL_BYTES`),
-  then `UnknownAttachment` (a name not staged, or no longer an image or the
-  hash it names). A refused command's linked files go as a crop's do. A
+  `AttachmentsTooLarge` (an image over `ATTACHMENT_MAX_BYTES`, or the images
+  total over `ATTACHMENTS_MAX_TOTAL_BYTES`), then `UnknownAttachment` (a name
+  not staged, a staged file that is not an image, or one no longer the hash it
+  names; the image check is here, not at staging). A staged file no longer the
+  hash it names is removed at that point, so the device's next `HEAD` misses
+  and it uploads the file again. A refused command's linked files go as a crop's do. A
   crash between a link and the commit leaves blob files without rows, which
   the startup sweep removes; one between the commit and the staged file's
   removal leaves that file, which eviction removes. `DeleteBlob` takes an
@@ -724,12 +729,17 @@ the daemon's appends, which would otherwise stop `serve` (below).
   children killed). The outer timeout is 20 s. Content blobs are
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
   keeps its blob across refreshes; event blobs are never reused for them,
-  nor deduplicated among themselves (D44).
+  nor deduplicated among themselves (D44). `download` shares `file`'s path
+  rules and differs only in serving binary content and in its cap. Its copy
+  runs outside the workdir lock under its own 120 s deadline
+  (`DOWNLOAD_DEADLINE`; its outer timeout is 125 s): the file is streamed into
+  the blob store with no lock held, so a large file neither blocks other
+  reads nor outlasts the 15 s snapshot deadline.
   **Blob GC**: a workdir blob lives while the latest answer to some read
   names it, any session: `workdir_answer_blobs` keeps the blobs of each
   read's latest answer, keyed as the core keys its stored answers
-  (session, `changes` or `file`, the path as requested), and every
-  changes or file answer but `ChangesResult::Failed` replaces its read's
+  (session, `changes`, `file` or `download`, the path as requested), and every
+  changes, file or download answer but `ChangesResult::Failed` replaces its read's
   rows. In that transaction every workdir blob no answer names loses its
   rows; its file goes after the commit. All of it runs on the workdir
   connection under the snapshot mutex, so no pass falls between a store
@@ -800,6 +810,25 @@ collects one. `serve`,
   any other exit `Failed` for that repo); the main working tree is merged by
   definition. Entries past `WORKTREES_MAX` get no git call. Nothing is
   recorded.
+- **Workdir writes** (D56): `POST /v1/workdir/write` runs as one workdir
+  snapshot (`workdir_task`), under `WRITE_DEADLINE` (120 s, a 503 past it),
+  and checks `DiskLow` first. The target is refused `NotAllowed` for an
+  absolute path, one climbing out with `..`, any `.git` component, or a last
+  component that is not a normal name. The parent must exist as a directory
+  (`NotFound`) and canonicalise under the canonical workdir (`NotAllowed` for
+  a link out; a link inside it is followed). The file is opened with
+  `O_NOFOLLOW`: a symlink is `NotAllowed`, a directory `IsADirectory`, another
+  non-regular file `NotAFile`. A regular file already holding the staged bytes
+  is `Same`, and nothing is written. Otherwise it is replaced only when
+  `replace` names its sha256, else the answer is `Exists { sha256, size }`. A
+  new file is placed without clobbering, so a file that appears meanwhile is
+  read and answered by the same rule. The staged upload is copied into a temp
+  file in the target's directory and hashed as it goes; one that no longer
+  hashes to its name is `NotStaged`, and the staged file is kept (staging is a
+  cache). A replaced file keeps its mode, a new one is `0644`, and the
+  directory is synced after the rename. A write that lands is logged as
+  `FileWritten` by the calling device and answered `Written`
+  (`workdir_write::write`, `api.rs`).
 
 ## Pairing
 
@@ -954,7 +983,14 @@ logs) an event that no longer decodes rather than failing.
   replica has not applied names it; this runs when the store opens (which
   also clears files without a row), and not after each batch: a detached
   image keeps its row and file until the next open, so attaching it again
-  in the meantime finds both. `workdir_snapshots` keeps the latest
+  in the meantime finds both. `draft_files` and `outbox_files` keep the
+  non-image files a draft or a queued message carries, in order, each as a
+  copy under `<data>/attachments/` (`store_file`, streamed, never in memory).
+  A draft holds one file per name; queuing a message moves its files onto
+  the outbox entry, and withdrawing it puts them back. A copy is kept while
+  a draft, or a message the server has not accepted (queued, or refused and
+  editable), names it; an accepted message's copy goes at the next open,
+  since the server holds it. `workdir_snapshots` keeps the latest
   stored answer per workdir read (session, kind, requested path), so a
   workdir already browsed reads offline; `workdir_blob_refs` names the
   blobs each answer holds. A refresh replaces the answer, and a blob row
@@ -1015,14 +1051,31 @@ logs) an event that no longer decodes rather than failing.
   HEAD on every attempt and PUT from its local file when the server does not
   hold it, since the server unlinks the staged files a message used, so
   nothing is cached. A missing or too-large local file, or an upload the
-  server refuses as too large, not an image or a hash mismatch, fails the
-  message as `AttachmentRefused`: final, discardable, never posted. A low disk
+  server refuses as too large or a hash mismatch, fails the message as
+  `AttachmentRefused`: final, discardable, never posted. (An outbox entry
+  stored before v36 may carry `NotAnImage`, which the server no longer
+  answers.) A low disk
   stops the uploads and posts the message anyway, so the server's stored
   `DiskLow` refusal shows it and the outbox keeps moving. A HEAD or PUT that
-  fails in transport backs off like the command's own request. A third loop,
+  fails in transport backs off like the command's own request. After its
+  images, the sender writes each file of the message into the workdir root as
+  `<name>`: the file is uploaded as an attachment, then written with the
+  workdir write route, with the file's `replace`, and only then is the message
+  posted. The message text already names `./<name>`. A file whose device copy
+  is missing, or no longer hashes to its name, fails the message as `Missing`,
+  without a request. A workdir that already holds other content at the name
+  fails it as `AttachmentRefused(FileExists)`, and the hash found there is kept
+  on that file. The user can then resend it replacing that file
+  (`ResendReplacing`): the same command is requeued with `replace` set to the
+  hash found, and a file changed again meanwhile is refused again. An `Exists`
+  or `Same` answer with our content counts as written, so a resend after a lost
+  answer is safe. A `NotStaged` answer uploads the file once more; any other
+  refusal fails the message as `FileNotWritten`, or as `ServerDiskLow` on a low
+  disk. A third loop,
   the draft stager, runs beside the pull and the sender: it uploads a draft's
   images as soon as they are attached (woken when a draft gains images), HEAD
-  then PUT, each image once per connection. It only saves time, since the
+  then PUT, each image once per connection (a draft's files are not staged
+  early: the sender uploads them at send). It only saves time, since the
   outbox still checks every image before posting; a transport error makes it
   wait a backoff and never ends the connection, and a refused image is left
   for the outbox to report when the message is sent. The user may
@@ -1314,6 +1367,23 @@ logs) an event that no longer decodes rather than failing.
   directory, diff → changes, directory → its parent, and the changes, the
   commits or the workdir root → the session; a session deleted here falls back to the
   archived list.
+- **Workdir downloads and pushes** (D54, D56). `Action::DownloadWorkdirFile`
+  asks for one file as a `WorkdirAsk::Download`, stored under its own kind so
+  it never replaces a file view's answer; the stored `WorkdirAnswer::File`
+  keeps its content as a workdir blob, which the model wants at once, off
+  screen (`Model::want_blob`). An action while that download is in flight
+  asks nothing. `WorkdirView.downloads` lists the session's downloads that are
+  stored, in flight or failed, each with its `fetch`, `result` and `blob`.
+  `Action::PushWorkdirFile { session_id, source, path, replace }` makes a
+  `Request::PushWorkdirFile`, which the engine's `push_workdir_file` carries
+  out: it reads the device file where it is (not copied into the data dir),
+  hashes the bytes read, HEADs `/v1/attachments/{sha256}` and PUTs them unless
+  the server holds them, then posts the write route. `WorkdirView.pushes`
+  lists the session's pushes with a `PushState` (`Pushing`, `Failed`, or
+  `Done(PushOutcome)`); a push the server answers `Exists` is
+  `Done(Written(Exists { sha256, size }))`, the hash the GUI's Replace… resends
+  with. A download's answer is stored like a read's; a push is held in
+  memory only.
 - **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
   the sessions they ran in; heads total them with `skywave_present::usage`
   by local day, session, workdir or model. A turn with no cost is unpriced,
@@ -1648,18 +1718,40 @@ skywave-core                 all logic, sync, replica
   only. The head counts each session's preparations in flight: a send waits
   for them, and the image cap counts the draft's images and those still
   being prepared.
-- **Image input and display** (D50). The attach button sends file paths
-  (`AttachImageFile`): `file_selector` on desktop, the `image_picker` gallery
-  or camera sheet on Android and iOS. Desktop paste (Ctrl/Cmd+V) reads a
-  clipboard image with `pasteboard`, which wins over text (text alone is a
-  normal paste), and mobile keyboard insertion (the TextField's
-  `contentInsertionConfiguration`) sends bytes (`AttachImageBytes`), as paste
-  does. Desktop drop (`desktop_drop`) sends one `AttachImageFile` per dropped
-  path, and the hub refuses a non-image with a notice. Each goes through the
-  preparation above. The timeline shows an image as a thumbnail (160 px high)
-  above the text; while it loads, or until it is downloaded, a placeholder
-  shows its size. A tap downloads it (`DownloadBlob`) or, once loaded, opens
-  it (`OpenFull`, or the local file for a message still queued).
+- **Attachments** (D50, D57). The composer's "Attach file" menu entry picks
+  any file: `file_selector`'s open dialog on desktop, and on Android and iOS
+  a sheet with the `image_picker` gallery, the camera, or the phone's `File`
+  option. Each picked path is sent as `GuiIntent::AttachFile`, and the hub
+  sniffs its first bytes: an image goes through the preparation above; any
+  other file is copied as it is and attached under its name. A second file of
+  a name the draft holds is refused with a notice ("a file named … is already
+  attached"), since the core keeps one per name. Desktop drop (`desktop_drop`)
+  sends one `AttachFile` per dropped path, of any kind. Desktop paste
+  (Ctrl/Cmd+V) reads a clipboard image with `pasteboard`, which wins over text
+  (text alone is a normal paste), and mobile keyboard insertion (the
+  TextField's `contentInsertionConfiguration`) sends bytes
+  (`AttachImageBytes`), as paste does; each image goes through the preparation
+  above. The draft's files show as chips with a ✕ above the field. A queued
+  message lists its files; one already in the workdir is marked "already in the
+  workdir", and "Replace & resend" for it asks first. The timeline shows an
+  image as a thumbnail (160 px high) above the text; while it loads, or until
+  it is downloaded, a placeholder shows its size. A tap downloads it
+  (`DownloadBlob`) or, once loaded, opens it (`OpenFull`, or the local file
+  for a message still queued).
+- **Workdir download and push** (D54, D56). A file row in a directory listing
+  and the file pane's app bar carry Download
+  (`ActionIntentDownloadWorkdirFile`).
+  The downloads panel shows each download: its progress, Retry when it failed,
+  and Save… once the file is on the device. Save… is the system save sheet on
+  Android and iOS (`flutter_file_dialog`), and `file_selector`'s
+  `getSaveLocation` on desktop, which copies the file
+  (`gui/lib/workdir/saving.dart`). The directory pane's push action picks a
+  device file (`pickPushFile`), proposes `<shown dir>/<file name>` in a target
+  dialog, and sends `ActionIntentPushWorkdirFile`. The pushes panel shows each
+  push's one line of progress or outcome, Retry when it failed, and Replace…
+  when the path holds another file: asked first, then pushed again with the
+  hash found. A written file's timeline row reads `<path> written by <who>`,
+  or `replaced` when it replaced one.
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.

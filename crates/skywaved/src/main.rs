@@ -323,6 +323,8 @@ async fn serve(
         login,
         login_state: login_state.clone(),
         log_file: config.log_file.clone(),
+        download_max: config.files.download_max,
+        upload_max: config.files.upload_max,
         ..ServerOptions::default()
     };
     #[cfg(unix)]

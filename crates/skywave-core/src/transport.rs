@@ -14,7 +14,7 @@ use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
     EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
     LoginFinishResult, LoginStartResult, RunId, StorageReport, UploadResult, UsageLimitsResult,
-    WorkdirQuery, WorktreeList,
+    WorkdirQuery, WorktreeList, WriteFileRequest, WriteFileResult,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -174,6 +174,17 @@ pub trait Transport: Send + Sync {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 
+    /// `GET /v1/workdir/download?session=&path=`: one file of the session's
+    /// workdir to save, text or binary, its content as a blob. Defaults to
+    /// [`TransportError::NotFound`] like [`workdir_file`](Transport::workdir_file).
+    fn workdir_download<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
+        let _ = query;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
     /// `HEAD /v1/attachments/{sha256}`: whether the server holds a staged
     /// upload with this hash. Defaults to [`TransportError::NotFound`] like
     /// [`list_dirs`](Transport::list_dirs).
@@ -194,6 +205,18 @@ pub trait Transport: Send + Sync {
         bytes: Bytes,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
         let _ = (sha256, bytes);
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `POST /v1/workdir/write`: writes a staged upload into the session's
+    /// workdir. Every outcome the server decides is an `Ok`
+    /// [`WriteFileResult`]. Defaults to [`TransportError::NotFound`] like
+    /// [`workdir_download`](Transport::workdir_download).
+    fn write_workdir_file<'a>(
+        &'a self,
+        request: &'a WriteFileRequest,
+    ) -> BoxFuture<'a, Result<WriteFileResult, TransportError>> {
+        let _ = request;
         Box::pin(async { Err(TransportError::NotFound) })
     }
 }

@@ -310,16 +310,25 @@ pub fn fail_reason(reason: FailReason) -> &'static str {
         FailReason::Rejected(reason) => reject_reason(reason),
         FailReason::Undeliverable => "the server could not take it",
         FailReason::AttachmentRefused(AttachmentRefusal::TooLarge) => {
-            "an image is too large for the server"
+            "a file is too large for the server"
         }
         FailReason::AttachmentRefused(AttachmentRefusal::NotAnImage) => {
             "the server did not read an image as one"
         }
         FailReason::AttachmentRefused(AttachmentRefusal::HashMismatch) => {
-            "an image was damaged on the way"
+            "a file was damaged on the way"
         }
         FailReason::AttachmentRefused(AttachmentRefusal::Missing) => {
-            "an image is no longer on this device"
+            "a file is no longer on this device"
+        }
+        FailReason::AttachmentRefused(AttachmentRefusal::FileExists) => {
+            "a file with that name is already in the workdir"
+        }
+        FailReason::AttachmentRefused(AttachmentRefusal::FileNotWritten) => {
+            "the workdir refused a file"
+        }
+        FailReason::AttachmentRefused(AttachmentRefusal::ServerDiskLow) => {
+            "the server is low on disk"
         }
     }
 }
@@ -1162,6 +1171,27 @@ mod tests {
             session: None,
             continued_in: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_refused_file_is_named_in_words() {
+        let refused = |reason| fail_reason(FailReason::AttachmentRefused(reason));
+        assert_eq!(
+            refused(AttachmentRefusal::FileExists),
+            "a file with that name is already in the workdir"
+        );
+        assert_eq!(
+            refused(AttachmentRefusal::FileNotWritten),
+            "the workdir refused a file"
+        );
+        assert_eq!(
+            refused(AttachmentRefusal::ServerDiskLow),
+            "the server is low on disk"
+        );
+        assert_eq!(
+            refused(AttachmentRefusal::Missing),
+            "a file is no longer on this device"
+        );
     }
 
     #[test]
@@ -2061,6 +2091,7 @@ mod tests {
             mode: skywave_core::ComposerMode::Agent,
             draft: None,
             draft_images: Vec::new(),
+            draft_files: Vec::new(),
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),

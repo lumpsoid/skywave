@@ -43,7 +43,8 @@ use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ContentHash, ConversationsResult, DirsResult,
     EventBatch, EventsQuery, FileResult, HelloResponse, ListResult, LogResult, LoginFinish,
     LoginFinishResult, LoginStartResult, PROTOCOL_VERSION, RUN_HEADER, RunId, StorageReport,
-    UploadResult, UsageLimitsResult, WorkdirQuery, WorktreeList, path,
+    UploadResult, UsageLimitsResult, WorkdirQuery, WorktreeList, WriteFileRequest, WriteFileResult,
+    path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -56,7 +57,7 @@ use crate::engine::WORKTREES_TIMEOUT;
 use crate::identity::Identity;
 use crate::tls;
 use crate::transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
-use crate::workdir::WORKDIR_TIMEOUT;
+use crate::workdir::{WORKDIR_TIMEOUT, WORKDIR_WRITE_TIMEOUT};
 
 /// Timeouts and pool size of an [`HttpsTransport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -905,6 +906,27 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `POST /v1/workdir/write` with `request` as its JSON body, bounded by
+    /// [`WORKDIR_WRITE_TIMEOUT`].
+    async fn write_workdir_file(
+        &self,
+        request: &WriteFileRequest,
+    ) -> Result<WriteFileResult, TransportError> {
+        let body = serde_json::to_vec(request)
+            .map_err(|e| TransportError::Decode(format!("encoding a workdir write: {e}")))?;
+        let reply = self
+            .http
+            .request(
+                Method::POST,
+                path::WORKDIR_WRITE,
+                &self.run_header(),
+                body.into(),
+                WORKDIR_WRITE_TIMEOUT,
+            )
+            .await?;
+        ok_json(reply)
+    }
+
     async fn blob(&self, id: BlobId, from: u64) -> Result<BlobDownload, TransportError> {
         let mut headers = self.run_header();
         if from > 0 {
@@ -1095,6 +1117,13 @@ impl Transport for HttpsTransport {
         Box::pin(self.workdir(path::WORKDIR_FILE, query))
     }
 
+    fn workdir_download<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
+        Box::pin(self.workdir(path::WORKDIR_DOWNLOAD, query))
+    }
+
     fn attachment_staged(
         &self,
         sha256: ContentHash,
@@ -1108,6 +1137,13 @@ impl Transport for HttpsTransport {
         bytes: Bytes,
     ) -> BoxFuture<'_, Result<UploadResult, TransportError>> {
         Box::pin(HttpsTransport::upload_attachment(self, sha256, bytes))
+    }
+
+    fn write_workdir_file<'a>(
+        &'a self,
+        request: &'a WriteFileRequest,
+    ) -> BoxFuture<'a, Result<WriteFileResult, TransportError>> {
+        Box::pin(HttpsTransport::write_workdir_file(self, request))
     }
 }
 

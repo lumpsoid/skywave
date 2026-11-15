@@ -950,8 +950,11 @@ pub struct ComposerView {
     /// The images of the agent draft, in the order they were attached; none
     /// in shell mode.
     pub images: Vec<ComposerImage>,
-    /// Images picked or pasted and still being prepared: a message waits
-    /// for them.
+    /// The non-image files of the agent draft, in the order attached; none
+    /// in shell mode.
+    pub files: Vec<ComposerFile>,
+    /// Images and files picked or pasted and still being prepared: a message
+    /// waits for them.
     pub preparing: u32,
 }
 
@@ -986,6 +989,19 @@ pub struct ComposerImage {
     pub path: String,
     /// `812 B`, `1.2 MiB`.
     pub size_label: String,
+}
+
+/// A non-image file of the composer's draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ComposerFile {
+    /// The name it is written as in the workdir root; it names the file to
+    /// detach.
+    pub name: String,
+    /// `812 B`, `1.2 MiB`.
+    pub size_label: String,
+    /// The file carries a replacement: the user agreed to write over a file
+    /// of this name in the workdir.
+    pub replaces: bool,
 }
 
 /// The shell prompt in its parts, shown in order: `work [if ok ✓] $`.

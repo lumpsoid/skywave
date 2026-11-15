@@ -10,14 +10,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 
+use crate::attachments::STAGING_MAX_BYTES;
 use crate::disk::DEFAULT_MIN_FREE;
 use crate::error::{Error, IoContext, Result};
 use crate::shell::{DEFAULT_OUTPUT_MAX, DEFAULT_PROGRAM, ShellConfig};
+use crate::workdir::DEFAULT_DOWNLOAD_MAX;
 
 /// Default `listen` address.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
 /// Default `agent.command`, looked up on `PATH`.
 pub const DEFAULT_AGENT_COMMAND: &str = "claude";
+/// Default `[files] upload_max`: the largest file a `PUT` stages (D55).
+pub const DEFAULT_UPLOAD_MAX: u64 = 64 << 20;
 
 /// The daemon configuration, with every default and relative path resolved.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +42,8 @@ pub struct Config {
     pub shell: ShellConfig,
     /// The data dir's disk (`[disk]`).
     pub disk: DiskConfig,
+    /// Files moving between devices and the server (`[files]`).
+    pub files: FilesConfig,
 }
 
 /// How much of the data dir's disk the daemon keeps free ([`crate::disk`]).
@@ -53,6 +59,25 @@ impl Default for DiskConfig {
     fn default() -> Self {
         DiskConfig {
             min_free: DEFAULT_MIN_FREE,
+        }
+    }
+}
+
+/// Files moving between devices and the server (`[files]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilesConfig {
+    /// Largest workdir file `GET /v1/workdir/download` serves, in bytes (D54).
+    pub download_max: u64,
+    /// Largest file `PUT /v1/attachments` stages, in bytes (D55); at most
+    /// [`crate::attachments::STAGING_MAX_BYTES`].
+    pub upload_max: u64,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        FilesConfig {
+            download_max: DEFAULT_DOWNLOAD_MAX,
+            upload_max: DEFAULT_UPLOAD_MAX,
         }
     }
 }
@@ -85,6 +110,8 @@ struct RawConfig {
     shell: RawShell,
     #[serde(default)]
     disk: RawDisk,
+    #[serde(default)]
+    files: RawFiles,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -92,6 +119,15 @@ struct RawConfig {
 struct RawDisk {
     #[serde(default, deserialize_with = "size")]
     min_free: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFiles {
+    #[serde(default, deserialize_with = "size")]
+    download_max: Option<u64>,
+    #[serde(default, deserialize_with = "size")]
+    upload_max: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -234,6 +270,14 @@ impl Config {
                 arg,
             });
         }
+        // A staged file is evicted to fit the staging cap, so an upload cap
+        // above it could never be kept whole (D55).
+        if let Some(max) = raw.files.upload_max.filter(|&max| max > STAGING_MAX_BYTES) {
+            return Err(Error::UploadMaxTooLarge {
+                path: path.to_owned(),
+                max,
+            });
+        }
         Self::resolve(raw, path.parent(), env)
     }
 
@@ -284,6 +328,10 @@ impl Config {
             },
             disk: DiskConfig {
                 min_free: raw.disk.min_free.unwrap_or(DEFAULT_MIN_FREE),
+            },
+            files: FilesConfig {
+                download_max: raw.files.download_max.unwrap_or(DEFAULT_DOWNLOAD_MAX),
+                upload_max: raw.files.upload_max.unwrap_or(DEFAULT_UPLOAD_MAX),
             },
         })
     }
@@ -407,6 +455,58 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_download_cap_takes_a_size() {
+        let parse = |text: &str| Config::parse(text, Path::new("/c.toml"), &env(&[("HOME", "/h")]));
+        assert_eq!(
+            parse("[files]\ndownload_max = \"256 MiB\"")
+                .unwrap()
+                .files
+                .download_max,
+            256 << 20
+        );
+        assert_eq!(
+            parse("[files]\ndownload_max = 1000")
+                .unwrap()
+                .files
+                .download_max,
+            1000
+        );
+        for bad in ["[files]\ndownload_max = \"1GB\"", "[files]\nupload = 1"] {
+            assert!(
+                matches!(parse(bad), Err(Error::ConfigParse { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_upload_cap_takes_a_size_up_to_the_staging_cap() {
+        let parse = |text: &str| Config::parse(text, Path::new("/c.toml"), &env(&[("HOME", "/h")]));
+        assert_eq!(
+            parse("[files]\nupload_max = \"1 MiB\"")
+                .unwrap()
+                .files
+                .upload_max,
+            1 << 20
+        );
+        assert_eq!(
+            parse("[files]\nupload_max = \"256 MiB\"")
+                .unwrap()
+                .files
+                .upload_max,
+            STAGING_MAX_BYTES,
+            "the staging cap itself is allowed"
+        );
+        assert!(
+            matches!(
+                parse("[files]\nupload_max = \"512 MiB\""),
+                Err(Error::UploadMaxTooLarge { max, .. }) if max == 512 << 20
+            ),
+            "over the staging cap is refused at load"
+        );
     }
 
     #[test]
@@ -538,6 +638,8 @@ mod tests {
         assert_eq!(c.shell.rc, None);
         assert_eq!(c.shell.output_max, 64 << 20);
         assert_eq!(c.disk.min_free, 1 << 30);
+        assert_eq!(c.files.download_max, 64 << 20);
+        assert_eq!(c.files.upload_max, 64 << 20);
     }
 
     #[test]

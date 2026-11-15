@@ -1,12 +1,14 @@
-//! Staged uploads: images a device uploads before the `SendMessage` that
+//! Staged uploads: files a device uploads before the `SendMessage` that
 //! names them by sha256 (`PUT` and `HEAD /v1/attachments/{sha256}`).
 //!
-//! A staged image is the file `<data dir>/attachments/<sha256 hex>`. There is
-//! no table: the hash is the name, and the type is sniffed again whenever the
-//! file is used. The bytes go to a temp file in the same directory, which is
-//! synced and renamed into place, so a name never holds a partial image.
+//! A staged upload is the file `<data dir>/attachments/<sha256 hex>`, of any
+//! type. There is no table: the hash is the name, and a file already there is
+//! trusted only while it still hashes to its name. A message that names one as
+//! an image sniffs it then. The bytes go to a temp file in the same directory,
+//! which is synced and renamed into place, so a name never holds a partial
+//! file.
 //!
-//! Staging is a cache. [`Staging::stage`] keeps it under [`STAGING_MAX_BYTES`]
+//! Staging is a cache. [`Staging::stage_file`] keeps it under [`STAGING_MAX_BYTES`]
 //! by evicting the oldest files, and [`Staging::sweep`] removes files older
 //! than [`STAGING_MAX_AGE`] at startup. Eviction is garbage collection, not an
 //! outcome: a message naming an image that is no longer staged is refused as
@@ -62,31 +64,64 @@ impl Staging {
     }
 
     /// Stages `bytes` under `sha256` and answers what the upload route
-    /// answers. An image already staged under `sha256` is answered as stored
-    /// and not rewritten. Otherwise the bytes must be at most
-    /// [`limits::ATTACHMENT_MAX_BYTES`], hash to `sha256` and sniff as an
-    /// image; then they are written, and the oldest files evicted down to
-    /// [`STAGING_MAX_BYTES`]. Nothing is written on any refusal.
+    /// answers: the bytes go to a temp file, which [`Staging::stage_file`]
+    /// stages. Nothing is left behind on any refusal.
     pub fn stage(&self, sha256: ContentHash, bytes: &[u8]) -> Result<UploadResult> {
-        if bytes.len() as u64 > limits::ATTACHMENT_MAX_BYTES {
-            return Ok(UploadResult::TooLarge);
-        }
+        let mut file = self
+            .temp()
+            .context(|| format!("staging in {}", self.dir.display()))?;
+        file.write_all(bytes)
+            .context(|| format!("staging in {}", self.dir.display()))?;
+        self.stage_file(sha256, file)
+    }
+
+    /// A temp file in the staging directory: never a staged file, and deleted
+    /// when dropped unless [`Staging::stage_file`] persists it.
+    pub fn temp(&self) -> io::Result<tempfile::NamedTempFile> {
+        tempfile::Builder::new()
+            .prefix(TEMP_PREFIX)
+            .tempfile_in(&self.dir)
+    }
+
+    /// Stages the temp file `file`, holding the bytes that `sha256` names, and
+    /// answers what the upload route answers. A file already staged under
+    /// `sha256` is answered as stored, and `file` is deleted unwritten.
+    /// Otherwise `file` must hash to `sha256`; it is then synced and renamed
+    /// to its name, and the oldest files evicted down to
+    /// [`STAGING_MAX_BYTES`]. A refused `file` is deleted.
+    pub fn stage_file(
+        &self,
+        sha256: ContentHash,
+        file: tempfile::NamedTempFile,
+    ) -> Result<UploadResult> {
         let path = self.path(sha256);
-        if let Some(stored) = self.existing(&path)? {
+        if let Some(stored) = self.existing(&path, sha256)? {
             return Ok(stored);
         }
-        if ContentHash::of(bytes) != sha256 {
+        let opened =
+            File::open(file.path()).context(|| format!("opening {}", file.path().display()))?;
+        let hash =
+            ContentHash::read(opened).context(|| format!("reading {}", file.path().display()))?;
+        if hash != sha256 {
             return Ok(UploadResult::HashMismatch);
         }
-        let Some(media_type) = ImageType::sniff(bytes) else {
-            return Ok(UploadResult::NotAnImage);
-        };
-        write_file(&self.dir, &path, bytes).context(|| format!("staging {}", path.display()))?;
+        let size = file
+            .as_file()
+            .metadata()
+            .context(|| format!("reading {}", file.path().display()))?
+            .len();
+        file.as_file()
+            .sync_all()
+            .context(|| format!("syncing {}", file.path().display()))?;
+        file.persist(&path)
+            .map_err(|e| e.error)
+            .context(|| format!("staging {}", path.display()))?;
+        if let Err(e) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(e).context(|| format!("staging {}", path.display()));
+        }
         self.evict(STAGING_MAX_BYTES)?;
-        Ok(UploadResult::Stored {
-            size: bytes.len() as u64,
-            media_type,
-        })
+        Ok(UploadResult::Stored { size })
     }
 
     /// Removes the oldest staged files, by modification time, until they
@@ -127,11 +162,11 @@ impl Staging {
         Ok(removed)
     }
 
-    /// The answer for an image already staged at `path`, if there is one. A
-    /// file there that no longer sniffs as an image is removed: it is not
-    /// one, so the upload goes on as a new one.
-    fn existing(&self, path: &Path) -> Result<Option<UploadResult>> {
-        let mut file = match File::open(path) {
+    /// The answer for a file already staged at `path` under `sha256`, if
+    /// there is one. A file there that no longer hashes to its name is
+    /// removed: it is not the upload, so the upload goes on as a new one.
+    fn existing(&self, path: &Path, sha256: ContentHash) -> Result<Option<UploadResult>> {
+        let file = match File::open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).context(|| format!("opening {}", path.display())),
@@ -140,17 +175,12 @@ impl Staging {
             .metadata()
             .context(|| format!("reading {}", path.display()))?
             .len();
-        let mut head = Vec::new();
-        Read::take(&mut file, SNIFF_LEN)
-            .read_to_end(&mut head)
-            .context(|| format!("reading {}", path.display()))?;
-        match ImageType::sniff(&head) {
-            Some(media_type) => Ok(Some(UploadResult::Stored { size, media_type })),
-            None => {
-                remove(path)?;
-                Ok(None)
-            }
+        let hash = ContentHash::read(file).context(|| format!("reading {}", path.display()))?;
+        if hash == sha256 {
+            return Ok(Some(UploadResult::Stored { size }));
         }
+        remove(path)?;
+        Ok(None)
     }
 
     /// Every regular file in the directory, temp files included. A missing
@@ -235,8 +265,11 @@ pub fn prepare(
 
 impl Prepared {
     /// Links the staged image `hash` as a new blob. `None` when it is not
-    /// staged, is no longer an image, or no longer hashes to its name: the
-    /// message then names an image it does not have.
+    /// staged or is no longer an image: the message then names an image it
+    /// does not have. A staged file that no longer hashes to its name is
+    /// removed as well, so the device's next `HEAD` misses and uploads it
+    /// again; `HEAD` checks only that the file exists, and would otherwise
+    /// keep answering for a file that is not the upload.
     fn link(&self, hash: ContentHash) -> Result<Option<(BlobMeta, ImageType)>> {
         let path = self.staging.path(hash);
         let mut file = match File::open(&path) {
@@ -261,6 +294,7 @@ impl Prepared {
         };
         if meta.sha256 != hash {
             self.blobs.discard(meta.id);
+            remove(&path)?;
             return Ok(None);
         }
         Ok(Some((meta, media_type)))
@@ -268,15 +302,24 @@ impl Prepared {
 
     /// Whether the message may be logged, or why not, checked in the order
     /// `apply` refuses: `DiskLow`, `TooManyAttachments` (more hashes than
-    /// [`limits::ATTACHMENTS_MAX`]), `AttachmentsTooLarge` (the images found
-    /// total over [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`]), then
-    /// `UnknownAttachment` for any hash not staged.
+    /// [`limits::ATTACHMENTS_MAX`]), `AttachmentsTooLarge` (an image found
+    /// over [`limits::ATTACHMENT_MAX_BYTES`], or the images found total over
+    /// [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`]), then `UnknownAttachment` for
+    /// any hash not staged.
     pub(crate) fn decide(&self) -> std::result::Result<(), RejectReason> {
         if self.disk_low {
             return Err(RejectReason::DiskLow);
         }
         if self.staged.len() > limits::ATTACHMENTS_MAX {
             return Err(RejectReason::TooManyAttachments);
+        }
+        if self
+            .links
+            .iter()
+            .flatten()
+            .any(|(meta, _)| meta.size > limits::ATTACHMENT_MAX_BYTES)
+        {
+            return Err(RejectReason::AttachmentsTooLarge);
         }
         let total: u64 = self.links.iter().flatten().map(|(meta, _)| meta.size).sum();
         if total > limits::ATTACHMENTS_MAX_TOTAL_BYTES {
@@ -342,23 +385,6 @@ struct Entry {
     temp: bool,
 }
 
-/// Writes `bytes` to `path` the way a blob is written: to a temp file in
-/// `dir`, synced and renamed into place, then `dir` synced. On error nothing
-/// is left at `path`.
-fn write_file(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut out = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
-        .tempfile_in(dir)?;
-    out.write_all(bytes)?;
-    out.as_file().sync_all()?;
-    out.persist(path).map_err(|e| e.error)?;
-    if let Err(e) = File::open(dir).and_then(|dir| dir.sync_all()) {
-        let _ = fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(())
-}
-
 /// Removes `path`; whether it was there to remove.
 fn remove(path: &Path) -> Result<bool> {
     match fs::remove_file(path) {
@@ -415,7 +441,6 @@ mod tests {
         let hash = ContentHash::of(&bytes);
         let stored = UploadResult::Stored {
             size: bytes.len() as u64,
-            media_type: ImageType::Png,
         };
         assert!(!staging.contains(hash));
         assert_eq!(staging.stage(hash, &bytes).unwrap(), stored);
@@ -430,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_must_hash_to_its_path_and_be_an_image() {
+    fn a_body_must_hash_to_its_path_and_may_be_any_file() {
         let tmp = tempfile::tempdir().unwrap();
         let staging = Staging::new(tmp.path());
         let bytes = png();
@@ -438,12 +463,17 @@ mod tests {
             staging.stage(ContentHash::of(b"other"), &bytes).unwrap(),
             UploadResult::HashMismatch
         );
-        let pdf = b"%PDF-1.4 not an image".to_vec();
-        assert_eq!(
-            staging.stage(ContentHash::of(&pdf), &pdf).unwrap(),
-            UploadResult::NotAnImage
-        );
         assert!(names(tmp.path()).is_empty(), "nothing is written");
+
+        let pdf = b"%PDF-1.4 not an image".to_vec();
+        let pdf_hash = ContentHash::of(&pdf);
+        assert_eq!(
+            staging.stage(pdf_hash, &pdf).unwrap(),
+            UploadResult::Stored {
+                size: pdf.len() as u64,
+            }
+        );
+        assert!(staging.contains(pdf_hash), "the pdf is staged");
 
         let hash = ContentHash::of(&bytes);
         assert!(
@@ -456,18 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn an_oversize_body_is_too_large_and_nothing_is_written() {
-        let tmp = tempfile::tempdir().unwrap();
-        let staging = Staging::new(tmp.path());
-        let mut bytes = png();
-        bytes.resize(limits::ATTACHMENT_MAX_BYTES as usize + 1, 0);
-        let hash = ContentHash::of(&bytes);
-        assert_eq!(staging.stage(hash, &bytes).unwrap(), UploadResult::TooLarge);
-        assert!(names(tmp.path()).is_empty());
-    }
-
-    #[test]
-    fn a_staged_file_that_is_no_longer_an_image_is_replaced() {
+    fn a_staged_file_that_no_longer_hashes_to_its_name_is_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let staging = Staging::new(tmp.path());
         let bytes = png();
@@ -477,7 +496,6 @@ mod tests {
             staging.stage(hash, &bytes).unwrap(),
             UploadResult::Stored {
                 size: bytes.len() as u64,
-                media_type: ImageType::Png,
             }
         );
         assert_eq!(fs::read(staging.path(hash)).unwrap(), bytes);
@@ -633,6 +651,76 @@ mod tests {
             prepare(&staging, blobs, false, &big).unwrap().decide(),
             Err(RejectReason::AttachmentsTooLarge)
         );
+    }
+
+    #[test]
+    fn one_image_over_the_image_limit_is_too_large() {
+        let (_tmp, storage, staging) = stores();
+        let over = stage(
+            &staging,
+            &image(limits::ATTACHMENT_MAX_BYTES as usize + 1, 1),
+        );
+        assert_eq!(
+            prepare(&staging, &storage.blobs, false, &[over])
+                .unwrap()
+                .decide(),
+            Err(RejectReason::AttachmentsTooLarge)
+        );
+
+        let at_limit = stage(&staging, &image(limits::ATTACHMENT_MAX_BYTES as usize, 2));
+        assert_eq!(
+            prepare(&staging, &storage.blobs, false, &[at_limit])
+                .unwrap()
+                .decide(),
+            Ok(()),
+            "control: an image of exactly the limit is accepted"
+        );
+    }
+
+    #[test]
+    fn a_staged_file_that_no_longer_hashes_to_its_name_is_removed_when_a_message_names_it() {
+        let (_tmp, storage, staging) = stores();
+        let hash = stage(&staging, &image(100, 1));
+        let intact = prepare(&staging, &storage.blobs, false, &[hash]).unwrap();
+        assert_eq!(
+            intact.decide(),
+            Ok(()),
+            "control: the staged image is accepted"
+        );
+        drop(intact);
+
+        // Other PNG bytes: the sniff still passes, and the hash check fails.
+        fs::write(staging.path(hash), image(100, 2)).unwrap();
+        let prepared = prepare(&staging, &storage.blobs, false, &[hash]).unwrap();
+        assert_eq!(prepared.decide(), Err(RejectReason::UnknownAttachment));
+        assert!(
+            !staging.contains(hash),
+            "the file that is not the upload is removed"
+        );
+        drop(prepared);
+        assert_eq!(blob_files(&storage), 0, "no blob is left");
+    }
+
+    #[test]
+    fn a_staged_file_that_is_not_an_image_is_unknown_to_a_message() {
+        let (_tmp, storage, staging) = stores();
+        let img = stage(&staging, &image(100, 1));
+        let pdf = stage(&staging, b"%PDF-1.4 not an image");
+        assert_eq!(
+            prepare(&staging, &storage.blobs, false, &[img])
+                .unwrap()
+                .decide(),
+            Ok(()),
+            "control: a staged image is accepted"
+        );
+        assert_eq!(
+            prepare(&staging, &storage.blobs, false, &[pdf])
+                .unwrap()
+                .decide(),
+            Err(RejectReason::UnknownAttachment)
+        );
+        assert_eq!(blob_files(&storage), 0, "nothing is linked");
+        assert!(staging.contains(pdf), "the staged file stays");
     }
 
     #[test]

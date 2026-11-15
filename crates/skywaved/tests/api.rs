@@ -25,7 +25,7 @@ use skywave_proto::{
     ListResult, LogResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason,
     RepoListing, RunId, RunsSince, Seq, SessionId, SessionOrigin, SessionState, ShellEnd,
     ShellRunStorage, StorageReport, ToolResult, UploadResult, UsageLimit, UsageLimitsResult,
-    Worktree, WorktreeList, limits, path,
+    Worktree, WorktreeList, WriteFileRequest, WriteFileResult, limits, path,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::login::ClaudeLogin;
@@ -1986,10 +1986,7 @@ async fn an_attachment_is_staged_once_and_reported_as_staged() {
     let mut device = f.client(&creds).await;
     let bytes = png(1000);
     let uri = path::attachment(ContentHash::of(&bytes));
-    let stored = UploadResult::Stored {
-        size: 1000,
-        media_type: ImageType::Png,
-    };
+    let stored = UploadResult::Stored { size: 1000 };
 
     let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
     assert_eq!(head.status, StatusCode::NOT_FOUND);
@@ -2013,10 +2010,10 @@ async fn an_attachment_is_staged_once_and_reported_as_staged() {
     assert_eq!(again.json::<UploadResult>(), stored);
 }
 
-/// A body is staged only under the hash its path names, and only if it is
-/// an image; a refusal leaves no file, temp files included.
+/// A body is staged only under the hash its path names, and any file will
+/// do; a refusal leaves no file, temp files included.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_staged_upload_must_hash_to_its_path_and_be_an_image() {
+async fn a_staged_upload_must_hash_to_its_path_and_may_be_any_file() {
     let f = Fixture::start().await;
     let creds = f.pair().await;
     let mut device = f.client(&creds).await;
@@ -2026,12 +2023,21 @@ async fn a_staged_upload_must_hash_to_its_path_and_be_an_image() {
         .send(Method::PUT, &other, &[], Bytes::from(image.clone()))
         .await;
     assert_eq!(reply.json::<UploadResult>(), UploadResult::HashMismatch);
+    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
 
     let pdf = b"%PDF-1.4 not an image".to_vec();
     let uri = path::attachment(ContentHash::of(&pdf));
-    let reply = device.send(Method::PUT, &uri, &[], Bytes::from(pdf)).await;
-    assert_eq!(reply.json::<UploadResult>(), UploadResult::NotAnImage);
-    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(pdf.clone()))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored {
+            size: pdf.len() as u64,
+        }
+    );
+    let head = device.send(Method::HEAD, &uri, &[], Bytes::new()).await;
+    assert_eq!(head.status, StatusCode::NO_CONTENT, "the pdf is staged");
 
     let uri = path::attachment(ContentHash::of(&image));
     let reply = device
@@ -2043,21 +2049,45 @@ async fn a_staged_upload_must_hash_to_its_path_and_be_an_image() {
     );
 }
 
-/// An upload over `ATTACHMENT_MAX_BYTES` is `TooLarge` as JSON, not a 413,
-/// and stores nothing. A 3 MiB image, over axum's default 2 MB body limit,
-/// is stored: the limit is off for this route.
+/// An upload over `upload_max` is `TooLarge` as JSON, not a 413, and leaves
+/// no file, temp file included; a body of exactly the cap is stored.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversize_upload_is_refused_as_json() {
-    let f = Fixture::start().await;
+    const CAP: u64 = 1 << 20;
+    let options = ServerOptions {
+        git: isolated_git(),
+        upload_max: CAP,
+        ..ServerOptions::default()
+    };
+    let f = Fixture::start_configured(|log| log, options).await;
     let creds = f.pair().await;
     let mut device = f.client(&creds).await;
-    let big = png(limits::ATTACHMENT_MAX_BYTES as usize + 1);
+    let big = png(CAP as usize + 1);
     let uri = path::attachment(ContentHash::of(&big));
     let reply = device.send(Method::PUT, &uri, &[], Bytes::from(big)).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.json::<UploadResult>(), UploadResult::TooLarge);
-    assert!(files_under(&f.storage.dir.attachments_dir()).is_empty());
+    assert!(
+        files_under(&f.storage.dir.attachments_dir()).is_empty(),
+        "nothing is left, temp file included"
+    );
 
+    let exact = png(CAP as usize);
+    let uri = path::attachment(ContentHash::of(&exact));
+    let reply = device
+        .send(Method::PUT, &uri, &[], Bytes::from(exact))
+        .await;
+    assert_eq!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { size: CAP },
+        "control: a body of exactly the cap is stored"
+    );
+
+    // Past axum's default 2 MB body limit, which is off for this route: a
+    // 3 MiB file is stored under the default cap.
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
     let three_mib = png(3 << 20);
     let uri = path::attachment(ContentHash::of(&three_mib));
     let reply = device
@@ -2065,10 +2095,7 @@ async fn an_oversize_upload_is_refused_as_json() {
         .await;
     assert_eq!(
         reply.json::<UploadResult>(),
-        UploadResult::Stored {
-            size: 3 << 20,
-            media_type: ImageType::Png,
-        }
+        UploadResult::Stored { size: 3 << 20 }
     );
 }
 
@@ -2100,10 +2127,7 @@ async fn an_upload_on_a_low_disk_is_refused() {
         .await;
     assert_eq!(
         reply.json::<UploadResult>(),
-        UploadResult::Stored {
-            size: 1000,
-            media_type: ImageType::Png,
-        },
+        UploadResult::Stored { size: 1000 },
         "control: with room again, the upload is stored"
     );
 }
@@ -2305,6 +2329,50 @@ async fn a_message_naming_an_unstaged_image_is_refused_and_logs_nothing() {
     assert_eq!(f.log.head(), seq);
 }
 
+/// A message naming a staged file that is not an image is `UnknownAttachment`,
+/// and logs and links nothing; the file stays staged for a resend. A staged
+/// image named the same way goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_naming_a_staged_non_image_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let pdf = b"%PDF-1.4 not an image".to_vec();
+    let hash = ContentHash::of(&pdf);
+    let reply = device
+        .send(Method::PUT, &path::attachment(hash), &[], Bytes::from(pdf))
+        .await;
+    assert!(matches!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { .. }
+    ));
+    let head = f.log.head();
+    let before = blob_files(&f);
+
+    let send = message_command(session, context, "look", vec![hash]);
+    assert_eq!(
+        device.command(&send).await,
+        rejected(RejectReason::UnknownAttachment)
+    );
+    assert_eq!(
+        device.command(&send).await,
+        rejected(RejectReason::UnknownAttachment),
+        "stored"
+    );
+    assert_eq!(f.log.head(), head, "nothing logged");
+    assert_eq!(blob_files(&f), before, "nothing linked");
+    assert!(is_staged(&mut device, hash).await, "the pdf stays staged");
+
+    // Control: a staged image named the same way goes in.
+    let bytes = png(1000);
+    let image = stage_image(&mut device, &bytes).await;
+    let staged = message_command(session, context, "look", vec![image]);
+    let seq = accepted_seq(&device.command(&staged).await);
+    assert_eq!(f.log.head(), seq);
+}
+
 /// A message refused for its context keeps its staged images: no blob is
 /// linked or recorded, and the image stays staged for the resend.
 #[tokio::test(flavor = "multi_thread")]
@@ -2335,9 +2403,11 @@ async fn a_refused_message_keeps_its_staged_images() {
     accepted_seq(&device.command(&current).await);
 }
 
-/// Too many names (more than `ATTACHMENTS_MAX`) and images over the total
+/// Too many names (more than `ATTACHMENTS_MAX`), an image over
+/// `ATTACHMENT_MAX_BYTES`, and images over the total
 /// (`ATTACHMENTS_MAX_TOTAL_BYTES`) are refused. Nothing is linked, and the
-/// staged images stay staged.
+/// staged images stay staged. An over-large image still stages: uploads have
+/// their own cap, `[files] upload_max`.
 #[tokio::test(flavor = "multi_thread")]
 async fn too_many_or_too_large_images_are_refused() {
     let f = Fixture::start().await;
@@ -2374,6 +2444,20 @@ async fn too_many_or_too_large_images_are_refused() {
     for hash in &big {
         assert!(is_staged(&mut device, *hash).await, "still staged");
     }
+
+    // One image over the per-image limit: it stages, but a message naming it
+    // is refused, and nothing is logged.
+    let over = stage_image(&mut device, &png(limits::ATTACHMENT_MAX_BYTES as usize + 1)).await;
+    let head = f.log.head();
+    let before = blob_files(&f);
+    let large = message_command(session, context, "large", vec![over]);
+    assert_eq!(
+        device.command(&large).await,
+        rejected(RejectReason::AttachmentsTooLarge)
+    );
+    assert_eq!(f.log.head(), head, "nothing logged");
+    assert_eq!(blob_files(&f), before, "no blob added");
+    assert!(is_staged(&mut device, over).await, "still staged");
 
     // Control: two of them, 7.2 MB, go in.
     let two = message_command(session, context, "two", big[..2].to_vec());
@@ -3849,6 +3933,312 @@ async fn workdir_list_and_file_answer_every_outcome_with_200() {
             "{route}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_download_serves_a_binary_file_as_a_blob() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let bytes = b"\x89PNG\0\x01\x02";
+    std::fs::write(workdir.join("logo.bin"), bytes).unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+
+    let reply = device
+        .get(&workdir_uri(path::WORKDIR_DOWNLOAD, session, "logo.bin"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let FileResult::File {
+        size: 7,
+        content: FileBody::Blob(blob),
+        ..
+    } = reply.json::<FileResult>()
+    else {
+        panic!("expected a binary blob: {:?}", reply.body);
+    };
+    let content = device.get(&path::blob(blob.id)).await;
+    assert_eq!(content.status, StatusCode::OK);
+    assert_eq!(&content.body[..], bytes);
+
+    // The same path through the file route is still refused as binary.
+    let reply = device
+        .get(&workdir_uri(path::WORKDIR_FILE, session, "logo.bin"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let FileResult::File {
+        content: FileBody::Binary,
+        ..
+    } = reply.json::<FileResult>()
+    else {
+        panic!("expected binary, got {:?}", reply.body);
+    };
+}
+
+/// Stages `bytes` with `PUT` as any file, not only an image; returns the hash.
+async fn stage_file(device: &mut Client, bytes: &[u8]) -> ContentHash {
+    let hash = ContentHash::of(bytes);
+    let reply = device
+        .send(
+            Method::PUT,
+            &path::attachment(hash),
+            &[],
+            Bytes::from(bytes.to_vec()),
+        )
+        .await;
+    assert!(matches!(
+        reply.json::<UploadResult>(),
+        UploadResult::Stored { .. }
+    ));
+    hash
+}
+
+/// Posts `request` to the write route and returns its answer, which is a 200.
+async fn write_file(device: &mut Client, request: &WriteFileRequest) -> WriteFileResult {
+    let reply = device
+        .send(Method::POST, path::WORKDIR_WRITE, &[], json(request))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    reply.json()
+}
+
+/// A staged file is written where its path names and logged as `FileWritten`
+/// by the calling device, with the answer naming that event's seq. The same
+/// request again is `Same` and logs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_file_is_written_into_the_workdir_and_logged() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    std::fs::create_dir(workdir.join("notes")).unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let content = b"hello from the phone\n";
+    let hash = stage_file(&mut device, content).await;
+    let request = WriteFileRequest {
+        session,
+        path: "notes/a.txt".into(),
+        content: hash,
+        replace: None,
+    };
+
+    let before = f.log.head();
+    let WriteFileResult::Written {
+        path: written,
+        size,
+        seq,
+    } = write_file(&mut device, &request).await
+    else {
+        panic!("expected Written");
+    };
+    assert_eq!(written, "notes/a.txt");
+    assert_eq!(size, content.len() as u64);
+    assert!(seq > before);
+    assert_eq!(seq, f.log.head(), "the answer names the event just logged");
+    assert_eq!(std::fs::read(workdir.join("notes/a.txt")).unwrap(), content);
+
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let logged = batch
+        .iter()
+        .find(|(s, _)| *s == seq)
+        .map(|(_, e)| e.kind.clone());
+    assert_eq!(
+        logged,
+        Some(EventKind::FileWritten {
+            path: "notes/a.txt".into(),
+            sha256: hash,
+            size,
+            replaced: None,
+            by: creds.id,
+        })
+    );
+
+    let head = f.log.head();
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::Same {
+            path: "notes/a.txt".into(),
+            size,
+        }
+    );
+    assert_eq!(f.log.head(), head, "a same write logs nothing");
+}
+
+/// A file already at the path is replaced only when the request names its
+/// hash. Otherwise the answer is `Exists` with that hash and nothing changes;
+/// naming it writes the file, and the event records what it replaced.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_replaces_an_existing_file_only_with_its_hash() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let old = b"the old a\n";
+    std::fs::write(workdir.join("a.txt"), old).unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let new = b"the new a, longer than the old\n";
+    let new_hash = stage_file(&mut device, new).await;
+    let old_hash = ContentHash::of(old);
+    let mut request = WriteFileRequest {
+        session,
+        path: "a.txt".into(),
+        content: new_hash,
+        replace: None,
+    };
+
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::Exists {
+            sha256: old_hash,
+            size: old.len() as u64,
+        }
+    );
+    request.replace = Some(ContentHash::of(b"some other file\n"));
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::Exists {
+            sha256: old_hash,
+            size: old.len() as u64,
+        },
+        "a hash that is not the file's does not replace it"
+    );
+    assert_eq!(std::fs::read(workdir.join("a.txt")).unwrap(), old);
+
+    request.replace = Some(old_hash);
+    let WriteFileResult::Written { size, seq, .. } = write_file(&mut device, &request).await else {
+        panic!("expected Written");
+    };
+    assert_eq!(size, new.len() as u64);
+    assert_eq!(std::fs::read(workdir.join("a.txt")).unwrap(), new);
+
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let logged = batch
+        .iter()
+        .find(|(s, _)| *s == seq)
+        .map(|(_, e)| e.kind.clone());
+    assert_eq!(
+        logged,
+        Some(EventKind::FileWritten {
+            path: "a.txt".into(),
+            sha256: new_hash,
+            size,
+            replaced: Some(old_hash),
+            by: creds.id,
+        })
+    );
+}
+
+/// A write the server refuses is answered in the body with a 200 and changes
+/// neither the workdir nor the log. A body that is not a request is a 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_write_answers_200_and_writes_nothing() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let hash = stage_file(&mut device, b"staged\n").await;
+    let write = |path: &str, content: ContentHash| WriteFileRequest {
+        session,
+        path: path.into(),
+        content,
+        replace: None,
+    };
+    let head = f.log.head();
+
+    let refused = [
+        (write("../x", hash), WriteFileResult::NotAllowed),
+        (write(".git/config", hash), WriteFileResult::NotAllowed),
+        (
+            write("ghost.txt", ContentHash::of(b"never staged\n")),
+            WriteFileResult::NotStaged,
+        ),
+        (
+            WriteFileRequest {
+                session: SessionId::new(),
+                path: "x.txt".into(),
+                content: hash,
+                replace: None,
+            },
+            WriteFileResult::UnknownSession,
+        ),
+    ];
+    for (request, answer) in refused {
+        assert_eq!(
+            write_file(&mut device, &request).await,
+            answer,
+            "{request:?}"
+        );
+    }
+    let not_json = device
+        .send(
+            Method::POST,
+            path::WORKDIR_WRITE,
+            &[],
+            Bytes::from_static(b"{"),
+        )
+        .await;
+    assert_eq!(not_json.status, StatusCode::BAD_REQUEST);
+
+    assert_eq!(f.log.head(), head, "refused writes log nothing");
+    assert!(!f.root.join("x").exists(), "../x is not written");
+    assert!(!workdir.join("ghost.txt").exists());
+    assert!(!workdir.join(".git").exists());
+
+    // Control: the same route writes what is allowed.
+    assert!(matches!(
+        write_file(&mut device, &write("ok.txt", hash)).await,
+        WriteFileResult::Written { .. }
+    ));
+    assert_eq!(std::fs::read(workdir.join("ok.txt")).unwrap(), b"staged\n");
+}
+
+/// On a low disk a write is `DiskLow` and writes nothing; with room again the
+/// same write goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_on_a_low_disk_is_disk_low() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let f = Fixture::start_cropping(disk.clone(), None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let content = b"low disk\n";
+    let hash = stage_file(&mut device, content).await;
+    let request = WriteFileRequest {
+        session,
+        path: "low.txt".into(),
+        content: hash,
+        replace: None,
+    };
+    let head = f.log.head();
+
+    free.0.store(9, std::sync::atomic::Ordering::SeqCst);
+    assert!(disk.check());
+    assert_eq!(
+        write_file(&mut device, &request).await,
+        WriteFileResult::DiskLow
+    );
+    assert!(!workdir.join("low.txt").exists());
+    assert_eq!(f.log.head(), head, "a refused write logs nothing");
+
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    assert!(!disk.check());
+    assert!(
+        matches!(
+            write_file(&mut device, &request).await,
+            WriteFileResult::Written { .. }
+        ),
+        "control: with room again the write lands"
+    );
+    assert_eq!(std::fs::read(workdir.join("low.txt")).unwrap(), content);
 }
 
 /// The content blob of the answer to reading file `name`.

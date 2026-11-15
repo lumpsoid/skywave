@@ -26,6 +26,7 @@ ComposerView shellComposer({
       : null,
   canStop: canStop,
   images: const [],
+  files: const [],
   preparing: 0,
 );
 

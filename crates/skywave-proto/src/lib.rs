@@ -194,7 +194,15 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// ([`RepoWorktrees`], [`RepoListing`], [`WorktreeEntry`]) and [`limits::WORKTREES_MAX`].
 ///
 /// v35: `TurnUsage::context_compacted`, marking the turn of a `/compact`.
-pub const PROTOCOL_VERSION: u32 = 35;
+///
+/// v36: repository file download: `GET` [`path::WORKDIR_DOWNLOAD`] answering a
+/// [`FileResult`] whose content is any file, text or binary, as a blob.
+/// Staging (`PUT` [`path::ATTACHMENT_ROUTE`]) takes any file:
+/// [`UploadResult::Stored`] lost `media_type` and `NotAnImage` is gone; a
+/// message's image is checked when the message names it. `POST`
+/// [`path::WORKDIR_WRITE`] writes a staged upload into a workdir
+/// ([`WriteFileResult`]), logged as the event [`EventKind::FileWritten`].
+pub const PROTOCOL_VERSION: u32 = 36;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -794,6 +802,16 @@ pub enum EventKind {
         holds: BlobUse,
         by: DeviceId,
     },
+    /// `by` wrote the file at `path` (relative to the session's workdir) through
+    /// `POST` [`path::WORKDIR_WRITE`]: `sha256` and `size` are what it holds now,
+    /// `replaced` the sha256 of the file it replaced, if any.
+    FileWritten {
+        path: String,
+        sha256: ContentHash,
+        size: u64,
+        replaced: Option<ContentHash>,
+        by: DeviceId,
+    },
     /// `by`'s `CropBlob` replaced the event blob `blob` with `into`, a new
     /// blob holding only the lines `kept` names ([`crop::crop`]); `blob` is
     /// gone from the server. `holds` is what both hold (`ToolOutput` or
@@ -903,6 +921,7 @@ impl EventKind {
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
             | EventKind::WorktreeRemoved { by }
+            | EventKind::FileWritten { by, .. }
             | EventKind::PermissionModeRequested { by, .. }
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
@@ -1003,6 +1022,7 @@ impl EventKind {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
+            | EventKind::FileWritten { .. }
             | EventKind::Imported { .. } => false,
         }
     }
@@ -1057,7 +1077,8 @@ impl EventKind {
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
-            | EventKind::BlobCropped { .. } => None,
+            | EventKind::BlobCropped { .. }
+            | EventKind::FileWritten { .. } => None,
         }
     }
 
@@ -1140,7 +1161,8 @@ impl EventKind {
             | EventKind::ShellOutput { .. }
             | EventKind::ImportFinished { .. }
             // It names a blob it deleted; it references none.
-            | EventKind::BlobDeleted { .. } => (None, None),
+            | EventKind::BlobDeleted { .. }
+            | EventKind::FileWritten { .. } => (None, None),
         };
         let attachments: &[Attachment] = match self {
             EventKind::UserMessage { attachments, .. } => attachments,
@@ -1303,7 +1325,10 @@ pub mod limits {
     /// Largest [`Attachment`](crate::Attachment), in raw bytes, once the
     /// device has shrunk it. The API takes an image up to 5 MiB of base64,
     /// 3,932,160 raw bytes; this keeps a margin. The device shrinks images
-    /// before this applies.
+    /// before this applies. The device refuses a larger image before it
+    /// sends it, and the server refuses a `SendMessage` naming one
+    /// (`AttachmentsTooLarge`). Uploads have their own cap, the server's
+    /// `[files] upload_max`.
     pub const ATTACHMENT_MAX_BYTES: u64 = 3_750_000;
     /// Most raw bytes of one message's [`Attachment`](crate::Attachment)s
     /// together. Bounds one message's upload and the images the agent's
@@ -2410,12 +2435,13 @@ pub enum RejectReason {
     /// span past the blob's last line, or every line kept.
     BadCrop,
     /// A `SendMessage` names an image hash the server has no staged upload
-    /// for (never uploaded, or evicted); upload it and send again.
+    /// for (never uploaded, or evicted), or whose staged upload is not an
+    /// image; upload it and send again.
     UnknownAttachment,
     /// A `SendMessage` with more than [`limits::ATTACHMENTS_MAX`] attachments.
     TooManyAttachments,
-    /// A `SendMessage` whose attachments together exceed
-    /// [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`].
+    /// A `SendMessage` with an image over [`limits::ATTACHMENT_MAX_BYTES`],
+    /// or whose images together exceed [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`].
     AttachmentsTooLarge,
 }
 
@@ -2789,13 +2815,10 @@ pub enum LoginFinishResult {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum UploadResult {
-    /// The image is staged, or already was. `size` is in bytes and
-    /// `media_type` is the sniffed type.
-    Stored { size: u64, media_type: ImageType },
-    /// Over [`limits::ATTACHMENT_MAX_BYTES`]; nothing stored.
+    /// The file is staged, or already was. `size` is in bytes.
+    Stored { size: u64 },
+    /// Over the server's `[files] upload_max`; nothing stored.
     TooLarge,
-    /// Not PNG, JPEG, GIF or WEBP.
-    NotAnImage,
     /// The body does not hash to the path's sha256.
     HashMismatch,
     /// The server's disk is low; nothing stored.
@@ -2853,7 +2876,7 @@ pub enum LimitSeverity {
     Warning,
 }
 
-/// Query string of `GET /v1/workdir/{changes,log,list,file}`. Names a session,
+/// Query string of `GET /v1/workdir/{changes,log,list,file,download}`. Names a session,
 /// not a raw path: the server resolves the root from the session's workdir,
 /// so a device reads only workdirs that sessions run in.
 ///
@@ -3138,10 +3161,64 @@ pub enum FileResult {
 pub enum FileBody {
     /// The bytes, fetched as a blob.
     Blob(BlobRef),
-    /// Not text; not served.
+    /// Not text; `GET /v1/workdir/file` does not serve it (download does).
     Binary,
-    /// Past [`limits::WORKDIR_FILE_MAX_BYTES`].
+    /// Past the route's cap: [`limits::WORKDIR_FILE_MAX_BYTES`] for `file`, the
+    /// server's download cap for `download`.
     TooLarge,
+}
+
+/// Body of `POST` [`path::WORKDIR_WRITE`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WriteFileRequest {
+    pub session: SessionId,
+    /// Relative to the session's workdir, `/` separated; the file to write.
+    pub path: String,
+    /// The staged upload (`PUT` [`path::ATTACHMENT_ROUTE`]) to write there.
+    pub content: ContentHash,
+    /// The sha256 of the file now at `path`, when the user chose to replace
+    /// it; `None` writes only where no file is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<ContentHash>,
+}
+
+/// Response to `POST` [`path::WORKDIR_WRITE`], always 200: every outcome is
+/// a domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum WriteFileResult {
+    /// Written; logged as [`EventKind::FileWritten`] at `seq`. `path` is
+    /// canonical, relative to the workdir.
+    Written {
+        path: String,
+        size: u64,
+        seq: Seq,
+    },
+    /// The file at `path` already holds `content`; nothing written. A retry
+    /// of a write that landed answers this.
+    Same {
+        path: String,
+        size: u64,
+    },
+    /// A different file is at `path` and `replace` is not its sha256;
+    /// nothing written. Resend with `replace: Some(sha256)` to replace it.
+    Exists {
+        sha256: ContentHash,
+        size: u64,
+    },
+    /// `content` is not staged (never uploaded, or evicted): upload it again.
+    NotStaged,
+    IsADirectory,
+    /// A FIFO, socket or device is at `path`.
+    NotAFile,
+    UnknownSession,
+    WorkdirGone,
+    /// Absolute, climbing out of the workdir, or resolving outside it.
+    NotAllowed,
+    /// The directory `path` names does not exist.
+    NotFound,
+    /// The server's disk is low; nothing written.
+    DiskLow,
 }
 
 /// HTTP paths of the v1 API.
@@ -3175,6 +3252,11 @@ pub mod path {
     /// Every worktree of the repositories sessions' worktrees came from:
     /// [`crate::WorktreeList`].
     pub const WORKTREES: &str = "/v1/worktrees";
+    /// One file of a session's workdir to download, text or binary: [`crate::FileResult`].
+    pub const WORKDIR_DOWNLOAD: &str = "/v1/workdir/download";
+    /// Writes a staged upload into a session's workdir: `POST` a
+    /// [`crate::WriteFileRequest`], answered by a [`crate::WriteFileResult`].
+    pub const WORKDIR_WRITE: &str = "/v1/workdir/write";
     /// Route template for blob downloads; `{id}` is a [`BlobId`].
     pub const BLOB_ROUTE: &str = "/v1/blobs/{id}";
 

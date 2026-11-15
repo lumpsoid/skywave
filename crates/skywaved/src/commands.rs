@@ -94,8 +94,9 @@
 //! [`limits::MESSAGE_MAX_BYTES`]: logged verbatim or not at all, never cut.
 //! Then, for a message naming images (staged by hash with `PUT
 //! /v1/attachments`): `TooManyAttachments` for more than
-//! [`limits::ATTACHMENTS_MAX`] names, `AttachmentsTooLarge` when the images
-//! they name total more than [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`], then
+//! [`limits::ATTACHMENTS_MAX`] names, `AttachmentsTooLarge` for an image over
+//! [`limits::ATTACHMENT_MAX_BYTES`] or the images together over
+//! [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`], then
 //! `UnknownAttachment` for a name that is not a staged image. The images are
 //! prepared like a crop ([`crate::attachments`]): the transaction records each
 //! one's new blob, as an `attachment`, and appends the `UserMessage` naming
