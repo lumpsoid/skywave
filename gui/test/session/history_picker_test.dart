@@ -76,6 +76,27 @@ void main() {
     expect(sent, contains(const GuiIntentHistorySearchPick(index: 1)));
   });
 
+  testWidgets('the picker sits above the shell bar', (tester) async {
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(
+        composer: _draft(
+          search: _search(rows: _twoRows, selected: 0, countLabel: '2/5'),
+        ),
+      ),
+      timeline: _holding(),
+      sent: sent,
+    );
+    // Positive control: both are on screen, so the comparison is real.
+    expect(find.byKey(const Key('shell-cwd')), findsOneWidget);
+    final picker = tester.getBottomLeft(
+      find.byKey(const Key('history-picker')),
+    );
+    final bar = tester.getTopLeft(find.byKey(const Key('shell-cwd')));
+    expect(picker.dy, lessThanOrEqualTo(bar.dy));
+  });
+
   testWidgets('matched chars are highlighted', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(

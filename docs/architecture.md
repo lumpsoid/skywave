@@ -1720,7 +1720,7 @@ skywave-core                 all logic, sync, replica
   `ComposerView::history_search` carries at most 100 rows, the selected row,
   a `matching/total` count and an empty label, each row's matched chars as
   `Utf16Range`s. Dart only
-  draws it: an inline list directly above the composer field (the field
-  keeps focus), newest row at the bottom as in fzf, matched chars
+  draws it: an inline list at the top of the composer, above its shell bar
+  (the field keeps focus), newest row at the bottom as in fzf, matched chars
   highlighted. Up/Down and Ctrl-P/N move while it is open, Enter and Tab
   accept, Esc closes.

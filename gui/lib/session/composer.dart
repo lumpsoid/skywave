@@ -342,6 +342,8 @@ class ComposerState extends State<Composer> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              if (shell && composer.historySearch != null)
+                HistoryPicker(view: composer.historySearch!, send: widget.send),
               if (notes.isNotEmpty)
                 Padding(
                   padding: const EdgeInsets.only(left: 4, bottom: 4),
@@ -404,8 +406,6 @@ class ComposerState extends State<Composer> {
                   preparing: composer.preparing,
                   send: widget.send,
                 ),
-              if (shell && composer.historySearch != null)
-                HistoryPicker(view: composer.historySearch!, send: widget.send),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
