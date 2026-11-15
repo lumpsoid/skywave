@@ -13,9 +13,11 @@ class TimelineHolder extends ChangeNotifier {
   String? get sessionId => _sessionId;
   String? _sessionId;
 
-  /// The rows, in timeline order.
-  List<TimelineRow> get rows => List.unmodifiable(_rows);
+  /// The rows, in timeline order, as of the last [apply]: the same list until
+  /// the next one, so a reader holding it sees no change.
+  List<TimelineRow> get rows => _rowsView ??= List.unmodifiable(_rows);
   List<TimelineRow> _rows = [];
+  List<TimelineRow>? _rowsView;
 
   /// Bumped by every [apply], so a reader can tell the rows changed without
   /// comparing them.
@@ -23,8 +25,19 @@ class TimelineHolder extends ChangeNotifier {
   int _revision = 0;
 
   /// Where the row keyed [key] is, or -1; for a keyed list's
-  /// `findChildIndexCallback`.
-  int indexOf(String key) => _rows.indexWhere((row) => row.key == key);
+  /// `findChildIndexCallback`. A map lookup; the map is rebuilt at most once
+  /// per [apply], and the first row with a repeated key wins.
+  int indexOf(String key) => (_indexByKey ??= _buildIndex())[key] ?? -1;
+
+  Map<String, int>? _indexByKey;
+
+  Map<String, int> _buildIndex() {
+    final index = <String, int>{};
+    for (var i = 0; i < _rows.length; i++) {
+      index.putIfAbsent(_rows[i].key, () => i);
+    }
+    return index;
+  }
 
   void connect() {
     _subscription = TimelineUpdate.rustSignalStream.listen(
@@ -47,6 +60,8 @@ class TimelineHolder extends ChangeNotifier {
     } else if (update is TimelineUpdateRemoved) {
       _rows.removeWhere((row) => row.key == update.key);
     }
+    _rowsView = null;
+    _indexByKey = null;
     _revision++;
     notifyListeners();
   }
