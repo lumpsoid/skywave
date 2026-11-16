@@ -1475,8 +1475,9 @@ logs) an event that no longer decodes rather than failing.
   screen is open (by its reply or, the reply lost, by the log).
   `StorageView` shows `Loading`, `Ready` or `Unavailable(Offline |
   Failed)`, the latest report (a failed refresh keeps the one before) and
-  the replica's title for each session it names; a session missing there
-  is not on this device. Only the latest request's answer is kept;
+  what the replica knows of each session it names (`StorageView::sessions`:
+  its title, whether it is archived, and the two delete gates); a session
+  missing there is not on this device. Only the latest request's answer is kept;
   offline nothing is asked. Nothing is stored: opening the screen drops
   the last report and asks again. The same asks also read this device's
   own report (`StorageView::device`, `store::read_device_storage`: the
@@ -1489,7 +1490,10 @@ logs) an event that no longer decodes rather than failing.
   nothing meanwhile. The server's `507` (no free disk for a reclaim) is
   `Unavailable(NoRoomToReclaim)`, the report before kept. `skywave_present::storage` words the
   totals and the three lists (by session, largest blobs, shell runs) for
-  both heads, with what a blob or run row may do (`RowActions`: delete
+  both heads. The by-session list joins the server's sessions with this
+  device's (largest by both sizes), so it shows offline too; each row
+  carries its `SessionFacts` for selecting it. A blob or run row may do
+  (`RowActions`: delete
   any blob, crop tool or shell output of a session in this replica; a
   run acts on its `output_blob`). `skywave_present::blob_actions` holds
   the same rule for a timeline item's content and the confirmation
