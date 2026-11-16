@@ -23,12 +23,15 @@ pub(crate) struct Storage {
     waiting: Option<u64>,
     status: Option<StorageStatus>,
     report: Option<StorageReport>,
-    /// Id of the latest [`Request::DeviceStorage`]; never reused.
+    /// Id of the latest [`Request::DeviceStorage`] or
+    /// [`Request::ReclaimDeviceStorage`]; never reused.
     device_req: u64,
     /// The device request the screen waits on; `None` when nothing is in
     /// flight.
     device_waiting: Option<u64>,
     device: Option<DeviceStorage>,
+    /// A `ReclaimDeviceStorage` is the request `device_waiting` names.
+    device_reclaiming: bool,
 }
 
 impl Storage {
@@ -37,14 +40,18 @@ impl Storage {
     pub(crate) fn open(&mut self, online: bool) -> Vec<Request> {
         self.report = None;
         self.device = None;
-        // Cleared so that `refresh` is not held back by a reclaim.
+        // Cleared so that `refresh` is not held back by a reclaim, of the
+        // server or of this device.
         self.status = None;
+        self.device_reclaiming = false;
         self.refresh(online)
     }
 
     /// Asks the server again, and this device for its report, keeping the
     /// reports shown until the answers. Offline the server is unavailable at
-    /// once. Nothing while a reclaim runs.
+    /// once. Nothing while a server reclaim runs. This device's report is not
+    /// asked while its own reclaim runs: its answer would supersede the
+    /// reclaim's.
     pub(crate) fn refresh(&mut self, online: bool) -> Vec<Request> {
         if self.reclaiming() {
             return Vec::new();
@@ -59,7 +66,9 @@ impl Storage {
             self.waiting = None;
             self.status = Some(StorageStatus::Unavailable(StorageUnavailable::Offline));
         }
-        asked.push(self.ask_device());
+        if !self.device_reclaiming {
+            asked.push(self.ask_device());
+        }
         asked
     }
 
@@ -79,6 +88,21 @@ impl Storage {
         self.waiting = Some(self.req);
         self.status = Some(StorageStatus::Reclaiming);
         Some(Request::ReclaimStorage { req: self.req })
+    }
+
+    /// Asks this device to reclaim its database's space, keeping the device
+    /// report shown until the answer, which is this device's report read
+    /// again. Nothing while a device reclaim runs.
+    pub(crate) fn reclaim_device(&mut self) -> Option<Request> {
+        if self.device_reclaiming {
+            return None;
+        }
+        self.device_req += 1;
+        self.device_waiting = Some(self.device_req);
+        self.device_reclaiming = true;
+        Some(Request::ReclaimDeviceStorage {
+            req: self.device_req,
+        })
     }
 
     /// The server's answer to request `req`; a stale one is ignored.
@@ -125,6 +149,7 @@ impl Storage {
             return;
         }
         self.device_waiting = None;
+        self.device_reclaiming = false;
         match result {
             Ok(device) => self.device = Some(device),
             Err(error) => tracing::debug!(%error, "device storage report failed"),
@@ -153,6 +178,11 @@ impl Storage {
 
     fn reclaiming(&self) -> bool {
         matches!(self.status, Some(StorageStatus::Reclaiming))
+    }
+
+    /// Whether this device's database is being reclaimed.
+    pub(crate) fn device_reclaiming(&self) -> bool {
+        self.device_reclaiming
     }
 }
 
@@ -212,6 +242,13 @@ mod tests {
         match request {
             Some(Request::ReclaimStorage { req }) => req,
             other => panic!("expected a reclaim request, got {other:?}"),
+        }
+    }
+
+    fn device_reclaim_req(request: Option<Request>) -> u64 {
+        match request {
+            Some(Request::ReclaimDeviceStorage { req }) => req,
+            other => panic!("expected a device reclaim request, got {other:?}"),
         }
     }
 
@@ -299,6 +336,57 @@ mod tests {
         let second = device_req(storage.refresh(true));
         storage.device_read(second, Err(StoreError::Corrupt("test")));
         assert_eq!(storage.shown().2, Some(device(1)));
+    }
+
+    #[test]
+    fn reclaiming_the_device_shows_the_fresh_report() {
+        let mut storage = Storage::default();
+        let first = device_req(storage.open(true));
+        storage.device_read(first, Ok(device(1)));
+        let reclaim = device_reclaim_req(storage.reclaim_device());
+        assert!(storage.device_reclaiming());
+        assert_eq!(storage.reclaim_device(), None);
+        // The server is still asked; this device's report is not, as its
+        // answer would supersede the reclaim's.
+        let asked = storage.refresh(true);
+        assert!(asked.contains(&Request::Storage { req: 2 }), "{asked:?}");
+        assert!(
+            asked
+                .iter()
+                .all(|request| !matches!(request, Request::DeviceStorage { .. })),
+            "{asked:?}"
+        );
+        assert_eq!(storage.shown().2, Some(device(1)));
+        storage.device_read(reclaim, Ok(device(2)));
+        assert_eq!(storage.shown().2, Some(device(2)));
+        assert!(!storage.device_reclaiming());
+    }
+
+    #[test]
+    fn a_failed_device_reclaim_keeps_the_report_before() {
+        let mut storage = Storage::default();
+        let first = device_req(storage.open(true));
+        storage.device_read(first, Ok(device(1)));
+        let reclaim = device_reclaim_req(storage.reclaim_device());
+        storage.device_read(reclaim, Err(StoreError::Corrupt("test")));
+        assert_eq!(storage.shown().2, Some(device(1)));
+        assert!(!storage.device_reclaiming());
+        assert!(storage.reclaim_device().is_some());
+    }
+
+    #[test]
+    fn opening_the_screen_forgets_a_device_reclaim() {
+        let mut storage = Storage::default();
+        device_req(storage.open(true));
+        let reclaim = device_reclaim_req(storage.reclaim_device());
+        let reopened = device_req(storage.open(true));
+        assert_ne!(reopened, reclaim);
+        assert!(!storage.device_reclaiming());
+        // The reclaim's answer is no longer waited on.
+        storage.device_read(reclaim, Ok(device(9)));
+        assert_eq!(storage.shown().2, None);
+        storage.device_read(reopened, Ok(device(3)));
+        assert_eq!(storage.shown().2, Some(device(3)));
     }
 
     #[test]

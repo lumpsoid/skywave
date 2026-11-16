@@ -107,6 +107,13 @@ pub enum Request {
     ReclaimStorage {
         req: u64,
     },
+    /// Give this device's database's free pages back to the disk, then read
+    /// this device's storage again, for the storage screen, off the state
+    /// lock. Needs no server. Answer with [`Seam::device_storage_read`],
+    /// naming `req`.
+    ReclaimDeviceStorage {
+        req: u64,
+    },
     /// Ask the server for its worktree list, for the worktrees screen,
     /// within [`WORKTREES_TIMEOUT`](crate::WORKTREES_TIMEOUT). Answer with
     /// [`Seam::worktrees_listed`], naming `req`.
@@ -716,6 +723,14 @@ impl Seam {
             })
         })
         .unwrap_or_else(|never| match never {});
+    }
+
+    /// Runs [`Store::reclaim_space`](crate::Store::reclaim_space) under the
+    /// state lock; call it from a blocking thread.
+    pub fn reclaim_device_space(&self) -> Result<(), StoreError> {
+        self.core
+            .shared
+            .update::<(), StoreError>(|state, _| state.store.reclaim_space())
     }
 
     /// The answer to [`Request::ReclaimStorage`] `req`. Kept in memory only;

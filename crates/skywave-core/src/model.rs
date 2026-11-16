@@ -747,6 +747,16 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::ReclaimDeviceSpace => {
+                if self.place != Place::Storage {
+                    return Vec::new();
+                }
+                self.storage
+                    .reclaim_device()
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
             Action::RefreshWorktrees => {
                 if self.device().is_none() || self.place != Place::Worktrees {
                     return Vec::new();
@@ -3213,6 +3223,7 @@ impl Model {
             pending: self.blob_pendings(),
             gone,
             device,
+            device_reclaiming: self.storage.device_reclaiming(),
         }
     }
 
@@ -12416,6 +12427,47 @@ mod tests {
         // Elsewhere a reclaim asks nothing.
         f.dispatch(Action::Navigate(Route::Settings));
         assert_eq!(reclaim_req(&f.dispatch(Action::ReclaimServerSpace)), None);
+    }
+
+    fn device_reclaim_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::ReclaimDeviceStorage { req })] => Some(*req),
+            other => panic!("expected a device reclaim request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reclaiming_this_device_asks_on_the_storage_screen_only() {
+        let mut f = Fixture::paired();
+        assert_eq!(
+            device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)),
+            None
+        );
+
+        let effects = f.dispatch(Action::Navigate(Route::Storage));
+        let device = device_req(&effects).unwrap();
+        f.model
+            .device_storage_read(device, Ok(device_storage(4096)));
+        let reclaim = device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)).unwrap();
+        assert!(storage_view(&f).device_reclaiming);
+        // Nothing else is asked while it runs.
+        assert_eq!(
+            device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)),
+            None
+        );
+        assert_eq!(device_req(&f.dispatch(Action::RefreshStorage)), None);
+        f.model
+            .device_storage_read(reclaim, Ok(device_storage(2048)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(2048)));
+        assert!(!storage_view(&f).device_reclaiming);
+
+        // Elsewhere a reclaim asks nothing.
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(
+            device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)),
+            None
+        );
     }
 
     fn worktrees_view(f: &Fixture) -> WorktreesView {

@@ -6766,3 +6766,32 @@ fn the_device_report_counts_events_blobs_and_attachments() {
     let sessions: Vec<SessionId> = after.sessions.iter().map(|s| s.session).collect();
     assert_eq!(sessions, [log.a], "a deleted session is not listed");
 }
+
+#[test]
+fn reclaiming_space_gives_free_pages_back() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    // Seven small events leave no page empty once deleted: a big message in
+    // B does, so its overflow pages go to the freelist.
+    let mut batch = log.batch(1, 7);
+    batch.events.push(event(
+        log.b,
+        7,
+        EventKind::UserMessage {
+            device_id: DeviceId::new(),
+            text: "x".repeat(400_000),
+            attachments: Vec::new(),
+        },
+    ));
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    store.delete_session_locally(log.a, at(2)).unwrap();
+    store.delete_session_locally(log.b, at(3)).unwrap();
+
+    let before = read_device_storage(&dir).unwrap();
+    assert!(before.reclaimable > 0, "{before:?}");
+    store.reclaim_space().unwrap();
+    let after = read_device_storage(&dir).unwrap();
+    assert_eq!(after.reclaimable, 0, "{after:?}");
+    assert!(after.database < before.database, "{before:?} -> {after:?}");
+}

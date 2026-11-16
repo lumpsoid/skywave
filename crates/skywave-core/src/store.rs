@@ -1828,6 +1828,17 @@ impl Store {
         Ok(blobs)
     }
 
+    /// Give the database's free pages back to the disk: `VACUUM`, then
+    /// truncate the WAL. Holds the database for its whole run.
+    pub fn reclaim_space(&mut self) -> Result<(), StoreError> {
+        self.conn.execute_batch("VACUUM;")?;
+        // The pragma answers a row (busy, log and checkpointed frames); a
+        // reader still in the WAL only leaves it to the next checkpoint.
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     /// Every stored turn's usage, in log order.
     pub fn turns(&self) -> Result<Vec<TurnRecord>, StoreError> {
         let mut stmt = self
