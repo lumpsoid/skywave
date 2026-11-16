@@ -42,8 +42,10 @@ IconData toolIcon(ToolKindView kind) => switch (kind) {
 };
 
 /// An agent state's icon asset: each state has its own shape, so the icon
-/// reads without its colour. The shapes are drawn in Skywave's radio
-/// language: a station dot, its arcs, and the logo's skywave chevron.
+/// reads without its colour. The logo's ionosphere arc sits over the
+/// station: idle a dot, working the ray bouncing off it, approval an
+/// exclamation mark, error the ray escaping a broken layer, stopped a hollow
+/// station with no sky.
 String agentIconAsset(AgentState state) => switch (state) {
   AgentState.idle => 'assets/status/idle.svg',
   AgentState.working => 'assets/status/working.svg',
