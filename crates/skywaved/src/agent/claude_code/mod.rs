@@ -19,9 +19,10 @@
 //! `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` ([`KEEP_BASH_CWD_ENV`]), so
 //! a Bash call starts in the workdir. The `--settings`
 //! ([`KEEP_TRANSCRIPTS_SETTINGS`]) keeps the CLI's own retention sweep from
-//! deleting the transcripts a resume needs. A CLI that still
-//! reports another version than [`protocol::PINNED_VERSION`] is reported as
-//! [`AdapterEvent::VersionUnconfirmed`](super::AdapterEvent::VersionUnconfirmed).
+//! deleting the transcripts a resume needs; a `DeleteSession` deletes the
+//! session's transcripts itself ([`AgentAdapter::forget`], D62). A CLI that
+//! still reports another version than [`protocol::PINNED_VERSION`] is
+//! reported as [`AdapterEvent::VersionUnconfirmed`](super::AdapterEvent::VersionUnconfirmed).
 //!
 //! A fresh context gets a new UUID as `--session-id`, reported with the first
 //! turn as the context's [`ResumeHandle`](super::ResumeHandle)
@@ -126,7 +127,8 @@ pub mod transcripts;
 pub mod usage;
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -145,8 +147,8 @@ use self::lines::{Line, LineReader, MAX_LINE};
 use self::protocol::{Output, Protocol, mode_name};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    Conversation, Effort, INTERRUPT_UNANSWERED, PermissionMode, QuestionAnswer, StartSpec,
-    UserInput,
+    Conversation, Effort, INTERRUPT_UNANSWERED, PermissionMode, QuestionAnswer, ResumeHandle,
+    StartSpec, UserInput,
 };
 use crate::config::AgentConfig;
 use crate::process::{self, DEFAULT_TERM_GRACE, Group};
@@ -273,6 +275,9 @@ pub struct ClaudeCodeAdapter {
     startup_timeout: Duration,
     write_timeout: Duration,
     term_grace: Duration,
+    /// The CLI's projects dir, whose transcripts [`AgentAdapter::forget`]
+    /// deletes; `None` when the environment names no home.
+    projects: Option<PathBuf>,
 }
 
 impl ClaudeCodeAdapter {
@@ -283,7 +288,15 @@ impl ClaudeCodeAdapter {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             term_grace: DEFAULT_TERM_GRACE,
+            projects: transcripts::projects_dir(),
         }
+    }
+
+    /// Sets the projects dir [`AgentAdapter::forget`] deletes transcripts
+    /// from (by default the CLI's own, [`transcripts::projects_dir`]).
+    pub fn with_projects(mut self, projects: PathBuf) -> ClaudeCodeAdapter {
+        self.projects = Some(projects);
+        self
     }
 
     /// Sets how long shutdown waits before killing the process.
@@ -541,6 +554,35 @@ impl AgentAdapter for ClaudeCodeAdapter {
             task,
         };
         Ok((session, events_rx))
+    }
+
+    fn forget(&self, workdir: &Path, handle: &ResumeHandle) {
+        let id = match protocol::parse_resume_handle(handle) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("cannot delete a conversation's transcript: {e}");
+                return;
+            }
+        };
+        let Some(projects) = &self.projects else {
+            tracing::warn!("cannot delete a conversation's transcript: no projects dir");
+            return;
+        };
+        let dir = projects.join(transcripts::project_dir(&workdir.to_string_lossy()));
+        // The id is a UUID, so neither path leaves `dir`.
+        let transcript = dir.join(format!("{id}.jsonl"));
+        let sidecars = dir.join(id.to_string());
+        forgotten(&transcript, fs::remove_file(&transcript));
+        forgotten(&sidecars, fs::remove_dir_all(&sidecars));
+    }
+}
+
+/// Logs a failed delete of `path`, unless the file was already gone.
+fn forgotten(path: &Path, removed: std::io::Result<()>) {
+    if let Err(e) = removed
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), "cannot delete the agent's transcript: {e}");
     }
 }
 

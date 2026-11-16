@@ -1712,6 +1712,7 @@ archived session. An accepted delete, in one transaction, frees nothing:
   that is not erased.
 
 The supervisor erases the session once it has read the tombstone and nothing of the session runs, starts or stops: queued work is dropped, a running agent is stopped (its exit is logged, then erased), and a restart finishes a deletion it had not.
+The supervisor deletes the agent's own transcript of each of the session's conversations (`AgentAdapter::forget`; for Claude Code `<projects>/<dir>/<id>.jsonl` and `<id>/`, which Claude otherwise keeps forever), except a context moved to another session, which that session still forks (D30). Best effort: a conversation already gone is not an error, and a failure is logged, so the erase always runs. It runs before the erase, so a restart repeats it.
 Erasing, in one transaction:
 - erases the session's events in place. Each keeps its seq, session,
   time, command and context, and its kind becomes `Erased`. The log stays
@@ -1725,6 +1726,8 @@ Erasing, in one transaction:
   `shell_runs` rows. An event blob is never shared (D44), so its file goes
   too, once the erase commits. A workdir blob is shared by content, so it
   stays until the workdir collection finds nothing names it.
+- clears its contexts' `agent_state` resume handles, except a context moved
+  to another session.
 - marks the session `erased`. Its `sessions` and `contexts` rows stay,
   because other rows reference them. Appends for it are refused from then
   on, and it is in no session list.
@@ -1732,7 +1735,5 @@ Erasing, in one transaction:
 The delete is irreversible.
 
 **Deferred here:**
-- The supervisor stopping the agent and deleting its transcript (the
-  session's `contexts.agent_state` stays for that).
 - Devices dropping their copy of an erased session.
 - Compacting the database file: an erased row's space is not given back.

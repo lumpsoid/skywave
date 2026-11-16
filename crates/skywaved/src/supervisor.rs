@@ -342,8 +342,9 @@ use tokio::time::Instant;
 use crate::agent::mapper::SafetyApproval;
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    Conversation, EventMapper, ImageInput, LoginSeen, LoginSource, LoginState, StartSpec,
-    UserInput, bounded_models, load_grants, load_origin, load_resume_handle, unsent_notice,
+    Conversation, EventMapper, ImageInput, LoginSeen, LoginSource, LoginState, ResumeHandle,
+    StartSpec, UserInput, bounded_models, load_grants, load_origin, load_resume_handle,
+    unsent_notice,
 };
 use crate::db::Db;
 use crate::disk::Disk;
@@ -1355,6 +1356,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         {
             return Ok(());
         }
+        self.forget_transcripts(id)?;
         let tx = event_log::begin(&mut self.storage.db)?;
         let freed = event_log::erase_session_in(&tx, id)?;
         tx.commit()?;
@@ -1365,6 +1367,32 @@ impl<A: AgentAdapter> Supervisor<A> {
         }
         self.deleting.remove(&id);
         tracing::info!(session = %id.0, "session erased");
+        Ok(())
+    }
+
+    /// Has the agent forget each conversation session `id` holds (D62), before
+    /// the erase clears their handles. A context moved to another session is
+    /// skipped: that session still forks its conversation (D30). Repeated
+    /// after a crash before the erase, so the adapter's forget is idempotent.
+    fn forget_transcripts(&self, id: SessionId) -> Result<()> {
+        let conn = self.storage.db.conn();
+        let session = id.0.to_string();
+        let workdir: String = conn.query_row(
+            "SELECT workdir FROM sessions WHERE id = ?1",
+            [&session],
+            |r| r.get(0),
+        )?;
+        let handles = conn
+            .prepare(
+                "SELECT agent_state FROM contexts
+                  WHERE session_id = ?1 AND agent_state IS NOT NULL AND moved_to IS NULL",
+            )?
+            .query_map([&session], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        for text in handles {
+            let handle: ResumeHandle = serde_json::from_str(&text)?;
+            self.adapter.forget(Path::new(&workdir), &handle);
+        }
         Ok(())
     }
 
