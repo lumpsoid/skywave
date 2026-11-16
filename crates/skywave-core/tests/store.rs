@@ -13,8 +13,8 @@ use skywave_core::store::OutboxFile;
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, AttachmentRefusal, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError,
-    Draft, LockError, OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Screen,
-    ServerAddress, ServerFacts, Settings, Snippet, SnippetId, Store, StoreError,
+    Draft, LockError, OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, SafetyRule,
+    Screen, ServerAddress, ServerFacts, Settings, Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
@@ -897,7 +897,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 20);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 21);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -1028,7 +1028,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 22);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 23);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1715,7 +1715,7 @@ fn v27_opens_a_v26_replica_without_usage_limits() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -2331,7 +2331,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 16);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2476,7 +2476,7 @@ fn sessions_are_ordered_by_their_newest_message_and_backfilled_by_the_migration(
     drop(store);
 
     // A replica from before the column: the migration derives it from the log.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
     let store = Store::open(&dir).unwrap();
     assert_eq!(order(&store), vec![c, b, a]);
     assert_eq!(store.session(c).unwrap().unwrap().last_message_seq, Seq(5));
@@ -2492,27 +2492,33 @@ const SHELL: ComposerMode = ComposerMode::Shell;
 /// server facts, canonicalizing the server addresses, creating the
 /// attachment tables and rebuilding the workdir snapshots, rerun over a
 /// current schema as is, and so does the download's rebuild after them. The
-/// file tables, the newest migration, are dropped below it, so their rerun
-/// does not find them.
+/// file tables and the safety check's column are dropped below their
+/// migrations, and the safety rules table below the newest one, so their
+/// reruns do not find them. Each threshold is `SCHEMA_VERSION - m`, `m` being
+/// how many migrations come after the one it undoes.
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
-    if version < skywave_core::store::SCHEMA_VERSION - 1 {
+    if version < skywave_core::store::SCHEMA_VERSION {
+        conn.execute_batch("DROP TABLE IF EXISTS safety_rules;")
+            .unwrap();
+    }
+    if version < skywave_core::store::SCHEMA_VERSION - 2 {
         conn.execute_batch("DROP TABLE draft_files; DROP TABLE outbox_files;")
             .unwrap();
     }
-    if version < skywave_core::store::SCHEMA_VERSION {
+    if version < skywave_core::store::SCHEMA_VERSION - 1 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN safety_check;")
             .unwrap();
     }
-    if version < skywave_core::store::SCHEMA_VERSION - 3 {
+    if version < skywave_core::store::SCHEMA_VERSION - 4 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN worktree_removed;")
             .unwrap();
     }
-    if version < skywave_core::store::SCHEMA_VERSION - 4 {
+    if version < skywave_core::store::SCHEMA_VERSION - 5 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN worktree;")
             .unwrap();
     }
-    if version < skywave_core::store::SCHEMA_VERSION - 9 {
+    if version < skywave_core::store::SCHEMA_VERSION - 10 {
         conn.execute_batch("ALTER TABLE sessions DROP COLUMN last_message_seq;")
             .unwrap();
     }
@@ -2535,8 +2541,8 @@ fn set_user_version_drops_the_list_order_column_exactly_below_its_migration() {
             > 0
     };
     for (version, present) in [
-        (skywave_core::store::SCHEMA_VERSION - 10, false),
-        (skywave_core::store::SCHEMA_VERSION - 9, true),
+        (skywave_core::store::SCHEMA_VERSION - 11, false),
+        (skywave_core::store::SCHEMA_VERSION - 10, true),
     ] {
         let (_tmp, dir) = data_dir();
         drop(Store::open(&dir).unwrap());
@@ -2569,7 +2575,7 @@ fn the_migration_moves_the_hello_settings_rows_into_the_server_facts() {
         ))
         .unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 9);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 10);
     };
     let settings_keys = |dir: &Path| -> Vec<String> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2631,7 +2637,7 @@ fn the_migration_canonicalizes_the_stored_server_addresses() {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
         conn.execute_batch(rows).unwrap();
         drop(conn);
-        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 8);
+        set_user_version(dir, skywave_core::store::SCHEMA_VERSION - 9);
     };
     let stored = |dir: &Path| -> Vec<(String, String)> {
         let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
@@ -2877,7 +2883,7 @@ fn the_attachment_tables_come_with_the_migration() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());
     drop_attachments(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
 
     let store = Store::open(&dir).unwrap();
     store
@@ -3457,7 +3463,7 @@ fn the_file_tables_come_with_the_migration() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());
     // A rewind below the migration drops both file tables.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
 
     let store = Store::open(&dir).unwrap();
     store
@@ -4138,7 +4144,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 23);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 24);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -4911,7 +4917,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 21);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 22);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -5274,7 +5280,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 19);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 20);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -5329,7 +5335,7 @@ fn the_workdir_log_migration_keeps_the_stored_answers() {
     assert!(insert("log").is_err(), "and refuses a log");
     drop(tx);
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
 
     let mut store = Store::open(&dir).unwrap();
     let loaded = store.load().unwrap().workdirs;
@@ -5459,7 +5465,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 18);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 19);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -5498,7 +5504,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 17);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 18);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -5540,7 +5546,7 @@ fn the_worktree_migration_backfills_from_the_session_created() {
 
     // The rewind drops the column; the migration re-adds it empty and must
     // backfill it from the stored `session_created` events.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
     let store = Store::open(&dir).unwrap();
     assert_eq!(
         store.session(in_worktree).unwrap().unwrap().worktree,
@@ -5614,7 +5620,7 @@ fn the_worktree_removed_migration_backfills_from_the_log() {
 
     // The rewind drops the column; the migration re-adds it and must
     // backfill it from the stored `worktree_removed` events.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
     let store = Store::open(&dir).unwrap();
     assert!(
         store.session(removed).unwrap().unwrap().worktree_removed,
@@ -5696,7 +5702,7 @@ fn the_safety_check_migration_backfills_from_the_newest_switch() {
 
     // The rewind drops the column; the migration re-adds it and must backfill
     // it from the newest stored `safety_check_set` of each session.
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
     let store = Store::open(&dir).unwrap();
     assert!(
         store.session(on).unwrap().unwrap().safety_check,
@@ -5733,6 +5739,175 @@ fn the_safety_check_migration_backfills_from_the_newest_switch() {
     drop(store);
     let store = Store::open(&fresh).unwrap();
     assert!(store.session(session).unwrap().unwrap().safety_check);
+}
+
+fn words(list: &[&str]) -> Vec<String> {
+    list.iter().map(|word| word.to_string()).collect()
+}
+
+/// A `SessionCreated` for `session`, so the session exists before its rules.
+fn created_session(session: SessionId) -> Event {
+    event(
+        session,
+        0,
+        EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        },
+    )
+}
+
+/// A `SafetyRuleSet` for `list`, logged in `session`.
+fn safety_rule_set(session: SessionId, minute: u32, list: &[&str], on: bool) -> Event {
+    event(
+        session,
+        minute,
+        EventKind::SafetyRuleSet {
+            words: words(list),
+            on,
+            by: DeviceId::new(),
+        },
+    )
+}
+
+#[test]
+fn safety_rules_keep_the_newest_switch_per_words() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: vec![
+                    created_session(a),
+                    created_session(b),
+                    safety_rule_set(a, 1, &["git", "commit"], true),
+                    safety_rule_set(b, 2, &["cargo", "test"], true),
+                    safety_rule_set(b, 3, &["git", "commit"], false),
+                    safety_rule_set(a, 4, &["cargo", "test"], true),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.load().unwrap().safety_rules,
+        vec![
+            SafetyRule {
+                words: words(&["git", "commit"]),
+                on: false,
+                session_id: b,
+            },
+            SafetyRule {
+                words: words(&["cargo", "test"]),
+                on: true,
+                session_id: a,
+            },
+        ]
+    );
+}
+
+#[test]
+fn safety_rules_outlive_a_deleted_session() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: vec![created_session(a), created_session(b)],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    store.delete_session_locally(a, Utc::now()).unwrap();
+    // The server still applies a rule logged in a session deleted here.
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(3),
+                events: vec![safety_rule_set(a, 2, &["git", "commit"], true)],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.load().unwrap().safety_rules,
+        vec![SafetyRule {
+            words: words(&["git", "commit"]),
+            on: true,
+            session_id: a,
+        }]
+    );
+}
+
+#[test]
+fn the_safety_rules_migration_backfills_from_the_newest_switch() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: vec![
+                    created_session(a),
+                    created_session(b),
+                    safety_rule_set(a, 1, &["git", "commit", "-m", "fix it"], true),
+                    safety_rule_set(b, 2, &["git", "commit", "-m", "fix it"], false),
+                    safety_rule_set(b, 3, &["cargo", "test"], true),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    drop(store);
+
+    // The rewind drops the table; the migration rebuilds it from the stored log.
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.load().unwrap().safety_rules,
+        vec![
+            SafetyRule {
+                words: words(&["git", "commit", "-m", "fix it"]),
+                on: false,
+                session_id: b,
+            },
+            SafetyRule {
+                words: words(&["cargo", "test"]),
+                on: true,
+                session_id: b,
+            },
+        ],
+        "the newest switch per words, backfilled"
+    );
+
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(6),
+                events: vec![safety_rule_set(
+                    a,
+                    4,
+                    &["git", "commit", "-m", "fix it"],
+                    true,
+                )],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    let rules = store.load().unwrap().safety_rules;
+    let fix_it: Vec<&SafetyRule> = rules
+        .iter()
+        .filter(|rule| rule.words == words(&["git", "commit", "-m", "fix it"]))
+        .collect();
+    assert_eq!(fix_it.len(), 1, "one row per words");
+    assert!(fix_it[0].on, "turned on again");
 }
 
 /// `hello`'s log against what the replica has seen of it: the cursor and
@@ -6143,7 +6318,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 14);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -6271,7 +6446,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);

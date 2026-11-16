@@ -37,7 +37,7 @@ use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
     AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxFile, OutboxStatus,
-    ReadMark, ServerFacts, Settings, Snapshot,
+    ReadMark, SafetyRule, ServerFacts, Settings, Snapshot,
 };
 use crate::tls;
 use crate::transport::TransportError;
@@ -380,6 +380,9 @@ pub(crate) struct Model {
     devices: HashMap<DeviceId, String>,
     /// The models of the newest `ModelsOffered`, as stored.
     models: Vec<ModelChoice>,
+    /// The safety rules as stored: every rule ever set, on or off, ordered
+    /// by its newest event.
+    safety_rules: Vec<SafetyRule>,
     /// Every turn's usage in the replica, in log order: what the usage
     /// screen totals.
     turns: Vec<TurnRecord>,
@@ -455,6 +458,7 @@ impl Model {
             opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
+            safety_rules: Vec::new(),
             turns: Vec::new(),
             workdirs: Workdirs::default(),
             count_req: 0,
@@ -486,6 +490,7 @@ impl Model {
         self.deleted = snapshot.deleted;
         self.devices = snapshot.devices;
         self.models = snapshot.models;
+        self.safety_rules = snapshot.safety_rules;
         self.turns = snapshot.turns;
         self.workdirs.stored = snapshot.workdirs;
         self.usage_limits.stored = snapshot.usage_limits;
@@ -2075,6 +2080,16 @@ impl Model {
             // Offered for every session, as the store keeps them.
             if let EventKind::ModelsOffered { models } = &event.kind {
                 self.models.clone_from(models);
+            }
+            // Kept whatever session said so, as the store keeps them: the
+            // newest rule for these words moves to the end.
+            if let EventKind::SafetyRuleSet { words, on, .. } = &event.kind {
+                self.safety_rules.retain(|rule| rule.words != *words);
+                self.safety_rules.push(SafetyRule {
+                    words: words.clone(),
+                    on: *on,
+                    session_id: event.session_id,
+                });
             }
             if self.deleted.contains(&event.session_id) {
                 continue;
@@ -5295,6 +5310,7 @@ mod tests {
             alerted: HashSet::new(),
             devices: HashMap::new(),
             models: Vec::new(),
+            safety_rules: Vec::new(),
             snippets: Vec::new(),
             shell_history: Vec::new(),
             turns: Vec::new(),
@@ -10911,6 +10927,7 @@ mod tests {
             alerted: model.alerted.clone(),
             devices: model.devices.clone(),
             models: model.models.clone(),
+            safety_rules: model.safety_rules.clone(),
             snippets: model.snippets.list().to_vec(),
             shell_history: model.shell_history.list().to_vec(),
             turns: model.turns.clone(),
@@ -10952,6 +10969,39 @@ mod tests {
             attention.approvals[0].alerted_at, 0,
             "an earlier process alerted on it"
         );
+    }
+
+    #[test]
+    fn safety_rules_fold_live_and_survive_a_restart() {
+        let mut f = Fixture::paired();
+        let (a, b) = (f.session("/srv/app"), f.session("/srv/api"));
+        let by = DeviceId::new();
+        let git: Vec<String> = vec!["git".into(), "commit".into()];
+        let cargo: Vec<String> = vec!["cargo".into(), "test".into()];
+        let set = |words: &Vec<String>, on: bool| EventKind::SafetyRuleSet {
+            words: words.clone(),
+            on,
+            by,
+        };
+        f.log(a, vec![set(&git, true)]);
+        f.log(a, vec![set(&cargo, true)]);
+        f.log(b, vec![set(&git, false)]);
+        // Git's newest switch came after cargo's, so it moved to the end.
+        let expected = vec![
+            SafetyRule {
+                words: cargo.clone(),
+                on: true,
+                session_id: a,
+            },
+            SafetyRule {
+                words: git.clone(),
+                on: false,
+                session_id: b,
+            },
+        ];
+        assert_eq!(f.model.safety_rules, expected, "live fold");
+        let model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
+        assert_eq!(model.safety_rules, expected, "after a restart");
     }
 
     #[test]

@@ -973,7 +973,7 @@ is newer, the file is damaged, or a row it loads no longer decodes
 `Core::reset_replica(data_dir)` needs no open core, only the data dir's
 lock: it drops what the server's log produced (events and their
 projections, cursor, outbox, blob rows and files, workdir answers, the
-stored usage limits, offered models, device names) and restamps, in one transaction, keeping the
+stored usage limits, offered models, safety rules, device names) and restamps, in one transaction, keeping the
 identity and everything that is this device's (settings, drafts, composer
 modes, snippets, read marks, local deletes, alerted approvals), so the
 next open pulls the whole log again from seq 0. A settings row this build

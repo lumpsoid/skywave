@@ -81,7 +81,8 @@ pub use skywave_proto::PROTOCOL_VERSION;
 pub use skywave_proto::{ContentHash, Fingerprint, ImageType};
 pub use store::{
     Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
-    OutboxStatus, PendingCrop, ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
+    OutboxStatus, PendingCrop, ReadMark, SafetyRule, ServerFacts, Settings, Snapshot, Store,
+    StoreError,
 };
 pub use transport::{
     BlobBody, BlobDownload, BoxFuture, ExpectedRun, StagedUpload, Transport, TransportError,
