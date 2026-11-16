@@ -1309,7 +1309,7 @@ async fn workdir_write(
             replaced,
         }) => (path, sha256, size, replaced),
         Ok(WriteOutcome::Answer(answer)) => return Json(answer).into_response(),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let kind = EventKind::FileWritten {
         path: path.clone(),
@@ -1349,7 +1349,7 @@ async fn workdir_blocking<T: serde::Serialize + Send + 'static>(
 ) -> Response {
     match workdir_task(api, timeout, f).await {
         Ok(answer) => Json(answer).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -1359,10 +1359,10 @@ async fn workdir_task<T: Send + 'static>(
     api: &Arc<Api>,
     timeout: Duration,
     f: impl FnOnce(&WorkdirReader) -> Result<T> + Send + 'static,
-) -> std::result::Result<T, Response> {
+) -> std::result::Result<T, Box<Response>> {
     let permit = match api.fs_permit().await {
         Ok(permit) => permit,
-        Err(status) => return Err(status.into_response()),
+        Err(status) => return Err(Box::new(status.into_response())),
     };
     let api = api.clone();
     let work = tokio::task::spawn_blocking(move || {
@@ -1373,19 +1373,19 @@ async fn workdir_task<T: Send + 'static>(
         Ok(Ok(Ok(answer))) => Ok(answer),
         Ok(Ok(Err(Error::WorkdirDeadline))) => {
             tracing::warn!("workdir snapshot passed its deadline");
-            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+            Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))
         }
         Ok(Ok(Err(e))) => {
             tracing::error!(error = %e, "workdir read failed");
-            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            Err(Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
         }
         Ok(Err(e)) => {
             tracing::error!(error = %e, "workdir task failed");
-            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            Err(Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
         }
         Err(_) => {
             tracing::warn!("workdir read timed out");
-            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+            Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))
         }
     }
 }
