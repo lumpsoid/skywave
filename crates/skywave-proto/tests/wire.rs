@@ -1124,6 +1124,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ApprovalAlreadyResolved,
             RejectReason::ApprovalCancelled,
             RejectReason::ApprovalPending,
+            RejectReason::WorktreeNotRemoved,
             RejectReason::NotAShellCall,
             RejectReason::NoActiveTurn,
             RejectReason::UnknownRule,

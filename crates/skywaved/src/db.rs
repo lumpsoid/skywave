@@ -499,10 +499,12 @@ const MIGRATIONS: &[&str] = &[
     -- uses it only with the expression written exactly so.
     CREATE INDEX events_type ON events (json_extract(kind, '$.type'), seq);
     "#,
-    // v27: a DeleteSession marks the session deleted; its rows stay for the foreign keys (D62).
+    // v27: a DeleteSession sets `requested`; the supervisor sets `erased`
+    // once the session's rows are erased. Its rows stay for the foreign keys
+    // (D62).
     r#"
     ALTER TABLE sessions ADD COLUMN
-        deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1));
+        deletion TEXT CHECK (deletion IN ('requested', 'erased'));
     "#,
 ];
 
@@ -658,7 +660,8 @@ fn v39_to_v40(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-/// v40 to v41: adds `DeleteSession` and two event kinds; nothing stored changes.
+/// v40 to v41: adds `DeleteSession`, two event kinds and the
+/// `WorktreeNotRemoved` refusal; nothing stored changes.
 fn v40_to_v41(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }

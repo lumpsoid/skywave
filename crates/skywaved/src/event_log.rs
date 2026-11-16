@@ -496,7 +496,7 @@ impl EventLog {
             }
         }
         let tx = begin(db)?;
-        if session_in(&tx, session_id)?.is_none() {
+        if session_for_append_in(&tx, session_id)?.is_none() {
             return Err(Error::InvalidAppend(format!(
                 "unknown session {}",
                 session_id.0
@@ -745,11 +745,14 @@ impl EventLog {
         workdir_shell_busy_in(db.conn(), workdir)
     }
 
-    /// Every session not deleted, oldest first.
+    /// Every session the supervisor still has to see, oldest first: every
+    /// session not erased, so a `requested` one is listed until its erase
+    /// finishes (D62).
     pub fn sessions(&self, db: &Db) -> Result<Vec<SessionInfo>> {
         let mut stmt = db.conn().prepare_cached(
             "SELECT id, workdir, turn_active, current_context, turn_context
-             FROM sessions WHERE deleted = 0 ORDER BY rowid",
+             FROM sessions WHERE deletion IS NULL OR deletion = 'requested'
+             ORDER BY rowid",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, SessionRow::from_row(r, 1)?))
@@ -1393,10 +1396,29 @@ pub(crate) fn head_in(conn: &Connection) -> Result<Seq> {
     seq_from_sql(max)
 }
 
+/// The session `id` for commands: a `requested` or `erased` session is gone,
+/// so `None` (D62).
 pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<SessionInfo>> {
     conn.prepare_cached(
         "SELECT workdir, turn_active, current_context, turn_context FROM sessions
-         WHERE id = ?1 AND deleted = 0",
+         WHERE id = ?1 AND deletion IS NULL",
+    )?
+    .query_row([id.0.to_string()], |r| SessionRow::from_row(r, 0))
+    .optional()?
+    .map(|row| row.info(id))
+    .transpose()
+}
+
+/// [`session_in`] for an append: a `requested` session still takes the
+/// events its supervisor logs while it erases the session; an `erased` one
+/// takes none (D62).
+pub(crate) fn session_for_append_in(
+    conn: &Connection,
+    id: SessionId,
+) -> Result<Option<SessionInfo>> {
+    conn.prepare_cached(
+        "SELECT workdir, turn_active, current_context, turn_context FROM sessions
+         WHERE id = ?1 AND (deletion IS NULL OR deletion = 'requested')",
     )?
     .query_row([id.0.to_string()], |r| SessionRow::from_row(r, 0))
     .optional()?
@@ -1405,15 +1427,25 @@ pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<Sess
 }
 
 /// Why `DeleteSession` of session `id` is refused, if it is: a turn runs or
-/// is owed to its agent, a shell command runs or waits, or an approval or
-/// question is open. The first of these that holds, in that order; `None`
-/// when none does.
+/// is owed to its agent, or a message or setting request is not handed to
+/// its agent yet; a shell command runs or waits; an approval or question is
+/// open; or its worktree is still on disk. The first of these that holds, in
+/// that order; `None` when none does.
 pub(crate) fn session_busy_in(conn: &Connection, id: SessionId) -> Result<Option<RejectReason>> {
     let session = id.0.to_string();
+    // The unhanded requests are those past the supervisor's position for the
+    // session: its held seq if it is held, else the cursor (as
+    // `WORKDIR_TURN_BUSY_SQL` reads them for a directory).
     let turn: bool = conn
         .prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND turn_active = 1)
-                OR EXISTS (SELECT 1 FROM supervisor_owed WHERE session_id = ?1)",
+                OR EXISTS (SELECT 1 FROM supervisor_owed WHERE session_id = ?1)
+                OR EXISTS (SELECT 1 FROM events WHERE session_id = ?1
+                     AND json_extract(kind, '$.type') IN
+                         ('user_message', 'permission_mode_requested', 'model_requested', 'effort_requested')
+                     AND seq > COALESCE(
+                         (SELECT h.seq FROM supervisor_held h WHERE h.session_id = ?1),
+                         (SELECT c.seq FROM supervisor_cursor c WHERE c.id = 1)))",
         )?
         .query_row([&session], |r| r.get(0))?;
     if turn {
@@ -1432,7 +1464,16 @@ pub(crate) fn session_busy_in(conn: &Connection, id: SessionId) -> Result<Option
             "SELECT EXISTS (SELECT 1 FROM approvals WHERE session_id = ?1 AND closed_seq IS NULL)",
         )?
         .query_row([&session], |r| r.get(0))?;
-    Ok(approval.then_some(RejectReason::ApprovalPending))
+    if approval {
+        return Ok(Some(RejectReason::ApprovalPending));
+    }
+    // Its directory is removed by `RemoveWorktree`, which logs
+    // `WorktreeRemoved`: the same test `RemoveWorktree` makes for "already
+    // removed".
+    if worktree_in(conn, id)?.is_some() && !worktree_removed_in(conn, id)? {
+        return Ok(Some(RejectReason::WorktreeNotRemoved));
+    }
+    Ok(None)
 }
 
 /// [`EventLog::worktree_of`]: the worktree its `SessionCreated` names. A
@@ -1803,13 +1844,27 @@ pub(crate) fn delete_blob_row_in(conn: &Connection, id: BlobId) -> Result<()> {
     Ok(())
 }
 
-/// Erases session `id` for `DeleteSession` (D62), in the command's
+/// Marks session `id` `requested` for `DeleteSession` (D62): commands and
+/// the session lists stop treating it as live, and the supervisor erases it.
+pub(crate) fn request_deletion_in(conn: &Connection, id: SessionId) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET deletion = 'requested' WHERE id = ?1",
+        [id.0.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Erases session `id` once its `DeleteSession` is logged (D62), in one
 /// transaction. Its events keep their seq, session, time, command and
 /// context, and their kind becomes [`EventKind::Erased`], so the log stays
-/// contiguous. Its event blobs' rows go, and the rows only its live state
+/// contiguous. Its `session_created` and `worktree_removed` events stay, as
+/// `WORKDIR_WORKTREE_REMOVED_SQL` reads them for other sessions' worktrees,
+/// and its `session_deleted` tombstone stays, as devices learn of the delete
+/// from it. Its event blobs' rows go, and the rows only its live state
 /// needs. The `sessions` and `contexts` rows stay, since other rows
-/// reference them; `sessions.deleted` hides it. Returns the blobs its events
-/// named: their files are the caller's to remove after commit.
+/// reference them; `sessions.deletion` becomes `erased`. Returns the blobs
+/// its events named: their files are the caller's to remove after commit.
+#[allow(dead_code)] // called by the supervisor in the next commit (D62)
 pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<BlobId>> {
     let session = id.0.to_string();
     let blobs = conn
@@ -1834,10 +1889,15 @@ pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<B
     conn.execute("DELETE FROM shell_runs WHERE session_id = ?1", [&session])?;
     let erased = serde_json::to_string(&EventKind::Erased)?;
     conn.execute(
-        "UPDATE events SET kind = ?2 WHERE session_id = ?1",
+        "UPDATE events SET kind = ?2 WHERE session_id = ?1
+           AND json_extract(kind, '$.type') NOT IN
+               ('session_created', 'worktree_removed', 'session_deleted')",
         params![session, erased],
     )?;
-    conn.execute("UPDATE sessions SET deleted = 1 WHERE id = ?1", [&session])?;
+    conn.execute(
+        "UPDATE sessions SET deletion = 'erased' WHERE id = ?1",
+        [&session],
+    )?;
     Ok(blobs)
 }
 
@@ -2173,5 +2233,88 @@ mod tests {
         assert_eq!(rows(), 1, "A's late forget removed B's row");
         forget_worktree_intent_in(conn, &b.repo, &b.branch, &b.attempt).unwrap();
         assert_eq!(rows(), 0);
+    }
+
+    /// Erasing keeps a session's `session_created`, `worktree_removed` and
+    /// tombstone rows and erases the rest. A `requested` session still takes
+    /// the supervisor's appends; an erased one takes none.
+    #[test]
+    fn erasing_keeps_the_created_removed_and_tombstone_rows_and_closes_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        let session = SessionId::new();
+        let context = ContextId::first_of(session);
+        let device = DeviceId::new();
+        let tx = begin(&mut db).unwrap();
+        let add = |kind: EventKind| append_in(&tx, session, context, None, &kind).unwrap();
+        add(EventKind::SessionCreated {
+            workdir: "/w".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        });
+        add(EventKind::UserMessage {
+            device_id: device,
+            text: "hi".into(),
+            attachments: Vec::new(),
+        });
+        add(EventKind::WorktreeRemoved { by: device });
+        add(EventKind::SessionDeleted { by: device });
+        tx.commit().unwrap();
+        let kinds = |db: &Db| -> Vec<String> {
+            db.conn()
+                .prepare(
+                    "SELECT json_extract(kind, '$.type') FROM events
+                     WHERE session_id = ?1 ORDER BY seq",
+                )
+                .unwrap()
+                .query_map([session.0.to_string()], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap()
+        };
+        let log = EventLog::open(&db, Vec::new()).unwrap();
+        let idle = || EventKind::SessionStateChanged(SessionState::Idle);
+        let for_append = |db: &Db| session_for_append_in(db.conn(), session).unwrap();
+
+        db.conn()
+            .execute(
+                "UPDATE sessions SET deletion = 'requested' WHERE id = ?1",
+                [session.0.to_string()],
+            )
+            .unwrap();
+        assert!(session_in(db.conn(), session).unwrap().is_none());
+        assert!(
+            for_append(&db).is_some(),
+            "a requested session takes appends"
+        );
+        log.append(&mut db, session, context, idle())
+            .expect("the supervisor's append to a requested session");
+
+        erase_session_in(db.conn(), session).unwrap();
+        let state: String = db
+            .conn()
+            .query_row(
+                "SELECT deletion FROM sessions WHERE id = ?1",
+                [session.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "erased");
+        assert_eq!(
+            kinds(&db),
+            [
+                "session_created",
+                "erased",
+                "worktree_removed",
+                "session_deleted",
+                "erased",
+            ]
+        );
+        assert!(for_append(&db).is_none(), "an erased session takes none");
+        assert!(matches!(
+            log.append(&mut db, session, context, idle()),
+            Err(Error::InvalidAppend(_))
+        ));
     }
 }

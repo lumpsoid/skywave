@@ -155,13 +155,15 @@ use crate::process::{self, DEFAULT_TERM_GRACE, Group};
 /// session: every stored resume handle of this adapter. A handle this
 /// adapter did not make is left out, and so is a moved context's: it is
 /// never started again (the session it moved to runs a fork of it), so its
-/// conversation is no session's.
+/// conversation is no session's. A deleted session's is left out too.
 pub fn own_conversations(
     conn: &rusqlite::Connection,
 ) -> crate::error::Result<HashMap<String, SessionId>> {
     let mut statement = conn.prepare_cached(
-        "SELECT session_id, agent_state FROM contexts
-         WHERE agent_state IS NOT NULL AND moved_to IS NULL",
+        "SELECT c.session_id, c.agent_state FROM contexts c
+         JOIN sessions s ON s.id = c.session_id
+         WHERE c.agent_state IS NOT NULL AND c.moved_to IS NULL
+           AND s.deletion IS NULL",
     )?;
     let rows = statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut own = HashMap::new();

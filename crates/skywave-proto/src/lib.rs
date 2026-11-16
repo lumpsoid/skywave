@@ -222,7 +222,8 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`RejectReason::BadSafetyRule`], with [`limits::SAFETY_RULE_WORDS_MAX`] and
 /// [`limits::SAFETY_RULE_MAX_BYTES`].
 ///
-/// v41: `DeleteSession`, `SessionDeleted`, `Erased`, `RejectReason::ApprovalPending`.
+/// v41: `DeleteSession`, `SessionDeleted`, `Erased`, `RejectReason::ApprovalPending`,
+/// `RejectReason::WorktreeNotRemoved`.
 pub const PROTOCOL_VERSION: u32 = 41;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
@@ -2516,6 +2517,9 @@ pub enum RejectReason {
     ApprovalCancelled,
     /// `DeleteSession` while the session has an open approval or question.
     ApprovalPending,
+    /// `DeleteSession` of a session whose worktree is still on disk: remove it
+    /// first (`RemoveWorktree`).
+    WorktreeNotRemoved,
     /// The call named no shell command, or not the kind of check the
     /// judgment is about.
     NotAShellCall,

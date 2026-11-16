@@ -3647,11 +3647,12 @@ async fn deleting_a_session_with_a_running_turn_is_refused() {
     accepted_seq(&device.command(&delete_command(session)).await);
 }
 
-/// `DeleteSession` erases the session in place: each of its events before
-/// the tombstone keeps its seq and reads `Erased`, its output blob's file and
-/// row go, and another session's events are left alone.
+/// `DeleteSession` only marks the session requested: its tombstone is at the
+/// seq returned, and its events and output blob are kept, for the supervisor
+/// to erase once its agent is stopped (D62). Positive control: the blob's
+/// file is there before the delete, so its survival is not a setup accident.
 #[tokio::test(flavor = "multi_thread")]
-async fn deleting_a_session_erases_its_events_and_blobs() {
+async fn deleting_a_session_marks_it_and_keeps_its_data_for_the_supervisor() {
     let mut f = Fixture::start_with_shell(true).await;
     let creds = f.pair().await;
     let mut device = f.client(&creds).await;
@@ -3667,12 +3668,8 @@ async fn deleting_a_session_erases_its_events_and_blobs() {
     let tombstone = accepted_seq(&device.command(&delete_command(session)).await);
 
     assert!(
-        !blob_file(&f, blob.id).exists(),
-        "the blob's file is removed"
-    );
-    assert_eq!(
-        device.get(&path::blob(blob.id)).await.status,
-        StatusCode::NOT_FOUND
+        blob_file(&f, blob.id).exists(),
+        "the command frees nothing: the blob's file is kept"
     );
     let batch = device.events(Seq::ZERO, 0).await;
     let before: Vec<_> = batch
@@ -3686,13 +3683,14 @@ async fn deleting_a_session_erases_its_events_and_blobs() {
     assert!(
         before
             .iter()
-            .all(|(_, e)| matches!(e.kind, EventKind::Erased)),
-        "every event of the session before the tombstone is erased"
+            .all(|(_, e)| !matches!(e.kind, EventKind::Erased)),
+        "no event of the session is erased by the command"
     );
     let (_, last) = batch
         .iter()
         .find(|(seq, _)| *seq == tombstone)
         .expect("the tombstone is in the log");
+    assert_eq!(last.session_id, session);
     assert!(matches!(last.kind, EventKind::SessionDeleted { .. }));
     assert!(
         batch
@@ -3700,6 +3698,53 @@ async fn deleting_a_session_erases_its_events_and_blobs() {
             .any(|(_, e)| e.session_id == other && !matches!(e.kind, EventKind::Erased)),
         "another session's events are not erased"
     );
+}
+
+/// `DeleteSession` while a message is in the log that the supervisor has not
+/// handed to its agent is refused `TurnRunning`. This fixture runs no
+/// supervisor, so the message stays unhanded. Positive control: once the
+/// supervisor's cursor has caught up, the same delete is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_with_an_unhanded_message_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    accepted_seq(
+        &device
+            .command(&message_command(session, context, "hi", Vec::new()))
+            .await,
+    );
+
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    supervisor_caught_up(&f);
+    accepted_seq(&device.command(&delete_command(session)).await);
+}
+
+/// `DeleteSession` of a session whose worktree is still on disk is refused
+/// `WorktreeNotRemoved`. Positive control: once `RemoveWorktree` has removed
+/// it, the same delete is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_whose_worktree_exists_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    assert!(f.root.join("project.worktrees/feat-x").is_dir());
+
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::WorktreeNotRemoved)
+    );
+    accepted_seq(&device.command(&remove_command(session)).await);
+    accepted_seq(&device.command(&delete_command(session)).await);
 }
 
 /// Once deleted, a session is unknown: a later command on it and a second
