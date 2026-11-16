@@ -4307,6 +4307,7 @@ impl Model {
                     None
                 }
                 EventKind::SafetyCheckSet { .. } => None,
+                EventKind::SafetyRuleSet { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -5054,6 +5055,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }
         | CommandKind::SetSafetyCheck { session_id, .. }
+        | CommandKind::SetSafetyRule { session_id, .. }
         | CommandKind::SafetyCheckFeedback { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
         | CommandKind::SwitchContext { session_id, .. }

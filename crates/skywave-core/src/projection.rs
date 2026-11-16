@@ -405,6 +405,7 @@ impl SessionSummary {
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::FileWritten { .. } => {}
@@ -506,6 +507,7 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::BlobDeleted { .. }
         | EventKind::BlobCropped { .. }
         | EventKind::SafetyCheckSet { .. }
+        | EventKind::SafetyRuleSet { .. }
         | EventKind::SafetyCheckApproved { .. }
         | EventKind::SafetyCheckFeedback { .. }
         | EventKind::FileWritten { .. } => false,
