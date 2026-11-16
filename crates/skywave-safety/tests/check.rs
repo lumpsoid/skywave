@@ -390,3 +390,121 @@ fn rule_new_rejects_empty() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn substitution_of_a_proven_command_passes_under_a_rule() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$(pwd)\" status", &root, &rules),
+        Verdict::Safe {
+            reason: "read-only: pwd; rules: git -C".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn backquotes_are_substitutions_too() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C `pwd` status", &root, &rules),
+        Verdict::Safe {
+            reason: "read-only: pwd; rules: git -C".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn substitution_of_an_unknown_command_asks() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$(rm x)\" status", &root, &rules),
+        unknown("rm")
+    );
+    Ok(())
+}
+
+#[test]
+fn table_program_asks_on_a_substituted_word() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let why = "`cat` takes a word from a command substitution, which is not checked";
+    assert_eq!(
+        check("cat \"$(pwd)\"", &root),
+        Verdict::Ask { why: why.into() }
+    );
+    // A word that mixes literal text with a substitution is unknown too.
+    assert_eq!(
+        check("cat \"a$(pwd)\"", &root),
+        Verdict::Ask { why: why.into() }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_words_must_be_known() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    assert_eq!(
+        check_with("git \"$(echo commit)\"", &root, &rules),
+        unknown("git")
+    );
+    // Positive control: the literal word is approved.
+    assert_eq!(
+        check_with("git commit", &root, &rules),
+        Verdict::Safe {
+            reason: "rules: git commit".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn substitution_in_the_command_name_still_asks() -> TestResult {
+    let (_dir, root) = workdir()?;
+    assert_eq!(
+        check("$(echo ls) a.txt", &root),
+        Verdict::Ask {
+            why: "expansions are not checked yet".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn variables_still_ask() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$HOME\" status", &root, &rules),
+        Verdict::Ask {
+            why: "expansions are not checked yet".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn nested_substitution_is_proven() -> TestResult {
+    let (_dir, root) = workdir()?;
+    // `echo` takes an unknown word here, so a rule must cover the inner echo.
+    let rules = rules_from(&["git -C", "echo"])?;
+    assert_eq!(
+        check_with("git -C \"$(echo $(pwd))\" status", &root, &rules),
+        Verdict::Safe {
+            reason: "read-only: pwd; rules: echo, git -C".into()
+        }
+    );
+    // Negative control: without the echo rule, the inner echo asks.
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$(echo $(pwd))\" status", &root, &rules),
+        Verdict::Ask {
+            why: "`echo` takes a word from a command substitution, which is not checked".into()
+        }
+    );
+    Ok(())
+}
