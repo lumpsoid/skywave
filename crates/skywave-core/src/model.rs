@@ -736,6 +736,17 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::ReclaimServerSpace => {
+                if self.device().is_none() || self.place != Place::Storage {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.storage
+                    .reclaim(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
             Action::RefreshWorktrees => {
                 if self.device().is_none() || self.place != Place::Worktrees {
                     return Vec::new();
@@ -2512,6 +2523,14 @@ impl Model {
         result: Result<StorageReport, TransportError>,
     ) {
         self.storage.reported(req, result);
+    }
+
+    pub(crate) fn storage_reclaimed(
+        &mut self,
+        req: u64,
+        result: Result<StorageReport, TransportError>,
+    ) {
+        self.storage.reclaimed(req, result);
     }
 
     pub(crate) fn worktrees_listed(
@@ -12300,6 +12319,32 @@ mod tests {
         f.model.set_link(PairedLink::Online { latency_ms: 5 });
         f.dispatch(Action::Navigate(Route::Settings));
         assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
+    }
+
+    fn reclaim_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::ReclaimStorage { req })] => Some(*req),
+            other => panic!("expected a reclaim request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reclaiming_asks_on_the_storage_screen_only() {
+        let mut f = Fixture::paired();
+        assert_eq!(reclaim_req(&f.dispatch(Action::ReclaimServerSpace)), None);
+
+        let first = storage_req(&f.dispatch(Action::Navigate(Route::Storage))).unwrap();
+        f.model.storage_reported(first, Ok(storage_report(&[])));
+        let reclaim = reclaim_req(&f.dispatch(Action::ReclaimServerSpace)).unwrap();
+        assert_eq!(storage_view(&f).status, StorageStatus::Reclaiming);
+        assert_eq!(storage_view(&f).report, Some(storage_report(&[])));
+        f.model.storage_reclaimed(reclaim, Ok(storage_report(&[])));
+        assert_eq!(storage_view(&f).status, StorageStatus::Ready);
+
+        // Elsewhere a reclaim asks nothing.
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(reclaim_req(&f.dispatch(Action::ReclaimServerSpace)), None);
     }
 
     fn worktrees_view(f: &Fixture) -> WorktreesView {

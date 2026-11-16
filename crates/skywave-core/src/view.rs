@@ -992,6 +992,9 @@ pub enum StorageStatus {
     Ready,
     /// The last ask failed; the report shown, if any, is older.
     Unavailable(StorageUnavailable),
+    /// Asked the server to reclaim space; the report shown, if any, is the
+    /// one before.
+    Reclaiming,
 }
 
 /// Why the storage screen has no fresh report.
@@ -1001,6 +1004,9 @@ pub enum StorageUnavailable {
     Offline,
     /// The request failed, worded by the transport.
     Failed(String),
+    /// The server's free disk is below what a reclaim needs (`507`): it did
+    /// nothing.
+    NoRoomToReclaim,
 }
 
 /// Where the worktrees screen's list stands.

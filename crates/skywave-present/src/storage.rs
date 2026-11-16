@@ -127,6 +127,13 @@ pub fn status_line(view: &StorageView) -> Option<String> {
         } else {
             format!("Could not read the server's storage: {reason}")
         }),
+        StorageStatus::Reclaiming => Some("Reclaiming space on the server…".to_owned()),
+        StorageStatus::Unavailable(StorageUnavailable::NoRoomToReclaim) => Some(if have {
+            "Not enough free disk on the server to reclaim space; this report may be out of date."
+                .to_owned()
+        } else {
+            "Not enough free disk on the server to reclaim space".to_owned()
+        }),
     }
 }
 
@@ -612,6 +619,19 @@ mod tests {
         assert_eq!(
             status_line(&view(Some(report()), failed)).unwrap(),
             "Refresh failed (timed out); this report may be out of date."
+        );
+        assert_eq!(
+            status_line(&view(Some(report()), StorageStatus::Reclaiming)).unwrap(),
+            "Reclaiming space on the server…"
+        );
+        let no_room = StorageStatus::Unavailable(StorageUnavailable::NoRoomToReclaim);
+        assert_eq!(
+            status_line(&view(None, no_room.clone())).unwrap(),
+            "Not enough free disk on the server to reclaim space"
+        );
+        assert_eq!(
+            status_line(&view(Some(report()), no_room)).unwrap(),
+            "Not enough free disk on the server to reclaim space; this report may be out of date."
         );
         assert!(rows(&view(None, StorageStatus::Loading), Grouping::Blobs).is_empty());
     }

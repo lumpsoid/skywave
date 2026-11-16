@@ -80,6 +80,10 @@ pub enum Action {
     /// (paired only). The report shown stays until the answer; offline the
     /// screen is `Unavailable` at once and nothing is asked later.
     RefreshStorage,
+    /// Ask the server to compact its database (`VACUUM`), on the storage
+    /// screen (paired only); the screen shows the fresh report after. Nothing
+    /// while one runs.
+    ReclaimServerSpace,
     /// Ask the server for its worktree list again, on the worktrees screen
     /// (paired only). The list shown stays until the answer; offline the
     /// screen is `Unavailable` at once and nothing is asked later.
