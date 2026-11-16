@@ -37,7 +37,7 @@ use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
     AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxFile, OutboxStatus,
-    ReadMark, SafetyRule, ServerFacts, Settings, Snapshot,
+    ReadMark, SafetyRule, ServerFacts, Settings, Snapshot, StoreError,
 };
 use crate::tls;
 use crate::transport::TransportError;
@@ -45,13 +45,13 @@ use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention,
     BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobUse, BlobView, BodyView, CallId,
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
-    CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
-    FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan,
-    Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
-    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
-    PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER,
-    SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView, SessionId,
-    SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
+    CropView, Decision, Delivery, DeviceId, DeviceRef, DeviceStorage, DiffBody, Draft, Entry,
+    ErrorInfo, FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView, ImportedEntry,
+    LineSpan, Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing,
+    PairedInfo, PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef,
+    PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
+    SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView,
+    SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
     SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
     SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage,
     TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable,
@@ -732,8 +732,8 @@ impl Model {
                 let online = self.online();
                 self.storage
                     .refresh(online)
-                    .map(Effect::Request)
                     .into_iter()
+                    .map(Effect::Request)
                     .collect()
             }
             Action::ReclaimServerSpace => {
@@ -1377,13 +1377,13 @@ impl Model {
                     return Vec::new();
                 }
                 let online = self.online();
-                let asked = match self.place {
+                let asked: Vec<Request> = match self.place {
                     Place::Storage => self.storage.open(online),
-                    Place::Worktrees => self.worktrees.open(online),
-                    Place::UsageLimits(_) => self.usage_limits.open(online),
-                    _ => None,
+                    Place::Worktrees => self.worktrees.open(online).into_iter().collect(),
+                    Place::UsageLimits(_) => self.usage_limits.open(online).into_iter().collect(),
+                    _ => Vec::new(),
                 };
-                asked.map(Effect::Request).into_iter().collect()
+                asked.into_iter().map(Effect::Request).collect()
             }
             Action::Back => {
                 // A subagent shown steps out to the one it runs under, then
@@ -2384,8 +2384,10 @@ impl Model {
         id: CommandId,
         result: CommandResult,
         now: DateTime<Utc>,
-    ) -> Option<Request> {
-        let entry = self.outbox_entry(id).filter(|e| !e.status.is_settled())?;
+    ) -> Vec<Request> {
+        let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) else {
+            return Vec::new();
+        };
         let accepted = matches!(result, CommandResult::Accepted { .. });
         let frees = accepted
             && matches!(
@@ -2399,8 +2401,10 @@ impl Model {
         let paired = self.device().is_some();
         match self.place {
             Place::Storage if frees && paired => self.storage.refresh(online),
-            Place::Worktrees if removes && paired => self.worktrees.refresh(online),
-            _ => None,
+            Place::Worktrees if removes && paired => {
+                self.worktrees.refresh(online).into_iter().collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -2523,6 +2527,14 @@ impl Model {
         result: Result<StorageReport, TransportError>,
     ) {
         self.storage.reported(req, result);
+    }
+
+    pub(crate) fn device_storage_read(
+        &mut self,
+        req: u64,
+        result: Result<DeviceStorage, StoreError>,
+    ) {
+        self.storage.device_read(req, result);
     }
 
     pub(crate) fn storage_reclaimed(
@@ -3175,10 +3187,15 @@ impl Model {
     }
 
     fn storage_view(&self) -> StorageView {
-        let (status, report) = self.storage.shown();
+        let (status, report, device) = self.storage.shown();
         let titles = report
             .iter()
             .flat_map(|report| report.sessions.iter().map(|s| s.session))
+            .chain(
+                device
+                    .iter()
+                    .flat_map(|device| device.sessions.iter().map(|s| s.session)),
+            )
             .filter_map(|id| Some((id, self.title(self.summary(id)?).text)))
             .collect();
         let gone = report
@@ -3195,6 +3212,7 @@ impl Model {
             titles,
             pending: self.blob_pendings(),
             gone,
+            device,
         }
     }
 
@@ -12235,11 +12253,29 @@ mod tests {
         }
     }
 
+    /// The server's storage request among `effects`, if one is asked.
     fn storage_req(effects: &[Effect]) -> Option<u64> {
-        match effects {
-            [] => None,
-            [Effect::Request(Request::Storage { req })] => Some(*req),
-            other => panic!("expected a storage request, got {other:?}"),
+        effects.iter().find_map(|effect| match effect {
+            Effect::Request(Request::Storage { req }) => Some(*req),
+            _ => None,
+        })
+    }
+
+    /// This device's storage request among `effects`, if one is asked.
+    fn device_req(effects: &[Effect]) -> Option<u64> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Request(Request::DeviceStorage { req }) => Some(*req),
+            _ => None,
+        })
+    }
+
+    fn device_storage(database: u64) -> DeviceStorage {
+        DeviceStorage {
+            database,
+            reclaimable: 0,
+            blobs: 0,
+            attachments: 0,
+            sessions: Vec::new(),
         }
     }
 
@@ -12319,6 +12355,41 @@ mod tests {
         f.model.set_link(PairedLink::Online { latency_ms: 5 });
         f.dispatch(Action::Navigate(Route::Settings));
         assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
+    }
+
+    #[test]
+    fn the_storage_screen_asks_for_this_devices_report_too() {
+        let mut f = Fixture::paired();
+        let effects = f.dispatch(Action::Navigate(Route::Storage));
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        assert!(storage_req(&effects).is_some());
+        let device = device_req(&effects).unwrap();
+        assert_eq!(storage_view(&f).device, None);
+        f.model
+            .device_storage_read(device, Ok(device_storage(4096)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(4096)));
+
+        // A refresh asks for it again and keeps the one shown until the answer.
+        let again = device_req(&f.dispatch(Action::RefreshStorage)).unwrap();
+        assert_ne!(again, device);
+        assert_eq!(storage_view(&f).device, Some(device_storage(4096)));
+        // The answer to the request before is ignored.
+        f.model.device_storage_read(device, Ok(device_storage(1)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(4096)));
+        f.model.device_storage_read(again, Ok(device_storage(8192)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(8192)));
+
+        // Offline only this device's report is asked.
+        f.model.set_link(PairedLink::Reconnecting {
+            attempt: 1,
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
+        });
+        let offline = f.dispatch(Action::RefreshStorage);
+        assert_eq!(storage_req(&offline), None);
+        assert!(device_req(&offline).is_some(), "{offline:?}");
+        assert_eq!(offline.len(), 1, "{offline:?}");
     }
 
     fn reclaim_req(effects: &[Effect]) -> Option<u64> {
@@ -12505,9 +12576,10 @@ mod tests {
         let rejected = CommandResult::Rejected {
             reason: RejectReason::ShellRunning,
         };
-        assert_eq!(
-            f.model.command_result(refused.id, rejected, Utc::now()),
-            None
+        assert!(
+            f.model
+                .command_result(refused.id, rejected, Utc::now())
+                .is_empty()
         );
 
         let removed = queued(&f.dispatch(Action::RemoveWorktree { session_id: a }));
@@ -12795,9 +12867,13 @@ mod tests {
         }
     }
 
+    /// The first request the answer asks: the screen's own, before this
+    /// device's storage report that a storage refresh asks with it.
     fn accept(f: &mut Fixture, id: CommandId, seq: u64) -> Option<Request> {
         f.model
             .command_result(id, CommandResult::Accepted { seq: Seq(seq) }, Utc::now())
+            .into_iter()
+            .next()
     }
 
     #[test]
@@ -12975,9 +13051,10 @@ mod tests {
         let rejected = CommandResult::Rejected {
             reason: RejectReason::BlobGone,
         };
-        assert_eq!(
-            f.model.command_result(refused.id, rejected, Utc::now()),
-            None
+        assert!(
+            f.model
+                .command_result(refused.id, rejected, Utc::now())
+                .is_empty()
         );
         let rename = queued(&f.dispatch(Action::RenameSession {
             session_id: sid,
@@ -15444,7 +15521,11 @@ mod tests {
             live.core
                 .dispatch(Action::Navigate(Route::Storage))
                 .unwrap();
-            assert!(matches!(&live.requests()[..], [Request::Storage { .. }]));
+            assert!(
+                live.requests()
+                    .iter()
+                    .any(|r| matches!(r, Request::Storage { .. }))
+            );
             let output = blob(10);
             live.core.dispatch(Action::DeleteBlob(output.id)).unwrap();
             live.requests();

@@ -9,7 +9,7 @@ use chrono::{TimeZone, Utc};
 use skywave_core::attachment::{
     AttachedFile, AttachedImage, attachment_dir, attachment_path, store_file,
 };
-use skywave_core::store::OutboxFile;
+use skywave_core::store::{OutboxFile, read_device_storage};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, AttachmentRefusal, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError,
@@ -6731,4 +6731,38 @@ fn opening_the_store_removes_unneeded_image_files() {
     assert!(!present(".tmp-abc"), "a temporary file goes");
     let rows: HashSet<ContentHash> = store.attachments().unwrap().into_keys().collect();
     assert_eq!(rows, HashSet::from([kept.sha256]));
+}
+
+#[test]
+fn the_device_report_counts_events_blobs_and_attachments() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let draft = image("a draft");
+    store.attach_to_draft(log.a, &draft, at(0)).unwrap();
+
+    let before = read_device_storage(&dir).unwrap();
+    assert!(before.database > 0);
+    assert_eq!(before.attachments, draft.size);
+    assert_eq!(before.blobs, 0, "a blob not downloaded takes no bytes");
+
+    let available = BlobStatus::Available {
+        path: "/data/blobs/x".into(),
+    };
+    store.set_blob_status(log.blob.id, &available).unwrap();
+    let report = read_device_storage(&dir).unwrap();
+    assert_eq!(report.blobs, log.blob.size);
+    // The session whose event names the blob is largest, so first.
+    let sessions: Vec<SessionId> = report.sessions.iter().map(|s| s.session).collect();
+    assert_eq!(sessions, [log.a, log.b]);
+    let (a, b) = (&report.sessions[0], &report.sessions[1]);
+    assert_eq!(a.blob_bytes, log.blob.size);
+    assert_eq!(b.blob_bytes, 0);
+    assert!(a.event_bytes > 0 && b.event_bytes > 0);
+
+    store.delete_session_locally(log.b, at(2)).unwrap();
+    let after = read_device_storage(&dir).unwrap();
+    let sessions: Vec<SessionId> = after.sessions.iter().map(|s| s.session).collect();
+    assert_eq!(sessions, [log.a], "a deleted session is not listed");
 }
