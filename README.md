@@ -303,9 +303,13 @@ snippets. The GUI offers the same as "Reset local data".
 ```sh
 skywaved devices list
 skywaved devices revoke <id>
+skywaved safety-feedback
 ```
 
 Admin commands work on the database directly, so `serve` can keep running.
+`skywaved safety-feedback` prints every safety check feedback sent from a
+device as JSON lines (command, workdir, the check's verdict now, the judgment
+and note), oldest first.
 
 ### Stopping and restarting the server
 

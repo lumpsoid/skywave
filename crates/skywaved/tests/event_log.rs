@@ -2365,6 +2365,73 @@ fn safety_feedback_caps_the_note() {
 }
 
 #[test]
+fn safety_feedback_exports_json_lines() {
+    let mut f = Fixture::new();
+    let first = f.create_session();
+    let asked = CallId::new();
+    f.agent(first, asked_shell(asked, Some("rm notes.txt")));
+    accepted(f.handle(CommandKind::SafetyCheckFeedback {
+        session_id: first,
+        call: asked,
+        judgment: SafetyJudgment::ShouldApprove,
+        note: Some("fine".into()),
+    }));
+    let second = f.create_session();
+    let approved = CallId::new();
+    f.agent(second, approved_shell(approved));
+    accepted(f.handle(feedback(second, approved, SafetyJudgment::ShouldAsk)));
+
+    let lines = skywaved::safety_feedback::lines(f.storage.db.conn()).unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let workdir = f.root.join("project").canonicalize().unwrap();
+    let workdir = workdir.to_str().unwrap();
+
+    let line: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let mut keys: Vec<&str> = line
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "at",
+            "by",
+            "call",
+            "checked_reason",
+            "checked_safe",
+            "judgment",
+            "note",
+            "session",
+            "shell",
+            "workdir"
+        ]
+    );
+    assert_eq!(line["session"], first.0.to_string());
+    assert_eq!(line["workdir"], workdir);
+    assert_eq!(line["call"], asked.0.to_string());
+    assert_eq!(line["shell"], "rm notes.txt");
+    assert_eq!(line["judgment"], "should_approve");
+    assert_eq!(line["note"], "fine");
+    assert_eq!(line["checked_safe"], false);
+    assert!(!line["checked_reason"].as_str().unwrap().is_empty());
+    assert!(line["by"].is_string());
+    let at = line["at"].as_str().unwrap();
+    chrono::DateTime::parse_from_rfc3339(at).unwrap_or_else(|e| panic!("{at}: {e}"));
+
+    let line: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(line["session"], second.0.to_string());
+    assert_eq!(line["workdir"], workdir);
+    assert_eq!(line["call"], approved.0.to_string());
+    assert_eq!(line["shell"], "ls");
+    assert_eq!(line["judgment"], "should_ask");
+    assert!(line["note"].is_null());
+    assert_eq!(line["checked_safe"], true);
+}
+
+#[test]
 fn run_shell_is_checked_in_order_and_logged_verbatim() {
     let mut f = Fixture::with_shell();
     assert!(f.log.shell_enabled());
