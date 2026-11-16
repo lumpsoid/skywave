@@ -559,6 +559,24 @@ UPDATE sessions SET safety_check = COALESCE((SELECT json_extract(event, '$.kind.
     ORDER BY seq DESC
     LIMIT 1), 0);
 "#),
+    // `SafetyRuleSet`: one row per distinct `words` (JSON array text), holding
+    // the newest event's switch, the session it was logged in and its seq.
+    // Backfilled from the stored log.
+    Sql(r#"
+CREATE TABLE safety_rules (
+    words TEXT PRIMARY KEY,
+    active INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL
+);
+INSERT INTO safety_rules (words, active, session_id, seq)
+SELECT json_extract(event, '$.kind.words'), json_extract(event, '$.kind.on'), session_id, seq
+FROM events
+WHERE json_extract(event, '$.kind.type') = 'safety_rule_set'
+    AND seq IN (SELECT MAX(seq) FROM events
+        WHERE json_extract(event, '$.kind.type') = 'safety_rule_set'
+        GROUP BY json_extract(event, '$.kind.words'));
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -632,6 +650,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
     v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
+    v39_to_v40, v40_to_v41,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -773,6 +792,18 @@ fn v37_to_v38(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// `SafetyCheckApproved`, which v38 JSON lacks and reads as `None`; nothing
 /// stored changes.
 fn v38_to_v39(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v39 to v40, as the server's step of the same name. v40 added safety rules:
+/// a command, an event and a reject reason, all new, so no stored event or
+/// command result changes.
+fn v39_to_v40(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v40 to v41: adds `DeleteSession` and two event kinds; nothing stored changes.
+fn v40_to_v41(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -1090,13 +1121,13 @@ pub struct OutboxFile {
 
 impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
-    /// message, shell run, session creation, context move, or blob delete
-    /// or crop the server has not answered, or refused. One already sent may have reached the
-    /// server, and withdrawing cannot stop it there; it only stops the
-    /// resends, so a command whose request keeps failing no longer holds
-    /// back every later one. If the server took it, its event shows it in
-    /// the log like any other, and its answer, if one still comes, settles
-    /// nothing.
+    /// message, shell run, session creation, context move, blob delete or
+    /// crop, or safety rule change the server has not answered, or refused.
+    /// One already sent may have reached the server, and withdrawing cannot
+    /// stop it there; it only stops the resends, so a command whose request
+    /// keeps failing no longer holds back every later one. If the server took
+    /// it, its event shows it in the log like any other, and its answer, if
+    /// one still comes, settles nothing.
     pub fn discardable(&self) -> bool {
         let kind = matches!(
             self.command.kind,
@@ -1106,6 +1137,7 @@ impl OutboxEntry {
                 | CommandKind::MoveContext { .. }
                 | CommandKind::DeleteBlob { .. }
                 | CommandKind::CropBlob { .. }
+                | CommandKind::SetSafetyRule { .. }
         );
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
@@ -1216,6 +1248,18 @@ pub struct ReadMark {
     pub notable: u64,
 }
 
+/// A shell command prefix the safety check trusts (`on`), as the newest
+/// `SafetyRuleSet` for its `words` left it. Kept in every session's replica,
+/// off rules included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyRule {
+    pub words: Vec<String>,
+    pub on: bool,
+    /// The session the newest `SafetyRuleSet` was logged in; a removal is
+    /// sent there.
+    pub session_id: SessionId,
+}
+
 /// Everything the replica holds except the events themselves, as read on
 /// startup.
 #[derive(Debug, Clone, PartialEq)]
@@ -1256,6 +1300,8 @@ pub struct Snapshot {
     /// The models of the newest `ModelsOffered` in the log, in any session;
     /// empty until one comes.
     pub models: Vec<ModelChoice>,
+    /// Every rule ever set, on or off, ordered by its newest event.
+    pub safety_rules: Vec<SafetyRule>,
     /// This device's saved prompts, in no order ([`Store::set_snippet`]).
     pub snippets: Vec<Snippet>,
     /// Shell commands from every session, newest first, each once ([`Store::shell_history`]).
@@ -1315,7 +1361,7 @@ impl Store {
     /// Makes the replica in `data_dir` a fresh one for the same server,
     /// for a replica this build cannot read ([`StoreError::unreadable`]):
     /// the event log, session summaries, cursor, outbox, blob rows, stored
-    /// workdir answers, offered models and device names go, and the
+    /// workdir answers, offered models, safety rules and device names go, and the
     /// replica is stamped with this build's `PROTOCOL_VERSION`, so the
     /// next sync pulls the whole log again. What is this device's stays —
     /// settings (the server address with them), drafts, composer modes,
@@ -1361,6 +1407,7 @@ impl Store {
             alerted: self.alerted()?,
             devices: self.devices()?,
             models: self.offered_models()?,
+            safety_rules: self.safety_rules()?,
             snippets: self.snippets()?,
             shell_history: self.shell_history(SHELL_HISTORY_MAX)?,
             turns: self.turns()?,
@@ -1382,6 +1429,21 @@ impl Store {
             .map(serde_json::from_str)
             .transpose()?
             .unwrap_or_default())
+    }
+
+    /// Every safety rule stored, in the order of their newest events.
+    fn safety_rules(&self) -> Result<Vec<SafetyRule>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT words, active, session_id FROM safety_rules ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SafetyRule {
+                words: json_col(row, 0)?,
+                on: row.get(1)?,
+                session_id: SessionId(uuid_col(row, 2)?),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     // ---- events, sessions, cursor -------------------------------------
@@ -1558,6 +1620,23 @@ impl Store {
                     "INSERT INTO offered_models (id, models) VALUES (0, ?1)
                      ON CONFLICT (id) DO UPDATE SET models = excluded.models",
                     [to_json(models)?],
+                )?;
+            }
+            // Kept whatever session said so, like offered models: the server
+            // applies a rule in every session, deleted here or not.
+            if let EventKind::SafetyRuleSet { words, on, .. } = &event.kind {
+                tx.execute(
+                    "INSERT INTO safety_rules (words, active, session_id, seq) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (words) DO UPDATE SET
+                         active = excluded.active,
+                         session_id = excluded.session_id,
+                         seq = excluded.seq",
+                    params![
+                        to_json(words)?,
+                        *on,
+                        event.session_id.0.to_string(),
+                        seq_sql(seq)?
+                    ],
                 )?;
             }
             if deleted.contains(&event.session_id) {
@@ -3122,8 +3201,8 @@ fn stamped_protocol(conn: &Connection) -> Result<Option<u32>, StoreError> {
 
 /// Deletes what the server's log produced: the events and what is folded
 /// from them, the cursor, the outbox, blob rows, stored workdir answers,
-/// the stored usage limits, offered models, the server's device names and
-/// what its last `hello` said of itself ([`ServerFacts`]). What is this
+/// the stored usage limits, offered models, safety rules, the server's device
+/// names and what its last `hello` said of itself ([`ServerFacts`]). What is this
 /// device's alone is the caller's to keep or drop.
 fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(
@@ -3137,6 +3216,7 @@ fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
          DELETE FROM blob_fates;
          DELETE FROM devices;
          DELETE FROM offered_models;
+         DELETE FROM safety_rules;
          DELETE FROM workdir_snapshots;
          DELETE FROM workdir_blob_refs;
          DELETE FROM usage_limits;

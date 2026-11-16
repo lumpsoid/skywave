@@ -208,6 +208,11 @@
 //! note is logged trimmed, `None` when blank. The event carries what the
 //! safety check says of the command now, not what it said then.
 //!
+//! **SetSafetyRule.** `UnknownSession`, then `BadSafetyRule` when the words are
+//! empty, one is empty, there are more than [`limits::SAFETY_RULE_WORDS_MAX`],
+//! or their bytes total more than [`limits::SAFETY_RULE_MAX_BYTES`]. Otherwise
+//! `SafetyRuleSet` is logged with the words exactly as sent, never trimmed.
+//!
 //! **DeleteBlob.** `UnknownBlob` when no event referenced the blob (no
 //! `event_blobs` row: a workdir blob, an id never minted), `BlobGone` when
 //! one did but its `blobs` row is gone. Otherwise the `blobs` row is
@@ -752,6 +757,16 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
+            CommandKind::DeleteSession { session_id } => {
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                if let Some(reason) = event_log::session_busy_in(tx, *session_id)? {
+                    return Ok(Err(reason));
+                }
+                let kind = EventKind::SessionDeleted { by: device };
+                (*session_id, session.context, kind)
+            }
             CommandKind::RemoveWorktree { session_id } => {
                 let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
@@ -814,6 +829,28 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
+            CommandKind::SetSafetyRule {
+                session_id,
+                words,
+                on,
+            } => {
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                let words_bytes: usize = words.iter().map(String::len).sum();
+                if skywave_safety::Rule::new(words.clone()).is_err()
+                    || words.len() > limits::SAFETY_RULE_WORDS_MAX
+                    || words_bytes > limits::SAFETY_RULE_MAX_BYTES
+                {
+                    return Ok(Err(RejectReason::BadSafetyRule));
+                }
+                let kind = EventKind::SafetyRuleSet {
+                    words: words.clone(),
+                    on: *on,
+                    by: device,
+                };
+                (*session_id, session.context, kind)
+            }
             CommandKind::SafetyCheckFeedback {
                 session_id,
                 call,
@@ -852,8 +889,9 @@ impl EventLog {
                     ) => shell,
                     _ => return Ok(Err(RejectReason::NotAShellCall)),
                 };
+                let rules = event_log::safety_rules_in(tx)?;
                 let (checked_safe, checked_reason) =
-                    match skywave_safety::check(&shell, Path::new(&session.workdir)) {
+                    match skywave_safety::check_with(&shell, Path::new(&session.workdir), &rules) {
                         Verdict::Safe { reason } => (true, reason),
                         Verdict::Ask { why } => (false, why),
                     };
@@ -1029,9 +1067,11 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::StopShell { .. }
         | CommandKind::RenameSession { .. }
         | CommandKind::SetSessionArchived { .. }
+        | CommandKind::DeleteSession { .. }
         | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         | CommandKind::SetSafetyCheck { .. }
+        | CommandKind::SetSafetyRule { .. }
         | CommandKind::SafetyCheckFeedback { .. }
         // Freeing space is what a low disk needs.
         | CommandKind::DeleteBlob { .. }
@@ -1063,9 +1103,11 @@ fn work_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::StopShell { .. }
         | CommandKind::RenameSession { .. }
         | CommandKind::SetSessionArchived { .. }
+        | CommandKind::DeleteSession { .. }
         | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         | CommandKind::SetSafetyCheck { .. }
+        | CommandKind::SetSafetyRule { .. }
         | CommandKind::SafetyCheckFeedback { .. }
         | CommandKind::DeleteBlob { .. }
         | CommandKind::CropBlob { .. } => None,

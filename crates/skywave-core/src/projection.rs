@@ -405,9 +405,12 @@ impl SessionSummary {
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
-            | EventKind::FileWritten { .. } => {}
+            | EventKind::FileWritten { .. }
+            | EventKind::SessionDeleted { .. }
+            | EventKind::Erased => {}
         }
     }
 
@@ -506,9 +509,12 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::BlobDeleted { .. }
         | EventKind::BlobCropped { .. }
         | EventKind::SafetyCheckSet { .. }
+        | EventKind::SafetyRuleSet { .. }
         | EventKind::SafetyCheckApproved { .. }
         | EventKind::SafetyCheckFeedback { .. }
-        | EventKind::FileWritten { .. } => false,
+        | EventKind::FileWritten { .. }
+        | EventKind::SessionDeleted { .. }
+        | EventKind::Erased => false,
     }
 }
 

@@ -350,6 +350,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::UnknownApproval => "the server does not know this approval",
         RejectReason::ApprovalAlreadyResolved => "already answered on another device",
         RejectReason::ApprovalCancelled => "the approval was cancelled first",
+        RejectReason::ApprovalPending => "the session is waiting for an answer",
         RejectReason::NotAShellCall => "that call has no shell command to check",
         RejectReason::NoActiveTurn => "the agent was not working",
         RejectReason::UnknownRule => "the agent did not offer that rule",
@@ -380,6 +381,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::UnknownAttachment => "an image expired on the server; send again",
         RejectReason::TooManyAttachments => "too many images in one message",
         RejectReason::AttachmentsTooLarge => "the message's images are too large together",
+        RejectReason::BadSafetyRule => "a rule needs 1 to 16 words, none empty, 512 bytes at most",
     }
 }
 

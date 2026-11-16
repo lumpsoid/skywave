@@ -45,7 +45,7 @@ use crate::signals::{
     RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
     TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range, WorkdirTextUpdate,
 };
-use crate::timeline::{BlobHeads, Rows, parse_key};
+use crate::timeline::{BlobHeads, Rows, RuleCandidates, parse_key};
 use crate::workdir::{WorkdirText, shown_blob, shown_text};
 use crate::{intents, link, screen, search, shell, timeline};
 
@@ -218,6 +218,8 @@ struct SessionHead {
     fetch: ExpandFetch,
     search: Option<TimelineSearch>,
     heads: BlobHeads,
+    /// The safety rule candidates of each shell call, parsed once.
+    candidates: RuleCandidates,
     /// The shell runs whose rows carry their whole output.
     shell_expanded: HashSet<CommandId>,
     outputs: shell::Outputs,
@@ -243,6 +245,7 @@ impl SessionHead {
             fetch: ExpandFetch::new(),
             search: None,
             heads: BlobHeads::default(),
+            candidates: RuleCandidates::default(),
             shell_expanded: HashSet::new(),
             outputs: shell::Outputs::default(),
             sending: None,
@@ -1671,6 +1674,7 @@ impl Head {
                     view,
                     &session.expanded,
                     &mut session.heads,
+                    &mut session.candidates,
                     &self.data_dir,
                     clock.wall_ms,
                 ),

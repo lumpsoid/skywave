@@ -26,6 +26,7 @@ panic = "deny"
 skywave-core.workspace = true
 skywave-present.workspace = true
 skywave-proto.workspace = true
+skywave-safety.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 rinf.workspace = true

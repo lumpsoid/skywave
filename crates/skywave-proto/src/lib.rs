@@ -216,7 +216,14 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`EventKind::SafetyCheckFeedback`], [`RejectReason::NotAShellCall`], and
 /// the `shell` of [`EventKind::ApprovalRequested`] and
 /// [`EventKind::SafetyCheckApproved`].
-pub const PROTOCOL_VERSION: u32 = 39;
+///
+/// v40: safety rules, which a person teaches the safety check to trust:
+/// [`CommandKind::SetSafetyRule`], [`EventKind::SafetyRuleSet`] and
+/// [`RejectReason::BadSafetyRule`], with [`limits::SAFETY_RULE_WORDS_MAX`] and
+/// [`limits::SAFETY_RULE_MAX_BYTES`].
+///
+/// v41: `DeleteSession`, `SessionDeleted`, `Erased`, `RejectReason::ApprovalPending`.
+pub const PROTOCOL_VERSION: u32 = 41;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -612,6 +619,14 @@ pub enum EventKind {
         archived: bool,
         by: DeviceId,
     },
+    /// `by`'s `DeleteSession` deleted the session everywhere. Every earlier
+    /// event of the session is [`EventKind::Erased`]; a device drops its copy.
+    SessionDeleted {
+        by: DeviceId,
+    },
+    /// What an event of a deleted session becomes: its row keeps its seq so
+    /// the log stays contiguous, its content is gone.
+    Erased,
     /// The session's git worktree and its branch were removed by a
     /// `RemoveWorktree` command. The agent is stopped and the session cannot
     /// run again: later work for it is refused `WorkdirNotFound`.
@@ -708,6 +723,15 @@ pub enum EventKind {
     /// or off. Skywave's own check: no agent is asked, so there is no
     /// request or answer event, only this one. Not notable.
     SafetyCheckSet {
+        on: bool,
+        by: DeviceId,
+    },
+    /// A `SetSafetyRule` command taught the safety check that the program and
+    /// literal leading words `words` are trusted (`on`), or no longer are. It
+    /// applies in every session; the newest `SafetyRuleSet` for the same
+    /// `words` decides whether the rule is on. Not notable.
+    SafetyRuleSet {
+        words: Vec<String>,
         on: bool,
         by: DeviceId,
     },
@@ -976,12 +1000,14 @@ impl EventKind {
             | EventKind::QuestionAnswered { by, .. }
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
+            | EventKind::SessionDeleted { by }
             | EventKind::WorktreeRemoved { by }
             | EventKind::FileWritten { by, .. }
             | EventKind::PermissionModeRequested { by, .. }
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
             | EventKind::SafetyCheckSet { by, .. }
+            | EventKind::SafetyRuleSet { by, .. }
             | EventKind::SafetyCheckFeedback { by, .. }
             | EventKind::ContextStarted { by, .. }
             | EventKind::ContextSwitched { by }
@@ -1022,7 +1048,8 @@ impl EventKind {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::Imported { .. }
-            | EventKind::ImportFinished { .. } => None,
+            | EventKind::ImportFinished { .. }
+            | EventKind::Erased => None,
         }
     }
 
@@ -1044,11 +1071,13 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::SessionDeleted { .. }
             | EventKind::WorktreeRemoved { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
@@ -1060,6 +1089,7 @@ impl EventKind {
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => true,
             EventKind::AgentMessage { .. }
+            | EventKind::Erased
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
             | EventKind::ApprovalRequested { .. }
@@ -1125,6 +1155,7 @@ impl EventKind {
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::ContextStarted { .. }
@@ -1143,7 +1174,9 @@ impl EventKind {
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. }
-            | EventKind::FileWritten { .. } => None,
+            | EventKind::FileWritten { .. }
+            | EventKind::SessionDeleted { .. }
+            | EventKind::Erased => None,
         }
     }
 
@@ -1228,9 +1261,12 @@ impl EventKind {
             // It names a blob it deleted; it references none.
             | EventKind::BlobDeleted { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
-            | EventKind::FileWritten { .. } => (None, None),
+            | EventKind::FileWritten { .. }
+            | EventKind::SessionDeleted { .. }
+            | EventKind::Erased => (None, None),
         };
         let attachments: &[Attachment] = match self {
             EventKind::UserMessage { attachments, .. } => attachments,
@@ -1382,6 +1418,10 @@ pub mod limits {
     pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
     /// Longest note a safety check feedback carries.
     pub const SAFETY_FEEDBACK_NOTE_MAX_BYTES: usize = 2000;
+    /// Most words in a safety rule (`SetSafetyRule::words`).
+    pub const SAFETY_RULE_WORDS_MAX: usize = 16;
+    /// Most bytes in a safety rule's words together (the sum of their lengths).
+    pub const SAFETY_RULE_MAX_BYTES: usize = 512;
     /// Longest `SendMessage::text`, in UTF-8 bytes; the server refuses a
     /// longer one as `MessageTooLong` rather than cut it, as a cut message
     /// would ask something else. Generous for anything typed or pasted (a
@@ -2156,6 +2196,10 @@ pub enum CommandKind {
         session_id: SessionId,
         archived: bool,
     },
+    /// Delete the session on the server and every device: its events become
+    /// [`EventKind::Erased`], its blobs and agent transcript go. Refused while
+    /// its turn or a shell runs, or an approval is open.
+    DeleteSession { session_id: SessionId },
     /// Remove the git worktree the session runs in and delete its branch, then
     /// stop the session's agent. Refused while a turn runs, when the worktree
     /// has uncommitted changes, or when the branch is not merged into the
@@ -2192,6 +2236,18 @@ pub enum CommandKind {
     /// `SafetyCheckSet` this logs, naming this device. Accepted for any
     /// known session, even when it is already so. Never starts the agent.
     SetSafetyCheck { session_id: SessionId, on: bool },
+    /// Teach the safety check that a shell command starting with `words` (a
+    /// program, then literal leading words, such as `["git", "commit"]`) is
+    /// trusted (`on: true`), or stop trusting it (`false`). The rule applies in
+    /// every session; `session_id` only says where the change is logged. The
+    /// answer is the `SafetyRuleSet` this logs, naming this device. Accepted
+    /// for any known session, even when it changes nothing. Never starts the
+    /// agent.
+    SetSafetyRule {
+        session_id: SessionId,
+        words: Vec<String>,
+        on: bool,
+    },
     /// A user's judgment of the safety check on `call`, a tool call of the
     /// session. The answer is the `SafetyCheckFeedback` event this logs,
     /// naming this device. `ShouldApprove` needs the call's logged
@@ -2443,10 +2499,12 @@ pub enum RejectReason {
     /// `RemoveWorktree` while the worktree's branch is not merged into the
     /// repo's HEAD.
     BranchUnmerged,
-    /// `RemoveWorktree` while the session's agent is running a turn.
+    /// `RemoveWorktree` or `DeleteSession` while the session's agent is
+    /// running a turn.
     TurnRunning,
     /// `RemoveWorktree` while a shell command runs, or waits to run, in the
-    /// worktree's directory.
+    /// worktree's directory. `DeleteSession` while a shell command of the
+    /// session runs or waits to run.
     ShellRunning,
     UnknownSession,
     UnknownApproval,
@@ -2456,6 +2514,8 @@ pub enum RejectReason {
     /// ended, its agent was stopped, or the daemon restarted. No answer can
     /// apply any more.
     ApprovalCancelled,
+    /// `DeleteSession` while the session has an open approval or question.
+    ApprovalPending,
     /// The call named no shell command, or not the kind of check the
     /// judgment is about.
     NotAShellCall,
@@ -2544,6 +2604,10 @@ pub enum RejectReason {
     /// A `SendMessage` with an image over [`limits::ATTACHMENT_MAX_BYTES`],
     /// or whose images together exceed [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`].
     AttachmentsTooLarge,
+    /// `SetSafetyRule.words` is empty, has an empty word, has more than
+    /// [`limits::SAFETY_RULE_WORDS_MAX`] words, or more than
+    /// [`limits::SAFETY_RULE_MAX_BYTES`] bytes in all.
+    BadSafetyRule,
 }
 
 impl RejectReason {
