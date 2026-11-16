@@ -54,8 +54,8 @@ Future<void> pickMode(
 }
 
 /// Says what the safety check does, and turns it on or off: the switch
-/// the chip asked for (`turnOn`) is sent only once the dialog's button
-/// confirms it, since turning it on lets Skywave approve calls unasked.
+/// (`turnOn`) is sent only once the dialog's button confirms it, since
+/// turning it on lets Skywave approve calls unasked.
 Future<void> pickSafetyCheck(
   BuildContext context,
   SessionScreen screen,

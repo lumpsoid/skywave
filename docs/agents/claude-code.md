@@ -101,6 +101,10 @@ skywaved starts a fresh context with `--session-id`, a restart with
 - `--include-partial-messages` adds `stream_event` lines that carry
   Anthropic-API stream events (§2.4). **[C]**
 - The working directory is the process cwd (D14). `system/init.cwd` echoes it. **[C]**
+- The adapter also sets `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
+  (`KEEP_BASH_CWD_ENV`), so every Bash call starts in the session's
+  workdir. Probed on 2.1.310: without it a `cd` carries over to later
+  calls. Skywave's safety check (D59) relies on that.
 - Fallback for an unsupported flag or version: the CLI exits 1 with a
   one-line `Error: ...`. T09 should surface that as a session error.
 
@@ -393,6 +397,8 @@ model, categories, …}`.
 - Not every tool call asks. Read-only commands such as `echo` were allowed
   without a prompt (`tool_result_meta.permission_decision.source:"config"`).
   **[C]** Only calls that would need a prompt produce `can_use_tool`.
+- For `tool_name == "Bash"` (`SHELL_TOOL`) the adapter passes `input.command`
+  as `ApprovalRequested.shell`, which the safety check reads (D59).
 
 ### 3.2 Allow (stdin → CLI) [C]
 
