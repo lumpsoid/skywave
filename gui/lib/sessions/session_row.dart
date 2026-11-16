@@ -1,35 +1,8 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/intents.dart';
-import 'package:skywave_gui/session/look.dart' hide StateBadge;
+import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/sessions/remove_worktree_dialog.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
-
-/// An agent state's badge with Rust's label.
-class StateBadge extends StatelessWidget {
-  const StateBadge({required this.state, required this.label, super.key});
-
-  final AgentState state;
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final color = SkyColors.of(context).agent(state);
-    return Container(
-      constraints: const BoxConstraints(minWidth: 72),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-      decoration: BoxDecoration(
-        border: Border.all(color: color),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text(
-        label,
-        textAlign: TextAlign.center,
-        style: theme.textTheme.labelMedium?.copyWith(color: color),
-      ),
-    );
-  }
-}
 
 /// One session on the list. A tap opens it; its menu starts a new session
 /// in its workdir, renames, archives or unarchives, removes a removable
@@ -61,15 +34,13 @@ class SessionRow extends StatelessWidget {
       label: rowSemanticsLabel(row),
       child: ListTile(
         leading: ExcludeSemantics(
-          child: compact
-              ? Tooltip(
-                  message: row.badgeLabel,
-                  child: AgentStateIcon(
-                    state: row.state,
-                    key: Key('row-state-${row.sessionId}'),
-                  ),
-                )
-              : StateBadge(state: row.state, label: row.badgeLabel),
+          child: Tooltip(
+            message: row.badgeLabel,
+            child: AgentStateIcon(
+              state: row.state,
+              key: Key('row-state-${row.sessionId}'),
+            ),
+          ),
         ),
         title: ExcludeSemantics(
           child: Text.rich(

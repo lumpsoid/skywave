@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/app.dart';
@@ -108,7 +109,15 @@ void main() {
       worktreeRemoved: false,
       archived: false,
     );
-    Color badge() => tester.widget<Text>(find.text('working')).style!.color!;
+    // The row shows the state as its icon, tinted with the state's colour.
+    ColorFilter? tint() => tester
+        .widget<SvgPicture>(
+          find.descendant(
+            of: find.byKey(const Key('row-state-w')),
+            matching: find.byType(SvgPicture),
+          ),
+        )
+        .colorFilter;
 
     for (final (brightness, expected) in [
       (Brightness.light, const Color(0xFF01579B)),
@@ -125,7 +134,18 @@ void main() {
       );
       // The theme cross-fades when it changes.
       await tester.pumpAndSettle();
-      expect(badge(), expected, reason: '$brightness');
+      expect(find.text('working'), findsNothing, reason: '$brightness');
+      expect(
+        tester
+            .widget<AgentStateIcon>(find.byKey(const Key('row-state-w')))
+            .state,
+        AgentState.working,
+      );
+      expect(
+        tint(),
+        ColorFilter.mode(expected, BlendMode.srcIn),
+        reason: '$brightness',
+      );
     }
 
     final holder = LinkHolder();
