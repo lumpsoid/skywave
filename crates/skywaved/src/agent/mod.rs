@@ -362,6 +362,10 @@ pub enum AdapterEvent {
     /// adapter cancels it when the task leaves the set, or the agent
     /// withdraws it; a turn's leftover approvals the adapter cancels before
     /// `TurnEnded`.
+    ///
+    /// `shell` is the shell command this tool call would run, when the
+    /// agent's tool runs one (the agent adapter decides); `None` for any
+    /// other tool.
     ApprovalRequested {
         request: AgentRequestId,
         call: Option<AgentCallId>,
@@ -369,6 +373,7 @@ pub enum AdapterEvent {
         input: serde_json::Value,
         suggestions: Vec<RuleSuggestion>,
         task: Option<String>,
+        shell: Option<String>,
     },
     /// The agent asks the user `questions` and is blocked until
     /// [`AgentSession::answer_question`] for `request`, or a denial with
