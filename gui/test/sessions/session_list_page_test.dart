@@ -2,7 +2,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/rendering.dart';
-import 'package:skywave_gui/session/look.dart' show agentIcon;
+import 'package:skywave_gui/session/look.dart' show AgentStateIcon;
 import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/sessions/session_row.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -81,7 +81,6 @@ void main() {
   testWidgets('a row shows its labels and a tap opens it', (tester) async {
     await pump(tester, list(rows: [sessionRow('a')]));
     for (final text in [
-      'approval',
       '/srv/proj-a',
       '3',
       '1 approval pending',
@@ -93,6 +92,11 @@ void main() {
     ]) {
       expect(find.text(text), findsOneWidget, reason: text);
     }
+    expect(find.text('approval'), findsNothing);
+    expect(
+      tester.widget<AgentStateIcon>(find.byKey(const Key('row-state-a'))).state,
+      AgentState.awaitingApproval,
+    );
     expect(find.textContaining('title a'), findsOneWidget);
     expect(find.textContaining('queued'), findsOneWidget);
 
@@ -532,12 +536,12 @@ void main() {
     semantics.dispose();
   });
 
-  testWidgets('a wide row keeps the badge, one title line and the path', (
+  testWidgets('a wide row shows the state icon, one title line and the path', (
     tester,
   ) async {
     await pump(tester, list(rows: [sessionRow('a')]));
-    expect(find.byType(StateBadge), findsOneWidget);
-    expect(find.byKey(const Key('row-state-a')), findsNothing);
+    expect(find.byKey(const Key('row-state-a')), findsOneWidget);
+    expect(find.text('approval'), findsNothing);
     expect(find.text('/srv/proj-a'), findsOneWidget);
     // The group header says `proj-a` too; only the row must not.
     expect(rowText('proj-a'), findsNothing);
@@ -580,10 +584,11 @@ void main() {
       await phone(tester, list(rows: [sessionRow('a', title: long)]));
       expect(tester.takeException(), isNull);
       expect(
-        tester.widget<Icon>(find.byKey(const Key('row-state-a'))).icon,
-        agentIcon(AgentState.awaitingApproval),
+        tester
+            .widget<AgentStateIcon>(find.byKey(const Key('row-state-a')))
+            .state,
+        AgentState.awaitingApproval,
       );
-      expect(find.byType(StateBadge), findsNothing);
       expect(find.text('approval'), findsNothing);
       expect(rowText('proj-a'), findsOneWidget);
       expect(find.text('/srv/proj-a'), findsNothing);

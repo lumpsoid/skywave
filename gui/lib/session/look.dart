@@ -1,3 +1,4 @@
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -40,15 +41,39 @@ IconData toolIcon(ToolKindView kind) => switch (kind) {
   ToolKindView.other => Icons.build_outlined,
 };
 
-/// An agent state's icon, for a phone's session row: each state has its
-/// own shape, so the row reads without its colour.
-IconData agentIcon(AgentState state) => switch (state) {
-  AgentState.idle => Icons.radio_button_unchecked,
-  AgentState.working => Icons.autorenew,
-  AgentState.awaitingApproval => Icons.notification_important,
-  AgentState.errored => Icons.error_outline,
-  AgentState.stopped => Icons.stop_circle_outlined,
+/// An agent state's icon asset: each state has its own shape, so the icon
+/// reads without its colour. The logo's ionosphere arc sits over the
+/// station: idle a dot, working the ray bouncing off it, approval an
+/// exclamation mark, error the ray escaping a broken layer, stopped a hollow
+/// station with no sky.
+String agentIconAsset(AgentState state) => switch (state) {
+  AgentState.idle => 'assets/status/idle.svg',
+  AgentState.working => 'assets/status/working.svg',
+  AgentState.awaitingApproval => 'assets/status/approval.svg',
+  AgentState.errored => 'assets/status/error.svg',
+  AgentState.stopped => 'assets/status/stopped.svg',
 };
+
+/// An agent state's icon, tinted with the state's colour.
+class AgentStateIcon extends StatelessWidget {
+  const AgentStateIcon({required this.state, this.size = 20, super.key});
+
+  final AgentState state;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return SvgPicture.asset(
+      agentIconAsset(state),
+      width: size,
+      height: size,
+      colorFilter: ColorFilter.mode(
+        SkyColors.of(context).agent(state),
+        BlendMode.srcIn,
+      ),
+    );
+  }
+}
 
 /// Colours that are not in the Material scheme: success, the TUI's
 /// magenta for a denial, the agent working, the link banner's, picked
