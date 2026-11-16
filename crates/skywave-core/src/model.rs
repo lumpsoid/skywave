@@ -53,10 +53,10 @@ use crate::view::{
     SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView,
     SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
     SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
-    SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable,
-    UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane,
-    WorkdirView, WorktreeSession, WorktreesView,
+    SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader, SubagentStatus,
+    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload,
+    WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -3198,7 +3198,7 @@ impl Model {
 
     fn storage_view(&self) -> StorageView {
         let (status, report, device) = self.storage.shown();
-        let titles = report
+        let sessions = report
             .iter()
             .flat_map(|report| report.sessions.iter().map(|s| s.session))
             .chain(
@@ -3206,7 +3206,16 @@ impl Model {
                     .iter()
                     .flat_map(|device| device.sessions.iter().map(|s| s.session)),
             )
-            .filter_map(|id| Some((id, self.title(self.summary(id)?).text)))
+            .filter_map(|id| {
+                let summary = self.summary(id)?;
+                let session = StorageSession {
+                    title: self.title(summary).text,
+                    archived: self.archived(summary),
+                    deletable: self.deletable(summary),
+                    deletable_everywhere: self.deletable_everywhere(summary),
+                };
+                Some((id, session))
+            })
             .collect();
         let gone = report
             .iter()
@@ -3219,7 +3228,7 @@ impl Model {
         StorageView {
             status,
             report,
-            titles,
+            sessions,
             pending: self.blob_pendings(),
             gone,
             device,
@@ -12330,9 +12339,9 @@ mod tests {
         let view = storage_view(&f);
         assert_eq!(view.status, StorageStatus::Ready);
         assert_eq!(view.report, Some(report.clone()));
-        // A session not in this replica has no title.
-        assert_eq!(view.titles.len(), 1);
-        assert!(view.titles.contains_key(&known));
+        // A session not in this replica has no entry.
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[&known].title, "a");
 
         // A refresh keeps the report until its answer, and a failure keeps it.
         let second = storage_req(&f.dispatch(Action::RefreshStorage)).unwrap();

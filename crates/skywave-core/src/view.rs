@@ -960,6 +960,19 @@ pub struct UsageView {
     pub deleted: usize,
 }
 
+/// What this replica knows of a session the storage screen lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageSession {
+    /// As [`SessionRow::title`].
+    pub title: String,
+    /// On the archived list, as the session list sorts it.
+    pub archived: bool,
+    /// As [`SessionRow::deletable`].
+    pub deletable: bool,
+    /// As [`SessionRow::deletable_everywhere`].
+    pub deletable_everywhere: bool,
+}
+
 /// What the server's data takes on its disk, as the server last reported
 /// it ([`Route::Storage`](crate::Route::Storage)). In memory only: opening
 /// the screen asks again, and so does
@@ -970,10 +983,10 @@ pub struct StorageView {
     /// The latest report; `None` until one arrives. A failed refresh keeps
     /// the one before it.
     pub report: Option<StorageReport>,
-    /// The replica's title (as [`SessionRow::title`]) of each session the
-    /// report or this device's report names; one missing is not in this
-    /// replica (deleted here, or not pulled yet).
-    pub titles: std::collections::HashMap<SessionId, String>,
+    /// What the replica knows of each session the report or this device's
+    /// report names; one missing is not in this replica (deleted here, or
+    /// not pulled yet).
+    pub sessions: std::collections::HashMap<SessionId, StorageSession>,
     /// This device's own delete or crop of each blob that has one, as a
     /// [`BlobView::pending`] shows it, so a row of it offers nothing more.
     pub pending: std::collections::HashMap<BlobId, BlobPending>,
