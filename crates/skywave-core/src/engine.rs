@@ -484,6 +484,21 @@ impl Engine {
                     seam.storage_reported(req, result);
                 });
             }
+            Request::DeviceStorage { req } => {
+                let seam = self.seam.clone();
+                let data_dir = self.seam.data_dir();
+                self.seam.spawn("a device storage report", async move {
+                    // Off the async workers: the scan of the events can take seconds.
+                    match tokio::task::spawn_blocking(move || {
+                        crate::store::read_device_storage(&data_dir)
+                    })
+                    .await
+                    {
+                        Ok(result) => seam.device_storage_read(req, result),
+                        Err(error) => tracing::warn!(%error, "cannot read this device's storage"),
+                    }
+                });
+            }
             Request::ReclaimStorage { req } => {
                 let seam = self.seam.clone();
                 let Some(transport) = self.side_transport() else {

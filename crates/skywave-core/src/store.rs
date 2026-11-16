@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
@@ -32,7 +32,9 @@ use crate::address::{ServerAddress, ServerAddresses};
 use crate::attachment::{self, AttachedFile, AttachedImage};
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::shell_history::SHELL_HISTORY_MAX;
-use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
+use crate::view::{
+    ComposerMode, DeviceSessionStorage, DeviceStorage, Draft, RunWhen, Snippet, SnippetId,
+};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
 /// File name of the database inside the core's data directory.
@@ -3071,6 +3073,102 @@ fn connect(data_dir: &Path) -> Result<Connection, StoreError> {
     // Every user action must survive power loss once dispatch returns.
     conn.pragma_update(None, "synchronous", "FULL")?;
     Ok(conn)
+}
+
+/// What this device keeps under `data_dir`, for the storage screen. Read in
+/// one transaction on its own read-only connection: the scan of every event
+/// can take seconds on a big replica, and WAL lets this reader run beside the
+/// engine's writer, so the engine's state lock is never held for it.
+pub fn read_device_storage(data_dir: &Path) -> Result<DeviceStorage, StoreError> {
+    let mut conn = Connection::open_with_flags(
+        data_dir.join(DB_FILE),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let tx = conn.transaction()?;
+    let database = file_len(&data_dir.join(DB_FILE)) + file_len(&data_dir.join("core.db-wal"));
+    let page_size = tx.query_row("PRAGMA page_size", [], |row| u64_col(row, 0))?;
+    let free_pages = tx.query_row("PRAGMA freelist_count", [], |row| u64_col(row, 0))?;
+    // What each blob holds on disk, by id.
+    let blob_disk: HashMap<BlobId, u64> = {
+        let mut stmt = tx.prepare("SELECT id, size, state, got FROM blobs")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((BlobId(uuid_col(row, 0)?), blob_on_disk(row)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let blobs: u64 = blob_disk.values().sum();
+    // The attachment files `kept_file_copies` keeps: an image row's, a draft
+    // file's, and those of an outbox entry not yet accepted. Equal hashes are
+    // one file, and equal hashes have equal sizes, so UNION counts it once.
+    let attachments = tx.query_row(
+        "SELECT COALESCE(SUM(size), 0) FROM (
+            SELECT sha256, size FROM attachments
+            UNION SELECT sha256, size FROM draft_files
+            UNION SELECT f.sha256, f.size FROM outbox_files f JOIN outbox o ON o.command_id = f.command_id
+            WHERE o.result IS NULL
+               OR json_extract(o.result, '$.result') IN ('rejected', 'undeliverable', 'attachment_refused'))",
+        [],
+        |row| u64_col(row, 0),
+    )?;
+    // Per session: the bytes of its events, and the blobs they name.
+    let mut per_session: HashMap<SessionId, (u64, HashSet<BlobId>)> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT session_id, event FROM events")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let session = SessionId(uuid_col(row, 0)?);
+            let text: String = row.get(1)?;
+            let (bytes, named) = per_session.entry(session).or_default();
+            // The column is TEXT: its bytes are its UTF-8 length.
+            *bytes += text.len() as u64;
+            match serde_json::from_str::<Event>(&text) {
+                Ok(event) => named.extend(blob_refs(&event.kind).map(|blob| blob.id)),
+                Err(error) => tracing::warn!(%error, "sizing an event that does not decode"),
+            }
+        }
+    }
+    let mut sessions: Vec<DeviceSessionStorage> = per_session
+        .into_iter()
+        .map(|(session, (event_bytes, named))| DeviceSessionStorage {
+            session,
+            event_bytes,
+            blob_bytes: named.iter().filter_map(|id| blob_disk.get(id)).sum(),
+        })
+        .collect();
+    let size = |s: &DeviceSessionStorage| s.event_bytes + s.blob_bytes;
+    sessions.sort_by(|a, b| size(b).cmp(&size(a)).then(a.session.cmp(&b.session)));
+    Ok(DeviceStorage {
+        database,
+        reclaimable: page_size * free_pages,
+        blobs,
+        attachments,
+        sessions,
+    })
+}
+
+/// The size of the file at `path`; a file not there is 0. One that cannot be
+/// read is 0 too, with a warning: the device report is best effort.
+fn file_len(path: &Path) -> u64 {
+    match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot size a database file");
+            0
+        }
+    }
+}
+
+/// A `blobs` row's bytes on disk, from the columns `size, state, got`: its
+/// whole size once available, else what its download got.
+fn blob_on_disk(row: &Row<'_>) -> rusqlite::Result<u64> {
+    let available = row.get::<_, String>(2)? == "available";
+    let bytes: Option<i64> = if available { row.get(1)? } else { row.get(3)? };
+    match bytes {
+        Some(bytes) => u64::try_from(bytes).map_err(|e| bad_value(3, Type::Integer, e)),
+        None => Ok(0),
+    }
 }
 
 /// Whether [`migrate`] migrates the stored wire JSON from the replica's

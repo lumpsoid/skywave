@@ -320,6 +320,7 @@ mod tests {
             titles: HashMap::new(),
             pending: HashMap::new(),
             gone: HashSet::new(),
+            device: None,
         }
     }
 

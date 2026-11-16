@@ -4466,10 +4466,13 @@ fn storage_asks_the_server_and_lists_what_takes_the_most() {
         h.key(KeyCode::Char('S')),
         Some(Action::Navigate(Route::Storage))
     );
-    let req = match h.drain_requests().as_slice() {
-        [Request::Storage { req }] => *req,
-        other => panic!("expected one storage request, got {other:?}"),
-    };
+    // The screen also asks for this device's report: pick the server's out.
+    let requests = h.drain_requests();
+    let req = requests.iter().find_map(|request| match request {
+        Request::Storage { req } => Some(*req),
+        _ => None,
+    });
+    let req = req.unwrap_or_else(|| panic!("expected a storage request, got {requests:?}"));
     assert_contains(&h.screen(), "Asking the server…");
 
     let report = skywave_proto::StorageReport {
@@ -4514,10 +4517,11 @@ fn storage_asks_the_server_and_lists_what_takes_the_most() {
     assert_contains(&h.screen(), "No shell runs.");
 
     assert_eq!(h.key(KeyCode::Char('r')), Some(Action::RefreshStorage));
-    assert!(matches!(
-        h.drain_requests().as_slice(),
-        [Request::Storage { .. }]
-    ));
+    assert!(
+        h.drain_requests()
+            .iter()
+            .any(|request| matches!(request, Request::Storage { .. }))
+    );
     assert_contains(&h.screen(), "Refreshing…");
     assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     assert!(matches!(h.app.view().screen, Screen::SessionList(_)));
@@ -9849,10 +9853,13 @@ fn storage_rows_move_with_j_k_and_act_on_their_blob() {
     let (here, gone) = (SessionId::new(), SessionId::new());
     pull(&mut h, vec![created(here, 0, "/srv/a")]);
     h.key(KeyCode::Char('S'));
-    let req = match h.drain_requests().as_slice() {
-        [Request::Storage { req }] => *req,
-        other => panic!("expected one storage request, got {other:?}"),
-    };
+    // The screen also asks for this device's report: pick the server's out.
+    let requests = h.drain_requests();
+    let req = requests.iter().find_map(|request| match request {
+        Request::Storage { req } => Some(*req),
+        _ => None,
+    });
+    let req = req.unwrap_or_else(|| panic!("expected a storage request, got {requests:?}"));
     let (mine, theirs, run_output) = (BlobId::new(), BlobId::new(), BlobId::new());
     let stored = |id, size, session, holds| skywave_proto::BlobStorage {
         id,

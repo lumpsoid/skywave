@@ -108,8 +108,8 @@ pub use view::{
     WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirPush, WorkdirView,
 };
 pub use view::{
-    BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,
-    StorageUnavailable, StorageView,
+    BlobStorage, BlobUse, DeviceSessionStorage, DeviceStorage, LineSpan, SessionStorage,
+    ShellRunStorage, StorageReport, StorageStatus, StorageUnavailable, StorageView,
 };
 pub use view::{
     ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry, EntryKind, FileBody, FileChange,

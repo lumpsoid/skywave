@@ -971,8 +971,8 @@ pub struct StorageView {
     /// the one before it.
     pub report: Option<StorageReport>,
     /// The replica's title (as [`SessionRow::title`]) of each session the
-    /// report names; one missing is not in this replica (deleted here, or
-    /// not pulled yet).
+    /// report or this device's report names; one missing is not in this
+    /// replica (deleted here, or not pulled yet).
     pub titles: std::collections::HashMap<SessionId, String>,
     /// This device's own delete or crop of each blob that has one, as a
     /// [`BlobView::pending`] shows it, so a row of it offers nothing more.
@@ -981,6 +981,37 @@ pub struct StorageView {
     /// deleted or cropped, by any device: the report predates that, so a
     /// row of it offers nothing.
     pub gone: std::collections::HashSet<BlobId>,
+    /// What this device keeps on its disk, read when the screen asks; `None`
+    /// until the first answer.
+    pub device: Option<DeviceStorage>,
+}
+
+/// What this device keeps on its disk, read when the storage screen asks.
+/// Bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceStorage {
+    /// `core.db` with its write-ahead log: the replica, drafts, outbox.
+    pub database: u64,
+    /// Of `database`, the free pages SQLite keeps after rows are deleted.
+    pub reclaimable: u64,
+    /// Blob files downloaded (complete) or partly downloaded.
+    pub blobs: u64,
+    /// Draft and outbox attachments (images and files).
+    pub attachments: u64,
+    /// Every session in the replica, largest (`event_bytes + blob_bytes`)
+    /// first, ties by session id.
+    pub sessions: Vec<DeviceSessionStorage>,
+}
+
+/// What one session takes on this device's disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSessionStorage {
+    pub session: SessionId,
+    /// The stored JSON of its events.
+    pub event_bytes: u64,
+    /// Its blobs' bytes on this disk (complete ones by size, partial ones by
+    /// what they got). A blob two of its events name counts once.
+    pub blob_bytes: u64,
 }
 
 /// Where the storage screen's report stands.

@@ -1478,7 +1478,11 @@ logs) an event that no longer decodes rather than failing.
   the replica's title for each session it names; a session missing there
   is not on this device. Only the latest request's answer is kept;
   offline nothing is asked. Nothing is stored: opening the screen drops
-  the last report and asks again.
+  the last report and asks again. The same asks also read this device's
+  own report (`StorageView::device`, `store::read_device_storage`: the
+  replica with its WAL, blob bytes on disk, attachment files, and each
+  session's event and blob bytes), off the state lock on a read-only
+  connection, and work offline too.
   `ReclaimServerSpace` (paired, online) asks `POST /v1/storage/reclaim`
   within `RECLAIM_TIMEOUT` (610 s, above the server's 600 s `VACUUM`) and
   shows `Reclaiming` until its answer; a refresh or a second reclaim asks
