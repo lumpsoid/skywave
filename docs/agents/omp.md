@@ -119,8 +119,9 @@ How omp asks:
 - Tools in a batch run concurrently unless `exclusive`, so two approval
   selects can be pending at once and their order does not identify the call.
 
-So `ApprovalRequested { call, tool, input, suggestions }` cannot be filled
-from definitive signals. Options:
+So `ApprovalRequested { request, call, tool, input, suggestions, task, shell }`
+cannot be filled from definitive signals. `shell` is set only for a command
+that runs in the workdir (D59). Options:
 
 1. **Upstream (preferred):** implement `approve` in the RPC UI context and
    thread `toolCallId`, tool name and args into `ExtensionApprovalPrompt`
