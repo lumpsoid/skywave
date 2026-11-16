@@ -1156,6 +1156,15 @@ impl Model {
                 }
                 vec![Effect::DeleteLocally(session_id)]
             }
+            Action::DeleteSessionEverywhere { session_id } => {
+                if !self
+                    .summary(session_id)
+                    .is_some_and(|s| self.deletable_everywhere(s))
+                {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::DeleteSession { session_id }, Vec::new())
+            }
             Action::OpenSession(id) => {
                 if self.device().is_none() || self.summary(id).is_none() {
                     return Vec::new();
@@ -3044,6 +3053,7 @@ impl Model {
                     },
                     cost_usd: s.usage.as_ref().and_then(|u| u.total.cost_usd),
                     deletable: self.deletable(s),
+                    deletable_everywhere: self.deletable_everywhere(s),
                     importing: s.importing,
                 }
             })
@@ -3436,6 +3446,13 @@ impl Model {
             && summary.pending_approvals.is_empty()
             && summary.state != LogState::AgentWorking
             && !unsettled
+    }
+
+    /// Whether [`Action::DeleteSessionEverywhere`] may send: `deletable`, and
+    /// its worktree is gone, since the server refuses a session whose
+    /// worktree is still on disk.
+    fn deletable_everywhere(&self, summary: &SessionSummary) -> bool {
+        self.deletable(summary) && (summary.worktree.is_none() || summary.worktree_removed)
     }
 
     /// The device whose request `answers` names, if it was seen.
@@ -8030,6 +8047,69 @@ mod tests {
             [kept]
         );
         assert_eq!(model.cursor, Seq(6));
+    }
+
+    /// Whether the archived list offers to delete the session everywhere.
+    fn shown_everywhere(f: &mut Fixture, id: SessionId) -> bool {
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        row(f, id).deletable_everywhere
+    }
+
+    #[test]
+    fn delete_everywhere_needs_archived_and_no_worktree() {
+        let mut f = Fixture::paired();
+        let active = f.session("/srv/active");
+        assert!(!row(&f, active).deletable_everywhere);
+        assert!(
+            f.dispatch(Action::DeleteSessionEverywhere { session_id: active })
+                .is_empty(),
+            "active"
+        );
+
+        // Archived as the log has it, so it may go everywhere.
+        let gone = f.session("/srv/gone");
+        f.log(gone, vec![archived_event(true, f.me)]);
+        assert!(shown_everywhere(&mut f, gone));
+        let command = queued(&f.dispatch(Action::DeleteSessionEverywhere { session_id: gone }));
+        assert_eq!(
+            command.kind,
+            CommandKind::DeleteSession { session_id: gone }
+        );
+        // Until the server answers, it is neither offered nor sent again.
+        assert!(!shown_everywhere(&mut f, gone));
+        assert!(
+            f.dispatch(Action::DeleteSessionEverywhere { session_id: gone })
+                .is_empty(),
+            "sent once"
+        );
+
+        // Its worktree is still on disk: the server would refuse the delete.
+        let in_worktree = SessionId::new();
+        f.log(in_worktree, vec![created_in_worktree("/srv/app")]);
+        f.log(in_worktree, vec![archived_event(true, f.me)]);
+        assert!(!shown_everywhere(&mut f, in_worktree));
+        let shown = row(&f, in_worktree);
+        assert!(shown.deletable, "locally it could go");
+        assert!(
+            f.dispatch(Action::DeleteSessionEverywhere {
+                session_id: in_worktree
+            })
+            .is_empty(),
+            "but not while the worktree is there"
+        );
+
+        // Removed, it may go everywhere.
+        f.log(in_worktree, vec![EventKind::WorktreeRemoved { by: f.me }]);
+        assert!(shown_everywhere(&mut f, in_worktree));
+        let command = queued(&f.dispatch(Action::DeleteSessionEverywhere {
+            session_id: in_worktree,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::DeleteSession {
+                session_id: in_worktree
+            }
+        );
     }
 
     #[test]

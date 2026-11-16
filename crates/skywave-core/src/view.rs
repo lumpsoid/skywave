@@ -930,6 +930,9 @@ pub struct SessionRow {
     /// would remove it: it is archived, has no pending approval, no running
     /// turn and no command from this device still unanswered.
     pub deletable: bool,
+    /// [`Action::DeleteSessionEverywhere`](crate::Action::DeleteSessionEverywhere)
+    /// would send: `deletable`, and no worktree of the session is on disk.
+    pub deletable_everywhere: bool,
     /// The session adopted an outside conversation whose imported history
     /// is not all in the replica yet (its `ImportFinished` has not been
     /// pulled): a long import arrives over several pulls. Its

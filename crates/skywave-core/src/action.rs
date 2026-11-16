@@ -390,6 +390,13 @@ pub enum Action {
     DeleteSessionLocally {
         session_id: SessionId,
     },
+    /// Delete the session on the server and every device
+    /// ([`CommandKind::DeleteSession`](skywave_proto::CommandKind::DeleteSession)):
+    /// irreversible. A no-op unless the session's row is
+    /// [`deletable_everywhere`](crate::SessionRow::deletable_everywhere).
+    DeleteSessionEverywhere {
+        session_id: SessionId,
+    },
     OpenSession(SessionId),
     /// Open the session of the next approval in
     /// [`Attention::approvals`](crate::Attention::approvals) outside the
