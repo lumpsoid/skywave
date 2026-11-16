@@ -105,18 +105,8 @@ class StatusLine extends StatelessWidget {
     final colors = SkyColors.of(context);
     final style = theme.textTheme.labelMedium!;
     final muted = style.copyWith(color: colors.muted);
-    final agent = style.copyWith(
-      color: colors.agent(screen.state),
-      fontWeight: FontWeight.w600,
-    );
     final rules = screen.rulesLabel;
     final settings = screen.agent;
-
-    final left = <InlineSpan>[
-      TextSpan(text: screen.badgeLabel, style: agent),
-      if (screen.stopLabel case final label?)
-        TextSpan(text: ' · $label', style: muted),
-    ];
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -174,7 +164,11 @@ class StatusLine extends StatelessWidget {
         // phone, or a line too narrow for every label in full, folds the
         // chips into one that shows the model and lists them all.
         // The state takes what it needs, up to a third of the line.
-        final leftWidth = width(TextSpan(children: left));
+        const stateIcon = 18.0;
+        final stop = screen.stopLabel;
+        final leftWidth =
+            stateIcon +
+            (stop == null ? 0 : 6 + width(TextSpan(text: stop, style: muted)));
         final stateRoom = 0.3 * constraints.maxWidth;
         final line = constraints.maxWidth - 32 - min(leftWidth, stateRoom);
         var labelRoom = line / chips.length - 8 - _Chip.chrome;
@@ -218,10 +212,26 @@ class StatusLine extends StatelessWidget {
                 constraints: BoxConstraints(maxWidth: stateRoom),
                 child: Tooltip(
                   message: screen.agentLabel,
-                  child: Text.rich(
-                    TextSpan(children: left),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      AgentStateIcon(
+                        state: screen.state,
+                        size: stateIcon,
+                        key: const Key('session-state'),
+                      ),
+                      if (stop != null) ...[
+                        const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            stop,
+                            style: muted,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),
