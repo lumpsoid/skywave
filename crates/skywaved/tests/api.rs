@@ -407,6 +407,7 @@ async fn without_a_client_cert_only_pairing_answers() {
     for (method, uri) in [
         (Method::GET, path::HELLO),
         (Method::POST, path::COMMANDS),
+        (Method::POST, path::STORAGE_RECLAIM),
         (Method::GET, "/v1/events?after=0"),
         (Method::GET, path::CONVERSATIONS),
         (Method::GET, blob.as_str()),
@@ -3800,6 +3801,89 @@ async fn a_deleted_session_leaves_the_storage_report() {
 
     let after: StorageReport = device.get(path::STORAGE).await.json();
     assert!(!lists(&after), "the deleted session is not in the report");
+}
+
+/// Leaves free pages in the server's database: a table of about 2 MB,
+/// dropped. SQLite keeps the pages on its freelist, so the file does not
+/// shrink until it is compacted.
+fn leave_free_pages(f: &Fixture) {
+    let conn = rusqlite::Connection::open(f.storage.dir.db_path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE filler (body BLOB);
+         INSERT INTO filler WITH RECURSIVE n(i) AS
+           (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+           SELECT randomblob(1000) FROM n;
+         DROP TABLE filler;",
+    )
+    .unwrap();
+}
+
+/// `POST` [`path::STORAGE_RECLAIM`] compacts the database: the free pages
+/// the report counted are given back, and the answer is the new report.
+#[tokio::test(flavor = "multi_thread")]
+async fn reclaiming_space_shrinks_the_database() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    leave_free_pages(&f);
+
+    let before: StorageReport = device.get(path::STORAGE).await.json();
+    assert!(
+        before.reclaimable > 0,
+        "the dropped table left free pages: {before:?}"
+    );
+
+    let reply = device
+        .send(Method::POST, path::STORAGE_RECLAIM, &[], Bytes::new())
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let after: StorageReport = reply.json();
+    assert_eq!(after.reclaimable, 0, "no free pages are left");
+    assert!(
+        after.database < before.database,
+        "the database shrank: {} -> {}",
+        before.database,
+        after.database
+    );
+    let read_again: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(read_again.reclaimable, 0);
+}
+
+/// A reclaim on a disk with less free space than the database plus the
+/// floor is refused with 507 and runs nothing; with room again it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reclaim_on_a_disk_too_full_is_refused() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let f = Fixture::start_cropping(disk, None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    leave_free_pages(&f);
+    let before: StorageReport = device.get(path::STORAGE).await.json();
+
+    let refused = device
+        .send(Method::POST, path::STORAGE_RECLAIM, &[], Bytes::new())
+        .await;
+    assert_eq!(refused.status, StatusCode::INSUFFICIENT_STORAGE);
+    let still: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(
+        still.reclaimable, before.reclaimable,
+        "a refused reclaim ran nothing"
+    );
+
+    free.0
+        .store(u64::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+    let reply = device
+        .send(Method::POST, path::STORAGE_RECLAIM, &[], Bytes::new())
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "with room, the same reclaim runs"
+    );
+    let after: StorageReport = reply.json();
+    assert_eq!(after.reclaimable, 0);
 }
 
 fn delete_command(session: SessionId) -> Command {

@@ -4474,6 +4474,7 @@ fn storage_asks_the_server_and_lists_what_takes_the_most() {
 
     let report = skywave_proto::StorageReport {
         database: 3 * 1024 * 1024,
+        reclaimable: 0,
         event_blobs: 2 * 1024 * 1024,
         workdir_blobs: 0,
         shell_running: 0,
@@ -9870,6 +9871,7 @@ fn storage_rows_move_with_j_k_and_act_on_their_blob() {
     };
     let report = skywave_proto::StorageReport {
         database: 0,
+        reclaimable: 0,
         event_blobs: 0,
         workdir_blobs: 0,
         shell_running: 0,
