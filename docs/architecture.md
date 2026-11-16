@@ -242,8 +242,8 @@ name was dropped (devices that connect by it fail with a name mismatch). A missi
 `ca/` is recreated by `serve` or `pair`; when unrevoked devices are registered,
 the command warns on stderr (and in the log) that every one must re-pair. Both
 warnings go to the command's stderr as well as the log. Admin commands
-(`pair`, `devices list`, `devices revoke`) work on the database directly,
-beside a running `serve`.
+(`pair`, `devices list`, `devices revoke`, `safety-feedback`) work on the
+database directly, beside a running `serve`.
 
 `stop` and `restart` (D41) instead ask the running `serve` over
 `control.sock` in its data dir (JSON lines, `crates/skywaved/src/control.rs`)

@@ -24,6 +24,7 @@ pub mod logging;
 pub mod login;
 pub mod pairing;
 mod process;
+pub mod safety_feedback;
 pub mod server;
 pub mod shell;
 pub mod storage;

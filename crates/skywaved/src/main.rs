@@ -22,6 +22,7 @@ use skywaved::disk::{Disk, FsFreeSpace};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 use skywaved::logging::LogFile;
 use skywaved::pairing;
+use skywaved::safety_feedback;
 use skywaved::server::{Server, ServerOptions};
 use skywaved::shell::ShellRunner;
 use skywaved::workdir::Git;
@@ -53,6 +54,8 @@ enum Command {
         #[command(subcommand)]
         command: DevicesCommand,
     },
+    /// Print all safety check feedback as JSON lines, oldest first.
+    SafetyFeedback,
     /// Stop the running serve. Refused while agent turns or shell runs are
     /// running, unless you confirm losing them.
     Stop(StopArgs),
@@ -214,6 +217,11 @@ fn run(cli: Cli) -> skywaved::Result<()> {
                     d.name,
                     d.revoked_at.map(|t| t.to_rfc3339()).unwrap_or_default()
                 ),
+            }
+        }
+        Command::SafetyFeedback => {
+            for line in safety_feedback::lines(storage.db.conn())? {
+                println!("{line}");
             }
         }
     }
