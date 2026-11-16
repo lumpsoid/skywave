@@ -471,6 +471,9 @@ pub struct Supervisor<A: AgentAdapter> {
     running: HashMap<SessionId, Running<A::Session>>,
     /// Sessions whose agent is starting or stopping, and what waits for it.
     held: HashMap<SessionId, Held>,
+    /// Sessions whose `SessionDeleted` was read: their work is dropped and
+    /// they are erased once nothing of theirs runs, starts or stops (D62).
+    deleting: HashSet<SessionId>,
     /// Agent starts under way.
     starts: JoinSet<(SessionId, Started<A::Session>)>,
     /// Agent stops under way, each with whether its exit is recorded.
@@ -905,6 +908,13 @@ impl<A: AgentAdapter> Supervisor<A> {
         }
         self.models = self.log.offered_models(db)?;
         self.held = self.held_events(&progress)?;
+        // A deletion the previous run read but had not finished (D62): its
+        // work is dropped, and `follow_log` erases it. A tombstone the run had
+        // not read stays with its held work: `follow` reads them in order.
+        for id in requested_deletions(&self.storage.db, self.cursor)? {
+            self.held.remove(&id);
+            self.deleting.insert(id);
+        }
         self.stored = Progress {
             owed: HashMap::new(),
             ..progress
@@ -979,6 +989,11 @@ impl<A: AgentAdapter> Supervisor<A> {
         let replayed: Vec<SessionId> = self.held.keys().copied().collect();
         for id in replayed {
             self.drain(id).await?;
+        }
+        // Deletions the previous run read, not yet erased (D62).
+        let deleting: Vec<SessionId> = self.deleting.iter().copied().collect();
+        for id in deleting {
+            self.finish_deletion(id)?;
         }
         self.publish_activity();
         loop {
@@ -1097,6 +1112,10 @@ impl<A: AgentAdapter> Supervisor<A> {
     async fn on_log_event(&mut self, seq: Seq, event: Event) -> Result<()> {
         if !reacts(&event.kind) {
             return Ok(());
+        }
+        // Before the held check: a held session's work is dropped, not queued.
+        if matches!(event.kind, EventKind::SessionDeleted { .. }) {
+            return self.delete_session(event.session_id);
         }
         let item = Queued {
             seq,
@@ -1288,6 +1307,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                             todo.push(waiter);
                         }
                     }
+                    self.finish_deletion(id)?;
                     break;
                 };
                 let seq = item.seq;
@@ -1300,6 +1320,52 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
         }
         self.store_progress()
+    }
+
+    /// Starts deleting session `id`, whose `SessionDeleted` was read (D62):
+    /// its queued work is dropped, and a running agent is stopped (its exit
+    /// is logged, while the session is `requested`). It is erased once
+    /// nothing of it runs, starts or stops ([`Supervisor::finish_deletion`]).
+    fn delete_session(&mut self, id: SessionId) -> Result<()> {
+        let erased: bool = self.storage.db.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND deletion = 'erased')",
+            [id.0.to_string()],
+            |r| r.get(0),
+        )?;
+        // Replayed after its erase: nothing is left to do.
+        if erased {
+            return Ok(());
+        }
+        self.deleting.insert(id);
+        if let Some(held) = self.held.get_mut(&id) {
+            held.queue.clear();
+        }
+        // Does nothing unless the agent runs.
+        self.begin_stop(id, true);
+        self.finish_deletion(id)
+    }
+
+    /// Erases session `id` if it is being deleted and nothing of it runs,
+    /// starts or stops: the erase and the blob files it freed, in that
+    /// order. Otherwise a later hook calls this again (D62).
+    fn finish_deletion(&mut self, id: SessionId) -> Result<()> {
+        if !self.deleting.contains(&id)
+            || self.running.contains_key(&id)
+            || self.held.contains_key(&id)
+        {
+            return Ok(());
+        }
+        let tx = event_log::begin(&mut self.storage.db)?;
+        let freed = event_log::erase_session_in(&tx, id)?;
+        tx.commit()?;
+        // Only once their rows are gone: a crash before this leaves a file
+        // without a row, which the startup sweep removes.
+        for blob in freed {
+            self.storage.blobs.discard(blob);
+        }
+        self.deleting.remove(&id);
+        tracing::info!(session = %id.0, "session erased");
+        Ok(())
     }
 
     /// Whether session `id` still holds its event at `seq`, unhandled.
@@ -1817,6 +1883,9 @@ impl<A: AgentAdapter> Supervisor<A> {
             asked,
             logins,
         } = *start;
+        // A session being deleted runs nothing: its trigger is dropped, not
+        // handed over, and nothing is answered for it (D62).
+        let deleting = self.deleting.contains(&id);
         match started {
             Ok((session, events)) => {
                 tracing::info!(session = %id.0, "agent started");
@@ -1835,7 +1904,10 @@ impl<A: AgentAdapter> Supervisor<A> {
                 // Nothing to do until a message comes, if one does.
                 running.settle_idle();
                 self.running.insert(id, running);
-                if matches!(trigger.event.kind, EventKind::UserMessage { .. }) {
+                if deleting {
+                    self.mark_handled(id, trigger.seq);
+                    self.begin_stop(id, true);
+                } else if matches!(trigger.event.kind, EventKind::UserMessage { .. }) {
                     self.hand_over(trigger).await?;
                 } else {
                     // The start asked for the setting.
@@ -1844,7 +1916,9 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
             Err(error) => {
                 tracing::warn!(session = %id.0, %error, "agent did not start");
-                self.start_failed(&trigger, error.to_string())?;
+                if !deleting {
+                    self.start_failed(&trigger, error.to_string())?;
+                }
                 self.mark_handled(id, trigger.seq);
             }
         }
@@ -2133,6 +2207,7 @@ fn reacts(kind: &EventKind) -> bool {
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::TaskStopRequested { .. }
+            | EventKind::SessionDeleted { .. }
     )
 }
 
@@ -2204,6 +2279,7 @@ fn run_thread<A: AgentAdapter>(
             },
             running: HashMap::new(),
             held: HashMap::new(),
+            deleting: HashSet::new(),
             starts: JoinSet::new(),
             stops: JoinSet::new(),
             models: None,
@@ -2469,6 +2545,25 @@ fn messages_lost(count: usize) -> String {
         1 => MESSAGE_LOST.to_owned(),
         n => format!("{n} messages lost when the server stopped; send them again"),
     }
+}
+
+/// The sessions a `DeleteSession` requested whose tombstone is at or before
+/// `cursor`, the seq the supervisor has read through: their erase has not
+/// finished. A later tombstone is read by `follow`, which erases then (D62).
+fn requested_deletions(db: &Db, cursor: Seq) -> Result<Vec<SessionId>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT s.id FROM sessions s
+         WHERE s.deletion = 'requested' AND EXISTS (
+             SELECT 1 FROM events e
+             WHERE e.session_id = s.id
+               AND json_extract(e.kind, '$.type') = 'session_deleted'
+               AND e.seq <= ?1)",
+    )?;
+    let ids = stmt
+        .query_map([to_sql(cursor)?], |r| r.get::<_, String>(0))?
+        .map(|text| parse_id(&text?))
+        .collect::<Result<Vec<SessionId>>>()?;
+    Ok(ids)
 }
 
 fn load_progress(db: &Db) -> Result<Progress> {
