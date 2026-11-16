@@ -1864,7 +1864,8 @@ pub(crate) fn request_deletion_in(conn: &Connection, id: SessionId) -> Result<()
 /// needs. The `sessions` and `contexts` rows stay, since other rows
 /// reference them; `sessions.deletion` becomes `erased`. Returns the blobs
 /// its events named: their files are the caller's to remove after commit.
-#[allow(dead_code)] // called by the supervisor in the next commit (D62)
+/// Its `models_offered` events stay too: the newest offered list is the
+/// server's (`offered_models`), not the session's.
 pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<BlobId>> {
     let session = id.0.to_string();
     let blobs = conn
@@ -1891,7 +1892,8 @@ pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<B
     conn.execute(
         "UPDATE events SET kind = ?2 WHERE session_id = ?1
            AND json_extract(kind, '$.type') NOT IN
-               ('session_created', 'worktree_removed', 'session_deleted')",
+               ('session_created', 'worktree_removed', 'session_deleted',
+                'models_offered')",
         params![session, erased],
     )?;
     conn.execute(

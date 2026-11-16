@@ -2021,6 +2021,143 @@ async fn idle_agent_is_shut_down_and_resumed_on_next_message() {
     );
 }
 
+/// Every event of the session but its tombstone is erased (D62).
+fn all_erased_but_tombstone(kinds: &[EventKind]) -> bool {
+    kinds
+        .iter()
+        .all(|k| matches!(k, EventKind::Erased | EventKind::SessionDeleted { .. }))
+}
+
+/// Waits until the session's events are erased. Polls the rows: the erase
+/// appends nothing, so the log's notifier need not wake for it.
+async fn wait_erased(f: &Fixture) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let kinds = f.kinds();
+        if all_erased_but_tombstone(&kinds) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the erase; log: {kinds:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The session's `deletion` as the database has it.
+fn deletion_of(f: &Fixture, session: SessionId) -> String {
+    f.storage
+        .db
+        .conn()
+        .query_row(
+            "SELECT deletion FROM sessions WHERE id = ?1",
+            [session.0.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn deleting_an_idle_session_stops_its_agent_and_erases_it() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("first reply", 1, is_idle).await;
+    let session = f.session_id;
+    accepted(f.handle(
+        DeviceId::new(),
+        CommandKind::DeleteSession {
+            session_id: session,
+        },
+    ));
+    wait_shutdown(&agent, &f, 1).await;
+    wait_erased(&f).await;
+    assert_eq!(deletion_of(&f, session), "erased");
+
+    // The supervisor outlived the erase: another session's turn still runs.
+    f.session_id = f.create_session();
+    f.send("two");
+    f.wait_count("the other session's reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_restart_finishes_a_requested_deletion() {
+    let mut f = Fixture::new();
+    let session = f.session_id;
+    let tombstone = accepted(f.handle(
+        DeviceId::new(),
+        CommandKind::DeleteSession {
+            session_id: session,
+        },
+    ));
+    // The run that read the tombstone stopped before it erased the session.
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1",
+            [i64::try_from(tombstone.0).unwrap()],
+        )
+        .unwrap();
+    set_accounted(&f);
+    f.reopen_log();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(deletion_of(&f, session), "erased");
+    // Nothing runs at startup: the erase ran no agent.
+    assert!(agent.inputs(session).is_empty());
+}
+
+#[tokio::test]
+async fn a_restart_reads_events_before_an_unread_tombstone_first() {
+    let mut f = Fixture::new();
+    let (session, first) = (f.session_id, f.first());
+    // A live background task, as an earlier run's agent reported it.
+    f.log
+        .append(
+            &mut f.storage.db,
+            session,
+            first,
+            EventKind::BackgroundTasksChanged {
+                tasks: vec![skywave_proto::BackgroundTask {
+                    call: None,
+                    id: TaskId("job".into()),
+                    kind: skywave_proto::TaskKind::Shell,
+                    title: "sleep 60".into(),
+                    parent: None,
+                    ambient: false,
+                }],
+            },
+        )
+        .unwrap();
+    // Neither the stop nor the delete has been read by a supervisor.
+    stop_task(&mut f, "job");
+    let tombstone = accepted(f.handle(
+        DeviceId::new(),
+        CommandKind::DeleteSession {
+            session_id: session,
+        },
+    ));
+    f.reopen_log();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    wait_erased(&f).await;
+    // The stop was read before the erase and answered after the tombstone:
+    // the recovered `BackgroundTasksChanged` and the refusal of the stop.
+    assert_eq!(f.events_after(tombstone).len(), 2, "log: {:#?}", f.kinds());
+    assert_eq!(deletion_of(&f, session), "erased");
+
+    // The supervisor outlived the restart: another session's turn still runs.
+    f.session_id = f.create_session();
+    f.send("two");
+    f.wait_count("the other session's reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+}
+
 /// Daemon shutdown stops every warm agent at once, so it takes one agent's
 /// grace period rather than the sum of them. The fake holds each shutdown
 /// until both are under way: stopped one after another, the first never

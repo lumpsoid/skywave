@@ -1711,13 +1711,15 @@ archived session. An accepted delete, in one transaction, frees nothing:
 - logs `SessionDeleted { by }`: the tombstone, the one event of the session
   that is not erased.
 
-The supervisor then erases it once its agent is stopped (a later change).
+The supervisor erases the session once it has read the tombstone and nothing of the session runs, starts or stops: queued work is dropped, a running agent is stopped (its exit is logged, then erased), and a restart finishes a deletion it had not.
 Erasing, in one transaction:
 - erases the session's events in place. Each keeps its seq, session,
   time, command and context, and its kind becomes `Erased`. The log stays
   contiguous (`EventLog::read` rejects a gap), so the rows are not removed.
   The `session_created` and `worktree_removed` rows stay: the worktree state
-  of other sessions at a path is read from them. So does the tombstone.
+  of other sessions at a path is read from them. So does the tombstone, and
+  so do its `models_offered` events: the newest offered model list is the
+  server's, not the session's.
 - deletes the blob rows its events name, and its `event_blobs`,
   `workdir_answer_blobs`, `open_calls`, `supervisor_held`, `approvals` and
   `shell_runs` rows. An event blob is never shared (D44), so its file goes
