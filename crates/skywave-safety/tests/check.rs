@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use skywave_safety::{Verdict, check};
+use skywave_safety::{Rule, Verdict, check, check_with};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -225,6 +225,168 @@ fn why_names_the_first_failure() -> TestResult {
     assert!(
         matches!(&write, Verdict::Ask { why } if why.contains("`b.txt`")),
         "{write:?}"
+    );
+    Ok(())
+}
+
+/// One rule per string, its words split on spaces.
+fn rules_from(lines: &[&str]) -> Result<Vec<Rule>, Box<dyn Error>> {
+    lines
+        .iter()
+        .map(|line| -> Result<Rule, Box<dyn Error>> {
+            Ok(Rule::new(line.split(' ').map(String::from).collect())?)
+        })
+        .collect()
+}
+
+/// The verdict for a program that is on neither the table nor a rule.
+fn unknown(name: &str) -> Verdict {
+    Verdict::Ask {
+        why: format!("`{name}` is not a known read-only program"),
+    }
+}
+
+#[test]
+fn rule_approves_a_matching_command() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    let verdict = check_with("git commit -qam \"msg\"", &root, &rules);
+    assert_eq!(
+        verdict,
+        Verdict::Safe {
+            reason: "rules: git commit".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_does_not_match_other_subcommands() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    for command in ["git push", "git commitx", "git"] {
+        assert_eq!(
+            check_with(command, &root, &rules),
+            unknown("git"),
+            "{command:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rule_longer_than_command_does_not_match() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["python3 -m unittest"])?;
+    assert_eq!(check_with("python3 -m", &root, &rules), unknown("python3"));
+    // Positive control: the full words are approved.
+    let full = check_with("python3 -m unittest", &root, &rules);
+    assert_eq!(
+        full,
+        Verdict::Safe {
+            reason: "rules: python3 -m unittest".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn every_command_in_a_line_must_pass() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    let verdict = check_with("git commit -m x && rm a.txt", &root, &rules);
+    assert_eq!(verdict, unknown("rm"));
+    // Positive control: a table program alongside the rule passes.
+    let both = check_with("git commit -m x && cat a.txt", &root, &rules);
+    assert_eq!(
+        both,
+        Verdict::Safe {
+            reason: "read-only: cat; rules: git commit".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn reason_lists_programs_then_rules() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git status", "ruff check"])?;
+    let verdict = check_with(
+        "echo hi && git status --short; ruff check src; git status",
+        &root,
+        &rules,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Safe {
+            reason: "read-only: echo; rules: git status, ruff check".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_overrides_the_table_asks() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["tail -f"])?;
+    let verdict = check_with("tail -f log.txt", &root, &rules);
+    assert_eq!(
+        verdict,
+        Verdict::Safe {
+            reason: "rules: tail -f".into()
+        }
+    );
+    // Without the rule, the table still asks on `-f`.
+    assert_eq!(
+        check("tail -f log.txt", &root),
+        Verdict::Ask {
+            why: "`-f` of `tail` is not checked".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_still_checks_redirections() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git status"])?;
+    assert_eq!(
+        check_with("git status > out.txt", &root, &rules),
+        Verdict::Ask {
+            why: "writes to `out.txt`".into()
+        }
+    );
+    // Positive control: without the redirection, the rule approves it.
+    assert_eq!(
+        check_with("git status", &root, &rules),
+        Verdict::Safe {
+            reason: "rules: git status".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_trusts_paths_outside_the_workdir() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C /etc status", &root, &rules),
+        Verdict::Safe {
+            reason: "rules: git -C".into()
+        }
+    );
+    // Without the rule, `git` is not on the table at all.
+    assert_eq!(check("git -C /etc status", &root), unknown("git"));
+    Ok(())
+}
+
+#[test]
+fn rule_new_rejects_empty() -> TestResult {
+    assert_eq!(Rule::new(vec![]), Err("a rule needs a program".into()));
+    assert_eq!(
+        Rule::new(vec!["git".into(), String::new()]),
+        Err("a rule word is empty".into())
     );
     Ok(())
 }
