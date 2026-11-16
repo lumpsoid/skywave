@@ -9,8 +9,8 @@ use skywave_core::{
     LoginFlowView, LoginOutcome, LoginView, Outgoing, PairingStatus, PairingView, PendingSession,
     PermissionMode, QuestionPrompt, RuleSuggestion, SafetyRuleView, Screen, SessionId,
     SessionInfoView, SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet,
-    StorageView, SubagentHeader, TimelineItem, UsageLimitsView, UsageView, ViewState,
-    WorktreeSession, WorktreesView,
+    StorageStatus, StorageView, SubagentHeader, TimelineItem, UsageLimitsView, UsageView,
+    ViewState, WorktreeSession, WorktreesView,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -46,9 +46,10 @@ use crate::signals::{
     ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
     QuestionView, RenamePrompt, RepairNotice, RuleOption, SafetyCheckView, SafetyRuleRow,
     ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, StorageGroupingView, StorageRowView, StorageTotalView, SubagentHeaderView,
-    SubagentRowView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView,
-    WorktreeRemoveView, WorktreeRepoView, WorktreeSessionView, WorktreeView,
+    StopHeadings, StorageGroupingView, StorageKindView, StorageRowView, StorageSessionView,
+    StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView,
+    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView,
+    WorktreeSessionView, WorktreeView,
 };
 use skywave_present::text::{clean, clean_line};
 
@@ -1078,8 +1079,21 @@ fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
                 .and_then(|_| storage::row_target(view, grouping, at))
                 .as_ref()
                 .map(crop::target_view),
+            session: row.session.map(storage_session),
         })
         .collect();
+    let server_reclaiming = view.status == StorageStatus::Reclaiming;
+    let server_reclaimable = view
+        .report
+        .as_ref()
+        .filter(|report| report.reclaimable > 0 && !server_reclaiming)
+        .map(|report| bytes(report.reclaimable));
+    let device_reclaiming = view.device_reclaiming;
+    let device_reclaimable = view
+        .device
+        .as_ref()
+        .filter(|device| device.reclaimable > 0 && !device_reclaiming)
+        .map(|device| bytes(device.reclaimable));
     ScreenView::Storage {
         grouping: match grouping {
             StorageGrouping::Sessions => StorageGroupingView::Sessions,
@@ -1087,20 +1101,72 @@ fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
             StorageGrouping::ShellRuns => StorageGroupingView::ShellRuns,
         },
         status_label: storage::status_line(view),
-        totals: view
-            .report
-            .as_ref()
-            .map(storage::totals)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| StorageTotalView {
-                label: t.label.to_owned(),
-                value: t.value,
-            })
-            .collect(),
+        totals: storage_totals(
+            view.report
+                .as_ref()
+                .map(storage::totals)
+                .unwrap_or_default(),
+        ),
         empty_label: (rows.is_empty() && view.report.is_some())
             .then(|| grouping.empty_label().to_owned()),
         rows,
+        server_kinds: storage_kinds(
+            view.report
+                .as_ref()
+                .map(storage::server_kinds)
+                .unwrap_or_default(),
+        ),
+        server_reclaimable,
+        server_reclaiming,
+        device_status_label: storage::device_status_line(view),
+        device_totals: storage_totals(
+            view.device
+                .as_ref()
+                .map(storage::device_totals)
+                .unwrap_or_default(),
+        ),
+        device_kinds: storage_kinds(
+            view.device
+                .as_ref()
+                .map(storage::device_kinds)
+                .unwrap_or_default(),
+        ),
+        device_reclaimable,
+        device_reclaiming,
+    }
+}
+
+fn storage_totals(totals: Vec<storage::Total>) -> Vec<StorageTotalView> {
+    totals
+        .into_iter()
+        .map(|t| StorageTotalView {
+            label: t.label.to_owned(),
+            value: t.value,
+        })
+        .collect()
+}
+
+/// A stacked bar's parts; the bytes cross as `i64`, clamped.
+fn storage_kinds(kinds: Vec<storage::Kind>) -> Vec<StorageKindView> {
+    kinds
+        .into_iter()
+        .map(|kind| StorageKindView {
+            label: kind.label.to_owned(),
+            bytes: i64::try_from(kind.bytes).unwrap_or(i64::MAX),
+            size: bytes(kind.bytes),
+        })
+        .collect()
+}
+
+fn storage_session(facts: storage::SessionFacts) -> StorageSessionView {
+    StorageSessionView {
+        session_id: facts.session.0.to_string(),
+        server_size: facts.server_bytes.map(bytes),
+        device_size: facts.device_bytes.map(bytes),
+        here: facts.here,
+        archived: facts.archived,
+        deletable: facts.deletable,
+        deletable_everywhere: facts.deletable_everywhere,
     }
 }
 
