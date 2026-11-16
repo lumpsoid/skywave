@@ -417,7 +417,7 @@ fn literal(word: &ast::Word) -> Result<String, String> {
     Ok(text)
 }
 
-/// An argument word: its literal text, or `None` when it holds a command
+/// An argument word: its literal text, or `None` when it holds a `$(...)`
 /// substitution, whose value nobody knows. The substitution's inner command
 /// is proven into `proof`, so it appears in the reason.
 fn argument(
@@ -435,8 +435,11 @@ fn argument(
 }
 
 /// Appends one piece of an argument word, and returns `false` when the piece
-/// is a command substitution (its value is unknown). Inside double quotes
-/// (`quoted`), a substitution is checked the same way.
+/// is a `$(...)` substitution (its value is unknown). Inside double quotes
+/// (`quoted`), a `$(...)` substitution is checked the same way. Backquotes are
+/// refused, not proven: bash un-escapes `\\` and `\$` inside them before it
+/// parses them, the parser does not, so the proven text could differ from
+/// what runs.
 fn argument_piece(
     piece: &WordPiece,
     quoted: bool,
@@ -446,7 +449,7 @@ fn argument_piece(
     proof: &mut Proof,
 ) -> Result<bool, String> {
     match piece {
-        WordPiece::CommandSubstitution(inner) | WordPiece::BackquotedCommandSubstitution(inner) => {
+        WordPiece::CommandSubstitution(inner) => {
             prove_into(inner, workdir, rules, proof)?;
             Ok(false)
         }
