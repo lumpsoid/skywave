@@ -365,10 +365,26 @@ impl Seam {
         let result = self.update(|state, requests| {
             let mut applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
-            let alerted = state.model.apply_batch(batch);
+            let mut alerted = state.model.apply_batch(batch);
+            // A session the batch dropped keeps no alert: its rows went with it.
+            alerted.retain(|(id, _)| applied.dropped.iter().all(|(dropped, _)| dropped != id));
             for (id, seq) in &applied.settled {
                 let accepted = CommandResult::Accepted { seq: *seq };
                 requests.extend(state.model.command_result(*id, accepted, now));
+            }
+            // After the settled ones: the store has deleted the outbox rows
+            // of a dropped session, so the model must settle them first.
+            // What a local delete does (`Effect::DeleteLocally`), for a
+            // session the server deleted.
+            for (id, blobs) in &applied.dropped {
+                state.model.session_deleted(*id, blobs);
+                state.blobs_purged(blobs);
+                for blob in blobs {
+                    remove_blob_files(&data_dir, *blob);
+                }
+                if !blobs.is_empty() {
+                    requests.push(Request::BlobsPurged(blobs.clone()));
+                }
             }
             // The batch is stored either way; a failed load leaves the
             // session empty until it is opened again.

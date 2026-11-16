@@ -3626,10 +3626,10 @@ fn local_delete_is_one_transaction() {
     assert_eq!(drafts, [(log.b, AGENT), (log.b, SHELL)]);
     assert_eq!(after.composer_modes.keys().collect::<Vec<_>>(), [&log.b]);
     assert_eq!(after.read_marks.keys().collect::<Vec<_>>(), [&log.b]);
-    // Only A's answered command goes; an unanswered one is the caller's to
-    // refuse the delete over.
+    // All of A's commands go, answered or not. The core refuses a local
+    // delete while one is unanswered, so only a synced tombstone meets one.
     let left: Vec<CommandId> = after.outbox.iter().map(|e| e.command.id).collect();
-    assert_eq!(left, [commands[1].id, commands[2].id, commands[3].id]);
+    assert_eq!(left, [commands[2].id, commands[3].id]);
     assert_eq!(after.deleted, [log.a].into());
 }
 
@@ -3655,6 +3655,138 @@ fn events_for_deleted_session_advance_cursor_but_are_not_stored() {
     );
     assert!(store.session_events(log.a).unwrap().is_empty());
     assert!(store.blob(log.blob.id).unwrap().is_none());
+}
+
+fn tombstone(session_id: SessionId, minute: u32) -> Event {
+    event(
+        session_id,
+        minute,
+        EventKind::SessionDeleted {
+            by: DeviceId::new(),
+        },
+    )
+}
+
+#[test]
+fn a_tombstone_drops_the_session_like_a_local_delete() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    // A and B, and A's blob, arrive first.
+    store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
+    assert_eq!(store.load().unwrap().sessions.len(), 2);
+
+    // The server's tombstone for A comes with A's approval request and B's
+    // message; the batch's own events of A are dropped with the rest.
+    let batch = EventBatch {
+        from: Seq(5),
+        events: vec![
+            log.events[4].clone(),
+            log.events[5].clone(),
+            tombstone(log.a, 7),
+        ],
+    };
+    let applied = store.apply_batch(&batch, Utc::now()).unwrap();
+    assert_eq!(applied.cursor, Seq(7));
+    assert_eq!(applied.dropped, [(log.a, vec![log.blob.id])]);
+    let snapshot = store.load().unwrap();
+    assert_eq!(
+        snapshot.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [log.b],
+        "B is untouched"
+    );
+    assert!(store.session_events(log.a).unwrap().is_empty());
+    assert_eq!(store.session_events(log.b).unwrap().len(), 2);
+    assert!(store.blob(log.blob.id).unwrap().is_none());
+    assert!(snapshot.deleted.contains(&log.a));
+
+    // A later event of A is not stored, as after a local delete.
+    let late = EventBatch {
+        from: Seq(8),
+        events: vec![log.events[6].clone()],
+    };
+    let applied = store.apply_batch(&late, Utc::now()).unwrap();
+    assert_eq!(applied.new_events, 0);
+    assert_eq!(applied.cursor, Seq(8));
+    assert!(store.session_events(log.a).unwrap().is_empty());
+}
+
+#[test]
+fn a_ghost_session_never_appears() {
+    let mut store = Store::open_in_memory().unwrap();
+    // A session the replica never saw: its erased events and the tombstone
+    // come in one batch.
+    let ghost = SessionId::new();
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(ghost, 0, EventKind::Erased),
+            event(ghost, 1, EventKind::Erased),
+            tombstone(ghost, 2),
+        ],
+    };
+    let applied = store.apply_batch(&batch, Utc::now()).unwrap();
+    assert_eq!(applied.dropped, [(ghost, Vec::new())]);
+    assert_eq!(applied.cursor, Seq(3));
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.cursor, Seq(3));
+    assert!(snapshot.sessions.is_empty(), "no summary for the ghost");
+    assert!(store.session_events(ghost).unwrap().is_empty());
+    assert!(snapshot.deleted.contains(&ghost));
+}
+
+#[test]
+fn a_tombstone_takes_the_answered_outbox_rows_of_its_session() {
+    let log = Log::new();
+    let mut store = Store::open_in_memory().unwrap();
+    store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
+    let own = send(log.a, "answered by the batch");
+    store.enqueue(&own, &[]).unwrap();
+    let other = send(log.b, "B's, kept");
+    store.enqueue(&other, &[]).unwrap();
+
+    // An event of A carries this device's command, so the batch settles it;
+    // the tombstone then drops the session with its settled row.
+    let mut answer = event(log.a, 7, EventKind::SessionStateChanged(SessionState::Idle));
+    answer.command_id = Some(own.id);
+    let batch = EventBatch {
+        from: Seq(5),
+        events: vec![answer, tombstone(log.a, 8)],
+    };
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    let left: Vec<CommandId> = store
+        .outbox()
+        .unwrap()
+        .iter()
+        .map(|e| e.command.id)
+        .collect();
+    assert_eq!(left, [other.id]);
+}
+
+#[test]
+fn a_tombstone_drops_the_unanswered_outbox_rows_of_its_session() {
+    let log = Log::new();
+    let mut store = Store::open_in_memory().unwrap();
+    store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
+    // Queued for A and never answered: the server refuses it as an unknown
+    // session once A is gone, so it must not stay queued.
+    let queued = send(log.a, "queued for a deleted session");
+    store.enqueue(&queued, &[]).unwrap();
+    let other = send(log.b, "B's, kept");
+    store.enqueue(&other, &[]).unwrap();
+
+    let batch = EventBatch {
+        from: Seq(5),
+        events: vec![tombstone(log.a, 8)],
+    };
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    let left: Vec<CommandId> = store
+        .outbox()
+        .unwrap()
+        .iter()
+        .map(|e| e.command.id)
+        .collect();
+    assert_eq!(left, [other.id]);
 }
 
 #[test]

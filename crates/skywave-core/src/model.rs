@@ -2115,6 +2115,11 @@ impl Model {
             if self.deleted.contains(&event.session_id) {
                 continue;
             }
+            // As the store does: a tombstone ends its session for the rest of
+            // the batch. The seam drops the session after this fold.
+            if matches!(event.kind, EventKind::SessionDeleted { .. }) {
+                self.deleted.insert(event.session_id);
+            }
             if let EventKind::ShellRequested { command, .. } = &event.kind {
                 self.shell_history.record(command);
             }
@@ -2320,8 +2325,9 @@ impl Model {
         self.draft_files.remove(&id);
         self.composer_modes.remove(&id);
         self.read_marks.remove(&id);
+        // Unanswered ones too, as the store drops them.
         self.outbox
-            .retain(|e| !e.status.is_settled() || command_session(&e.command.kind) != Some(id));
+            .retain(|e| command_session(&e.command.kind) != Some(id));
         for blob in blobs {
             self.forget_blob(*blob);
             self.fates.remove(blob);
@@ -8024,6 +8030,52 @@ mod tests {
             [kept]
         );
         assert_eq!(model.cursor, Seq(6));
+    }
+
+    #[test]
+    fn events_after_a_tombstone_in_its_batch_are_skipped() {
+        let mut f = Fixture::paired();
+        let gone = f.session("/srv/gone");
+        let blob = BlobRef {
+            id: BlobId::new(),
+            size: 10_000,
+            sha256: skywave_proto::ContentHash::of(b"out"),
+        };
+        let event = |kind| Event {
+            session_id: gone,
+            at: minute(2),
+            command_id: None,
+            context: skywave_proto::ContextId::first_of(gone),
+            kind,
+        };
+        // As the store does, the tombstone ends the session for the rest of
+        // its batch: the output and the approval after it register nothing.
+        let from = f.model.cursor.next();
+        let batch = EventBatch {
+            from,
+            events: vec![
+                event(message("before")),
+                event(EventKind::SessionDeleted { by: f.me }),
+                event(EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "out".into(),
+                    lines: 1,
+                    output: Some(Full::Blob(blob.clone())),
+                })),
+                event(approval_requested(ApprovalId::new(), None)),
+            ],
+        };
+        let alerted = f.model.apply_batch(&batch);
+        assert_eq!(f.model.cursor, Seq(from.0 + 3), "the batch is folded");
+        f.model.session_deleted(gone, &[]);
+        assert!(alerted.is_empty(), "nothing after the tombstone alerts");
+        assert!(
+            !f.model.blobs.contains_key(&blob.id),
+            "nor registers a blob"
+        );
+        assert!(!f.model.sessions.iter().any(|s| s.id == gone));
     }
 
     #[test]
