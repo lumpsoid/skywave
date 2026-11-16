@@ -264,6 +264,7 @@ fn all_event_kinds() -> Vec<EventKind> {
                     scope: RuleScope::User,
                 },
             ],
+            shell: Some("rm -rf target".into()),
         },
         EventKind::ApprovalRequested {
             id: approval(),
@@ -272,6 +273,7 @@ fn all_event_kinds() -> Vec<EventKind> {
             summary: "src/main.rs".into(),
             input: Some(Full::Blob(blob())),
             suggestions: Vec::new(),
+            shell: None,
         },
         EventKind::ApprovalRequested {
             id: approval(),
@@ -280,6 +282,7 @@ fn all_event_kinds() -> Vec<EventKind> {
             summary: "src/main.rs".into(),
             input: Some(Full::Lost),
             suggestions: Vec::new(),
+            shell: None,
         },
         EventKind::ApprovalResolved {
             id: approval(),
@@ -464,12 +467,32 @@ fn all_event_kinds() -> Vec<EventKind> {
             tool: "Bash".into(),
             summary: "git status".into(),
             reason: "read-only git command".into(),
+            shell: Some("git status".into()),
         },
         EventKind::SafetyCheckApproved {
             call: None,
             tool: "Bash".into(),
             summary: "ls".into(),
             reason: "read-only command".into(),
+            shell: None,
+        },
+        EventKind::SafetyCheckFeedback {
+            call: call(),
+            judgment: SafetyJudgment::ShouldApprove,
+            note: Some("a plain listing".into()),
+            shell: "ls -la".into(),
+            checked_safe: false,
+            checked_reason: "not on the read-only list".into(),
+            by: device(),
+        },
+        EventKind::SafetyCheckFeedback {
+            call: call(),
+            judgment: SafetyJudgment::ShouldAsk,
+            note: None,
+            shell: "git status".into(),
+            checked_safe: true,
+            checked_reason: "read-only git command".into(),
+            by: device(),
         },
         EventKind::BackgroundTasksChanged {
             tasks: vec![
@@ -1016,6 +1039,12 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             on: true,
         },
+        CommandKind::SafetyCheckFeedback {
+            session_id: session(),
+            call: call(),
+            judgment: SafetyJudgment::ShouldAsk,
+            note: Some("it wrote a file".into()),
+        },
         CommandKind::ClearContext {
             session_id: session(),
             context: context(),
@@ -1079,6 +1108,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::UnknownApproval,
             RejectReason::ApprovalAlreadyResolved,
             RejectReason::ApprovalCancelled,
+            RejectReason::NotAShellCall,
             RejectReason::NoActiveTurn,
             RejectReason::UnknownRule,
             RejectReason::BadAnswer,
@@ -1461,6 +1491,7 @@ fn v1_approval_requested_decodes_without_a_call() {
             summary: "rm -rf target".into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         }
     );
 }
@@ -2005,11 +2036,12 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v38() {
-    assert_eq!(PROTOCOL_VERSION, 38);
+fn protocol_is_v39() {
+    assert_eq!(PROTOCOL_VERSION, 39);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
+    assert_eq!(limits::SAFETY_FEEDBACK_NOTE_MAX_BYTES, 2000);
     assert_eq!(limits::MESSAGE_MAX_BYTES, 256 * 1024);
     assert_eq!(limits::FIRST_PROMPT_MAX_CHARS, 200);
     assert_eq!(limits::ATTACHMENTS_MAX, 8);

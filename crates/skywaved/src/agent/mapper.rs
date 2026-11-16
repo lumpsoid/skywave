@@ -420,6 +420,7 @@ impl EventMapper {
                         summary,
                         input,
                         suggestions: bounded_suggestions(suggestions),
+                        shell: None,
                     },
                 )?);
                 self.approvals.push(LoggedApproval {
@@ -715,6 +716,7 @@ impl EventMapper {
                 tool,
                 summary,
                 reason,
+                shell: None,
             },
         )
     }

@@ -1111,6 +1111,7 @@ fn every_session_state_has_its_own_badge() {
                     summary: "rm -rf target".into(),
                     input: None,
                     suggestions: Vec::new(),
+                    shell: None,
                 },
             ),
             event(
@@ -1866,6 +1867,7 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
                     summary: "rm -rf target".into(),
                     input: None,
                     suggestions: Vec::new(),
+                    shell: None,
                 },
             ),
             event(
@@ -2103,6 +2105,7 @@ fn an_approval_whose_input_was_lost_warns_in_its_prompt() {
         summary: "a.txt".into(),
         input: Some(full),
         suggestions: Vec::new(),
+        shell: None,
     };
     let (mut h, id, _) = open_session();
     pull(&mut h, vec![event(id, 1, approval(Full::Lost))]);
@@ -2152,6 +2155,7 @@ fn an_approval_of_a_call_warns_of_its_own_lost_input() {
                         summary: "src/lib.rs".into(),
                         input,
                         suggestions: Vec::new(),
+                        shell: None,
                     },
                 ),
             ],
@@ -2197,6 +2201,7 @@ fn an_approval_offers_its_own_input_when_it_differs() {
                         summary: "make".into(),
                         input,
                         suggestions: Vec::new(),
+                        shell: None,
                     },
                 ),
             ],
@@ -2534,6 +2539,7 @@ fn approval_prompt_answer_and_resolutions() {
                 summary: "a.txt".into(),
                 input: Some(Full::Blob(input)),
                 suggestions: Vec::new(),
+                shell: None,
             },
         )],
     );
@@ -2595,6 +2601,7 @@ fn approval_prompt_answer_and_resolutions() {
                 summary: "rm -rf build".into(),
                 input: None,
                 suggestions: Vec::new(),
+                shell: None,
             },
         )],
     );
@@ -2634,6 +2641,7 @@ fn approval_prompt_answer_and_resolutions() {
                     summary: "curl".into(),
                     input: None,
                     suggestions: Vec::new(),
+                    shell: None,
                 },
             ),
             event(
@@ -4662,6 +4670,7 @@ fn a_grouped_tool_call_shows_its_approval_and_result() {
                     summary: "a.txt".into(),
                     input: None,
                     suggestions: Vec::new(),
+                    shell: None,
                 },
             ),
             event(
@@ -4820,6 +4829,7 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
             summary: summary.into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         }
     };
     let resolve =
@@ -5366,6 +5376,7 @@ fn gated_offering(
         summary,
         input: None,
         suggestions,
+        shell: None,
     });
     let seq = Seq(h.seam.cursor().unwrap().0 + kinds.len() as u64 - 1);
     let events: Vec<Event> = kinds.into_iter().map(|kind| event(id, 1, kind)).collect();
@@ -7184,6 +7195,7 @@ fn approval(session_id: SessionId, minute: u32, id: ApprovalId, summary: &str) -
             summary: summary.into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         },
     )
 }
@@ -8633,6 +8645,7 @@ fn an_approval_from_a_subagent_says_so_and_where_to_look() {
                     summary: "Write src/sync.rs".into(),
                     input: None,
                     suggestions: vec![],
+                    shell: None,
                 },
             ),
         ],
@@ -9695,6 +9708,7 @@ fn x_still_denies_and_shift_c_still_opens_contexts() {
                 summary: "rm -rf target".into(),
                 input: None,
                 suggestions: Vec::new(),
+                shell: None,
             },
         )],
     );

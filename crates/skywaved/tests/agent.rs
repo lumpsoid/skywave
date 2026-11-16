@@ -392,7 +392,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     // The approval names its call and drops the input it shares with it.
     assert!(matches!(
         &kinds[6],
-        EventKind::ApprovalRequested { id: a, call: Some(c), tool, summary, input: None, suggestions, }
+        EventKind::ApprovalRequested { id: a, call: Some(c), tool, summary, input: None, suggestions, .. }
             if *a == id && *c == write && tool == "write" && summary == "hi" && suggestions.is_empty()
     ));
     assert!(matches!(

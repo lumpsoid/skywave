@@ -1915,6 +1915,7 @@ fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
         summary: "ls".into(),
         input: None,
         suggestions: Vec::new(),
+        shell: None,
     };
     let (in_a, in_b) = (ApprovalId::new(), ApprovalId::new());
     let (shown_a, none) = notifications(&rig.log_in(a, vec![approval(in_a)]));
@@ -3777,6 +3778,7 @@ fn a_call_the_safety_check_approved_says_so() {
             tool: "Bash".into(),
             summary: "cat notes.txt".into(),
             reason: "read-only: cat".into(),
+            shell: None,
         },
         result(call),
     ]);
@@ -4526,6 +4528,7 @@ fn a_background_subagent_opens_from_its_task_and_says_where_its_approval_is() {
             summary: "src/sync.rs".into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         },
     ]);
     let session = rig.open_session();

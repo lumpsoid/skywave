@@ -481,6 +481,7 @@ impl EventLog {
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyCheckFeedback { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => {
                 return Err(Error::InvalidAppend(format!(
@@ -1046,6 +1047,7 @@ pub(crate) fn append_in(
         | EventKind::TaskStopRefused { .. }
         | EventKind::SafetyCheckSet { .. }
         | EventKind::SafetyCheckApproved { .. }
+        | EventKind::SafetyCheckFeedback { .. }
         | EventKind::ShellOutput { .. } => {}
         // Imported history is a record: an imported call opens nothing.
         EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
@@ -1726,6 +1728,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortRefused { .. } => "EffortRefused",
         EventKind::SafetyCheckSet { .. } => "SafetyCheckSet",
         EventKind::SafetyCheckApproved { .. } => "SafetyCheckApproved",
+        EventKind::SafetyCheckFeedback { .. } => "SafetyCheckFeedback",
         EventKind::ContextStarted { .. } => "ContextStarted",
         EventKind::ContextSwitched { .. } => "ContextSwitched",
         EventKind::ContextMoved { .. } => "ContextMoved",

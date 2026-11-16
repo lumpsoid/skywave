@@ -102,6 +102,7 @@ impl Log {
                     summary: "rm -rf target".into(),
                     input: None,
                     suggestions: Vec::new(),
+                    shell: None,
                 },
             ),
             event(
@@ -1262,6 +1263,7 @@ fn notable_count_is_projected_and_backfilled() {
                     summary: "ls".into(),
                     input: None,
                     suggestions: Vec::new(),
+                    shell: None,
                 },
             ),
             event(
@@ -1647,6 +1649,7 @@ fn v26_reads_the_pending_approval_a_v25_replica_holds() {
         summary: "rm -rf target".into(),
         input: None,
         suggestions: Vec::new(),
+        shell: None,
     };
     let batch = EventBatch {
         from: Seq(1),
@@ -2190,6 +2193,45 @@ fn v38_opens_a_v37_replica_unchanged() {
         .map(|(_, e)| e.kind)
         .collect();
     assert_eq!(events, [created, message]);
+}
+
+/// A v38 replica's approval request, which has no `shell`, opens as v39 and
+/// reads back with `shell: None`: v39 added the field optional.
+#[test]
+fn v39_opens_a_v38_replica_unchanged() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let session = "01920000-0000-7000-8000-000000000001";
+    let v38 = format!(
+        r#"{{"session_id":"{session}","at":"2026-10-29T12:00:00Z","command_id":null,"context":"{session}","kind":{{"type":"approval_requested","id":"01920000-0000-7000-8000-000000000004","call":"01920000-0000-7000-8000-000000000007","tool":"Bash","summary":"ls","input":null,"suggestions":[]}}}}"#
+    );
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute(
+        "INSERT INTO events (seq, session_id, event) VALUES (1, ?1, ?2)",
+        rusqlite::params![session, v38],
+    )
+    .unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 38", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let id = SessionId(session.parse().unwrap());
+    let kinds: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, event)| event.kind)
+        .collect();
+    assert!(matches!(
+        &kinds[..],
+        [EventKind::ApprovalRequested {
+            shell: None,
+            call: Some(_),
+            ..
+        }]
+    ));
 }
 
 fn usage_limits_read() -> UsageLimitsResult {
@@ -3800,6 +3842,7 @@ fn requested(session_id: SessionId, minute: u32, id: ApprovalId) -> Event {
             summary: "ls".into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         },
     )
 }

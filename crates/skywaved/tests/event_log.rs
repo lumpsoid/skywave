@@ -128,6 +128,7 @@ impl Fixture {
                 summary: "ls".into(),
                 input: None,
                 suggestions,
+                shell: None,
             },
         );
         id
@@ -2814,6 +2815,7 @@ fn agent_appends_are_checked() {
             summary: "again".into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         },
     );
     assert!(matches!(duplicate, Err(Error::InvalidAppend(_))));

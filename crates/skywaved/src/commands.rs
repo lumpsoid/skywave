@@ -805,6 +805,13 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
+            CommandKind::SafetyCheckFeedback { session_id, .. } => {
+                if known(*session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                // Feedback is not accepted yet: the next step logs it.
+                return Ok(Err(RejectReason::NotAShellCall));
+            }
             CommandKind::StopTask { session_id, task } => {
                 let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
@@ -969,6 +976,7 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         | CommandKind::SetSafetyCheck { .. }
+        | CommandKind::SafetyCheckFeedback { .. }
         // Freeing space is what a low disk needs.
         | CommandKind::DeleteBlob { .. }
         | CommandKind::CropBlob { .. } => false,
@@ -1002,6 +1010,7 @@ fn work_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         | CommandKind::SetSafetyCheck { .. }
+        | CommandKind::SafetyCheckFeedback { .. }
         | CommandKind::DeleteBlob { .. }
         | CommandKind::CropBlob { .. } => None,
     }
