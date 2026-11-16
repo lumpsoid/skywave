@@ -223,7 +223,8 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`limits::SAFETY_RULE_MAX_BYTES`].
 ///
 /// v41: `DeleteSession`, `SessionDeleted`, `Erased`, `RejectReason::ApprovalPending`,
-/// `RejectReason::WorktreeNotRemoved`.
+/// `RejectReason::WorktreeNotRemoved`, `StorageReport::reclaimable` and `POST`
+/// [`path::STORAGE_RECLAIM`].
 pub const PROTOCOL_VERSION: u32 = 41;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
@@ -2845,6 +2846,9 @@ pub struct StorageReport {
     /// The database file with its write-ahead log: the event log, its
     /// projections and everything else the server records.
     pub database: u64,
+    /// Of `database`, the free pages SQLite keeps after rows are deleted: what
+    /// [`path::STORAGE_RECLAIM`] gives back.
+    pub reclaimable: u64,
     /// Blobs events reference ([`EventKind::blobs`]).
     pub event_blobs: u64,
     /// Blobs workdir reads keep for their latest answers.
@@ -3412,6 +3416,9 @@ pub mod path {
     pub const CONVERSATIONS: &str = "/v1/conversations";
     /// What the server's data takes on its disk: [`crate::StorageReport`].
     pub const STORAGE: &str = "/v1/storage";
+    /// `POST`, no body: compact the server's database (`VACUUM`), answering
+    /// the fresh [`crate::StorageReport`].
+    pub const STORAGE_RECLAIM: &str = "/v1/storage/reclaim";
     /// The agent's usage limits: [`crate::UsageLimitsResult`].
     pub const USAGE_LIMITS: &str = "/v1/usage-limits";
     /// Start logging the agent in: [`crate::LoginStartResult`].

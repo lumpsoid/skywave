@@ -293,6 +293,7 @@ mod tests {
     fn report() -> StorageReport {
         StorageReport {
             database: 2 * 1024 * 1024,
+            reclaimable: 0,
             event_blobs: 3 * 1024 * 1024,
             workdir_blobs: 0,
             shell_running: 512,

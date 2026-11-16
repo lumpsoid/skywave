@@ -1734,5 +1734,4 @@ Erasing, in one transaction:
 
 The delete is irreversible.
 
-**Deferred here:**
-- Compacting the database file: an erased row's space is not given back.
+Compaction is the explicit `POST /v1/storage/reclaim` (`VACUUM`), never automatic: `VACUUM` blocks writers and needs free disk about the size of the database, so it runs only when asked.

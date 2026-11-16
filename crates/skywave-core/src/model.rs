@@ -12227,6 +12227,7 @@ mod tests {
     fn storage_report(sessions: &[SessionId]) -> StorageReport {
         StorageReport {
             database: 4096,
+            reclaimable: 0,
             event_blobs: 0,
             workdir_blobs: 0,
             shell_running: 0,

@@ -167,6 +167,7 @@ every version.
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
+| `POST /v1/storage/reclaim` | Compacts the server's database (`VACUUM`, then the WAL truncated into it, no body), answering the fresh `StorageReport`, whose `reclaimable` is then 0. Explicit only. Refused with 507 when the free space is below the database's size plus `min_free`, nothing run; 503 when the connection is still held at the report's 8 s deadline, or past the 10-minute reply timeout. Since v41. |
 | `GET /v1/usage-limits` | The usage limits of the account the agent runs as, as a `UsageLimitsResult` read from the agent when asked: `Read { at, limits }` (each limit's window, `Session` or `Weekly`, its scope such as one model, percent used, severity and reset time, a figure the agent did not report left out), `Unavailable` for an agent that reports none, or `Failed { reason }`. Nothing is stored on the server. |
 | `POST /v1/agent-login/start` | No body. Starts logging the agent in from a device (D49), as a `LoginStartResult`: `Open { flow, url }` (the user signs in at `url`, at most `LOGIN_URL_MAX_BYTES`; a longer one is `Failed`, never cut), the same flow and URL to a start while one is starting or open, `Busy` while a finish runs, `Unavailable` when `agent_login_offered` is false, or `Failed { reason }`. The agent gets 15 s; 503 at 20 s. See "The agent's login". Since v29. |
 | `POST /v1/agent-login/finish` | A `LoginFinish { flow, code }` (the code the sign-in page showed; over `LOGIN_CODE_MAX_BYTES` a 400). Answers `LoggedIn { expires }`, `NoFlow` (no such flow, or given up on) or `Failed { reason }`. The first finish of a flow is the only one the agent sees: every later one gets its outcome, whatever code it carries. 503 after 20 s of waiting for the agent, while the finish goes on; a retry collects it. Since v29. |
@@ -223,7 +224,7 @@ every version.
   `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations`,
   `/v1/usage-limits`, `/v1/agent-login/*`, `/v1/attachments/{sha256}` (`PUT`) and `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
-  `/v1/conversations`, `/v1/storage` and `/v1/workdir/*` answer 503 when
+  `/v1/conversations`, `/v1/storage`, `/v1/storage/reclaim` and `/v1/workdir/*` answer 503 when
   they run out of time, or when 8 of their file-system reads are already
   running (a wait of at most 0.5 s first). Each read holds its permit until its blocking
   thread returns, even after its request gave up, so reads stuck on a hung
@@ -627,8 +628,16 @@ the daemon's appends, which would otherwise stop `serve` (below).
   is a command (`DeleteBlob`, above). A deleted session (`DeleteSession`,
   D62) is in no report from the moment its delete is logged. The supervisor
   then erases its rows and has the agent delete its transcripts of the
-  session's conversations (D62); the erased rows stay until the database is
-  compacted, and nothing compacts it yet.
+  session's conversations (D62). The erased rows stay in the file as free
+  pages until it is compacted: `reclaimable` is their size (`freelist_count`
+  times `page_size`), and `POST /v1/storage/reclaim` compacts it. Reclaim is
+  a `VACUUM` then `PRAGMA wal_checkpoint(TRUNCATE)`, on the storage reader's
+  connection, answering the fresh report. It is explicit only, never
+  automatic: `VACUUM` blocks other writers (they wait out their busy
+  timeout) and writes a copy of the database, so it is refused with 507 when
+  the free space is below the database's size plus `min_free`, and nothing
+  runs. Only the wait for the connection has a deadline; the `VACUUM` itself
+  is not cut short, and its reply gives up at 10 minutes.
 - **Usage limits** (`GET /v1/usage-limits`): the account's limits belong to
   no session, so the API asks a `UsageLimitsSource` (agent-agnostic;
   `NoUsageLimits` answers `Unavailable`). The Claude Code one

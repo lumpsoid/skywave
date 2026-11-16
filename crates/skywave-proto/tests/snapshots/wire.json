@@ -2532,6 +2532,7 @@
   ],
   "storage": {
     "database": 48000000,
+    "reclaimable": 3000000,
     "event_blobs": 310000000,
     "workdir_blobs": 2000000,
     "shell_running": 4096,

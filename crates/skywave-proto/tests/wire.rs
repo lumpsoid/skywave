@@ -738,6 +738,7 @@ fn all_conversations_results() -> Vec<ConversationsResult> {
 fn storage_report() -> StorageReport {
     StorageReport {
         database: 48_000_000,
+        reclaimable: 3_000_000,
         event_blobs: 310_000_000,
         workdir_blobs: 2_000_000,
         shell_running: 4096,
@@ -2295,6 +2296,7 @@ fn api_paths() {
     assert_eq!(path::EVENTS, "/v1/events");
     assert_eq!(path::CONVERSATIONS, "/v1/conversations");
     assert_eq!(path::STORAGE, "/v1/storage");
+    assert_eq!(path::STORAGE_RECLAIM, "/v1/storage/reclaim");
     assert_eq!(path::USAGE_LIMITS, "/v1/usage-limits");
     assert_eq!(path::AGENT_LOGIN_START, "/v1/agent-login/start");
     assert_eq!(path::AGENT_LOGIN_FINISH, "/v1/agent-login/finish");

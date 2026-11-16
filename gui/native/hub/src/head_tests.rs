@@ -2097,6 +2097,7 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
         req,
         Ok(skywave_proto::StorageReport {
             database: 1024 * 1024,
+            reclaimable: 0,
             event_blobs: 0,
             workdir_blobs: 0,
             shell_running: 0,
@@ -7008,6 +7009,7 @@ mod blob_actions {
             req,
             Ok(skywave_proto::StorageReport {
                 database: 0,
+                reclaimable: 0,
                 event_blobs: 0,
                 workdir_blobs: 0,
                 shell_running: 0,
