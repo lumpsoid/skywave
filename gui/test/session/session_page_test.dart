@@ -531,6 +531,132 @@ void main() {
     },
   );
 
+  testWidgets('a shell row offers to trust its commands', (tester) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        's:1',
+        RowKind.tool,
+        '',
+        tool: shellFacts(
+          'cargo test -p x | tail -n 5',
+          ruleCandidates: const [
+            ['cargo', 'test', '-p', 'x'],
+            ['tail', '-n', '5'],
+          ],
+        ),
+        expandable: true,
+      ),
+      anyRow(
+        's:2',
+        RowKind.tool,
+        '',
+        tool: shellFacts('cat b'),
+        expandable: true,
+      ),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+    sent.clear();
+
+    Future<void> openMenu(String label) async {
+      await tester.tapAt(
+        tester.getCenter(find.text(label, findRichText: true)),
+        buttons: kSecondaryButton,
+      );
+      await tester.pumpAndSettle();
+    }
+
+    Finder dialogButton(String label) => find.descendant(
+      of: find.byType(AlertDialog),
+      matching: find.text(label),
+    );
+
+    // A row with no candidates has no trust item. The menu is open
+    // (Copy call shows), so the absence is not an empty menu.
+    await openMenu('Bash  cat b');
+    expect(find.text('Copy call'), findsOneWidget);
+    expect(find.text('Trust command…'), findsNothing);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    // Cancel sends nothing.
+    await openMenu('Bash  cargo test -p x | tail -n 5');
+    await tester.tap(find.text('Trust command…'));
+    await tester.pumpAndSettle();
+    expect(find.text('Trust command'), findsOneWidget);
+    await tester.tap(dialogButton('Cancel'));
+    await tester.pumpAndSettle();
+    expect(sent, isEmpty);
+
+    // A word stops the rule there; an unchecked candidate is left out.
+    await openMenu('Bash  cargo test -p x | tail -n 5');
+    await tester.tap(find.text('Trust command…'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('trust-word-0-1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('trust-include-1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('trust-confirm')));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentSetSafetyRule(
+          sessionId: 's1',
+          words: ['cargo', 'test'],
+          on: true,
+        ),
+      ),
+    ]);
+
+    // The defaults keep each whole command, in candidate order.
+    await openMenu('Bash  cargo test -p x | tail -n 5');
+    await tester.tap(find.text('Trust command…'));
+    await tester.pumpAndSettle();
+    sent.clear();
+    await tester.tap(find.byKey(const Key('trust-confirm')));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentSetSafetyRule(
+          sessionId: 's1',
+          words: ['cargo', 'test', '-p', 'x'],
+          on: true,
+        ),
+      ),
+      const GuiIntentAct(
+        action: ActionIntentSetSafetyRule(
+          sessionId: 's1',
+          words: ['tail', '-n', '5'],
+          on: true,
+        ),
+      ),
+    ]);
+
+    // With no candidate checked, Trust is disabled.
+    await openMenu('Bash  cargo test -p x | tail -n 5');
+    await tester.tap(find.text('Trust command…'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('trust-include-0')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('trust-include-1')));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<FilledButton>(find.byKey(const Key('trust-confirm')))
+          .onPressed,
+      isNull,
+    );
+    await tester.tap(dialogButton('Cancel'));
+    await tester.pumpAndSettle();
+    expect(sent, hasLength(2));
+  });
+
   testWidgets('a message\'s text selects; its menu copies it or the whole '
       'message; a tap and the row menu still work', (tester) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.linux;
@@ -3332,6 +3458,7 @@ void main() {
       stateLabel: 'Async agent launched · 0.1s',
       opens: opens,
       status: opens == null ? null : 'running · 3 steps · Write src/sync.rs',
+      ruleCandidates: const <List<String>>[],
     );
 
     testWidgets('a subagent row shows how it stands; Open sends '

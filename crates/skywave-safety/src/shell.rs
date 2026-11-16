@@ -6,12 +6,12 @@ use std::path::Path;
 use std::thread;
 
 use brush_parser::ast::{self, AndOr, CompoundListItem, SeparatorOperator};
-use brush_parser::word::{self, WordPiece};
+use brush_parser::word::{self, WordPiece, WordPieceWithSource};
 use brush_parser::{Parser, ParserOptions};
 
-use crate::Verdict;
 use crate::paths;
 use crate::programs::{self, Program};
+use crate::{Rule, Verdict};
 
 /// Why an expansion is refused: the checker does not evaluate them.
 const EXPANSION: &str = "expansions are not checked yet";
@@ -24,16 +24,17 @@ const MAX_COMMAND_BYTES: usize = 8192;
 /// Stack for the parse and walk, far above what `MAX_COMMAND_BYTES` can need.
 const STACK_BYTES: usize = 64 * 1024 * 1024;
 
-pub(crate) fn check(command: &str, workdir: &Path) -> Verdict {
+pub(crate) fn check(command: &str, workdir: &Path, rules: &[Rule]) -> Verdict {
     if command.len() > MAX_COMMAND_BYTES {
         return Verdict::Ask {
             why: "too long to check".into(),
         };
     }
-    let (command, workdir) = (command.to_owned(), workdir.to_owned());
+    // The worker needs owned data, so it gets its own copy of the rules.
+    let (command, workdir, rules) = (command.to_owned(), workdir.to_owned(), rules.to_vec());
     let worker = thread::Builder::new()
         .stack_size(STACK_BYTES)
-        .spawn(move || prove(&command, &workdir));
+        .spawn(move || prove(&command, &workdir, &rules));
     let outcome = match worker {
         Ok(handle) => handle
             .join()
@@ -41,15 +42,184 @@ pub(crate) fn check(command: &str, workdir: &Path) -> Verdict {
         Err(_) => Err("the checker could not start".into()),
     };
     match outcome {
-        Ok(names) => Verdict::Safe {
-            reason: format!("read-only: {}", names.join(", ")),
+        Ok(proof) => Verdict::Safe {
+            reason: proof.reason(),
         },
         Err(why) => Verdict::Ask { why },
     }
 }
 
-/// The programs the command runs, in first-seen order, if all of it is proven.
-fn prove(command: &str, workdir: &Path) -> Result<Vec<&'static str>, String> {
+/// The literal words of each simple command in `command`, in source order.
+/// Runs like `check`: on the large stack, and no entries if the worker fails.
+pub(crate) fn simple_commands(command: &str) -> Vec<Vec<String>> {
+    if command.len() > MAX_COMMAND_BYTES {
+        return Vec::new();
+    }
+    let command = command.to_owned();
+    let worker = thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(move || {
+            let mut entries = Vec::new();
+            words_into(&command, &mut entries);
+            entries
+        });
+    match worker {
+        Ok(handle) => handle.join().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Appends the entries of `command`: each simple command, then the entries of
+/// the `$(...)` commands inside its words. A line that does not parse adds
+/// nothing.
+fn words_into(command: &str, entries: &mut Vec<Vec<String>>) {
+    let Ok(program) = parse(command) else {
+        return;
+    };
+    let items = program.complete_commands.iter().flat_map(|list| &list.0);
+    for CompoundListItem(and_or, _) in items {
+        pipeline_words(&and_or.first, entries);
+        for next in &and_or.additional {
+            match next {
+                AndOr::And(later) | AndOr::Or(later) => pipeline_words(later, entries),
+            }
+        }
+    }
+}
+
+fn pipeline_words(pipeline: &ast::Pipeline, entries: &mut Vec<Vec<String>>) {
+    for command in &pipeline.seq {
+        // Compound commands, functions and `[[ ]]` tests have no entry and are
+        // not entered.
+        if let ast::Command::Simple(simple) = command {
+            simple_words(simple, entries);
+        }
+    }
+}
+
+/// One simple command: its entry, then the entries of the `$(...)` commands in
+/// its words, in order. The entry is only the literal words; an assignment or
+/// a redirection is not a word and is skipped.
+fn simple_words(simple: &ast::SimpleCommand, entries: &mut Vec<Vec<String>>) {
+    // The program must be literal, or there is no entry and no argument is read.
+    let program = simple
+        .word_or_name
+        .as_ref()
+        .and_then(|word| literal(word).ok());
+    let mut cut = program.is_none();
+    let mut words: Vec<String> = program.into_iter().collect();
+    let mut inner = Vec::new();
+    if let Some(word) = &simple.word_or_name {
+        substitutions_into(word, &mut inner);
+    }
+    let items = simple
+        .prefix
+        .iter()
+        .flat_map(|prefix| &prefix.0)
+        .chain(simple.suffix.iter().flat_map(|suffix| &suffix.0));
+    for item in items {
+        match item {
+            ast::CommandPrefixOrSuffixItem::Word(word) => {
+                if !cut {
+                    match literal(word) {
+                        Ok(text) => words.push(text),
+                        Err(_) => cut = true,
+                    }
+                }
+                substitutions_into(word, &mut inner);
+            }
+            ast::CommandPrefixOrSuffixItem::ProcessSubstitution(..) => cut = true,
+            ast::CommandPrefixOrSuffixItem::IoRedirect(_)
+            | ast::CommandPrefixOrSuffixItem::AssignmentWord(..) => {}
+        }
+    }
+    if !words.is_empty() {
+        entries.push(words);
+    }
+    // The substitutions come after the command that holds them, in order.
+    for text in &inner {
+        words_into(text, entries);
+    }
+}
+
+/// The text of each `$(...)` in `word`, at top level and inside double quotes,
+/// in order. Backquotes are not returned: they are never proven.
+fn substitutions_into(word: &ast::Word, found: &mut Vec<String>) {
+    let Ok(parts) = pieces(word) else {
+        return;
+    };
+    for part in &parts {
+        match &part.piece {
+            WordPiece::DoubleQuotedSequence(inner) => {
+                found.extend(
+                    inner
+                        .iter()
+                        .filter_map(|nested| substitution_text(&nested.piece)),
+                );
+            }
+            other => found.extend(substitution_text(other)),
+        }
+    }
+}
+
+fn substitution_text(piece: &WordPiece) -> Option<String> {
+    match piece {
+        WordPiece::CommandSubstitution(inner) => Some(inner.clone()),
+        _ => None,
+    }
+}
+
+/// What a passing command was proven by: the table programs and the rules it
+/// used, each listed once, in first-seen order.
+#[derive(Default)]
+struct Proof {
+    programs: Vec<&'static str>,
+    rules: Vec<String>,
+}
+
+impl Proof {
+    fn add_program(&mut self, name: &'static str) {
+        if !self.programs.contains(&name) {
+            self.programs.push(name);
+        }
+    }
+
+    fn add_rule(&mut self, rule: &Rule) {
+        let text = rule.to_string();
+        if !self.rules.contains(&text) {
+            self.rules.push(text);
+        }
+    }
+
+    /// `read-only: cat, grep; rules: git commit`. A part is omitted when no
+    /// command was proven by that kind.
+    fn reason(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.programs.is_empty() {
+            parts.push(format!("read-only: {}", self.programs.join(", ")));
+        }
+        if !self.rules.is_empty() {
+            parts.push(format!("rules: {}", self.rules.join(", ")));
+        }
+        parts.join("; ")
+    }
+}
+
+/// The proof of the command, if all of it is proven.
+fn prove(command: &str, workdir: &Path, rules: &[Rule]) -> Result<Proof, String> {
+    let mut proof = Proof::default();
+    prove_into(command, workdir, rules, &mut proof)?;
+    Ok(proof)
+}
+
+/// Proves the command into `proof`, which may already hold the proof of an
+/// enclosing command's substitutions.
+fn prove_into(
+    command: &str,
+    workdir: &Path,
+    rules: &[Rule],
+    proof: &mut Proof,
+) -> Result<(), String> {
     let program = parse(command)?;
     let items: Vec<&CompoundListItem> = program
         .complete_commands
@@ -59,19 +229,20 @@ fn prove(command: &str, workdir: &Path) -> Result<Vec<&'static str>, String> {
     if items.is_empty() {
         return Err("the command is empty".into());
     }
-    let mut names = Vec::new();
     for CompoundListItem(and_or, separator) in items {
         if matches!(separator, SeparatorOperator::Async) {
             return Err("background jobs (`&`) are not checked".into());
         }
-        pipeline(&and_or.first, workdir, &mut names)?;
+        pipeline(&and_or.first, workdir, rules, proof)?;
         for next in &and_or.additional {
             match next {
-                AndOr::And(later) | AndOr::Or(later) => pipeline(later, workdir, &mut names)?,
+                AndOr::And(later) | AndOr::Or(later) => {
+                    pipeline(later, workdir, rules, proof)?;
+                }
             }
         }
     }
-    Ok(names)
+    Ok(())
 }
 
 fn parse(command: &str) -> Result<ast::Program, String> {
@@ -85,7 +256,8 @@ fn parse(command: &str) -> Result<ast::Program, String> {
 fn pipeline(
     pipeline: &ast::Pipeline,
     workdir: &Path,
-    names: &mut Vec<&'static str>,
+    rules: &[Rule],
+    proof: &mut Proof,
 ) -> Result<(), String> {
     if pipeline.timed.is_some() {
         return Err("`time` is not checked".into());
@@ -93,16 +265,17 @@ fn pipeline(
     pipeline
         .seq
         .iter()
-        .try_for_each(|command| command_check(command, workdir, names))
+        .try_for_each(|command| command_check(command, workdir, rules, proof))
 }
 
 fn command_check(
     command: &ast::Command,
     workdir: &Path,
-    names: &mut Vec<&'static str>,
+    rules: &[Rule],
+    proof: &mut Proof,
 ) -> Result<(), String> {
     match command {
-        ast::Command::Simple(simple) => simple_command(simple, workdir, names),
+        ast::Command::Simple(simple) => simple_command(simple, workdir, rules, proof),
         ast::Command::Compound(..) => {
             Err("compound commands (`( )`, `{ }`, `if`, loops) are not checked".into())
         }
@@ -114,38 +287,80 @@ fn command_check(
 fn simple_command(
     simple: &ast::SimpleCommand,
     workdir: &Path,
-    names: &mut Vec<&'static str>,
+    rules: &[Rule],
+    proof: &mut Proof,
 ) -> Result<(), String> {
     let name_word = simple
         .word_or_name
         .as_ref()
         .ok_or("a command with no command word is not checked")?;
     let name = literal(name_word)?;
-    let program = programs::find(&name)
-        .ok_or_else(|| format!("`{name}` is not a known read-only program"))?;
+    // The table is looked up now, but an unknown program is only reported
+    // after the words are read: a rule may name a program the table lacks.
+    let table = programs::find(&name);
     let items = simple
         .prefix
         .iter()
         .flat_map(|prefix| &prefix.0)
         .chain(simple.suffix.iter().flat_map(|suffix| &suffix.0));
-    let mut args = Vec::new();
+    let mut args: Vec<Option<String>> = Vec::new();
+    // Every item is read, so a rule can see all the words; the first failure
+    // is kept.
+    let mut failure: Option<String> = None;
     for item in items {
-        match item {
-            ast::CommandPrefixOrSuffixItem::Word(word) => args.push(literal(word)?),
-            ast::CommandPrefixOrSuffixItem::IoRedirect(io) => redirection(io, workdir)?,
+        let outcome = match item {
+            ast::CommandPrefixOrSuffixItem::Word(word) => {
+                argument(word, workdir, rules, proof).map(|arg| args.push(arg))
+            }
+            ast::CommandPrefixOrSuffixItem::IoRedirect(io) => redirection(io, workdir),
             ast::CommandPrefixOrSuffixItem::AssignmentWord(..) => {
-                return Err("assignments are not checked".into());
+                Err("assignments are not checked".into())
             }
             ast::CommandPrefixOrSuffixItem::ProcessSubstitution(..) => {
-                return Err("process substitution is not checked".into());
+                Err("process substitution is not checked".into())
             }
+        };
+        if let Err(why) = outcome {
+            failure.get_or_insert(why);
         }
     }
-    check_args(&program, &args, workdir)?;
-    if !names.contains(&program.name) {
-        names.push(program.name);
+    let rule = rules.iter().find(|rule| covers(rule, &name, &args));
+    if let Some(why) = failure {
+        // Without a rule, an unknown program is the error, as it always was.
+        return Err(match (table, rule) {
+            (None, None) => unknown(&name),
+            _ => why,
+        });
     }
+    if let Some(rule) = rule {
+        proof.add_rule(rule);
+        return Ok(());
+    }
+    let program = table.ok_or_else(|| unknown(&name))?;
+    // A table program cannot be checked against a value nobody knows.
+    let words = args
+        .into_iter()
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| {
+            format!("`{name}` takes a word from a command substitution, which is not checked")
+        })?;
+    check_args(&program, &words, workdir)?;
+    proof.add_program(program.name);
     Ok(())
+}
+
+fn unknown(name: &str) -> String {
+    format!("`{name}` is not a known read-only program")
+}
+
+/// Whether the rule's words are the first words of the command: the program,
+/// then the arguments, word for word. An unknown argument matches no rule
+/// word; words after the rule's are not looked at.
+fn covers(rule: &Rule, name: &str, args: &[Option<String>]) -> bool {
+    let mut command = std::iter::once(Some(name)).chain(args.iter().map(Option::as_deref));
+    rule.words()
+        .iter()
+        .all(|word| command.next().flatten() == Some(word.as_str()))
 }
 
 /// The arguments of a program. Options come first (up to `--`): each is
@@ -302,20 +517,73 @@ fn here_document(doc: &ast::IoHereDocument) -> Result<(), String> {
     }
 }
 
-/// The literal text of a word after unquoting, or why it is not a literal.
-fn literal(word: &ast::Word) -> Result<String, String> {
+/// The pieces of a word as the parser reads them.
+fn pieces(word: &ast::Word) -> Result<Vec<WordPieceWithSource>, String> {
     // A backslash-newline is removed by the shell, so the parser's view of
     // the word would differ from the shell's; refuse rather than guess.
     if word.value.contains("\\\n") {
         return Err("line continuations are not checked yet".into());
     }
-    let pieces = word::parse(&word.value, &ParserOptions::default())
-        .map_err(|_| format!("could not read `{}`", word.value))?;
+    word::parse(&word.value, &ParserOptions::default())
+        .map_err(|_| format!("could not read `{}`", word.value))
+}
+
+/// The literal text of a word after unquoting, or why it is not a literal.
+fn literal(word: &ast::Word) -> Result<String, String> {
     let mut text = String::new();
-    for piece in &pieces {
+    for piece in &pieces(word)? {
         push_piece(&piece.piece, &mut text)?;
     }
     Ok(text)
+}
+
+/// An argument word: its literal text, or `None` when it holds a `$(...)`
+/// substitution, whose value nobody knows. The substitution's inner command
+/// is proven into `proof`, so it appears in the reason.
+fn argument(
+    word: &ast::Word,
+    workdir: &Path,
+    rules: &[Rule],
+    proof: &mut Proof,
+) -> Result<Option<String>, String> {
+    let mut text = String::new();
+    let mut known = true;
+    for piece in &pieces(word)? {
+        known &= argument_piece(&piece.piece, false, &mut text, workdir, rules, proof)?;
+    }
+    Ok(known.then_some(text))
+}
+
+/// Appends one piece of an argument word, and returns `false` when the piece
+/// is a `$(...)` substitution (its value is unknown). Inside double quotes
+/// (`quoted`), a `$(...)` substitution is checked the same way. Backquotes are
+/// refused, not proven: bash un-escapes `\\` and `\$` inside them before it
+/// parses them, the parser does not, so the proven text could differ from
+/// what runs.
+fn argument_piece(
+    piece: &WordPiece,
+    quoted: bool,
+    text: &mut String,
+    workdir: &Path,
+    rules: &[Rule],
+    proof: &mut Proof,
+) -> Result<bool, String> {
+    match piece {
+        WordPiece::CommandSubstitution(inner) => {
+            prove_into(inner, workdir, rules, proof)?;
+            Ok(false)
+        }
+        WordPiece::DoubleQuotedSequence(inner) if !quoted => {
+            let mut known = true;
+            for inner_piece in inner {
+                let part = &inner_piece.piece;
+                known &= argument_piece(part, true, text, workdir, rules, proof)?;
+            }
+            Ok(known)
+        }
+        _ if quoted => push_quoted(piece, text).map(|()| true),
+        _ => push_piece(piece, text).map(|()| true),
+    }
 }
 
 /// Appends one piece of an unquoted word. Literal text, quoted text and

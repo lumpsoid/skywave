@@ -124,6 +124,15 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             judgment: safety_judgment(judgment),
             note,
         },
+        ActionIntent::SetSafetyRule {
+            session_id,
+            words,
+            on,
+        } => Action::SetSafetyRule {
+            session_id: id("session", &session_id)?,
+            words,
+            on,
+        },
         ActionIntent::SetModel { session_id, model } => Action::SetModel {
             session_id: id("session", &session_id)?,
             model,
@@ -350,6 +359,32 @@ mod tests {
                 note: None,
             }),
             Err("not a call id: \"nope\"".to_owned())
+        );
+    }
+
+    #[test]
+    fn set_safety_rule_maps_its_session() {
+        let session = SessionId::new();
+        let words = vec!["git".to_owned(), "commit".to_owned()];
+        assert_eq!(
+            action(ActionIntent::SetSafetyRule {
+                session_id: session.0.to_string(),
+                words: words.clone(),
+                on: true,
+            }),
+            Ok(Action::SetSafetyRule {
+                session_id: session,
+                words,
+                on: true,
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::SetSafetyRule {
+                session_id: "nope".into(),
+                words: Vec::new(),
+                on: false,
+            }),
+            Err("not a session id: \"nope\"".to_owned())
         );
     }
 

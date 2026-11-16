@@ -405,6 +405,14 @@ pub enum ActionIntent {
         judgment: SafetyJudgmentView,
         note: Option<String>,
     },
+    /// Trust shell commands starting with `words` (a program, then literal
+    /// leading words; a row's `rule_candidates`) in every session, or stop
+    /// (`on: false`).
+    SetSafetyRule {
+        session_id: String,
+        words: Vec<String>,
+        on: bool,
+    },
     /// Switch the session's agent to `model`: an offered model's `id`, or
     /// a name typed in. Blank does nothing.
     SetModel {

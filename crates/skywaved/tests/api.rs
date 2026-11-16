@@ -3582,6 +3582,80 @@ async fn deleting_a_shell_output_blob_frees_it_and_logs_it() {
     );
 }
 
+/// `DeleteSession` of an idle session is accepted, and the event at its seq
+/// is the `SessionDeleted` tombstone: logged by the command, naming the
+/// device, in the session's context.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_an_idle_session_logs_a_tombstone() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+
+    let delete = delete_command(session);
+    let seq = accepted_seq(&device.command(&delete).await);
+    let batch = device.events(Seq::ZERO, 0).await;
+    let (_, event) = batch
+        .iter()
+        .find(|(s, _)| *s == seq)
+        .expect("the tombstone is in the log");
+    assert_eq!(event.session_id, session);
+    assert_eq!(event.context, context);
+    assert_eq!(event.command_id, Some(delete.id));
+    assert!(matches!(
+        event.kind,
+        EventKind::SessionDeleted { by } if by == creds.id
+    ));
+}
+
+/// `DeleteSession` of a session the server does not know is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_an_unknown_session_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+
+    assert_eq!(
+        device.command(&delete_command(SessionId::new())).await,
+        rejected(RejectReason::UnknownSession)
+    );
+}
+
+/// `DeleteSession` while the session's turn runs is refused `TurnRunning`.
+/// Positive control: once the turn is idle, the same session is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_with_a_running_turn_is_refused() {
+    let mut f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let working = EventKind::SessionStateChanged(SessionState::AgentWorking);
+    f.log
+        .append(&mut f.storage.db, session, context, working)
+        .unwrap();
+
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    let idle = EventKind::SessionStateChanged(SessionState::Idle);
+    f.log
+        .append(&mut f.storage.db, session, context, idle)
+        .unwrap();
+    accepted_seq(&device.command(&delete_command(session)).await);
+}
+
+fn delete_command(session: SessionId) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::DeleteSession {
+            session_id: session,
+        },
+    }
+}
+
 /// `seq first last`'s output.
 fn numbers(lines: std::ops::RangeInclusive<u32>) -> Vec<u8> {
     lines.flat_map(|n| format!("{n}\n").into_bytes()).collect()

@@ -1886,6 +1886,9 @@ pub struct ToolView {
     /// Feedback on the safety check this call's row may send, if it is a
     /// shell call that asked a person or that the safety check approved.
     pub safety_feedback: Option<SafetyFeedbackView>,
+    /// The shell command this call runs, as the agent's approval request or
+    /// the safety check named it; `None` when neither did.
+    pub shell: Option<String>,
     /// How the call's own outcome stands. A [`ToolKind::Subagent`] call's
     /// says how its launch went (a background one is `Done` once launched);
     /// heads show [`subagent`](Self::subagent) instead.
@@ -2133,6 +2136,35 @@ pub struct SettingsView {
     pub server_fingerprint: Option<Fingerprint>,
     /// Logging the server's agent in from this device.
     pub login: LoginView,
+    /// The safety rules: the ones logged on, and the ones with a change of
+    /// this device still on its way in front.
+    pub safety_rules: Vec<SafetyRuleView>,
+}
+
+/// A shell command prefix the safety check trusts, as Settings lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyRuleView {
+    /// The program, then the literal leading words it must start with.
+    pub words: Vec<String>,
+    /// The session a removal is sent to: the one the newest rule event was
+    /// logged in, or the session of this device's pending change for a rule
+    /// never logged.
+    pub session_id: SessionId,
+    /// Whether the log holds the rule on; `false` for a rule never logged.
+    pub on: bool,
+    /// This device's change to the rule, while the log does not hold it yet.
+    pub pending: Option<PendingSafetyRule>,
+}
+
+/// A change to a safety rule that this device sent and the log does not hold
+/// yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSafetyRule {
+    /// This device's command, for `Action::Discard` once it failed.
+    pub command: CommandId,
+    /// The state the change sets the rule to.
+    pub on: bool,
+    pub outgoing: Outgoing,
 }
 
 #[cfg(test)]

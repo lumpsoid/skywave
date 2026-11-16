@@ -12,8 +12,10 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// paired as, the link to it with its round trip, the fingerprint to
 /// compare with what `skywaved` prints, when the agent's login on the
 /// server expires, with Log in where the server offers a login from a
-/// device ([AgentLoginPanel] below it), and Re-pair. A paired server's tile opens its
-/// addresses ([ServerAddressesPage]), to reach it at another without
+/// device ([AgentLoginPanel] below it), and Re-pair. Below it, the safety
+/// rules the person trusts, each with a remove button (D61). A paired
+/// server's tile opens its addresses ([ServerAddressesPage]), to reach it at
+/// another without
 /// re-pairing.
 class SettingsPage extends StatelessWidget {
   const SettingsPage({
@@ -188,6 +190,51 @@ class SettingsPage extends StatelessWidget {
                 ),
               ),
             ),
+            const _Section('Safety rules'),
+            if (screen.safetyRules.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Commands you trust run without asking. Add one from a shell '
+                  'row\'s menu.',
+                  style: muted,
+                ),
+              ),
+            // Keyed by position: two rules can share a label.
+            for (final (index, rule) in screen.safetyRules.indexed)
+              ListTile(
+                key: Key('safety-rule-$index'),
+                leading: const Icon(Icons.verified_user_outlined),
+                title: Text(rule.label, style: monoText),
+                subtitle: switch (rule.pending) {
+                  final pending? => Text(pending),
+                  null => null,
+                },
+                trailing: switch (rule.discard) {
+                  // A failed change is dismissed, not removed.
+                  final discard? => IconButton(
+                    key: Key('dismiss-safety-rule-$index'),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Dismiss',
+                    onPressed: () =>
+                        send.act(ActionIntentDiscard(commandId: discard)),
+                  ),
+                  null => IconButton(
+                    key: Key('remove-safety-rule-$index'),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Stop trusting this command',
+                    onPressed: rule.on
+                        ? () => send.act(
+                            ActionIntentSetSafetyRule(
+                              sessionId: rule.sessionId,
+                              words: rule.words,
+                              on: false,
+                            ),
+                          )
+                        : null,
+                  ),
+                },
+              ),
           ],
         ),
       ),
