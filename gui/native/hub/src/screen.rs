@@ -289,6 +289,7 @@ fn row_view(row: &SessionRow, archived: bool, group: &str) -> SessionRowView {
         rename_label: rename_label(row.rename.as_ref()),
         importing_label: row.importing.then(|| IMPORTING_HISTORY.to_owned()),
         deletable: row.deletable,
+        deletable_everywhere: row.deletable_everywhere,
         delete_blocked_label: (archived && !row.deletable)
             .then(|| format!("cannot delete {title} yet: answer or cancel first")),
         removable: row.worktree.is_some() && !row.worktree_removed,

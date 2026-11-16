@@ -107,10 +107,10 @@ pub enum Request {
     ReclaimStorage {
         req: u64,
     },
-    /// Give this device's database's free pages back to the disk, then read
-    /// this device's storage again, for the storage screen, off the state
-    /// lock. Needs no server. Answer with [`Seam::device_storage_read`],
-    /// naming `req`.
+    /// Give this device's database's free pages back to the disk (`VACUUM`
+    /// under the state lock, so dispatch waits for it), then read this
+    /// device's storage again, off the lock. Needs no server. Answer with
+    /// [`Seam::device_storage_read`], naming `req`.
     ReclaimDeviceStorage {
         req: u64,
     },

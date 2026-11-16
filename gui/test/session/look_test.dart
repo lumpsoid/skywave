@@ -105,6 +105,7 @@ void main() {
       lastActivityLabel: sessionRow('a').lastActivityLabel,
       lastActivityMs: 0,
       deletable: false,
+      deletableEverywhere: false,
       removable: false,
       worktreeRemoved: false,
       archived: false,
