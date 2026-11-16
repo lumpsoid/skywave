@@ -18,23 +18,11 @@ const _screen = ScreenViewWorktrees(
           path: '/srv/app-fix',
           branch: 'fix-login',
           tags: ['uncommitted changes', 'not merged'],
-          sessions: [
-            WorktreeSessionView(
-              sessionId: 'a',
-              title: 'Fix login',
-              archived: false,
-              removable: true,
-              worktreeRemoved: false,
-            ),
-            WorktreeSessionView(
-              sessionId: 'b',
-              title: 'Old spike',
-              archived: true,
-              removable: false,
-              worktreeRemoved: false,
-              removalLabel: 'queued',
-            ),
-          ],
+          main: false,
+          sessions: [WorktreeSessionView(sessionId: 'a', title: 'Fix login')],
+          archived: [WorktreeSessionView(sessionId: 'b', title: 'Old spike')],
+          remove: WorktreeRemoveView(sessionId: 'a', title: 'Fix login'),
+          removalLabel: 'queued',
         ),
       ],
     ),
@@ -60,16 +48,41 @@ void main() {
       'uncommitted changes',
       'not merged',
       'Fix login',
-      'Old spike',
-      'archived',
+      '1 archived',
       'queued',
     ]) {
       expect(find.text(text), findsOneWidget, reason: text);
     }
-    // Only the removable session has the button.
+    // The archived session is folded until the fold is opened.
+    expect(find.text('Old spike'), findsNothing);
+    await tester.tap(find.byKey(const Key('archived-/srv/app-fix')));
+    await tester.pump();
+    expect(find.text('Old spike'), findsOneWidget);
+    // Only the worktree that can go has the button, keyed by its session.
     expect(find.byKey(const Key('remove-worktree-a')), findsOneWidget);
     expect(find.byKey(const Key('remove-worktree-b')), findsNothing);
     expect(find.byTooltip('Remove worktree'), findsOneWidget);
+  });
+
+  testWidgets('a session line opens its session', (tester) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: WorktreesPage(screen: _screen, send: sent.add),
+      ),
+    );
+    await tester.tap(find.byKey(const Key('worktree-session-a')));
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentOpenSession(sessionId: 'a')),
+    ]);
+
+    await tester.tap(find.byKey(const Key('archived-/srv/app-fix')));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('worktree-session-b')));
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentOpenSession(sessionId: 'a')),
+      const GuiIntentAct(action: ActionIntentOpenSession(sessionId: 'b')),
+    ]);
   });
 
   testWidgets('refresh then back send their intents', (tester) async {

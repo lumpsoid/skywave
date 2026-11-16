@@ -1465,7 +1465,22 @@ logs) an event that no longer decodes rather than failing.
   delivery state of its latest `RemoveWorktree` (`removal`). A listed
   worktree no session runs in has no key. Nothing is stored: opening the
   screen drops the last list and asks again. `skywave_present::worktrees`
-  words it for both heads.
+  words it for both heads. The GUI's hub (`gui/native/hub/src/screen.rs`)
+  orders the page: a repository with a linked (non-main) worktree first, then
+  one with only its main working tree, then gone or failed ones, each group in
+  the server's path order. Inside a repository, linked worktrees with a
+  non-archived session come first, then the other linked worktrees, and the
+  main working tree last; git's order holds within each group. The hub splits
+  each worktree's sessions into `WorktreeView.sessions` and `archived`, latest
+  message first in both. The GUI folds the archived ones behind an "N archived"
+  toggle, collapsed by default. Removal is per worktree card:
+  `WorktreeView.remove` names the first removable session (a skywave worktree
+  not yet removed, non-archived before archived), and `RemoveWorktree` for it
+  is sent after a confirm. `removal_label` is the first removal on its way or
+  failed among the worktree's sessions. The main working tree has none, and a
+  worktree no session runs in can't be removed from the page. Tapping a session
+  line sends `OpenSession`. The card leads with the branch, with the path under
+  it.
 - **Server addresses page** (`Route::ServerAddresses`,
   `Screen::ServerAddresses(ServerAddressesView)`): the address in use and
   the server's other addresses (see Pairing), from the replica's settings.

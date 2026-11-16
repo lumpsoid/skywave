@@ -138,7 +138,9 @@ pub enum ScreenView {
     Worktrees {
         /// Asking, offline or failed; `None` once the list is fresh.
         status_label: Option<String>,
-        /// One per repository, sorted by path.
+        /// One per repository: those with a linked worktree that is in use
+        /// first, then the other listed ones, then those gone or failed; the
+        /// server's path order within each group.
         repos: Vec<WorktreeRepoView>,
         /// What an empty list says; `None` when it has repos or there is no
         /// list.
@@ -279,7 +281,8 @@ pub struct WorktreeRepoView {
     pub repo: String,
     /// Why the list is short or missing (more, gone, git failed).
     pub note: Option<String>,
-    /// The main working tree first.
+    /// Linked worktrees with a session in use first, then the other linked
+    /// ones, the main working tree last; git's order within each group.
     pub worktrees: Vec<WorktreeView>,
 }
 
@@ -291,9 +294,23 @@ pub struct WorktreeView {
     pub branch: String,
     /// `main`, `missing`, `uncommitted changes`, `merged`, `not merged`….
     pub tags: Vec<String>,
-    /// The sessions running in it, latest message first, as the session
-    /// list orders them.
+    /// The repository's main working tree, which can't be removed.
+    pub main: bool,
+    /// Its sessions that are not archived, latest message first.
     pub sessions: Vec<WorktreeSessionView>,
+    /// Its archived sessions, latest message first.
+    pub archived: Vec<WorktreeSessionView>,
+    /// How to remove it; `None` when no session of it may send `RemoveWorktree`.
+    pub remove: Option<WorktreeRemoveView>,
+    /// A removal on its way or failed; `None` when none or settled.
+    pub removal_label: Option<String>,
+}
+
+/// The session a worktree's removal is sent for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct WorktreeRemoveView {
+    pub session_id: String,
+    pub title: String,
 }
 
 /// A session running in a listed worktree.
@@ -301,12 +318,6 @@ pub struct WorktreeView {
 pub struct WorktreeSessionView {
     pub session_id: String,
     pub title: String,
-    pub archived: bool,
-    /// `RemoveWorktree` may be sent: a skywave worktree, not removed.
-    pub removable: bool,
-    pub worktree_removed: bool,
-    /// A removal on its way or failed; `None` when none or settled.
-    pub removal_label: Option<String>,
 }
 
 /// The usage limits as listed, on their page and a session's info page.

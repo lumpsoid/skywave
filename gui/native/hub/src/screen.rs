@@ -47,8 +47,8 @@ use crate::signals::{
     QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
     SessionRowView, SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
     StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView,
-    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRepoView, WorktreeSessionView,
-    WorktreeView,
+    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView,
+    WorktreeSessionView, WorktreeView,
 };
 use skywave_present::text::{clean, clean_line};
 
@@ -1052,22 +1052,36 @@ fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
 }
 
 /// The worktrees screen: each repository's worktrees, with the sessions
-/// running in each.
+/// running in each. Repositories with a linked worktree in use come first.
 fn worktrees_view(view: &WorktreesView) -> ScreenView {
+    let mut repos: Vec<(u8, WorktreeRepoView)> = view
+        .list
+        .iter()
+        .flat_map(|list| &list.repos)
+        .map(|repo| (repo_rank(repo), worktree_repo_view(view, repo)))
+        .collect();
+    repos.sort_by_key(|(rank, _)| *rank);
     ScreenView::Worktrees {
         status_label: worktrees::status_line(view),
-        repos: view
-            .list
-            .iter()
-            .flat_map(|list| &list.repos)
-            .map(|repo| worktree_repo_view(view, repo))
-            .collect(),
+        repos: repos.into_iter().map(|(_, repo)| repo).collect(),
         empty_label: worktrees::empty_label(view),
     }
 }
 
+/// Where a repository sorts on the worktrees screen: 0 when it lists a linked
+/// worktree, 1 when only its main one, 2 when gone or failed.
+fn repo_rank(repo: &RepoWorktrees) -> u8 {
+    match &repo.listing {
+        RepoListing::Worktrees {
+            worktrees: listed, ..
+        } if listed.iter().any(|entry| !entry.main) => 0,
+        RepoListing::Worktrees { .. } => 1,
+        RepoListing::Gone | RepoListing::Failed { .. } => 2,
+    }
+}
+
 fn worktree_repo_view(view: &WorktreesView, repo: &RepoWorktrees) -> WorktreeRepoView {
-    let entries = match &repo.listing {
+    let mut entries: Vec<WorktreeView> = match &repo.listing {
         RepoListing::Worktrees {
             worktrees: listed, ..
         } => listed
@@ -1076,6 +1090,9 @@ fn worktree_repo_view(view: &WorktreesView, repo: &RepoWorktrees) -> WorktreeRep
             .collect(),
         RepoListing::Gone | RepoListing::Failed { .. } => Vec::new(),
     };
+    // Linked worktrees in use first, then the other linked ones, the main
+    // working tree last (`false` sorts first).
+    entries.sort_by_key(|w| (w.main, w.sessions.is_empty()));
     WorktreeRepoView {
         repo: clean_line(&repo.repo),
         note: worktrees::listing_note(&repo.listing).map(|note| clean_line(&note)),
@@ -1084,17 +1101,34 @@ fn worktree_repo_view(view: &WorktreesView, repo: &RepoWorktrees) -> WorktreeRep
 }
 
 fn worktree_view(view: &WorktreesView, entry: &WorktreeEntry) -> WorktreeView {
+    let (active, archived): (Vec<&WorktreeSession>, Vec<&WorktreeSession>) = view
+        .sessions
+        .get(&entry.path)
+        .into_iter()
+        .flatten()
+        .partition(|session| !session.archived);
+    // The first session that may be removed, archived ones last.
+    let remove = active
+        .iter()
+        .chain(&archived)
+        .find(|session| session.worktree && !session.worktree_removed)
+        .map(|session| WorktreeRemoveView {
+            session_id: session.id.0.to_string(),
+            title: clean_line(&session.title),
+        });
+    let removal_label = active
+        .iter()
+        .chain(&archived)
+        .find_map(|session| worktrees::removal_label(session.removal.as_ref()));
     WorktreeView {
         path: clean_line(&entry.path),
         branch: clean_line(&worktrees::branch_label(entry)),
         tags: worktrees::tags(entry),
-        sessions: view
-            .sessions
-            .get(&entry.path)
-            .into_iter()
-            .flatten()
-            .map(worktree_session_view)
-            .collect(),
+        main: entry.main,
+        sessions: active.into_iter().map(worktree_session_view).collect(),
+        archived: archived.into_iter().map(worktree_session_view).collect(),
+        remove,
+        removal_label,
     }
 }
 
@@ -1102,10 +1136,6 @@ fn worktree_session_view(session: &WorktreeSession) -> WorktreeSessionView {
     WorktreeSessionView {
         session_id: session.id.0.to_string(),
         title: clean_line(&session.title),
-        archived: session.archived,
-        removable: session.worktree && !session.worktree_removed,
-        worktree_removed: session.worktree_removed,
-        removal_label: worktrees::removal_label(session.removal.as_ref()),
     }
 }
 
