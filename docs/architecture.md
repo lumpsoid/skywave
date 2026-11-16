@@ -482,6 +482,17 @@ the daemon's appends, which would otherwise stop `serve` (below).
   given to `skywave_safety::check`: a `Safe` verdict answers the agent at
   once and logs `SafetyCheckApproved` instead of `ApprovalRequested`, so
   nothing is pending; `Ask` logs the approval as usual (D59).
+
+  Both events carry the `shell` command. A device can then send
+  `SafetyCheckFeedback` on such a call: `ShouldApprove` where a person was
+  asked, `ShouldAsk` where the check approved. The server checks that from
+  the call's newest `ApprovalRequested` or `SafetyCheckApproved` in the log
+  (else `NotAShellCall`), re-runs the check and logs `SafetyCheckFeedback`
+  with today's verdict, the judgment and the trimmed note. Core puts it on
+  the call's tool row (`ToolView.safety_feedback`): which judgment the row
+  may send and the newest one sent. `skywaved safety-feedback` exports them
+  all as JSON lines (D60).
+
   A question the agent asks with options (`QuestionAsked`, D47)
   is an approval in all but its answer: the same ids, pending list,
   cancels and first answer wins. `AnswerQuestion` answers it with one

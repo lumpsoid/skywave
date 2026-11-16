@@ -1594,3 +1594,40 @@ logs `SafetyCheckApproved { call, tool, summary, reason }` in place of
 `git`, which first needs a guard against repo-configured programs such
 as `core.fsmonitor`, `diff.external` and filters); a timeline line for
 the switch; the TUI's toggle.
+
+## D60. Feedback on the safety check is a session event, exported from the server (v39)
+
+The safety check (D59) gets better only from its mistakes, and the people
+who see them are the ones answering approvals. A shell call's row lets
+them say the check judged it wrong, and the server keeps what they said
+beside the command it was about, for whoever improves the checker.
+
+**Decided:** "A device sends `SafetyCheckFeedback { session_id, call,
+judgment, note }`. `ShouldApprove` is accepted only on a call whose newest
+`ApprovalRequested` names a `shell` command (it asked a person);
+`ShouldAsk` only on one whose newest `SafetyCheckApproved` does (the check
+approved it). Anything else is `NotAShellCall`. The server re-runs the
+check on the command and logs `SafetyCheckFeedback { call, judgment,
+note, shell, checked_safe, checked_reason, by }`, synced like any event."
+- Both `ApprovalRequested` and `SafetyCheckApproved` carry the `shell`
+  command, so the server decides eligibility from the log, not by
+  guessing from the tool name.
+- The verdict stored is the checker's when the feedback is logged, not
+  when the call ran: it is what the next change to the checker must beat.
+- The note is optional and trimmed; blank is none. Over 2000 bytes is
+  `MessageTooLong`, not cut.
+- Any number of feedbacks per call; a row shows the newest, or this
+  device's own while it is on its way. Not notable, not activity.
+- `skywaved safety-feedback` prints every feedback as JSON lines (command,
+  workdir, verdict and reason, judgment, note, session, time), oldest
+  first, for review off the device.
+
+**Rejected:**
+- A review screen in the GUI. The reader is whoever changes the checker,
+  at a terminal on the server; JSON lines feed scripts and tests.
+- Sending feedback anywhere but the user's own server.
+- Feedback on a call that never reached the check (no `shell`): there is
+  no verdict to judge.
+
+**Deferred:**
+- The TUI's way to send it (the GUI's row menu has it).
