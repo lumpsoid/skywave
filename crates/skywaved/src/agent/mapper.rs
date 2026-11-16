@@ -224,6 +224,18 @@ struct UnlinkedCall {
     parent: Option<AgentCallId>,
 }
 
+/// An approval the safety check answered in place of a person: `tool`, asking
+/// to run `input` on `call`, approved for `reason`. `shell` is the command the
+/// adapter reported, if any.
+#[derive(Debug)]
+pub struct SafetyApproval {
+    pub call: Option<AgentCallId>,
+    pub tool: String,
+    pub input: Value,
+    pub reason: String,
+    pub shell: Option<String>,
+}
+
 impl EventMapper {
     /// A mapper for `session_id`, whose log holds `settings` and `work`,
     /// running its agent in session context `context`.
@@ -401,7 +413,7 @@ impl EventMapper {
                 input,
                 suggestions,
                 task,
-                shell: _,
+                shell,
             } => {
                 let (call, summary, input_known) = self.approval_view(call.as_ref(), &input);
                 let input = if input_known {
@@ -420,7 +432,7 @@ impl EventMapper {
                         summary,
                         input,
                         suggestions: bounded_suggestions(suggestions),
-                        shell: None,
+                        shell,
                     },
                 )?);
                 self.approvals.push(LoggedApproval {
@@ -695,19 +707,23 @@ impl EventMapper {
         Ok(seqs)
     }
 
-    /// Logs that Skywave's safety check approved the approval of `call` (a
-    /// `tool` asking to run `input`) for `reason`, instead of a person. Nothing
-    /// is pending, so no approval is recorded and no input blob is stored.
+    /// Logs that Skywave's safety check approved `approval` instead of a
+    /// person. Nothing is pending, so no approval is recorded and no input blob
+    /// is stored.
     pub fn safety_approved(
         &mut self,
         log: &EventLog,
         storage: &mut Storage,
-        call: Option<AgentCallId>,
-        tool: String,
-        input: &Value,
-        reason: String,
+        approval: SafetyApproval,
     ) -> Result<Seq> {
-        let (call, summary, _) = self.approval_view(call.as_ref(), input);
+        let SafetyApproval {
+            call,
+            tool,
+            input,
+            reason,
+            shell,
+        } = approval;
+        let (call, summary, _) = self.approval_view(call.as_ref(), &input);
         self.append(
             log,
             storage,
@@ -716,7 +732,7 @@ impl EventMapper {
                 tool,
                 summary,
                 reason,
-                shell: None,
+                shell,
             },
         )
     }

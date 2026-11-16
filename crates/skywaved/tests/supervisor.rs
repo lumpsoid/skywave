@@ -805,7 +805,7 @@ async fn the_safety_check_approves_a_read_only_command() {
         tool: "shell".into(),
         summary: "cat notes.txt".into(),
         reason: "read-only: cat".into(),
-        shell: None,
+        shell: Some("cat notes.txt".into()),
     }));
     assert!(!kinds.iter().any(is_approval_requested));
     assert!(kinds.contains(&EventKind::AgentMessage {
@@ -855,6 +855,10 @@ async fn without_the_safety_check_a_read_only_command_waits() {
     f.send("read notes");
     f.wait_count("approval", 1, is_approval_requested).await;
     assert!(!f.kinds().iter().any(is_safety_approved));
+    assert!(f.kinds().iter().any(|k| matches!(
+        k,
+        EventKind::ApprovalRequested { shell: Some(s), .. } if s == "cat notes.txt"
+    )));
 
     let id = f.approval_id();
     accepted(f.resolve(DeviceId::new(), id, Decision::Deny));
