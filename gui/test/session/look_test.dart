@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/app.dart';
@@ -35,8 +36,16 @@ Future<SkyColors> colorsIn(WidgetTester tester, Brightness brightness) async {
 
 void main() {
   test('each agent state has its own icon', () {
-    final icons = AgentState.values.map(agentIcon).toSet();
+    final icons = AgentState.values.map(agentIconAsset).toSet();
     expect(icons, hasLength(AgentState.values.length));
+  });
+
+  test('every agent state icon is a bundled svg', () async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    for (final state in AgentState.values) {
+      final svg = await rootBundle.loadString(agentIconAsset(state));
+      expect(svg, contains('<svg'), reason: '$state');
+    }
   });
 
   for (final brightness in Brightness.values) {

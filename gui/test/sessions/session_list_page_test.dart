@@ -2,7 +2,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/rendering.dart';
-import 'package:skywave_gui/session/look.dart' show agentIcon;
+import 'package:skywave_gui/session/look.dart' show AgentStateIcon;
 import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/sessions/session_row.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -580,8 +580,10 @@ void main() {
       await phone(tester, list(rows: [sessionRow('a', title: long)]));
       expect(tester.takeException(), isNull);
       expect(
-        tester.widget<Icon>(find.byKey(const Key('row-state-a'))).icon,
-        agentIcon(AgentState.awaitingApproval),
+        tester
+            .widget<AgentStateIcon>(find.byKey(const Key('row-state-a')))
+            .state,
+        AgentState.awaitingApproval,
       );
       expect(find.byType(StateBadge), findsNothing);
       expect(find.text('approval'), findsNothing);
