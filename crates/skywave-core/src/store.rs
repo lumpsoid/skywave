@@ -1227,6 +1227,10 @@ pub struct Applied {
     /// Outbox commands still unanswered that the batch settled as accepted
     /// at the seq of their event, in log order.
     pub settled: Vec<(CommandId, Seq)>,
+    /// Sessions whose server tombstone (`EventKind::SessionDeleted`) arrived
+    /// in this batch, dropped as a local delete drops them, with the blobs
+    /// whose files the caller removes.
+    pub dropped: Vec<(SessionId, Vec<BlobId>)>,
 }
 
 /// A server crop this device makes itself from the bytes it holds: `from`
@@ -1581,6 +1585,12 @@ impl Store {
     /// are not stored, project no summary and register no blob. Contiguity
     /// is the cursor's alone and events are read per session, so the holes
     /// they leave between stored events are harmless.
+    ///
+    /// A `SessionDeleted` tombstone drops its session as
+    /// [`delete_session_locally`](Store::delete_session_locally) does, in
+    /// this transaction and after the batch's own events of it are written.
+    /// The session's later events in the batch are skipped, as those of a
+    /// deleted one are; its blobs are reported in [`Applied::dropped`].
     pub fn apply_batch(
         &mut self,
         batch: &EventBatch,
@@ -1598,7 +1608,8 @@ impl Store {
             });
         }
 
-        let deleted = read_deleted(&tx)?;
+        let mut deleted = read_deleted(&tx)?;
+        let mut tombstoned: Vec<SessionId> = Vec::new();
         let mut touched: BTreeMap<SessionId, SessionSummary> = BTreeMap::new();
         let mut new_cursor = cursor;
         let mut new_events = 0;
@@ -1641,6 +1652,12 @@ impl Store {
             }
             if deleted.contains(&event.session_id) {
                 continue;
+            }
+            // Later events of the session in this batch are skipped, and its
+            // rows go once the batch's own are written.
+            if matches!(event.kind, EventKind::SessionDeleted { .. }) {
+                deleted.insert(event.session_id);
+                tombstoned.push(event.session_id);
             }
             tx.execute(
                 "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
@@ -1709,6 +1726,13 @@ impl Store {
                 ],
             )?;
         }
+        // After the summaries are written: dropping removes the rows just
+        // written for a tombstoned session.
+        let mut dropped = Vec::new();
+        for id in tombstoned {
+            let blobs = drop_session_in(&tx, id, now)?;
+            dropped.push((id, blobs));
+        }
         if new_cursor != cursor {
             tx.execute(
                 "UPDATE cursor SET seq = ?1 WHERE id = 0",
@@ -1717,9 +1741,12 @@ impl Store {
         }
         tx.commit()?;
         // A later event of the batch may have purged a crop's `into`, and
-        // with it the crop's blob.
-        local_crops.retain(|crop| !purged.contains(&crop.into) && !purged.contains(&crop.from));
-        blobs.retain(|id| !local_crops.iter().any(|crop| crop.into == *id));
+        // with it the crop's blob; a dropped session takes its blobs too.
+        let gone = |id: &BlobId| {
+            purged.contains(id) || dropped.iter().any(|(_, blobs)| blobs.contains(id))
+        };
+        local_crops.retain(|crop| !gone(&crop.into) && !gone(&crop.from));
+        blobs.retain(|id| !gone(id) && !local_crops.iter().any(|crop| crop.into == *id));
         Ok(Applied {
             cursor: new_cursor,
             new_events,
@@ -1728,6 +1755,7 @@ impl Store {
             purged,
             local_crops,
             settled,
+            dropped,
         })
     }
 
@@ -1762,77 +1790,7 @@ impl Store {
         now: DateTime<Utc>,
     ) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
-        let session = id.0.to_string();
-        // The blobs table has no session column: the events say which.
-        let mut blobs = Vec::new();
-        {
-            let mut stmt = tx.prepare("SELECT seq, event FROM events WHERE session_id = ?1")?;
-            let mut rows = stmt.query([&session])?;
-            while let Some(row) = rows.next()? {
-                match json_col::<Event>(row, 1) {
-                    Ok(event) => blobs.extend(blob_refs(&event.kind).map(|blob| blob.id)),
-                    Err(error) => {
-                        let seq: i64 = row.get(0)?;
-                        tracing::warn!(seq, %error, "deleting an event that does not decode");
-                    }
-                }
-            }
-        }
-        for blob in &blobs {
-            tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
-            // The fates of its blobs: its events named every one, a crop's
-            // `into` included.
-            tx.execute(
-                "DELETE FROM blob_fates WHERE blob_id = ?1",
-                [blob.0.to_string()],
-            )?;
-        }
-        // Its workdir answers' blobs go only if no other session's names them.
-        let workdir_blobs = {
-            let mut stmt =
-                tx.prepare("SELECT DISTINCT blob_id FROM workdir_blob_refs WHERE session_id = ?1")?;
-            let rows = stmt.query_map([&session], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        tx.execute(
-            "DELETE FROM workdir_blob_refs WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute(
-            "DELETE FROM workdir_snapshots WHERE session_id = ?1",
-            [&session],
-        )?;
-        blobs.extend(purge_workdir_blobs(&tx, &workdir_blobs)?);
-        blobs.sort();
-        blobs.dedup();
-        tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
-        tx.execute("DELETE FROM turns WHERE session_id = ?1", [&session])?;
-        tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
-        tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
-        tx.execute(
-            "DELETE FROM draft_attachments WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute("DELETE FROM draft_files WHERE session_id = ?1", [&session])?;
-        tx.execute(
-            "DELETE FROM composer_modes WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute("DELETE FROM read_marks WHERE session_id = ?1", [&session])?;
-        tx.execute(
-            "DELETE FROM alerted_approvals WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute(
-            "DELETE FROM outbox WHERE result IS NOT NULL
-                AND json_extract(command, '$.kind.session_id') = ?1",
-            [&session],
-        )?;
-        tx.execute(
-            "INSERT INTO deleted_sessions (session_id, at) VALUES (?1, ?2)
-             ON CONFLICT (session_id) DO NOTHING",
-            params![session, now.to_rfc3339()],
-        )?;
+        let blobs = drop_session_in(&tx, id, now)?;
         tx.commit()?;
         Ok(blobs)
     }
@@ -3604,6 +3562,89 @@ fn opt_time_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<DateTime<U
             .map_err(|e| bad_value(idx, Type::Text, e))
     })
     .transpose()
+}
+
+/// The cleanup of a dropped session, in the caller's transaction: its rows
+/// go and it is recorded as deleted. Returns the blobs whose files the
+/// caller removes. Shared by a local delete and a synced tombstone.
+fn drop_session_in(
+    tx: &Transaction<'_>,
+    id: SessionId,
+    now: DateTime<Utc>,
+) -> Result<Vec<BlobId>, StoreError> {
+    let session = id.0.to_string();
+    // The blobs table has no session column: the events say which.
+    let mut blobs = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT seq, event FROM events WHERE session_id = ?1")?;
+        let mut rows = stmt.query([&session])?;
+        while let Some(row) = rows.next()? {
+            match json_col::<Event>(row, 1) {
+                Ok(event) => blobs.extend(blob_refs(&event.kind).map(|blob| blob.id)),
+                Err(error) => {
+                    let seq: i64 = row.get(0)?;
+                    tracing::warn!(seq, %error, "deleting an event that does not decode");
+                }
+            }
+        }
+    }
+    for blob in &blobs {
+        tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
+        // The fates of its blobs: its events named every one, a crop's
+        // `into` included.
+        tx.execute(
+            "DELETE FROM blob_fates WHERE blob_id = ?1",
+            [blob.0.to_string()],
+        )?;
+    }
+    // Its workdir answers' blobs go only if no other session's names them.
+    let workdir_blobs = {
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT blob_id FROM workdir_blob_refs WHERE session_id = ?1")?;
+        let rows = stmt.query_map([&session], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        "DELETE FROM workdir_blob_refs WHERE session_id = ?1",
+        [&session],
+    )?;
+    tx.execute(
+        "DELETE FROM workdir_snapshots WHERE session_id = ?1",
+        [&session],
+    )?;
+    blobs.extend(purge_workdir_blobs(tx, &workdir_blobs)?);
+    blobs.sort();
+    blobs.dedup();
+    tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
+    tx.execute("DELETE FROM turns WHERE session_id = ?1", [&session])?;
+    tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
+    tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
+    tx.execute(
+        "DELETE FROM draft_attachments WHERE session_id = ?1",
+        [&session],
+    )?;
+    tx.execute("DELETE FROM draft_files WHERE session_id = ?1", [&session])?;
+    tx.execute(
+        "DELETE FROM composer_modes WHERE session_id = ?1",
+        [&session],
+    )?;
+    tx.execute("DELETE FROM read_marks WHERE session_id = ?1", [&session])?;
+    tx.execute(
+        "DELETE FROM alerted_approvals WHERE session_id = ?1",
+        [&session],
+    )?;
+    // Unanswered ones too: a command sent after the tombstone is refused
+    // as an unknown session, and would otherwise stay queued forever.
+    tx.execute(
+        "DELETE FROM outbox WHERE json_extract(command, '$.kind.session_id') = ?1",
+        [&session],
+    )?;
+    tx.execute(
+        "INSERT INTO deleted_sessions (session_id, at) VALUES (?1, ?2)
+         ON CONFLICT (session_id) DO NOTHING",
+        params![session, now.to_rfc3339()],
+    )?;
+    Ok(blobs)
 }
 
 /// Deletes the rows of the `candidates` no workdir answer names any more and

@@ -1735,5 +1735,4 @@ Erasing, in one transaction:
 The delete is irreversible.
 
 **Deferred here:**
-- Devices dropping their copy of an erased session.
 - Compacting the database file: an erased row's space is not given back.
