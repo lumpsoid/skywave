@@ -10,7 +10,7 @@ use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
     ActionIntent, ComposerFile, CreatePrompt, ListKindView, LoginFlowState, PastedCode, RouteView,
-    RowKind, ScreenView, ShellPromptView, ToolState,
+    RowKind, ScreenView, ShellPromptView, ToolState, WorktreeSessionView,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -2886,17 +2886,20 @@ fn the_worktrees_screen_lists_each_repo_with_its_sessions() {
     assert_eq!(repos[1].note.as_deref(), Some("Not a repository any more."));
     assert!(repos[1].worktrees.is_empty());
 
-    let (main, feature) = (&repos[0].worktrees[0], &repos[0].worktrees[1]);
+    let (feature, main) = (&repos[0].worktrees[0], &repos[0].worktrees[1]);
+    assert!(main.main);
+    assert!(!feature.main);
     assert_eq!(main.tags, ["main"]);
     assert!(main.sessions.is_empty(), "no session runs in the main tree");
     assert_eq!(feature.branch, "feat-x");
     assert_eq!(feature.tags, ["uncommitted changes", "not merged"]);
     assert_eq!(feature.sessions.len(), 1);
-    let session = &feature.sessions[0];
-    assert_eq!(session.session_id, in_worktree.0.to_string());
-    assert!(!session.archived);
-    assert!(session.removable);
-    assert_eq!(session.removal_label, None);
+    assert_eq!(feature.sessions[0].session_id, in_worktree.0.to_string());
+    assert!(feature.archived.is_empty());
+    let remove = feature.remove.as_ref().unwrap();
+    assert_eq!(remove.session_id, in_worktree.0.to_string());
+    assert_eq!(main.remove, None);
+    assert_eq!(feature.removal_label, None);
 
     rig.intent(GuiIntent::Act {
         action: ActionIntent::RemoveWorktree {
@@ -2909,9 +2912,116 @@ fn the_worktrees_screen_lists_each_repo_with_its_sessions() {
         unreachable!()
     };
     assert_eq!(
-        repos[0].worktrees[1].sessions[0].removal_label.as_deref(),
+        repos[0].worktrees[0].removal_label.as_deref(),
         Some("queued")
     );
+}
+
+#[test]
+fn the_worktrees_screen_puts_active_worktrees_first_and_folds_archived_sessions() {
+    use skywave_proto::{RepoListing, RepoWorktrees, WorktreeEntry, WorktreeList};
+
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let (active, old) = (SessionId::new(), SessionId::new());
+    let archive = EventKind::SessionArchived {
+        archived: true,
+        by: rig.me,
+    };
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![
+                event_at(active, at, created_session(Some("feat-x"))),
+                event_at(old, at, created_session(Some("old"))),
+                event_at(old, at, archive),
+            ],
+        })
+        .unwrap();
+    rig.online_on_the_list();
+    let req = open_worktrees(&mut rig, &requests);
+
+    let entry = |path: &str, branch: &str, main: bool, merged: bool| WorktreeEntry {
+        path: path.into(),
+        branch: Some(branch.into()),
+        head: None,
+        main,
+        missing: false,
+        dirty: Some(false),
+        merged,
+    };
+    // The server's order: repositories by path, worktrees in git's order.
+    rig.seam.worktrees_listed(
+        req,
+        Ok(WorktreeList {
+            at,
+            repos: vec![
+                RepoWorktrees {
+                    repo: "/srv/a-plain".into(),
+                    listing: RepoListing::Worktrees {
+                        worktrees: vec![entry("/srv/a-plain", "main", true, true)],
+                        more: false,
+                    },
+                },
+                RepoWorktrees {
+                    repo: "/srv/app".into(),
+                    listing: RepoListing::Worktrees {
+                        worktrees: vec![
+                            entry("/srv/app", "main", true, true),
+                            entry("/srv/app.worktrees/old", "old", false, true),
+                            entry("/srv/app.worktrees/feat-x", "feat-x", false, false),
+                        ],
+                        more: false,
+                    },
+                },
+                RepoWorktrees {
+                    repo: "/srv/gone".into(),
+                    listing: RepoListing::Gone,
+                },
+            ],
+        }),
+    );
+    rig.view();
+    let ScreenView::Worktrees { repos, .. } = sent_screen(&rig) else {
+        unreachable!()
+    };
+    let names: Vec<&str> = repos.iter().map(|r| r.repo.as_str()).collect();
+    assert_eq!(names, ["/srv/app", "/srv/a-plain", "/srv/gone"]);
+    let paths: Vec<&str> = repos[0].worktrees.iter().map(|w| w.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/srv/app.worktrees/feat-x",
+            "/srv/app.worktrees/old",
+            "/srv/app"
+        ]
+    );
+
+    let (feat, old_tree, main) = (
+        &repos[0].worktrees[0],
+        &repos[0].worktrees[1],
+        &repos[0].worktrees[2],
+    );
+    let ids = |sessions: &[WorktreeSessionView]| -> Vec<String> {
+        sessions.iter().map(|s| s.session_id.clone()).collect()
+    };
+    assert_eq!(ids(&feat.sessions), [active.0.to_string()]);
+    assert!(feat.archived.is_empty());
+    assert_eq!(
+        feat.remove.as_ref().map(|r| r.session_id.clone()),
+        Some(active.0.to_string())
+    );
+
+    assert!(old_tree.sessions.is_empty());
+    assert_eq!(ids(&old_tree.archived), [old.0.to_string()]);
+    let remove = old_tree.remove.as_ref().unwrap();
+    assert_eq!(remove.session_id, old.0.to_string());
+    assert_eq!(remove.title, old_tree.archived[0].title);
+
+    assert!(main.main);
+    assert!(main.sessions.is_empty() && main.archived.is_empty());
+    assert_eq!(main.remove, None);
 }
 
 #[test]
