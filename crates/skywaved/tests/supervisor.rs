@@ -386,6 +386,14 @@ impl Fixture {
         })
     }
 
+    /// Sends a `SetSafetyCheck` and returns its command id.
+    fn set_safety_check(&mut self, on: bool) -> CommandId {
+        self.command(CommandKind::SetSafetyCheck {
+            session_id: self.session_id,
+            on,
+        })
+    }
+
     fn command(&mut self, kind: CommandKind) -> CommandId {
         let command = Command {
             id: CommandId::new(),
@@ -767,6 +775,107 @@ async fn first_of_two_devices_answering_wins() {
         answers,
         [FakeInput::Answer("req-1".into(), Decision::Deny, None)]
     );
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A turn asking to run `command` in the shell: approved, it says "ran";
+/// denied, "skipped".
+fn shell_script(command: &str) -> FakeScript {
+    FakeScript::new().turn([Step::shell_approval("r", command)
+        .on_approve([Step::text("ran")])
+        .on_deny([Step::text("skipped")])])
+}
+
+fn is_safety_approved(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::SafetyCheckApproved { .. })
+}
+
+#[tokio::test]
+async fn the_safety_check_approves_a_read_only_command() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(shell_script("cat notes.txt"));
+    let supervisor = f.start(&agent).await;
+
+    f.set_safety_check(true);
+    f.send("read notes");
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+
+    assert!(kinds.contains(&EventKind::SafetyCheckApproved {
+        call: None,
+        tool: "shell".into(),
+        summary: "cat notes.txt".into(),
+        reason: "read-only: cat".into(),
+    }));
+    assert!(!kinds.iter().any(is_approval_requested));
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "ran".into(),
+        full: None,
+    }));
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("read notes"),
+            FakeInput::Answer("r".into(), Decision::Approve, None),
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_safety_check_leaves_an_unsafe_command_to_a_person() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(shell_script("rm notes.txt"));
+    let supervisor = f.start(&agent).await;
+
+    f.set_safety_check(true);
+    f.send("delete notes");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    assert!(!f.kinds().iter().any(is_safety_approved));
+
+    let id = f.approval_id();
+    accepted(f.resolve(DeviceId::new(), id, Decision::Deny));
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "skipped".into(),
+        full: None,
+    }));
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn without_the_safety_check_a_read_only_command_waits() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(shell_script("cat notes.txt"));
+    let supervisor = f.start(&agent).await;
+
+    f.send("read notes");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    assert!(!f.kinds().iter().any(is_safety_approved));
+
+    let id = f.approval_id();
+    accepted(f.resolve(DeviceId::new(), id, Decision::Deny));
+    f.wait_count("idle", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn turning_the_safety_check_off_takes_effect() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(shell_script("cat notes.txt"));
+    let supervisor = f.start(&agent).await;
+
+    f.set_safety_check(true);
+    f.set_safety_check(false);
+    f.send("read notes");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    assert!(!f.kinds().iter().any(is_safety_approved));
+
+    let id = f.approval_id();
+    accepted(f.resolve(DeviceId::new(), id, Decision::Deny));
+    f.wait_count("idle", 1, is_idle).await;
     supervisor.shutdown().await.unwrap();
 }
 

@@ -365,7 +365,8 @@ pub enum AdapterEvent {
     ///
     /// `shell` is the shell command this tool call would run, when the
     /// agent's tool runs one (the agent adapter decides); `None` for any
-    /// other tool.
+    /// other tool. An adapter sets it only when the command runs in the
+    /// session's workdir: Skywave's safety check relies on that.
     ApprovalRequested {
         request: AgentRequestId,
         call: Option<AgentCallId>,

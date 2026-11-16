@@ -324,24 +324,25 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::future::join_all;
 use skywave_proto::{
-    Attachment, CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq,
-    SessionId, SessionOrigin, SessionState, TaskId,
+    Attachment, CommandId, ContextId, Decision, Effort, Event, EventKind, ModelChoice,
+    PermissionMode, Seq, SessionId, SessionOrigin, SessionState, TaskId,
 };
+use skywave_safety::Verdict;
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
 use crate::agent::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation, EventMapper,
-    ImageInput, LoginSeen, LoginSource, LoginState, StartSpec, UserInput, bounded_models,
-    load_grants, load_origin, load_resume_handle, unsent_notice,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
+    Conversation, EventMapper, ImageInput, LoginSeen, LoginSource, LoginState, StartSpec,
+    UserInput, bounded_models, load_grants, load_origin, load_resume_handle, unsent_notice,
 };
 use crate::db::Db;
 use crate::disk::Disk;
@@ -1883,7 +1884,15 @@ impl<A: AgentAdapter> Supervisor<A> {
         // About to log: a reading up to the check interval old is reused,
         // so a burst costs one. A flip to low pauses the reads from here.
         self.log.disk().refresh();
-        self.map(id, event)?;
+        if let Some(request) = self.map(id, event)?
+            && let Some(running) = self.running.get_mut(&id)
+            && let Err(error) = running
+                .session
+                .answer_approval(request, Decision::Approve, None)
+                .await
+        {
+            tracing::warn!(session = %id.0, %error, "cannot answer approval");
+        }
         if exited && let Some(running) = self.running.remove(&id) {
             tracing::info!(session = %id.0, "agent exited");
             // Reap it; it has already stopped.
@@ -1892,15 +1901,18 @@ impl<A: AgentAdapter> Supervisor<A> {
         Ok(())
     }
 
-    /// Records `event` from session `id`'s agent in the log.
-    fn map(&mut self, id: SessionId, event: AdapterEvent) -> Result<()> {
+    /// Records `event` from session `id`'s agent in the log. Returns the
+    /// request the safety check approved, which the caller answers once the
+    /// log has the approval.
+    fn map(&mut self, id: SessionId, event: AdapterEvent) -> Result<Option<AgentRequestId>> {
         if !self.running.contains_key(&id) {
-            return Ok(());
+            return Ok(None);
         }
         let turn_open = (self.running.get(&id)).is_some_and(|r| r.mapper.turn_open());
         let event = self.before_mapping(id, event, turn_open)?;
+        let safe_reason = self.safe_shell(id, &event)?;
         let Some(running) = self.running.get_mut(&id) else {
-            return Ok(());
+            return Ok(None);
         };
         let started = matches!(event, AdapterEvent::TurnStarted { .. });
         let message_turn = matches!(event, AdapterEvent::TurnStarted { message: true });
@@ -1915,7 +1927,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                 source,
                 &running.login_seen,
             );
-            return Ok(());
+            return Ok(None);
         }
         if let AdapterEvent::ModelsOffered(models) = event {
             let context = running.context();
@@ -1926,13 +1938,40 @@ impl<A: AgentAdapter> Supervisor<A> {
                 id,
                 context,
                 models,
-            );
+            )
+            .map(|()| None);
         }
         if let AdapterEvent::BackgroundTasks(tasks) = &event {
             // Counted uncut: a task the log has no room for still runs.
             running.busy_tasks = tasks.iter().filter(|t| !t.ambient).count();
         }
-        let seqs = running.mapper.apply(&self.log, &mut self.storage, event)?;
+        let (seqs, answer) = match (safe_reason, event) {
+            (
+                Some(reason),
+                AdapterEvent::ApprovalRequested {
+                    request,
+                    call,
+                    tool,
+                    input,
+                    ..
+                },
+            ) => {
+                tracing::debug!(session = %id.0, %reason, "safety check approves a shell command");
+                let seq = running.mapper.safety_approved(
+                    &self.log,
+                    &mut self.storage,
+                    call,
+                    tool,
+                    &input,
+                    reason,
+                )?;
+                (vec![seq], Some(request))
+            }
+            (_, event) => (
+                running.mapper.apply(&self.log, &mut self.storage, event)?,
+                None,
+            ),
+        };
         if started && let Some(&seq) = seqs.first() {
             running.turn_started = Some(seq);
             running.interrupted = false;
@@ -1948,7 +1987,34 @@ impl<A: AgentAdapter> Supervisor<A> {
         // A turn the agent started on its own is work too, as is a task.
         running.settle_idle();
         self.after_mapping(id, exited, message_turn, &seqs);
-        Ok(())
+        Ok(answer)
+    }
+
+    /// The reason the safety check approves `event`, an approval of session
+    /// `id`'s agent: `Some` only for a shell command, with the check on for
+    /// the session, that it proves read-only in the session's workdir. It
+    /// never denies; anything else stays with a person.
+    fn safe_shell(&self, id: SessionId, event: &AdapterEvent) -> Result<Option<String>> {
+        let AdapterEvent::ApprovalRequested {
+            shell: Some(command),
+            ..
+        } = event
+        else {
+            return Ok(None);
+        };
+        if !self.log.safety_check_on(&self.storage.db, id)? {
+            return Ok(None);
+        }
+        let Some(session) = self.log.session(&self.storage.db, id)? else {
+            return Ok(None);
+        };
+        match skywave_safety::check(command, Path::new(&session.workdir)) {
+            Verdict::Safe { reason } => Ok(Some(reason)),
+            Verdict::Ask { why } => {
+                tracing::debug!(session = %id.0, %why, "safety check leaves a command to a person");
+                Ok(None)
+            }
+        }
     }
 
     /// Records what session `id`'s agent reported while it stopped; with
