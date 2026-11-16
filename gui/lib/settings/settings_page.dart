@@ -188,6 +188,40 @@ class SettingsPage extends StatelessWidget {
                 ),
               ),
             ),
+            const _Section('Safety rules'),
+            if (screen.safetyRules.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Commands you trust run without asking. Add one from a shell '
+                  'row\'s menu.',
+                  style: muted,
+                ),
+              ),
+            for (final rule in screen.safetyRules)
+              ListTile(
+                key: Key('safety-rule-${rule.label}'),
+                leading: const Icon(Icons.verified_user_outlined),
+                title: Text(rule.label, style: monoText),
+                subtitle: switch (rule.pending) {
+                  final pending? => Text(pending),
+                  null => null,
+                },
+                trailing: IconButton(
+                  key: Key('remove-safety-rule-${rule.label}'),
+                  icon: const Icon(Icons.close),
+                  tooltip: 'Stop trusting this command',
+                  onPressed: rule.on
+                      ? () => send.act(
+                          ActionIntentSetSafetyRule(
+                            sessionId: rule.sessionId,
+                            words: rule.words,
+                            on: false,
+                          ),
+                        )
+                      : null,
+                ),
+              ),
           ],
         ),
       ),
