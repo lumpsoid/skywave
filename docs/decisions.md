@@ -1554,3 +1554,43 @@ N` (absent = 0 = restart) and appends; any other N answers
   is simpler to check than a range grammar.
 - Keeping partials in memory. A restart would lose them, which is the
   failure the feature exists for.
+
+## D59. Skywave's safety check approves provably read-only shell commands (v38)
+A session that opts in lets `skywaved` answer some approvals itself: a
+shell command it can prove read-only and confined to the session's
+workdir is approved without a prompt, and the log says the safety check
+did it, not a person. Everything else waits for a human as before (D8),
+so a wrong "unsure" costs a tap, never a broken turn. It is a first step
+toward the pre-approved tools D8 deferred.
+
+**Decided:** "Per session, default off, switched from any device by
+`SetSafetyCheck`, logged as `SafetyCheckSet { on, by }` and in effect
+once logged. When on, an approval whose adapter names a `shell` command
+is checked by `skywave_safety::check`; `Safe { reason }` answers it and
+logs `SafetyCheckApproved { call, tool, summary, reason }` in place of
+`ApprovalRequested`. It approves only, never denies."
+
+- The checker parses with `brush-parser` (a real shell AST, so later
+  work can widen it); a parse error, a command over 8 KiB, or anything
+  not on the reviewed allowlist asks. Every path must resolve inside the
+  workdir.
+- Agent-agnostic (D3): the adapter supplies `ApprovalRequested.shell`
+  only when the command runs in the session's workdir. The Claude
+  adapter sets it for `Bash` and starts `claude` with
+  `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`: probed on claude
+  2.1.310, without it a `cd` carries over to later Bash calls.
+- Subagents' shell approvals are checked too.
+- A safety approval is never pending: no notification, nothing to
+  answer.
+
+**Rejected:**
+- Auto-deny of commands it judges dangerous. A wrong denial breaks the
+  agent's turn; a wrong "ask" costs a tap.
+- A server-wide switch. Trust is per session and its workdir.
+- Reusing `ApprovalResolved` with a widened `by`. A device id would
+  mean a person; the new event says it was Skywave's heuristic.
+
+**Deferred:** widening the allowlist (`find`, `rg`, `sort`, ...; read-only
+`git`, which first needs a guard against repo-configured programs such
+as `core.fsmonitor`, `diff.external` and filters); a timeline line for
+the switch; the TUI's toggle.

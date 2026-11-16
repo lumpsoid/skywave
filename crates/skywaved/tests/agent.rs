@@ -1011,6 +1011,7 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
             input: json!("short"),
             suggestions,
             task: None,
+            shell: None,
         },
     ] {
         mapper.apply(&f.log, &mut f.storage, event).unwrap();
@@ -1220,6 +1221,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
             input: json!("short"),
             suggestions: Vec::new(),
             task: None,
+            shell: None,
         },
         AdapterEvent::ToolResult {
             call: None,
@@ -1343,6 +1345,7 @@ fn large_content_gives_small_events_and_blobs() {
                 input: input.clone(),
                 suggestions: Vec::new(),
                 task: None,
+                shell: None,
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -1648,6 +1651,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 input: write.clone(),
                 suggestions: Vec::new(),
                 task: None,
+                shell: None,
             },
             AdapterEvent::ApprovalRequested {
                 request: "q2".into(),
@@ -1656,6 +1660,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 input: edited.clone(),
                 suggestions: Vec::new(),
                 task: None,
+                shell: None,
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -2895,6 +2900,7 @@ fn asked(request: &str, task: Option<&str>) -> AdapterEvent {
         input: json!(request),
         suggestions: Vec::new(),
         task: task.map(str::to_owned),
+        shell: None,
     }
 }
 

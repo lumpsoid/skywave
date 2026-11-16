@@ -1,0 +1,21 @@
+[package]
+name = "skywave-safety"
+description = "Proves a shell command read-only and inside the session workdir; anything unproven asks a human"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Real shell grammar (pure Rust, sync), so quoting and compound commands are
+# parsed the way bash reads them, not guessed with a tokenizer.
+brush-parser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

@@ -455,6 +455,22 @@ fn all_event_kinds() -> Vec<EventKind> {
             reason: "not on this model".into(),
             answers: Some(command()),
         },
+        EventKind::SafetyCheckSet {
+            on: true,
+            by: device(),
+        },
+        EventKind::SafetyCheckApproved {
+            call: Some(call()),
+            tool: "Bash".into(),
+            summary: "git status".into(),
+            reason: "read-only git command".into(),
+        },
+        EventKind::SafetyCheckApproved {
+            call: None,
+            tool: "Bash".into(),
+            summary: "ls".into(),
+            reason: "read-only command".into(),
+        },
         EventKind::BackgroundTasksChanged {
             tasks: vec![
                 BackgroundTask {
@@ -995,6 +1011,10 @@ fn all_command_kinds() -> Vec<CommandKind> {
         CommandKind::SetEffort {
             session_id: session(),
             effort: Effort::High,
+        },
+        CommandKind::SetSafetyCheck {
+            session_id: session(),
+            on: true,
         },
         CommandKind::ClearContext {
             session_id: session(),
@@ -1985,8 +2005,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v37() {
-    assert_eq!(PROTOCOL_VERSION, 37);
+fn protocol_is_v38() {
+    assert_eq!(PROTOCOL_VERSION, 38);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

@@ -72,6 +72,8 @@ pub struct SessionSummary {
     pub worktree: Option<Worktree>,
     /// The session's worktree was removed (`WorktreeRemoved`); its work is refused.
     pub worktree_removed: bool,
+    /// Skywave's safety check is on: the newest `SafetyCheckSet`.
+    pub safety_check: bool,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -233,6 +235,7 @@ impl SessionSummary {
             adopted: None,
             worktree: None,
             worktree_removed: false,
+            safety_check: false,
         };
         summary.apply(seq, event);
         summary
@@ -243,12 +246,12 @@ impl SessionSummary {
     /// A rename only sets the name, an archive only the archived flag, a
     /// mode or model event only the agent settings, a change of background
     /// tasks or schedules only the agent's work, a context cleared or
-    /// switched only the current context, and the models an agent offers
-    /// or a context moved away nothing here, imported history only an unset
-    /// `first_prompt`, a deleted or cropped blob nothing here: none is
-    /// activity, so they move neither `last_seq` nor `last_activity`. Only
-    /// a `UserMessage` moves `last_message_seq`, the session's place in the
-    /// list.
+    /// switched only the current context, a safety check switch only its
+    /// flag, and the models an agent offers or a context moved away nothing
+    /// here, imported history only an unset `first_prompt`, a deleted or
+    /// cropped blob nothing here: none is activity, so they move neither
+    /// `last_seq` nor `last_activity`. Only a `UserMessage` moves
+    /// `last_message_seq`, the session's place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
         if let Some(archived) = event.kind.archived_effect() {
@@ -292,6 +295,10 @@ impl SessionSummary {
             | EventKind::BlobCropped { .. } => return,
             EventKind::ImportFinished { .. } => {
                 self.importing = false;
+                return;
+            }
+            EventKind::SafetyCheckSet { on, .. } => {
+                self.safety_check = *on;
                 return;
             }
             // Imported history is a record, not activity; but its first
@@ -397,6 +404,8 @@ impl SessionSummary {
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. }
+            | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyCheckApproved { .. }
             | EventKind::FileWritten { .. } => {}
         }
     }
@@ -495,6 +504,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ImportFinished { .. }
         | EventKind::BlobDeleted { .. }
         | EventKind::BlobCropped { .. }
+        | EventKind::SafetyCheckSet { .. }
+        | EventKind::SafetyCheckApproved { .. }
         | EventKind::FileWritten { .. } => false,
     }
 }
@@ -852,6 +863,30 @@ mod tests {
             summary.last_activity,
             event(sid, 6, EventKind::TurnInterrupted).at
         );
+    }
+
+    #[test]
+    fn the_safety_check_switch_folds_without_moving_activity() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/x".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        assert!(!summary.safety_check, "off until a switch says otherwise");
+        let (last_seq, last_activity) = (summary.last_seq, summary.last_activity);
+
+        let by = DeviceId::new();
+        let switch = |on| EventKind::SafetyCheckSet { on, by };
+        summary.apply(Seq(2), &event(sid, 1, switch(true)));
+        assert!(summary.safety_check);
+        summary.apply(Seq(3), &event(sid, 2, switch(false)));
+        assert!(!summary.safety_check);
+        assert_eq!(summary.last_seq, last_seq, "a setting is not activity");
+        assert_eq!(summary.last_activity, last_activity);
+        assert_eq!(summary.notable, 0);
     }
 
     #[test]

@@ -3619,6 +3619,14 @@ impl Rig {
             other => panic!("not a session: {other:?}"),
         }
     }
+
+    /// The safety check switch as the head last told Dart.
+    fn safety_check(&self) -> crate::signals::SafetyCheckView {
+        match &self.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Session { session } => session.safety_check.clone(),
+            other => panic!("not a session: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -3698,6 +3706,82 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
         Some("big refused: no model named")
     );
     assert_eq!(agent.mode_refusal, None);
+}
+
+#[test]
+fn the_safety_check_switch_shows_off_waiting_then_on() {
+    let mut rig = Rig::new();
+    let switch = rig.safety_check();
+    assert_eq!(switch.label, "safety check off");
+    assert!(!switch.on && switch.turn_on && !switch.pending);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SetSafetyCheck {
+            session_id: rig.session.0.to_string(),
+            on: true,
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::SetSafetyCheck {
+            session_id: rig.session,
+            on: true,
+        }]
+    );
+    rig.results();
+    rig.view();
+    let switch = rig.safety_check();
+    assert_eq!(switch.label, "safety check off → on");
+    assert!(switch.pending && switch.on && !switch.turn_on);
+
+    rig.log(vec![EventKind::SafetyCheckSet {
+        on: true,
+        by: rig.me,
+    }]);
+    let switch = rig.safety_check();
+    assert_eq!(switch.label, "safety check on");
+    assert!(switch.on && !switch.pending && !switch.turn_on);
+    assert_eq!(switch.refusal, None);
+}
+
+#[test]
+fn a_call_the_safety_check_approved_says_so() {
+    use skywave_proto::{CallId, ToolKind, ToolResult};
+    let approved = "approved by the safety check (read-only: cat)";
+    let result = |call| {
+        EventKind::ToolResult(ToolResult {
+            call: Some(call),
+            is_error: false,
+            status: None,
+            preview: "notes".into(),
+            lines: 1,
+            output: None,
+        })
+    };
+
+    // The control: the same call, no approval logged, says nothing of one.
+    let mut plain = Rig::new();
+    let call = CallId::new();
+    plain.log(vec![
+        a_call(None, call, "Bash", ToolKind::Shell, "cat notes.txt"),
+        result(call),
+    ]);
+    assert!(!plain.tool_row("Bash").state_label.contains("safety check"));
+
+    let mut rig = Rig::new();
+    let call = CallId::new();
+    rig.log(vec![
+        a_call(None, call, "Bash", ToolKind::Shell, "cat notes.txt"),
+        EventKind::SafetyCheckApproved {
+            call: Some(call),
+            tool: "Bash".into(),
+            summary: "cat notes.txt".into(),
+            reason: "read-only: cat".into(),
+        },
+        result(call),
+    ]);
+    let row = rig.tool_row("Bash");
+    assert!(row.state_label.contains(approved), "{}", row.state_label);
 }
 
 #[test]

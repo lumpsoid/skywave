@@ -260,6 +260,7 @@ pub enum Step {
         tool: String,
         input: Value,
         suggestions: Vec<RuleSuggestion>,
+        shell: Option<String>,
         on_approve: Vec<Step>,
         on_deny: Vec<Step>,
     },
@@ -380,9 +381,21 @@ impl Step {
             tool: tool.into(),
             input,
             suggestions: Vec::new(),
+            shell: None,
             on_approve: Vec::new(),
             on_deny: Vec::new(),
         }
+    }
+
+    /// An approval of the shell command `command`, as the Claude adapter
+    /// names one: the tool `shell` with input `{"command": command}`, and
+    /// `shell` set to `command`.
+    pub fn shell_approval(request: &str, command: &str) -> Step {
+        let mut step = Step::approval(request, "shell", json!({ "command": command }));
+        if let Step::Approval { shell, .. } = &mut step {
+            *shell = Some(command.to_owned());
+        }
+        step
     }
 
     /// A question with no follow-up steps; add them with
@@ -1148,6 +1161,7 @@ impl Runner {
                     tool,
                     input,
                     suggestions,
+                    shell,
                     on_approve,
                     on_deny,
                 } => {
@@ -1158,6 +1172,7 @@ impl Runner {
                         input,
                         suggestions,
                         task: None,
+                        shell,
                     };
                     if let Err(flow) = self
                         .ask(asked, request, on_approve, on_deny, &mut work)

@@ -448,7 +448,10 @@ impl EventLog {
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRefused { .. }
-            | EventKind::CallsUnanswered { .. } => {}
+            | EventKind::CallsUnanswered { .. }
+            // The supervisor logs it through the agent's mapper when the
+            // safety check answers a request.
+            | EventKind::SafetyCheckApproved { .. } => {}
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
@@ -477,6 +480,7 @@ impl EventLog {
             // The adopting `CreateSession` logs the import, not the agent.
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
+            | EventKind::SafetyCheckSet { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => {
                 return Err(Error::InvalidAppend(format!(
@@ -757,6 +761,21 @@ impl EventLog {
         agent_settings_in(db.conn(), id)
     }
 
+    /// Whether session `id`'s safety check is on: the `on` of its newest
+    /// `SafetyCheckSet`, and off when it has none or is unknown.
+    pub fn safety_check_on(&self, db: &Db, session_id: SessionId) -> Result<bool> {
+        let kind: Option<String> = db
+            .conn()
+            .prepare_cached(LAST_SAFETY_CHECK_SQL)?
+            .query_row([session_id.0.to_string()], |r| r.get(0))
+            .optional()?;
+        let Some(kind) = kind else {
+            return Ok(false);
+        };
+        let kind: EventKind = serde_json::from_str(&kind)?;
+        Ok(matches!(kind, EventKind::SafetyCheckSet { on: true, .. }))
+    }
+
     /// Session `id`'s agent's background tasks and schedules as its log has
     /// them; empty when it has none or is unknown.
     pub fn agent_work(&self, db: &Db, id: SessionId) -> Result<AgentWork> {
@@ -1025,6 +1044,8 @@ pub(crate) fn append_in(
         | EventKind::AgentVersionUnconfirmed { .. }
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
+        | EventKind::SafetyCheckSet { .. }
+        | EventKind::SafetyCheckApproved { .. }
         | EventKind::ShellOutput { .. } => {}
         // Imported history is a record: an imported call opens nothing.
         EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
@@ -1134,6 +1155,11 @@ const LAST_WORK_CONTEXT_SQL: &str = "SELECT context FROM events WHERE seq = MAX(
                AND json_extract(kind, '$.type') = 'background_tasks_changed'), 0),
      COALESCE((SELECT MAX(seq) FROM events WHERE session_id = ?1
                AND json_extract(kind, '$.type') = 'schedules_changed'), 0))";
+
+/// [`EventLog::safety_check_on`]: the session's newest `SafetyCheckSet`.
+const LAST_SAFETY_CHECK_SQL: &str = "SELECT kind FROM events WHERE seq = (
+     SELECT MAX(seq) FROM events WHERE session_id = ?1
+       AND json_extract(kind, '$.type') = 'safety_check_set')";
 
 /// [`worktree_in`]: the session's `SessionCreated`, the only event that
 /// names a worktree.
@@ -1698,6 +1724,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortRequested { .. } => "EffortRequested",
         EventKind::EffortChanged { .. } => "EffortChanged",
         EventKind::EffortRefused { .. } => "EffortRefused",
+        EventKind::SafetyCheckSet { .. } => "SafetyCheckSet",
+        EventKind::SafetyCheckApproved { .. } => "SafetyCheckApproved",
         EventKind::ContextStarted { .. } => "ContextStarted",
         EventKind::ContextSwitched { .. } => "ContextSwitched",
         EventKind::ContextMoved { .. } => "ContextMoved",

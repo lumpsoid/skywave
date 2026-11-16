@@ -120,6 +120,7 @@ mod tests {
                     answer: None,
                     input: None,
                 }),
+                safety_check: None,
                 outcome: ToolOutcome::Running {
                     since: chrono::Utc::now(),
                 },

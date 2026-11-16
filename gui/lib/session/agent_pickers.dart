@@ -53,6 +53,55 @@ Future<void> pickMode(
   );
 }
 
+/// Says what the safety check does, and turns it on or off: the switch
+/// (`turnOn`) is sent only once the dialog's button confirms it, since
+/// turning it on lets Skywave approve calls unasked.
+Future<void> pickSafetyCheck(
+  BuildContext context,
+  SessionScreen screen,
+  SendIntent send,
+) async {
+  final check = screen.safetyCheck;
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Safety check'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (check.refusal case final refusal?) _Refusal(text: refusal),
+            Text(
+              check.label,
+              style: Theme.of(context).textTheme.bodySmall
+                  ?.copyWith(color: SkyColors.of(context).muted),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              "Skywave approves a shell command itself when it can prove the command only reads files inside this session's folder. Anything else still asks you.",
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: Text(check.turnOn ? 'Turn on' : 'Turn off'),
+        ),
+      ],
+    ),
+  );
+  if (confirmed != true || !context.mounted) return;
+  send.act(
+    ActionIntentSetSafetyCheck(sessionId: screen.sessionId, on: check.turnOn),
+  );
+}
+
 /// Asks once more before a mode that lets every tool run unasked.
 Future<bool> _confirm(BuildContext context, ModeOption option) async {
   final confirmed = await showDialog<bool>(

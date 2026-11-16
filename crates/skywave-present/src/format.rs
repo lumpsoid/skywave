@@ -723,6 +723,29 @@ pub fn decision_label(decision: Decision) -> &'static str {
     }
 }
 
+/// A switch in words: `on` or `off`.
+pub fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// The safety check's switch: `safety check on`, or while this device's
+/// switch waits for the server, `safety check off → on` (the arrow reads
+/// as [`agent_mode_label`] does).
+pub fn safety_check_label(on: bool, change: Option<bool>) -> String {
+    match change {
+        Some(value) if value != on => {
+            format!("safety check {} → {}", on_off(on), on_off(value))
+        }
+        _ => format!("safety check {}", on_off(on)),
+    }
+}
+
+/// A call the safety check approved, and why: `approved by the safety check
+/// (read-only: cat, grep)`.
+pub fn safety_approval_label(reason: &str) -> String {
+    format!("approved by the safety check ({reason})")
+}
+
 /// An answer in words: `approved always` when it granted a rule.
 pub fn answer_words(decision: Decision, rule: Option<&RuleSuggestion>) -> &'static str {
     match rule {
@@ -1811,6 +1834,31 @@ mod tests {
     }
 
     #[test]
+    fn the_safety_check_switch_reads_as_on_off_or_as_waiting() {
+        assert_eq!(safety_check_label(false, None), "safety check off");
+        assert_eq!(safety_check_label(true, None), "safety check on");
+        assert_eq!(
+            safety_check_label(false, Some(true)),
+            "safety check off → on"
+        );
+        assert_eq!(
+            safety_check_label(true, Some(false)),
+            "safety check on → off"
+        );
+        // A waiting switch to what is in effect already reads plain.
+        assert_eq!(safety_check_label(true, Some(true)), "safety check on");
+        assert_eq!(safety_check_label(false, Some(false)), "safety check off");
+    }
+
+    #[test]
+    fn a_safety_approval_names_its_reason() {
+        assert_eq!(
+            safety_approval_label("read-only: cat, grep"),
+            "approved by the safety check (read-only: cat, grep)"
+        );
+    }
+
+    #[test]
     fn agent_settings_read_as_current_then_switch() {
         let mut agent = AgentView {
             mode: Some(PermissionMode::Ask),
@@ -2084,6 +2132,8 @@ mod tests {
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
+            safety_check: false,
+            safety_check_change: None,
             interrupt: None,
             stop: None,
             work: Default::default(),

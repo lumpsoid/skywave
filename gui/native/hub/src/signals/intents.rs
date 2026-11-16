@@ -391,6 +391,11 @@ pub enum ActionIntent {
         session_id: String,
         mode: PermissionModeView,
     },
+    /// Turn the session's safety check on or off.
+    SetSafetyCheck {
+        session_id: String,
+        on: bool,
+    },
     /// Switch the session's agent to `model`: an offered model's `id`, or
     /// a name typed in. Blank does nothing.
     SetModel {

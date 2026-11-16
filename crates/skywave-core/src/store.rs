@@ -548,6 +548,17 @@ CREATE TABLE IF NOT EXISTS outbox_files (
     PRIMARY KEY (command_id, position)
 );
 "#),
+    // `SessionSummary::safety_check`: on if the session's newest
+    // `SafetyCheckSet` turned it on, off if it has none. Backfilled from the
+    // stored log.
+    Sql(r#"
+ALTER TABLE sessions ADD COLUMN safety_check INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET safety_check = COALESCE((SELECT json_extract(event, '$.kind.on') FROM events
+    WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'safety_check_set'
+    ORDER BY seq DESC
+    LIMIT 1), 0);
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -620,7 +631,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
-    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37,
+    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -747,6 +758,13 @@ fn v35_to_v36(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// resumable, which stores nothing; no stored event or command result
 /// changes.
 fn v36_to_v37(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v37 to v38, as the server's step of the same name. v38 added the safety
+/// check: a command and two events, all new, so no stored event or command
+/// result changes.
+fn v37_to_v38(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -3413,7 +3431,7 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
     stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted, \
-    last_message_seq, worktree, worktree_removed";
+    last_message_seq, worktree, worktree_removed, safety_check";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -3428,7 +3446,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
         ),
         params![
             summary.id.0.to_string(),
@@ -3451,6 +3469,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             seq_sql(summary.last_message_seq)?,
             summary.worktree.as_ref().map(to_json).transpose()?,
             summary.worktree_removed,
+            summary.safety_check,
         ],
     )?;
     Ok(())
@@ -3478,6 +3497,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         last_message_seq: seq_col(row, 17)?,
         worktree: opt_json_col(row, 18)?,
         worktree_removed: row.get(19)?,
+        safety_check: row.get(20)?,
     })
 }
 
