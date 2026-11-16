@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use skywave_safety::{Verdict, check};
+use skywave_safety::{Rule, Verdict, check, check_with, simple_commands};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -227,4 +227,346 @@ fn why_names_the_first_failure() -> TestResult {
         "{write:?}"
     );
     Ok(())
+}
+
+/// One rule per string, its words split on spaces.
+fn rules_from(lines: &[&str]) -> Result<Vec<Rule>, Box<dyn Error>> {
+    lines
+        .iter()
+        .map(|line| -> Result<Rule, Box<dyn Error>> {
+            Ok(Rule::new(line.split(' ').map(String::from).collect())?)
+        })
+        .collect()
+}
+
+/// The verdict for a program that is on neither the table nor a rule.
+fn unknown(name: &str) -> Verdict {
+    Verdict::Ask {
+        why: format!("`{name}` is not a known read-only program"),
+    }
+}
+
+#[test]
+fn rule_approves_a_matching_command() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    let verdict = check_with("git commit -qam \"msg\"", &root, &rules);
+    assert_eq!(
+        verdict,
+        Verdict::Safe {
+            reason: "rules: git commit".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_does_not_match_other_subcommands() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    for command in ["git push", "git commitx", "git"] {
+        assert_eq!(
+            check_with(command, &root, &rules),
+            unknown("git"),
+            "{command:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rule_longer_than_command_does_not_match() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["python3 -m unittest"])?;
+    assert_eq!(check_with("python3 -m", &root, &rules), unknown("python3"));
+    // Positive control: the full words are approved.
+    let full = check_with("python3 -m unittest", &root, &rules);
+    assert_eq!(
+        full,
+        Verdict::Safe {
+            reason: "rules: python3 -m unittest".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn every_command_in_a_line_must_pass() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    let verdict = check_with("git commit -m x && rm a.txt", &root, &rules);
+    assert_eq!(verdict, unknown("rm"));
+    // Positive control: a table program alongside the rule passes.
+    let both = check_with("git commit -m x && cat a.txt", &root, &rules);
+    assert_eq!(
+        both,
+        Verdict::Safe {
+            reason: "read-only: cat; rules: git commit".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn reason_lists_programs_then_rules() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git status", "ruff check"])?;
+    let verdict = check_with(
+        "echo hi && git status --short; ruff check src; git status",
+        &root,
+        &rules,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Safe {
+            reason: "read-only: echo; rules: git status, ruff check".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_overrides_the_table_asks() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["tail -f"])?;
+    let verdict = check_with("tail -f log.txt", &root, &rules);
+    assert_eq!(
+        verdict,
+        Verdict::Safe {
+            reason: "rules: tail -f".into()
+        }
+    );
+    // Without the rule, the table still asks on `-f`.
+    assert_eq!(
+        check("tail -f log.txt", &root),
+        Verdict::Ask {
+            why: "`-f` of `tail` is not checked".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_still_checks_redirections() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git status"])?;
+    assert_eq!(
+        check_with("git status > out.txt", &root, &rules),
+        Verdict::Ask {
+            why: "writes to `out.txt`".into()
+        }
+    );
+    // Positive control: without the redirection, the rule approves it.
+    assert_eq!(
+        check_with("git status", &root, &rules),
+        Verdict::Safe {
+            reason: "rules: git status".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_trusts_paths_outside_the_workdir() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C /etc status", &root, &rules),
+        Verdict::Safe {
+            reason: "rules: git -C".into()
+        }
+    );
+    // Without the rule, `git` is not on the table at all.
+    assert_eq!(check("git -C /etc status", &root), unknown("git"));
+    Ok(())
+}
+
+#[test]
+fn rule_new_rejects_empty() -> TestResult {
+    assert_eq!(Rule::new(vec![]), Err("a rule needs a program".into()));
+    assert_eq!(
+        Rule::new(vec!["git".into(), String::new()]),
+        Err("a rule word is empty".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn substitution_of_a_proven_command_passes_under_a_rule() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$(pwd)\" status", &root, &rules),
+        Verdict::Safe {
+            reason: "read-only: pwd; rules: git -C".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn backquote_substitutions_ask() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let why = "expansions are not checked yet";
+    let git_c = rules_from(&["git -C"])?;
+    let git_log = rules_from(&["git log"])?;
+    assert_eq!(
+        check_with("git -C `pwd` status", &root, &git_c),
+        Verdict::Ask { why: why.into() }
+    );
+    // bash un-escapes `\\` and `\$` inside backquotes before it parses them;
+    // the parser does not, so the proven text would differ from what runs.
+    for command in [
+        "git log `echo \"\\$(touch /tmp/pwned)\"`",
+        "git log `echo \\\\'$(touch p) \\\\'`",
+        "git log `cat \\$HOME/.ssh/id_rsa`",
+        "git log \"`pwd`\"",
+    ] {
+        assert_eq!(
+            check_with(command, &root, &git_log),
+            Verdict::Ask { why: why.into() },
+            "{command}"
+        );
+    }
+    // Positive control: the `$(...)` form of the same substitution is proven.
+    assert_eq!(
+        check_with("git log \"$(pwd)\"", &root, &git_log),
+        Verdict::Safe {
+            reason: "read-only: pwd; rules: git log".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn substitution_of_an_unknown_command_asks() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$(rm x)\" status", &root, &rules),
+        unknown("rm")
+    );
+    Ok(())
+}
+
+#[test]
+fn table_program_asks_on_a_substituted_word() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let why = "`cat` takes a word from a command substitution, which is not checked";
+    assert_eq!(
+        check("cat \"$(pwd)\"", &root),
+        Verdict::Ask { why: why.into() }
+    );
+    // A word that mixes literal text with a substitution is unknown too.
+    assert_eq!(
+        check("cat \"a$(pwd)\"", &root),
+        Verdict::Ask { why: why.into() }
+    );
+    Ok(())
+}
+
+#[test]
+fn rule_words_must_be_known() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git commit"])?;
+    assert_eq!(
+        check_with("git \"$(echo commit)\"", &root, &rules),
+        unknown("git")
+    );
+    // Positive control: the literal word is approved.
+    assert_eq!(
+        check_with("git commit", &root, &rules),
+        Verdict::Safe {
+            reason: "rules: git commit".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn substitution_in_the_command_name_still_asks() -> TestResult {
+    let (_dir, root) = workdir()?;
+    assert_eq!(
+        check("$(echo ls) a.txt", &root),
+        Verdict::Ask {
+            why: "expansions are not checked yet".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn variables_still_ask() -> TestResult {
+    let (_dir, root) = workdir()?;
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$HOME\" status", &root, &rules),
+        Verdict::Ask {
+            why: "expansions are not checked yet".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn nested_substitution_is_proven() -> TestResult {
+    let (_dir, root) = workdir()?;
+    // `echo` takes an unknown word here, so a rule must cover the inner echo.
+    let rules = rules_from(&["git -C", "echo"])?;
+    assert_eq!(
+        check_with("git -C \"$(echo $(pwd))\" status", &root, &rules),
+        Verdict::Safe {
+            reason: "read-only: pwd; rules: echo, git -C".into()
+        }
+    );
+    // Negative control: without the echo rule, the inner echo asks.
+    let rules = rules_from(&["git -C"])?;
+    assert_eq!(
+        check_with("git -C \"$(echo $(pwd))\" status", &root, &rules),
+        Verdict::Ask {
+            why: "`echo` takes a word from a command substitution, which is not checked".into()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn simple_commands_lists_literal_words() {
+    let rows: &[(&str, &[&[&str]])] = &[
+        ("git status", &[&["git", "status"]]),
+        (
+            "cargo test -p x 2>&1 | tail -n 20",
+            &[&["cargo", "test", "-p", "x"], &["tail", "-n", "20"]],
+        ),
+        (
+            "cd a && git log --oneline; ls",
+            &[&["cd", "a"], &["git", "log", "--oneline"], &["ls"]],
+        ),
+        (
+            "git commit -m \"$(cat msg)\" --amend",
+            &[&["git", "commit", "-m"], &["cat", "msg"]],
+        ),
+        ("FOO=1 make build > out.txt", &[&["make", "build"]]),
+        ("echo 'a b' $HOME c", &[&["echo", "a b"]]),
+        ("$EDITOR file", &[]),
+        ("echo `id`", &[&["echo"]]),
+        ("(cd x && ls)", &[]),
+        ("echo 'unterminated", &[]),
+        ("", &[]),
+        // A background job still lists its words.
+        ("cat a.txt &", &[&["cat", "a.txt"]]),
+        // A process substitution cuts the list.
+        ("cat <(ls a)", &[&["cat"]]),
+        // A substitution in the program word is listed, with no entry for it.
+        ("$(echo ls) a.txt", &[&["echo", "ls"]]),
+        // Nested: the outer command's entry comes before the inner ones.
+        ("echo $(echo $(pwd))", &[&["echo"], &["echo"], &["pwd"]]),
+    ];
+    for (command, expected) in rows {
+        let want: Vec<Vec<String>> = expected
+            .iter()
+            .map(|words| words.iter().map(|word| word.to_string()).collect())
+            .collect();
+        assert_eq!(simple_commands(command), want, "{command:?}");
+    }
 }

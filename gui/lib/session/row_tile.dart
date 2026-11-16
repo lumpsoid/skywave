@@ -10,13 +10,14 @@ import 'package:skywave_gui/session/markdown_body.dart';
 import 'package:skywave_gui/session/safety_feedback.dart';
 import 'package:skywave_gui/session/section_block.dart';
 import 'package:skywave_gui/session/snippets.dart';
+import 'package:skywave_gui/session/trust_command.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// One timeline row as Rust sent it: the turn separator or "new" rule
 /// above it, its time, then the item by kind, with its content sections.
 /// A tap selects it and expands or collapses it; a long press or right
-/// click opens its menu (copy, save as snippet, safety feedback, download,
-/// edit or discard). A message's
+/// click opens its menu (copy, save as snippet, safety feedback, trust
+/// command, download, edit or discard). A message's
 /// text selects, with its own menu. A call that starts a subagent has an
 /// Open that shows the subagent's own steps.
 class RowTile extends StatelessWidget {
@@ -97,6 +98,25 @@ class RowTile extends StatelessWidget {
           ),
         );
       }
+    } else if (chosen case GuiIntentAct(action: ActionIntentSetSafetyRule())) {
+      // The prefixes come first; the menu only says which row. Each one the
+      // person keeps is its own rule.
+      if (!context.mounted) return;
+      final rules = await askTrustCommand(
+        context,
+        row.tool?.ruleCandidates ?? const <List<String>>[],
+      );
+      for (final words in rules ?? const <List<String>>[]) {
+        send(
+          GuiIntentAct(
+            action: ActionIntentSetSafetyRule(
+              sessionId: sessionId,
+              words: words,
+              on: true,
+            ),
+          ),
+        );
+      }
     } else if (chosen != null) {
       send(chosen);
     }
@@ -130,6 +150,19 @@ class RowTile extends StatelessWidget {
             sessionId: sessionId,
             call: feedback.call,
             judgment: feedback.judgment,
+          ),
+        ),
+      ),
+    if (row.tool?.ruleCandidates case final candidates?
+        when candidates.isNotEmpty)
+      (
+        'Trust command…',
+        Icons.verified_user_outlined,
+        GuiIntentAct(
+          action: ActionIntentSetSafetyRule(
+            sessionId: sessionId,
+            words: const [],
+            on: true,
           ),
         ),
       ),

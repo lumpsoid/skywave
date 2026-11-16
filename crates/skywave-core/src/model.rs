@@ -37,7 +37,7 @@ use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
     AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxFile, OutboxStatus,
-    ReadMark, ServerFacts, Settings, Snapshot,
+    ReadMark, SafetyRule, ServerFacts, Settings, Snapshot,
 };
 use crate::tls;
 use crate::transport::TransportError;
@@ -48,14 +48,15 @@ use crate::view::{
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
     FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan,
     Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
-    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession,
-    QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER, SafetyFeedbackView,
-    Screen, Seq, ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef,
-    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun,
-    ShellRunState, ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader,
-    SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView,
-    UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody,
-    WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
+    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
+    PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER,
+    SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView, SessionId,
+    SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
+    SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
+    SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage,
+    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable,
+    UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane,
+    WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -380,6 +381,9 @@ pub(crate) struct Model {
     devices: HashMap<DeviceId, String>,
     /// The models of the newest `ModelsOffered`, as stored.
     models: Vec<ModelChoice>,
+    /// The safety rules as stored: every rule ever set, on or off, ordered
+    /// by its newest event.
+    safety_rules: Vec<SafetyRule>,
     /// Every turn's usage in the replica, in log order: what the usage
     /// screen totals.
     turns: Vec<TurnRecord>,
@@ -455,6 +459,7 @@ impl Model {
             opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
+            safety_rules: Vec::new(),
             turns: Vec::new(),
             workdirs: Workdirs::default(),
             count_req: 0,
@@ -486,6 +491,7 @@ impl Model {
         self.deleted = snapshot.deleted;
         self.devices = snapshot.devices;
         self.models = snapshot.models;
+        self.safety_rules = snapshot.safety_rules;
         self.turns = snapshot.turns;
         self.workdirs.stored = snapshot.workdirs;
         self.usage_limits.stored = snapshot.usage_limits;
@@ -1082,6 +1088,26 @@ impl Model {
                     return Vec::new();
                 }
                 self.enqueue(CommandKind::SetSafetyCheck { session_id, on }, Vec::new())
+            }
+            Action::SetSafetyRule {
+                session_id,
+                words,
+                on,
+            } => {
+                // No session guard, unlike the other session actions: a
+                // removal goes to the session that logged the rule, which may
+                // be deleted here while the server still keeps it.
+                if words.is_empty() || words.iter().any(String::is_empty) {
+                    return Vec::new();
+                }
+                self.enqueue(
+                    CommandKind::SetSafetyRule {
+                        session_id,
+                        words,
+                        on,
+                    },
+                    Vec::new(),
+                )
             }
             Action::SafetyCheckFeedback {
                 session_id,
@@ -2076,6 +2102,16 @@ impl Model {
             if let EventKind::ModelsOffered { models } = &event.kind {
                 self.models.clone_from(models);
             }
+            // Kept whatever session said so, as the store keeps them: the
+            // newest rule for these words moves to the end.
+            if let EventKind::SafetyRuleSet { words, on, .. } = &event.kind {
+                self.safety_rules.retain(|rule| rule.words != *words);
+                self.safety_rules.push(SafetyRule {
+                    words: words.clone(),
+                    on: *on,
+                    session_id: event.session_id,
+                });
+            }
             if self.deleted.contains(&event.session_id) {
                 continue;
             }
@@ -2748,6 +2784,7 @@ impl Model {
                     expires: self.settings.server.login_expires,
                     flow: self.login.view(),
                 },
+                safety_rules: self.safety_rule_views(),
             }),
             Place::ServerAddresses => Screen::ServerAddresses(ServerAddressesView {
                 current: self.paired.as_ref().map(|p| p.addresses.current().clone()),
@@ -3649,6 +3686,66 @@ impl Model {
         }
     }
 
+    /// The safety rules Settings lists: the rules the log holds on, then the
+    /// changes this device sent that the log does not hold yet. Only this
+    /// device's newest change for given words counts: an earlier one for the
+    /// same words is superseded, whatever its state, so once the newest is in
+    /// the replica the row has nothing pending. Rows only pending are listed
+    /// in outbox order of their newest change. A change is held once its
+    /// accepted seq is folded in: a log position, not the reply's arrival.
+    fn safety_rule_views(&self) -> Vec<SafetyRuleView> {
+        let mut rows: Vec<SafetyRuleView> = self
+            .safety_rules
+            .iter()
+            .map(|rule| SafetyRuleView {
+                words: rule.words.clone(),
+                session_id: rule.session_id,
+                on: rule.on,
+                pending: None,
+            })
+            .collect();
+        let mut newest: Vec<&OutboxEntry> = Vec::new();
+        for entry in &self.outbox {
+            let CommandKind::SetSafetyRule { words, .. } = &entry.command.kind else {
+                continue;
+            };
+            newest.retain(|kept| match &kept.command.kind {
+                CommandKind::SetSafetyRule {
+                    words: kept_words, ..
+                } => kept_words != words,
+                _ => true,
+            });
+            newest.push(entry);
+        }
+        for entry in newest {
+            let CommandKind::SetSafetyRule {
+                session_id,
+                words,
+                on,
+            } = &entry.command.kind
+            else {
+                continue;
+            };
+            let outgoing = Outgoing::from(&entry.status);
+            let pending = (!self.in_replica(outgoing)).then_some(PendingSafetyRule {
+                command: entry.command.id,
+                on: *on,
+                outgoing,
+            });
+            match rows.iter_mut().find(|row| row.words == *words) {
+                Some(row) => row.pending = pending,
+                None => rows.push(SafetyRuleView {
+                    words: words.clone(),
+                    session_id: *session_id,
+                    on: false,
+                    pending,
+                }),
+            }
+        }
+        rows.retain(|row| row.on || row.pending.is_some());
+        rows
+    }
+
     /// The session's safety check switch still on its way in front: this
     /// device's newest `SetSafetyCheck` for the session, until the replica
     /// holds its result.
@@ -4010,6 +4107,7 @@ impl Model {
                             input: input.as_ref().map(|f| self.full_view(f)),
                         });
                         if shell.is_some() {
+                            view.shell.clone_from(shell);
                             view.safety_feedback = Some(SafetyFeedbackView {
                                 judgment: SafetyJudgment::ShouldApprove,
                                 sent: None,
@@ -4282,6 +4380,7 @@ impl Model {
                     if let Some((_, view, _)) = tools.call(&mut items, *call) {
                         view.safety_check = Some(reason.clone());
                         if shell.is_some() {
+                            view.shell.clone_from(shell);
                             view.safety_feedback = Some(SafetyFeedbackView {
                                 judgment: SafetyJudgment::ShouldAsk,
                                 sent: None,
@@ -4307,6 +4406,7 @@ impl Model {
                     None
                 }
                 EventKind::SafetyCheckSet { .. } => None,
+                EventKind::SafetyRuleSet { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -4423,6 +4523,7 @@ impl Model {
             approval: None,
             safety_check: None,
             safety_feedback: None,
+            shell: None,
             outcome,
             subagent: None,
         }
@@ -5054,6 +5155,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }
         | CommandKind::SetSafetyCheck { session_id, .. }
+        | CommandKind::SetSafetyRule { session_id, .. }
         | CommandKind::SafetyCheckFeedback { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
         | CommandKind::SwitchContext { session_id, .. }
@@ -5293,6 +5395,7 @@ mod tests {
             alerted: HashSet::new(),
             devices: HashMap::new(),
             models: Vec::new(),
+            safety_rules: Vec::new(),
             snippets: Vec::new(),
             shell_history: Vec::new(),
             turns: Vec::new(),
@@ -6384,6 +6487,341 @@ mod tests {
         let view = f.session_view();
         assert!(view.safety_check);
         assert_eq!(view.safety_check_change, None);
+    }
+
+    /// The safety rules Settings lists; the settings screen must be open.
+    fn safety_rules(f: &Fixture) -> Vec<SafetyRuleView> {
+        match f.model.view().screen {
+            Screen::Settings(view) => view.safety_rules,
+            other => panic!("expected settings, got {other:?}"),
+        }
+    }
+
+    fn prefix(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn a_new_safety_rule_shows_pending_until_logged() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let me = f.me;
+        let git = prefix(&["git", "commit"]);
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(safety_rules(&f), Vec::<SafetyRuleView>::new());
+
+        let command = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: sid,
+            words: git.clone(),
+            on: true,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::SetSafetyRule {
+                session_id: sid,
+                words: git.clone(),
+                on: true,
+            }
+        );
+        // On its way: never logged, so off in the log, with the change pending.
+        let pending = |outgoing| SafetyRuleView {
+            words: git.clone(),
+            session_id: sid,
+            on: false,
+            pending: Some(PendingSafetyRule {
+                command: command.id,
+                on: true,
+                outgoing,
+            }),
+        };
+        assert_eq!(safety_rules(&f), vec![pending(Outgoing::Queued)]);
+
+        // Accepted at a seq the log does not hold yet: still pending.
+        let seq = Seq(f.events.len() as u64 + 1);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        assert_eq!(safety_rules(&f), vec![pending(Outgoing::Accepted(seq))]);
+
+        // Logged: the log holds it on, and nothing is pending.
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::SafetyRuleSet {
+                    words: git.clone(),
+                    on: true,
+                    by: me,
+                },
+            )],
+        );
+        assert_eq!(
+            safety_rules(&f),
+            vec![SafetyRuleView {
+                words: git,
+                session_id: sid,
+                on: true,
+                pending: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_safety_rule_change_clears_once_a_later_one_is_logged() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let me = f.me;
+        let git = prefix(&["git", "status"]);
+        f.dispatch(Action::Navigate(Route::Settings));
+
+        // The add is refused: listed as failed, off in the log.
+        let first = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: sid,
+            words: git.clone(),
+            on: true,
+        }));
+        f.model.command_result(
+            first.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        let failed = SafetyRuleView {
+            words: git.clone(),
+            session_id: sid,
+            on: false,
+            pending: Some(PendingSafetyRule {
+                command: first.id,
+                on: true,
+                outgoing: Outgoing::Failed(FailReason::Rejected(RejectReason::UnknownSession)),
+            }),
+        };
+        assert_eq!(safety_rules(&f), vec![failed]);
+
+        // Trusted again: the newer add is accepted and logged, so the failed
+        // one no longer shows.
+        let second = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: sid,
+            words: git.clone(),
+            on: true,
+        }));
+        let seq = Seq(f.events.len() as u64 + 1);
+        f.model
+            .command_result(second.id, CommandResult::Accepted { seq }, Utc::now());
+        f.log_commands(
+            sid,
+            vec![(
+                Some(second.id),
+                EventKind::SafetyRuleSet {
+                    words: git.clone(),
+                    on: true,
+                    by: me,
+                },
+            )],
+        );
+        assert_eq!(
+            safety_rules(&f),
+            vec![SafetyRuleView {
+                words: git,
+                session_id: sid,
+                on: true,
+                pending: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_safety_rule_add_can_be_dismissed() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let git = prefix(&["git", "status"]);
+        f.dispatch(Action::Navigate(Route::Settings));
+        let command = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: sid,
+            words: git,
+            on: true,
+        }));
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        // The failed add is listed, and its command id is what dismisses it.
+        let listed = safety_rules(&f);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].pending.as_ref().map(|change| change.command),
+            Some(command.id)
+        );
+
+        f.dispatch(Action::Discard(command.id));
+        assert_eq!(safety_rules(&f), Vec::<SafetyRuleView>::new());
+    }
+
+    #[test]
+    fn removing_a_safety_rule_lists_it_until_logged_off() {
+        let mut f = Fixture::paired();
+        let b = f.session("/srv/b");
+        let me = f.me;
+        let git = prefix(&["git", "commit"]);
+        f.log(
+            b,
+            vec![EventKind::SafetyRuleSet {
+                words: git.clone(),
+                on: true,
+                by: me,
+            }],
+        );
+        f.dispatch(Action::Navigate(Route::Settings));
+        let logged = SafetyRuleView {
+            words: git.clone(),
+            session_id: b,
+            on: true,
+            pending: None,
+        };
+        assert_eq!(safety_rules(&f), vec![logged.clone()]);
+
+        // Listed while the removal is on its way: on in the log, change pending.
+        let command = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: b,
+            words: git.clone(),
+            on: false,
+        }));
+        assert_eq!(
+            safety_rules(&f),
+            vec![SafetyRuleView {
+                pending: Some(PendingSafetyRule {
+                    command: command.id,
+                    on: false,
+                    outgoing: Outgoing::Queued,
+                }),
+                ..logged.clone()
+            }]
+        );
+
+        // Accepted and logged off: nothing is listed any more.
+        let seq = Seq(f.events.len() as u64 + 1);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        f.log_commands(
+            b,
+            vec![(
+                Some(command.id),
+                EventKind::SafetyRuleSet {
+                    words: git,
+                    on: false,
+                    by: me,
+                },
+            )],
+        );
+        assert_eq!(safety_rules(&f), Vec::<SafetyRuleView>::new());
+    }
+
+    #[test]
+    fn safety_rule_rows_skip_off_rules_and_bad_words() {
+        let mut f = Fixture::paired();
+        let (a, b) = (f.session("/srv/a"), f.session("/srv/b"));
+        let me = f.me;
+        let (git, cargo) = (prefix(&["git", "commit"]), prefix(&["cargo", "test"]));
+        f.log(
+            a,
+            vec![EventKind::SafetyRuleSet {
+                words: git.clone(),
+                on: true,
+                by: me,
+            }],
+        );
+        f.log(
+            b,
+            vec![EventKind::SafetyRuleSet {
+                words: git,
+                on: false,
+                by: me,
+            }],
+        );
+        f.log(
+            a,
+            vec![EventKind::SafetyRuleSet {
+                words: cargo.clone(),
+                on: true,
+                by: me,
+            }],
+        );
+        f.dispatch(Action::Navigate(Route::Settings));
+        // Git's newest rule is off: only cargo's on rule is listed.
+        assert_eq!(
+            safety_rules(&f),
+            vec![SafetyRuleView {
+                words: cargo,
+                session_id: a,
+                on: true,
+                pending: None,
+            }]
+        );
+
+        // Neither an empty prefix nor one with an empty word is queued.
+        for words in [Vec::new(), prefix(&["git", ""])] {
+            let effects = f.dispatch(Action::SetSafetyRule {
+                session_id: a,
+                words,
+                on: true,
+            });
+            assert!(effects.is_empty());
+        }
+        assert!(f.model.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_safety_rule_of_a_session_deleted_here_is_listed_and_removable() {
+        let mut f = Fixture::paired();
+        let gone = f.session("/srv/gone");
+        let me = f.me;
+        let git = prefix(&["git", "commit"]);
+        f.log(
+            gone,
+            vec![EventKind::SafetyRuleSet {
+                words: git.clone(),
+                on: true,
+                by: me,
+            }],
+        );
+        f.model.session_deleted(gone, &[]);
+        f.dispatch(Action::Navigate(Route::Settings));
+        let logged = SafetyRuleView {
+            words: git.clone(),
+            session_id: gone,
+            on: true,
+            pending: None,
+        };
+        assert_eq!(safety_rules(&f), vec![logged.clone()]);
+
+        // The removal still goes to that session, which the server keeps.
+        let command = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: gone,
+            words: git.clone(),
+            on: false,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::SetSafetyRule {
+                session_id: gone,
+                words: git,
+                on: false,
+            }
+        );
+        assert_eq!(
+            safety_rules(&f),
+            vec![SafetyRuleView {
+                pending: Some(PendingSafetyRule {
+                    command: command.id,
+                    on: false,
+                    outgoing: Outgoing::Queued,
+                }),
+                ..logged
+            }]
+        );
     }
 
     #[test]
@@ -10143,6 +10581,47 @@ mod tests {
         );
     }
 
+    /// A shell row keeps the raw command its approval request or safety
+    /// check named, for a head to prefill a rule from. A row neither named
+    /// has none.
+    #[test]
+    fn a_shell_row_keeps_its_command() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (asked, approved, unnamed) = (CallId::new(), CallId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                tool_call(Some(asked), ToolKind::Shell, "$ git status"),
+                EventKind::ApprovalRequested {
+                    id: ApprovalId::new(),
+                    call: Some(asked),
+                    tool: "agent-tool".into(),
+                    summary: "git status".into(),
+                    input: None,
+                    suggestions: Vec::new(),
+                    shell: Some("git status".into()),
+                },
+                tool_call(Some(approved), ToolKind::Shell, "$ ls -la"),
+                EventKind::SafetyCheckApproved {
+                    call: Some(approved),
+                    tool: "agent-tool".into(),
+                    summary: "ls -la".into(),
+                    reason: "read-only: ls".into(),
+                    shell: Some("ls -la".into()),
+                },
+                tool_call(Some(unnamed), ToolKind::Shell, "$ make"),
+                approval_requested(ApprovalId::new(), Some(unnamed)),
+            ],
+        );
+        f.open(sid);
+        let shells: Vec<Option<String>> = tools(&f).into_iter().map(|view| view.shell).collect();
+        assert_eq!(
+            shells,
+            vec![Some("git status".into()), Some("ls -la".into()), None]
+        );
+    }
+
     #[test]
     fn safety_feedback_needs_a_known_session() {
         let mut f = Fixture::paired();
@@ -10292,6 +10771,7 @@ mod tests {
             }),
             safety_check: None,
             safety_feedback: None,
+            shell: None,
             outcome: ToolOutcome::Running { since: minute(2) },
         };
         assert_eq!(entries(&f), vec![Entry::Tool(Box::new(waiting.clone()))]);
@@ -10909,6 +11389,7 @@ mod tests {
             alerted: model.alerted.clone(),
             devices: model.devices.clone(),
             models: model.models.clone(),
+            safety_rules: model.safety_rules.clone(),
             snippets: model.snippets.list().to_vec(),
             shell_history: model.shell_history.list().to_vec(),
             turns: model.turns.clone(),
@@ -10950,6 +11431,39 @@ mod tests {
             attention.approvals[0].alerted_at, 0,
             "an earlier process alerted on it"
         );
+    }
+
+    #[test]
+    fn safety_rules_fold_live_and_survive_a_restart() {
+        let mut f = Fixture::paired();
+        let (a, b) = (f.session("/srv/app"), f.session("/srv/api"));
+        let by = DeviceId::new();
+        let git: Vec<String> = vec!["git".into(), "commit".into()];
+        let cargo: Vec<String> = vec!["cargo".into(), "test".into()];
+        let set = |words: &Vec<String>, on: bool| EventKind::SafetyRuleSet {
+            words: words.clone(),
+            on,
+            by,
+        };
+        f.log(a, vec![set(&git, true)]);
+        f.log(a, vec![set(&cargo, true)]);
+        f.log(b, vec![set(&git, false)]);
+        // Git's newest switch came after cargo's, so it moved to the end.
+        let expected = vec![
+            SafetyRule {
+                words: cargo.clone(),
+                on: true,
+                session_id: a,
+            },
+            SafetyRule {
+                words: git.clone(),
+                on: false,
+                session_id: b,
+            },
+        ];
+        assert_eq!(f.model.safety_rules, expected, "live fold");
+        let model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
+        assert_eq!(model.safety_rules, expected, "after a restart");
     }
 
     #[test]

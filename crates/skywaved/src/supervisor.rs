@@ -1993,8 +1993,8 @@ impl<A: AgentAdapter> Supervisor<A> {
 
     /// The reason the safety check approves `event`, an approval of session
     /// `id`'s agent: `Some` only for a shell command, with the check on for
-    /// the session, that it proves read-only in the session's workdir. It
-    /// never denies; anything else stays with a person.
+    /// the session, that it proves read-only in the session's workdir or a
+    /// safety rule covers. It never denies; anything else stays with a person.
     fn safe_shell(&self, id: SessionId, event: &AdapterEvent) -> Result<Option<String>> {
         let AdapterEvent::ApprovalRequested {
             shell: Some(command),
@@ -2009,7 +2009,8 @@ impl<A: AgentAdapter> Supervisor<A> {
         let Some(session) = self.log.session(&self.storage.db, id)? else {
             return Ok(None);
         };
-        match skywave_safety::check(command, Path::new(&session.workdir)) {
+        let rules = self.log.safety_rules(&self.storage.db)?;
+        match skywave_safety::check_with(command, Path::new(&session.workdir), &rules) {
             Verdict::Safe { reason } => Ok(Some(reason)),
             Verdict::Ask { why } => {
                 tracing::debug!(session = %id.0, %why, "safety check leaves a command to a person");

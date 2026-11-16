@@ -1,9 +1,12 @@
-//! Proves a shell command read-only and confined to the session's workdir.
+//! Proves a shell command read-only and confined to the session's workdir,
+//! or covered by a person's rules.
 //!
 //! The checker answers only "safe" or "ask". Every unknown, unparsed or
 //! unsupported construct is "ask": an expansion, a glob, a write, a path
-//! outside the workdir, a program off the allowlist. It never denies; a
-//! human decides anything it cannot prove.
+//! outside the workdir, a program off the allowlist. A rule (a program and
+//! its literal leading words) trusts a simple command the proof can't
+//! cover, as the person's choice (D61). It never denies; a human decides
+//! anything it cannot prove or the person has not trusted.
 
 mod paths;
 mod programs;
@@ -22,8 +25,56 @@ pub enum Verdict {
     Ask { why: String },
 }
 
+/// A rule a person wrote: a program and the literal words that must follow it.
+/// A simple command whose words start with these is approved without proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    words: Vec<String>,
+}
+
+impl Rule {
+    /// Builds a rule from its words, the program first. At least one word is
+    /// needed, and no word may be empty.
+    pub fn new(words: Vec<String>) -> Result<Rule, String> {
+        if words.is_empty() {
+            return Err("a rule needs a program".into());
+        }
+        if words.iter().any(String::is_empty) {
+            return Err("a rule word is empty".into());
+        }
+        Ok(Rule { words })
+    }
+
+    /// The rule's words, the program first.
+    pub fn words(&self) -> &[String] {
+        &self.words
+    }
+}
+
+impl std::fmt::Display for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.words.join(" "))
+    }
+}
+
 /// Checks `command`, which runs with its working directory at `workdir`
 /// (absolute and canonical).
 pub fn check(command: &str, workdir: &Path) -> Verdict {
-    shell::check(command, workdir)
+    check_with(command, workdir, &[])
+}
+
+/// Like `check`, and also approves a simple command that starts with the
+/// words of one of `rules`. Redirections are still checked, and every simple
+/// command in the line must pass by a rule or by the built-in table.
+pub fn check_with(command: &str, workdir: &Path, rules: &[Rule]) -> Verdict {
+    shell::check(command, workdir, rules)
+}
+
+/// The literal words of each simple command in `command`, in source order.
+/// Each entry starts with the program, then its arguments, cut at the first
+/// word that is not literal. A `$(...)` inside a word gives its own entries,
+/// right after the command that holds it. Parse only: nothing runs and no
+/// file is read. A line that does not parse, or is too long, gives no entries.
+pub fn simple_commands(command: &str) -> Vec<Vec<String>> {
+    shell::simple_commands(command)
 }
