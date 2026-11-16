@@ -2843,9 +2843,7 @@ void main() {
       final workdir = tester.getRect(
         find.textContaining('skywave', findRichText: true),
       );
-      final state = tester.getRect(
-        find.textContaining('idle', findRichText: true),
-      );
+      final state = tester.getRect(find.byKey(const Key('session-state')));
       final first = tester.getRect(find.text('first row'));
       expect(title.top, greaterThanOrEqualTo(bar.top));
       expect(workdir.top, greaterThanOrEqualTo(title.bottom));
@@ -2939,22 +2937,51 @@ void main() {
       }
     });
 
-    testWidgets('the agent state shows once, its full label as a tooltip', (
-      tester,
-    ) async {
+    testWidgets(
+      'the agent state shows as its icon, its full label as a tooltip',
+      (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SessionPage(
+              screen: screenWith(state: AgentState.working),
+              timeline: holding([]),
+              send: (_) {},
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(
+          tester
+              .widget<AgentStateIcon>(find.byKey(const Key('session-state')))
+              .state,
+          AgentState.working,
+        );
+        expect(
+          find.textContaining('working', findRichText: true),
+          findsNothing,
+        );
+        expect(byTooltip('agent working'), findsOneWidget);
+        expect(find.text('/home/me/skywave'), findsOneWidget);
+      },
+    );
+
+    testWidgets('a stop on its way shows after the state icon', (tester) async {
       await tester.pumpWidget(
         MaterialApp(
           home: SessionPage(
-            screen: screenWith(state: AgentState.working),
+            screen: screenWith(state: AgentState.working)
+                .copyWith(stopLabel: () => 'stop queued'),
             timeline: holding([]),
             send: (_) {},
           ),
         ),
       );
       await tester.pump();
-      expect(find.textContaining('working', findRichText: true), findsOne);
-      expect(byTooltip('agent working'), findsOneWidget);
-      expect(find.text('/home/me/skywave'), findsOneWidget);
+      expect(find.text('stop queued'), findsOneWidget);
+      expect(find.text(' · stop queued'), findsNothing);
+      final icon = tester.getRect(find.byKey(const Key('session-state')));
+      final stop = tester.getRect(find.text('stop queued'));
+      expect(stop.left, greaterThan(icon.right));
     });
 
     testWidgets('on a wide window the header keeps to the timeline column', (
