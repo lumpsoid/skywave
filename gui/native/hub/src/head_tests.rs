@@ -3886,6 +3886,100 @@ fn a_safety_check_feedback_on_its_way_shows_its_outgoing_state() {
 }
 
 #[test]
+fn a_shell_row_offers_its_commands_as_rule_candidates() {
+    use skywave_proto::{CallId, ToolKind};
+    let words = |line: &[&str]| line.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+    let command = "cargo test -p x | tail -n 5";
+    let mut rig = Rig::new();
+    let call = CallId::new();
+    rig.log(vec![
+        a_call(None, call, "Bash", ToolKind::Shell, command),
+        EventKind::SafetyCheckApproved {
+            call: Some(call),
+            tool: "Bash".into(),
+            summary: command.into(),
+            reason: "read-only: cargo, tail".into(),
+            shell: Some(command.into()),
+        },
+        a_result(call),
+    ]);
+    assert_eq!(
+        rig.tool_row("Bash").rule_candidates,
+        vec![
+            words(&["cargo", "test", "-p", "x"]),
+            words(&["tail", "-n", "5"]),
+        ]
+    );
+
+    // The control: a call that names no shell command offers none.
+    let mut plain = Rig::new();
+    let plain_call = CallId::new();
+    plain.log(vec![
+        a_call(None, plain_call, "Bash", ToolKind::Shell, "rm -rf build"),
+        a_result(plain_call),
+    ]);
+    assert_eq!(
+        plain.tool_row("Bash").rule_candidates,
+        Vec::<Vec<String>>::new()
+    );
+}
+
+#[test]
+fn trusting_a_command_sends_set_safety_rule() {
+    let mut rig = Rig::new();
+    let words = vec!["git".to_owned(), "commit".to_owned()];
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SetSafetyRule {
+            session_id: rig.session.0.to_string(),
+            words: words.clone(),
+            on: true,
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::SetSafetyRule {
+            session_id: rig.session,
+            words,
+            on: true,
+        }]
+    );
+}
+
+#[test]
+fn rule_candidates_wait_for_the_shell_command() {
+    use skywave_proto::{ApprovalId, CallId, ToolKind};
+    let mut rig = Rig::new();
+    let call = CallId::new();
+    rig.log(vec![a_call(
+        None,
+        call,
+        "Bash",
+        ToolKind::Shell,
+        "git status",
+    )]);
+    // Mapped before its approval names the command: nothing to offer yet,
+    // and nothing is remembered for later.
+    assert_eq!(
+        rig.tool_row("Bash").rule_candidates,
+        Vec::<Vec<String>>::new()
+    );
+
+    rig.log(vec![EventKind::ApprovalRequested {
+        id: ApprovalId::new(),
+        call: Some(call),
+        tool: "Bash".into(),
+        summary: "git status".into(),
+        input: None,
+        suggestions: Vec::new(),
+        shell: Some("git status".into()),
+    }]);
+    assert_eq!(
+        rig.tool_row("Bash").rule_candidates,
+        vec![vec!["git".to_owned(), "status".to_owned()]]
+    );
+}
+
+#[test]
 fn a_shell_call_that_asked_offers_should_have_been_approved() {
     use crate::signals::{SafetyFeedbackFacts, SafetyJudgmentView};
     use skywave_proto::{ApprovalId, CallId, ToolKind};

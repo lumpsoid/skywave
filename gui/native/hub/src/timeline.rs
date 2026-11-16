@@ -11,10 +11,10 @@ use std::time::Duration;
 use skywave_core::attachment::{AttachedImage, attachment_path};
 use skywave_core::store::OutboxFile;
 use skywave_core::{
-    Answer, ApprovalStatus, AttachmentRefusal, BlobId, BlobState, BlobView, BodyFormat, Decision,
-    DeviceRef, Entry, FailReason, FullView, ImportedEntry, MessageImage, Outgoing, QUESTION_TOOL,
-    RuleSuggestion, SafetyJudgment, Seq, SessionId, SessionView, TimelineItem, ToolKind,
-    ToolOutcome, ToolView, read_head,
+    Answer, ApprovalStatus, AttachmentRefusal, BlobId, BlobState, BlobView, BodyFormat, CallId,
+    Decision, DeviceRef, Entry, FailReason, FullView, ImportedEntry, MessageImage, Outgoing,
+    QUESTION_TOOL, RuleSuggestion, SafetyJudgment, Seq, SessionId, SessionView, TimelineItem,
+    ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
@@ -88,6 +88,25 @@ impl BlobHeads {
     }
 }
 
+/// Each shell call's rule candidates, by call, so its command is parsed once
+/// and not on every snapshot: rows are mapped on every publish, and parsing
+/// spawns a thread.
+#[derive(Debug, Default)]
+pub struct RuleCandidates {
+    by_call: HashMap<CallId, Vec<Vec<String>>>,
+}
+
+impl RuleCandidates {
+    /// The literal words of each simple command in `command`, the shell
+    /// command of call `call`.
+    fn get(&mut self, call: CallId, command: &str) -> Vec<Vec<String>> {
+        self.by_call
+            .entry(call)
+            .or_insert_with(|| skywave_safety::simple_commands(command))
+            .clone()
+    }
+}
+
 fn read(path: &Path) -> Result<Head, String> {
     let (text, size) = read_head(path, SHOW_BYTES)
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
@@ -135,6 +154,7 @@ pub fn rows(
     view: &SessionView,
     expanded: &HashSet<Seq>,
     heads: &mut BlobHeads,
+    candidates: &mut RuleCandidates,
     data_dir: &Path,
     wall_ms: i64,
 ) -> Rows {
@@ -159,7 +179,7 @@ pub fn rows(
         };
         let key = ItemKey::of(item);
         let open = matches!(key, ItemKey::Logged(seq) if expanded.contains(&seq));
-        let mut row = row(item, view.id, open, heads, data_dir, wall_ms);
+        let mut row = row(item, view.id, open, heads, candidates, data_dir, wall_ms);
         row.time_label = time_label;
         row.unread_rule = rule == Some(index);
         row.turn_start = !row.unread_rule && index > 0 && starts_turn(item);
@@ -191,6 +211,7 @@ fn row(
     session: SessionId,
     expanded: bool,
     heads: &mut BlobHeads,
+    candidates: &mut RuleCandidates,
     data_dir: &Path,
     wall_ms: i64,
 ) -> TimelineRow {
@@ -336,7 +357,7 @@ fn row(
                 }
                 ImportedEntry::Tool(view) => {
                     row.kind = RowKind::ImportedTool;
-                    row.tool = Some(tool_facts(view, wall_ms, expanded, entry));
+                    row.tool = Some(tool_facts(view, candidates, wall_ms, expanded, entry));
                 }
                 ImportedEntry::ToolResult { .. } => {
                     row.kind = RowKind::ImportedTool;
@@ -410,7 +431,7 @@ fn row(
         }
         Entry::Tool(view) => {
             row.kind = RowKind::Tool;
-            row.tool = Some(tool_facts(view, wall_ms, expanded, entry));
+            row.tool = Some(tool_facts(view, candidates, wall_ms, expanded, entry));
         }
         Entry::ToolCall { name, summary, .. } => {
             row.kind = RowKind::ToolCall;
@@ -577,7 +598,13 @@ pub fn diff(old: &[TimelineRow], new: &Rows) -> Option<Vec<TimelineUpdate>> {
 }
 
 /// A grouped call's head line.
-fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> ToolFacts {
+fn tool_facts(
+    view: &ToolView,
+    candidates: &mut RuleCandidates,
+    wall_ms: i64,
+    expanded: bool,
+    entry: &Entry,
+) -> ToolFacts {
     let (state, mut label) = tool_state(view, wall_ms);
     if let Some(note) = view
         .approval
@@ -602,6 +629,10 @@ fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> T
         Some((state, status)) => (state, Some(status)),
         None => (state, None),
     };
+    let rule_candidates = match &view.shell {
+        Some(command) => candidates.get(view.call, command),
+        None => Vec::new(),
+    };
     ToolFacts {
         kind: tool_kind(view.kind),
         name: clean_line(&view.name),
@@ -613,6 +644,7 @@ fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> T
         opens: view.subagent.as_ref().map(|_| view.call.0.to_string()),
         status,
         feedback,
+        rule_candidates,
     }
 }
 
@@ -673,6 +705,7 @@ fn plain_facts(name: &str, summary: &str, expanded: bool, entry: &Entry) -> Tool
         opens: None,
         status: None,
         feedback: None,
+        rule_candidates: Vec::new(),
     }
 }
 
@@ -1184,6 +1217,7 @@ mod tests {
             &session(timeline),
             &HashSet::new(),
             &mut BlobHeads::default(),
+            &mut RuleCandidates::default(),
             Path::new("/data"),
             0,
         )
@@ -1403,6 +1437,7 @@ mod tests {
                 &view,
                 expanded,
                 &mut BlobHeads::default(),
+                &mut RuleCandidates::default(),
                 Path::new("/data"),
                 0,
             )
@@ -1436,6 +1471,7 @@ mod tests {
             &view,
             &HashSet::new(),
             &mut BlobHeads::default(),
+            &mut RuleCandidates::default(),
             Path::new("/data"),
             0,
         )
@@ -1679,6 +1715,7 @@ mod tests {
             &session(vec![item]),
             &HashSet::new(),
             &mut BlobHeads::default(),
+            &mut RuleCandidates::default(),
             Path::new("/data"),
             0,
         )

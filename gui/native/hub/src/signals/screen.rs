@@ -103,6 +103,10 @@ pub enum ScreenView {
         /// (the head's own preference, not the core's); `None` where it
         /// is not offered: everywhere but Android.
         stay_connected: Option<bool>,
+        /// The safety rules: the ones the server's log holds, and the ones
+        /// with a change of this device still on its way; in the core's
+        /// order.
+        safety_rules: Vec<SafetyRuleRow>,
     },
     /// Cost and tokens across sessions, from the replica alone.
     Usage {
@@ -800,6 +804,23 @@ pub struct SafetyCheckView {
     pub pending: bool,
     /// `safety check on failed: <why>` until the next switch.
     pub refusal: Option<String>,
+}
+
+/// A safety rule as Settings lists it: a shell command prefix the safety
+/// check trusts, with this device's change to it while on its way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct SafetyRuleRow {
+    /// The session a removal is sent in.
+    pub session_id: String,
+    /// The program, then the literal leading words it must start with.
+    pub words: Vec<String>,
+    /// The words joined by single spaces.
+    pub label: String,
+    /// Whether the server's log holds the rule on.
+    pub on: bool,
+    /// `adding`, `removing` while this device's change waits; `could not
+    /// add: <why>` or `could not remove: <why>` when the server refused it.
+    pub pending: Option<String>,
 }
 
 /// A mode the picker lists.

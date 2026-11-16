@@ -218,6 +218,10 @@ pub struct ToolFacts {
     /// Feedback on the safety check this row can send: set only for a
     /// shell call that asked a person or that the safety check approved.
     pub feedback: Option<SafetyFeedbackFacts>,
+    /// The literal words of each simple command in this shell call, for a
+    /// person to trust as a safety rule (`ActionIntent::SetSafetyRule`);
+    /// empty when the call named no shell command or none is literal.
+    pub rule_candidates: Vec<Vec<String>>,
 }
 
 /// Feedback on the safety check a shell call's row can send.
