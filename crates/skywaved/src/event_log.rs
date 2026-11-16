@@ -1862,8 +1862,11 @@ pub(crate) fn request_deletion_in(conn: &Connection, id: SessionId) -> Result<()
 /// and its `session_deleted` tombstone stays, as devices learn of the delete
 /// from it. Its event blobs' rows go, and the rows only its live state
 /// needs. The `sessions` and `contexts` rows stay, since other rows
-/// reference them; `sessions.deletion` becomes `erased`. Returns the blobs
-/// its events named: their files are the caller's to remove after commit.
+/// reference them; `sessions.deletion` becomes `erased`. Its contexts'
+/// resume handles go (their conversations were forgotten by the agent, D62),
+/// except a context moved to another session, whose conversation that session
+/// still forks (D30). Returns the blobs its events named: their files are the
+/// caller's to remove after commit.
 /// Its `models_offered` events stay too: the newest offered list is the
 /// server's (`offered_models`), not the session's.
 pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<BlobId>> {
@@ -1895,6 +1898,10 @@ pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<B
                ('session_created', 'worktree_removed', 'session_deleted',
                 'models_offered')",
         params![session, erased],
+    )?;
+    conn.execute(
+        "UPDATE contexts SET agent_state = NULL WHERE session_id = ?1 AND moved_to IS NULL",
+        [&session],
     )?;
     conn.execute(
         "UPDATE sessions SET deletion = 'erased' WHERE id = ?1",

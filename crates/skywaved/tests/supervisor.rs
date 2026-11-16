@@ -27,7 +27,7 @@ use skywaved::agent::fake::{
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
 use skywaved::agent::{
     AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED, Image, LoginSource,
-    LoginState, LoginStatus,
+    LoginState, LoginStatus, ResumeHandle,
 };
 use skywaved::attachments::{Staging, prepare};
 use skywaved::config::AgentConfig;
@@ -2058,6 +2058,19 @@ fn deletion_of(f: &Fixture, session: SessionId) -> String {
         .unwrap()
 }
 
+/// The `agent_state` of each of the session's contexts, as the database has
+/// it, oldest first.
+fn agent_states(f: &Fixture, session: SessionId) -> Vec<Option<String>> {
+    let conn = f.storage.db.conn();
+    let mut stmt = conn
+        .prepare("SELECT agent_state FROM contexts WHERE session_id = ?1 ORDER BY rowid")
+        .unwrap();
+    stmt.query_map([session.0.to_string()], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 #[tokio::test]
 async fn deleting_an_idle_session_stops_its_agent_and_erases_it() {
     let mut f = Fixture::new();
@@ -2066,6 +2079,12 @@ async fn deleting_an_idle_session_stops_its_agent_and_erases_it() {
     f.send("one");
     f.wait_count("first reply", 1, is_idle).await;
     let session = f.session_id;
+    let before = agent_states(&f, session);
+    assert_eq!(before.len(), 1, "one context: {before:?}");
+    let held = before[0]
+        .as_deref()
+        .expect("the first reply stored a handle");
+    let handle: ResumeHandle = serde_json::from_str(held).unwrap();
     accepted(f.handle(
         DeviceId::new(),
         CommandKind::DeleteSession {
@@ -2075,6 +2094,13 @@ async fn deleting_an_idle_session_stops_its_agent_and_erases_it() {
     wait_shutdown(&agent, &f, 1).await;
     wait_erased(&f).await;
     assert_eq!(deletion_of(&f, session), "erased");
+    // The agent forgot the conversation the session's context held (D62).
+    assert_eq!(
+        agent.forgotten(),
+        vec![(f.root.join("project"), handle)],
+        "the agent's forgets"
+    );
+    assert_eq!(agent_states(&f, session), vec![None::<String>]);
 
     // The supervisor outlived the erase: another session's turn still runs.
     f.session_id = f.create_session();

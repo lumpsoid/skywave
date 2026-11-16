@@ -658,6 +658,12 @@ pub trait AgentAdapter: Send + Sync + 'static {
         &self,
         spec: StartSpec,
     ) -> impl Future<Output = Result<(Self::Session, AdapterEvents), AgentError>> + Send;
+
+    /// Deletes what the agent itself stored of the conversation `handle`
+    /// names, run in `workdir`, for `DeleteSession` (D62). Best effort: a
+    /// conversation already gone is not an error, and a failure is logged,
+    /// never returned, so a deletion always finishes.
+    fn forget(&self, workdir: &Path, handle: &ResumeHandle);
 }
 
 /// The exit error of an agent stopped by
