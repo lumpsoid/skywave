@@ -332,6 +332,12 @@ pub enum Action {
         session_id: SessionId,
         mode: PermissionMode,
     },
+    /// Turn Skywave's safety check on or off for the session; in effect once
+    /// the server logs it.
+    SetSafetyCheck {
+        session_id: SessionId,
+        on: bool,
+    },
     /// Ask the session's agent to stop its background `task` (one the
     /// view's [`work`](crate::SessionView::work) lists). The session view's
     /// [`task_stops`](crate::SessionView::task_stops) shows it until the

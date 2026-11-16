@@ -363,6 +363,7 @@ mod tests {
             body: None,
             input: None,
             approval: None,
+            safety_check: None,
             outcome,
             subagent: None,
         }))

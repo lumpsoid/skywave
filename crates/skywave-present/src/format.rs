@@ -2084,6 +2084,8 @@ mod tests {
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
+            safety_check: false,
+            safety_check_change: None,
             interrupt: None,
             stop: None,
             work: Default::default(),

@@ -1269,6 +1269,11 @@ pub struct SessionView {
     pub usage: Option<SessionUsage>,
     /// The agent's permission mode and model, and the switches on their way.
     pub agent: AgentView,
+    /// Skywave's safety check is on for the session.
+    pub safety_check: bool,
+    /// This device's switch of the safety check on its way in, until the log
+    /// holds it.
+    pub safety_check_change: Option<SettingChange<bool>>,
     /// This device's latest interrupt of the session, until its effect is in
     /// the replica.
     pub interrupt: Option<Outgoing>,
@@ -1875,6 +1880,9 @@ pub struct ToolView {
     pub input: Option<FullView>,
     /// The approval that gated the call, if it needed one.
     pub approval: Option<ToolApproval>,
+    /// Skywave's safety check approved the call without asking anyone, for
+    /// this reason.
+    pub safety_check: Option<String>,
     /// How the call's own outcome stands. A [`ToolKind::Subagent`] call's
     /// says how its launch went (a background one is `Done` once launched);
     /// heads show [`subagent`](Self::subagent) instead.
@@ -2182,6 +2190,8 @@ mod tests {
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
+            safety_check: false,
+            safety_check_change: None,
             contexts: Vec::new(),
             context: ContextId::new(),
             viewing: None,

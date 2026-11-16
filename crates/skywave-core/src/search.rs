@@ -401,6 +401,7 @@ mod tests {
             }),
             input: None,
             approval: None,
+            safety_check: None,
             outcome,
         }
     }

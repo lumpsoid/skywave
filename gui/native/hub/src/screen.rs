@@ -1511,6 +1511,8 @@ mod tests {
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
+            safety_check: false,
+            safety_check_change: None,
             contexts: Vec::new(),
             context: skywave_core::ContextId::new(),
             viewing: None,
@@ -1662,6 +1664,7 @@ mod tests {
                     }),
                     input: call_input,
                     approval: None,
+                    safety_check: None,
                     outcome: skywave_core::ToolOutcome::Running {
                         since: chrono::Utc::now(),
                     },
@@ -1726,6 +1729,7 @@ mod tests {
                         answer: None,
                         input: asked.clone(),
                     }),
+                    safety_check: None,
                     outcome: skywave_core::ToolOutcome::Running {
                         since: chrono::Utc::now(),
                     },
