@@ -19,9 +19,9 @@ use skywave_present::format::{
     context_moved_label, context_row, conversation_detail, conversation_link, conversation_title,
     conversations_empty, conversations_status, delivery_label, dir_name, dollars, effort_label,
     effort_refusal, fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal,
-    model_refusal, move_refusal, offered_modes, outgoing_label, repeat_word, scope_label,
-    session_usage_fields, stop_heading, stop_warning, subagent_status, task_kind_word, trail,
-    viewing_hint, work_summary,
+    model_refusal, move_refusal, offered_modes, on_off, outgoing_label, repeat_word,
+    safety_check_label, scope_label, session_usage_fields, stop_heading, stop_warning,
+    subagent_status, task_kind_word, trail, viewing_hint, work_summary,
 };
 use skywave_present::limits;
 use skywave_present::login;
@@ -44,11 +44,11 @@ use crate::signals::{
     ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView,
     InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState, ModeOption,
     ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
-    QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
-    SessionRowView, SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
-    StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView,
-    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView,
-    WorktreeSessionView, WorktreeView,
+    QuestionView, RenamePrompt, RepairNotice, RuleOption, SafetyCheckView, ScheduleRow,
+    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, StopHeadings,
+    StorageGroupingView, StorageRowView, StorageTotalView, SubagentHeaderView, SubagentRowView,
+    TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView,
+    WorktreeRepoView, WorktreeSessionView, WorktreeView,
 };
 use skywave_present::text::{clean, clean_line};
 
@@ -505,6 +505,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             n => Some(format!("{n} rules")),
         },
         agent: agent_settings(&session.agent),
+        safety_check: safety_check(session),
         usage: session
             .usage
             .as_ref()
@@ -708,6 +709,30 @@ fn agent_settings(agent: &AgentView) -> AgentSettingsView {
                     && waiting.effort_change.as_ref().is_some_and(|c| c.value == e),
             })
             .collect(),
+    }
+}
+
+/// Skywave's safety check: the logged switch, and this device's switch
+/// while it waits. A switch the server refused is not waiting: it shows as
+/// the refusal.
+fn safety_check(session: &SessionView) -> SafetyCheckView {
+    let change = session.safety_check_change.as_ref();
+    let refusal = change.and_then(|c| match c.outgoing {
+        Some(Outgoing::Failed(reason)) => Some(format!(
+            "safety check {} failed: {}",
+            on_off(c.value),
+            fail_reason(reason)
+        )),
+        _ => None,
+    });
+    let waiting = change.filter(|_| refusal.is_none()).map(|c| c.value);
+    let on = waiting.unwrap_or(session.safety_check);
+    SafetyCheckView {
+        label: clean_line(&safety_check_label(session.safety_check, waiting)),
+        turn_on: !on,
+        on,
+        pending: waiting.is_some_and(|v| v != session.safety_check),
+        refusal: refusal.map(|r| clean_line(&r)),
     }
 }
 

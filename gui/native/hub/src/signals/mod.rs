@@ -48,11 +48,11 @@ pub use screen::{
     HistoryRowView, HistorySearchView, InfoFieldView, InfoSectionView, LimitRowView, LimitsView,
     ListKindView, LoginFlowState, ModeOption, ModelOption, PairForm, PairingState,
     PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView, RenamePrompt,
-    RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    ShellPromptView, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
-    StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, UsageGroupingView,
-    UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView, WorktreeSessionView,
-    WorktreeView,
+    RepairNotice, RuleOption, SafetyCheckView, ScheduleRow, ScreenUpdate, ScreenView,
+    SessionRowView, SessionScreen, ShellPromptView, SnippetView, StopHeadings, StorageGroupingView,
+    StorageRowView, StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow,
+    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView,
+    WorktreeSessionView, WorktreeView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};
