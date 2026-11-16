@@ -347,6 +347,14 @@ pub enum Action {
         judgment: SafetyJudgment,
         note: Option<String>,
     },
+    /// Trust shell commands starting with `words` (a program, then literal
+    /// leading words) in every session, or stop (`on: false`); logged in
+    /// `session_id`; in effect once the server logs it.
+    SetSafetyRule {
+        session_id: SessionId,
+        words: Vec<String>,
+        on: bool,
+    },
     /// Ask the session's agent to stop its background `task` (one the
     /// view's [`work`](crate::SessionView::work) lists). The session view's
     /// [`task_stops`](crate::SessionView::task_stops) shows it until the

@@ -1288,6 +1288,7 @@ mod tests {
                     expires: login_expires,
                     flow: skywave_core::LoginFlowView::Idle,
                 },
+                safety_rules: Vec::new(),
             };
             let view = ViewState {
                 link: Link::Online { latency_ms: 1 },
@@ -1329,6 +1330,7 @@ mod tests {
             device_id: paired.then(skywave_core::DeviceId::new),
             server_fingerprint: None,
             login,
+            safety_rules: Vec::new(),
         };
         let view = ViewState {
             link: Link::Online { latency_ms: 1 },
