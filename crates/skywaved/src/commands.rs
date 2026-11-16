@@ -200,6 +200,14 @@
 //! `ShellFinished` is `RunFinished`. A second stop of a running run is
 //! accepted and logged; the first is the one the runner acts on.
 //!
+//! **SafetyCheckFeedback.** `UnknownSession`, then `MessageTooLong` for a note
+//! over [`limits::SAFETY_FEEDBACK_NOTE_MAX_BYTES`] (checked untrimmed). Then
+//! `NotAShellCall` unless the call's newest `ApprovalRequested` names a shell
+//! command (for `ShouldApprove`), or its newest `SafetyCheckApproved` does
+//! (for `ShouldAsk`): the log decides which call a feedback may judge. The
+//! note is logged trimmed, `None` when blank. The event carries what the
+//! safety check says of the command now, not what it said then.
+//!
 //! **DeleteBlob.** `UnknownBlob` when no event referenced the blob (no
 //! `event_blobs` row: a workdir blob, an id never minted), `BlobGone` when
 //! one did but its `blobs` row is gone. Otherwise the `blobs` row is
@@ -225,15 +233,16 @@
 //! after the commit, like a deleted one's. Without a preparation (plain
 //! [`EventLog::handle`]) a crop that passes its checks is an error.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     BlobUse, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
-    DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, Seq, SessionId,
-    SessionOrigin, Worktree, answers_fit, check_conversation_id, context_name, limits,
+    DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, SafetyJudgment, Seq,
+    SessionId, SessionOrigin, Worktree, answers_fit, check_conversation_id, context_name, limits,
     normalise_context_name,
 };
+use skywave_safety::Verdict;
 
 use crate::agent::import;
 use crate::attachments;
@@ -805,12 +814,59 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
-            CommandKind::SafetyCheckFeedback { session_id, .. } => {
-                if known(*session_id)?.is_none() {
+            CommandKind::SafetyCheckFeedback {
+                session_id,
+                call,
+                judgment,
+                note,
+            } => {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
+                };
+                if note
+                    .as_ref()
+                    .is_some_and(|note| note.len() > limits::SAFETY_FEEDBACK_NOTE_MAX_BYTES)
+                {
+                    return Ok(Err(RejectReason::MessageTooLong));
                 }
-                // Feedback is not accepted yet: the next step logs it.
-                return Ok(Err(RejectReason::NotAShellCall));
+                let note = note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|note| !note.is_empty())
+                    .map(str::to_owned);
+                let shell = match (
+                    judgment,
+                    event_log::call_shell_event_in(tx, *session_id, *call)?,
+                ) {
+                    (
+                        SafetyJudgment::ShouldApprove,
+                        Some(EventKind::ApprovalRequested {
+                            shell: Some(shell), ..
+                        }),
+                    )
+                    | (
+                        SafetyJudgment::ShouldAsk,
+                        Some(EventKind::SafetyCheckApproved {
+                            shell: Some(shell), ..
+                        }),
+                    ) => shell,
+                    _ => return Ok(Err(RejectReason::NotAShellCall)),
+                };
+                let (checked_safe, checked_reason) =
+                    match skywave_safety::check(&shell, Path::new(&session.workdir)) {
+                        Verdict::Safe { reason } => (true, reason),
+                        Verdict::Ask { why } => (false, why),
+                    };
+                let kind = EventKind::SafetyCheckFeedback {
+                    call: *call,
+                    judgment: *judgment,
+                    note,
+                    shell,
+                    checked_safe,
+                    checked_reason,
+                    by: device,
+                };
+                (*session_id, session.context, kind)
             }
             CommandKind::StopTask { session_id, task } => {
                 let Some(session) = known(*session_id)? else {
