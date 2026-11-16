@@ -1,7 +1,7 @@
 {
-  "protocol_version": 37,
+  "protocol_version": 38,
   "hello": {
-    "protocol_version": 37,
+    "protocol_version": 38,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -926,6 +926,43 @@
       {
         "session_id": "01920000-0000-7000-8000-000000000001",
         "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "safety_check_set",
+          "on": true,
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "safety_check_approved",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "tool": "Bash",
+          "summary": "git status",
+          "reason": "read-only git command"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "safety_check_approved",
+          "call": null,
+          "tool": "Bash",
+          "summary": "ls",
+          "reason": "read-only command"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
         "command_id": null,
         "context": "01920000-0000-7000-8000-000000000008",
         "kind": {
@@ -1669,6 +1706,14 @@
         "type": "set_effort",
         "session_id": "01920000-0000-7000-8000-000000000001",
         "effort": "high"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "set_safety_check",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "on": true
       }
     },
     {

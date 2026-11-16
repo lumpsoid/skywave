@@ -2107,6 +2107,43 @@ fn bypass_is_refused_unless_the_server_allows_it() {
     );
 }
 
+// --- SetSafetyCheck ----------------------------------------------------------
+
+#[test]
+fn set_safety_check_needs_a_known_session_and_logs_the_device() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(CommandKind::SetSafetyCheck {
+            session_id: SessionId::new(),
+            on: true,
+        }),
+        rejected(RejectReason::UnknownSession)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetSafetyCheck {
+            session_id: session,
+            on: true,
+        },
+    };
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    assert_eq!(seq, head.next(), "one event, nothing else");
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(
+        event.kind,
+        EventKind::SafetyCheckSet {
+            on: true,
+            by: device,
+        }
+    );
+}
+
 #[test]
 fn run_shell_is_checked_in_order_and_logged_verbatim() {
     let mut f = Fixture::with_shell();
