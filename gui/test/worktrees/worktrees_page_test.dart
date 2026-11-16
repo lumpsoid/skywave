@@ -18,23 +18,11 @@ const _screen = ScreenViewWorktrees(
           path: '/srv/app-fix',
           branch: 'fix-login',
           tags: ['uncommitted changes', 'not merged'],
-          sessions: [
-            WorktreeSessionView(
-              sessionId: 'a',
-              title: 'Fix login',
-              archived: false,
-              removable: true,
-              worktreeRemoved: false,
-            ),
-            WorktreeSessionView(
-              sessionId: 'b',
-              title: 'Old spike',
-              archived: true,
-              removable: false,
-              worktreeRemoved: false,
-              removalLabel: 'queued',
-            ),
-          ],
+          main: false,
+          sessions: [WorktreeSessionView(sessionId: 'a', title: 'Fix login')],
+          archived: [WorktreeSessionView(sessionId: 'b', title: 'Old spike')],
+          remove: WorktreeRemoveView(sessionId: 'a', title: 'Fix login'),
+          removalLabel: 'queued',
         ),
       ],
     ),
@@ -66,7 +54,7 @@ void main() {
     ]) {
       expect(find.text(text), findsOneWidget, reason: text);
     }
-    // Only the removable session has the button.
+    // Only the worktree that can go has the button, keyed by its session.
     expect(find.byKey(const Key('remove-worktree-a')), findsOneWidget);
     expect(find.byKey(const Key('remove-worktree-b')), findsNothing);
     expect(find.byTooltip('Remove worktree'), findsOneWidget);
