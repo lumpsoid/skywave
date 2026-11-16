@@ -1478,7 +1478,12 @@ logs) an event that no longer decodes rather than failing.
   the replica's title for each session it names; a session missing there
   is not on this device. Only the latest request's answer is kept;
   offline nothing is asked. Nothing is stored: opening the screen drops
-  the last report and asks again. `skywave_present::storage` words the
+  the last report and asks again.
+  `ReclaimServerSpace` (paired, online) asks `POST /v1/storage/reclaim`
+  within `RECLAIM_TIMEOUT` (610 s, above the server's 600 s `VACUUM`) and
+  shows `Reclaiming` until its answer; a refresh or a second reclaim asks
+  nothing meanwhile. The server's `507` (no free disk for a reclaim) is
+  `Unavailable(NoRoomToReclaim)`, the report before kept. `skywave_present::storage` words the
   totals and the three lists (by session, largest blobs, shell runs) for
   both heads, with what a blob or run row may do (`RowActions`: delete
   any blob, crop tool or shell output of a session in this replica; a

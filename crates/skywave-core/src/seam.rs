@@ -94,6 +94,12 @@ pub enum Request {
     Storage {
         req: u64,
     },
+    /// Ask the server to compact its database and report its storage, for
+    /// the storage screen, within [`RECLAIM_TIMEOUT`](crate::RECLAIM_TIMEOUT).
+    /// Answer with [`Seam::storage_reclaimed`], naming `req`.
+    ReclaimStorage {
+        req: u64,
+    },
     /// Ask the server for its worktree list, for the worktrees screen,
     /// within [`WORKTREES_TIMEOUT`](crate::WORKTREES_TIMEOUT). Answer with
     /// [`Seam::worktrees_listed`], naming `req`.
@@ -687,6 +693,18 @@ impl Seam {
         blocking(|| {
             self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.storage_reported(req, result);
+                Ok(())
+            })
+        })
+        .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::ReclaimStorage`] `req`. Kept in memory only;
+    /// an answer to an older request than the latest is ignored.
+    pub fn storage_reclaimed(&self, req: u64, result: Result<StorageReport, TransportError>) {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
+                state.model.storage_reclaimed(req, result);
                 Ok(())
             })
         })
