@@ -462,6 +462,11 @@ fn all_event_kinds() -> Vec<EventKind> {
             on: true,
             by: device(),
         },
+        EventKind::SafetyRuleSet {
+            words: vec!["git".into(), "commit".into()],
+            on: true,
+            by: device(),
+        },
         EventKind::SafetyCheckApproved {
             call: Some(call()),
             tool: "Bash".into(),
@@ -1039,6 +1044,11 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             on: true,
         },
+        CommandKind::SetSafetyRule {
+            session_id: session(),
+            words: vec!["git".into(), "commit".into()],
+            on: true,
+        },
         CommandKind::SafetyCheckFeedback {
             session_id: session(),
             call: call(),
@@ -1136,6 +1146,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::UnknownAttachment,
             RejectReason::TooManyAttachments,
             RejectReason::AttachmentsTooLarge,
+            RejectReason::BadSafetyRule,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -2036,12 +2047,14 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v39() {
-    assert_eq!(PROTOCOL_VERSION, 39);
+fn protocol_is_v40() {
+    assert_eq!(PROTOCOL_VERSION, 40);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
     assert_eq!(limits::SAFETY_FEEDBACK_NOTE_MAX_BYTES, 2000);
+    assert_eq!(limits::SAFETY_RULE_WORDS_MAX, 16);
+    assert_eq!(limits::SAFETY_RULE_MAX_BYTES, 512);
     assert_eq!(limits::MESSAGE_MAX_BYTES, 256 * 1024);
     assert_eq!(limits::FIRST_PROMPT_MAX_CHARS, 200);
     assert_eq!(limits::ATTACHMENTS_MAX, 8);

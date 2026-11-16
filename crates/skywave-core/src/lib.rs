@@ -81,7 +81,8 @@ pub use skywave_proto::PROTOCOL_VERSION;
 pub use skywave_proto::{ContentHash, Fingerprint, ImageType};
 pub use store::{
     Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
-    OutboxStatus, PendingCrop, ReadMark, ServerFacts, Settings, Snapshot, Store, StoreError,
+    OutboxStatus, PendingCrop, ReadMark, SafetyRule, ServerFacts, Settings, Snapshot, Store,
+    StoreError,
 };
 pub use transport::{
     BlobBody, BlobDownload, BoxFuture, ExpectedRun, StagedUpload, Transport, TransportError,
@@ -96,15 +97,15 @@ pub use view::{
     DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo, FailReason, FeedbackSent, FullView,
     ImportOutcome, ImportedEntry, Link, LinkFailure, LinkRejection, ListKind, MessageImage,
     ModelChoice, Outgoing, PairedInfo, PairedLink, PairingStatus, PairingView, Pause,
-    PendingApprovalRef, PendingSession, PermissionMode, PushState, QUESTION_TOOL, Question,
-    QuestionAnswer, QuestionOption, QuestionPrompt, Refusal, RejectReason, RuleScope,
-    RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyJudgment, Schedule,
-    ScheduleId, Screen, Seq, ServerAddressesView, SessionId, SessionListView, SessionRef,
-    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellEnd,
-    ShellRun, ShellRunState, ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
-    SubagentUsage, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView,
-    TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload, WorkdirFetch,
-    WorkdirPane, WorkdirPush, WorkdirView,
+    PendingApprovalRef, PendingSafetyRule, PendingSession, PermissionMode, PushState,
+    QUESTION_TOOL, Question, QuestionAnswer, QuestionOption, QuestionPrompt, Refusal, RejectReason,
+    RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyJudgment,
+    SafetyRuleView, Schedule, ScheduleId, Screen, Seq, ServerAddressesView, SessionId,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    SubagentHeader, SubagentStatus, SubagentUsage, TaskId, TaskKind, TimelineItem, ToolApproval,
+    ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody,
+    WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirPush, WorkdirView,
 };
 pub use view::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,

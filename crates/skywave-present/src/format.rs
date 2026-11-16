@@ -380,6 +380,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::UnknownAttachment => "an image expired on the server; send again",
         RejectReason::TooManyAttachments => "too many images in one message",
         RejectReason::AttachmentsTooLarge => "the message's images are too large together",
+        RejectReason::BadSafetyRule => "a rule needs 1 to 16 words, none empty, 512 bytes at most",
     }
 }
 

@@ -394,6 +394,16 @@ impl Fixture {
         })
     }
 
+    /// Sends a `SetSafetyRule` for `words`, on or off, and returns its
+    /// command id.
+    fn set_safety_rule(&mut self, words: &[&str], on: bool) -> CommandId {
+        self.command(CommandKind::SetSafetyRule {
+            session_id: self.session_id,
+            words: words.iter().map(|word| word.to_string()).collect(),
+            on,
+        })
+    }
+
     fn command(&mut self, kind: CommandKind) -> CommandId {
         let command = Command {
             id: CommandId::new(),
@@ -881,6 +891,65 @@ async fn turning_the_safety_check_off_takes_effect() {
     let id = f.approval_id();
     accepted(f.resolve(DeviceId::new(), id, Decision::Deny));
     f.wait_count("idle", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_safety_rule_approves_a_trusted_command() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(shell_script("git commit -m x"));
+    let supervisor = f.start(&agent).await;
+
+    f.set_safety_check(true);
+    f.set_safety_rule(&["git", "commit"], true);
+    f.send("commit it");
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+
+    assert!(kinds.contains(&EventKind::SafetyCheckApproved {
+        call: None,
+        tool: "shell".into(),
+        summary: "git commit -m x".into(),
+        reason: "rules: git commit".into(),
+        shell: Some("git commit -m x".into()),
+    }));
+    assert!(!kinds.iter().any(is_approval_requested));
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "ran".into(),
+        full: None,
+    }));
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("commit it"),
+            FakeInput::Answer("r".into(), Decision::Approve, None),
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_removed_safety_rule_no_longer_approves() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(shell_script("git commit -m x"));
+    let supervisor = f.start(&agent).await;
+
+    f.set_safety_check(true);
+    f.set_safety_rule(&["git", "commit"], true);
+    f.set_safety_rule(&["git", "commit"], false);
+    f.send("commit it");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    assert!(!f.kinds().iter().any(is_safety_approved));
+
+    let id = f.approval_id();
+    accepted(f.resolve(DeviceId::new(), id, Decision::Deny));
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "skipped".into(),
+        full: None,
+    }));
     supervisor.shutdown().await.unwrap();
 }
 

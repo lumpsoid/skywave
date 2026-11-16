@@ -928,6 +928,7 @@ dependencies = [
  "skywave-core",
  "skywave-present",
  "skywave-proto",
+ "skywave-safety",
  "tempfile",
  "tokio",
  "tracing",

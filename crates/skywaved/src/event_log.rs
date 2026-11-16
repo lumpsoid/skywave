@@ -48,6 +48,7 @@ use skywave_proto::{
     Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, Question, RunId, RunWhen, RunsSince,
     Seq, SessionId, SessionState, ShellEnd, ToolCall, ToolResult, Worktree, limits,
 };
+use skywave_safety::Rule;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -481,6 +482,7 @@ impl EventLog {
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => {
@@ -777,6 +779,14 @@ impl EventLog {
         Ok(matches!(kind, EventKind::SafetyCheckSet { on: true, .. }))
     }
 
+    /// The safety rules that are on, as every session's log has them: the
+    /// newest `SafetyRuleSet` of each exact word list decides, and the rules
+    /// come in the order those newest events were logged. Read on each check,
+    /// so nothing caches them.
+    pub fn safety_rules(&self, db: &Db) -> Result<Vec<Rule>> {
+        safety_rules_in(db.conn())
+    }
+
     /// Session `id`'s agent's background tasks and schedules as its log has
     /// them; empty when it has none or is unknown.
     pub fn agent_work(&self, db: &Db, id: SessionId) -> Result<AgentWork> {
@@ -1046,6 +1056,7 @@ pub(crate) fn append_in(
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
         | EventKind::SafetyCheckSet { .. }
+        | EventKind::SafetyRuleSet { .. }
         | EventKind::SafetyCheckApproved { .. }
         | EventKind::SafetyCheckFeedback { .. }
         | EventKind::ShellOutput { .. } => {}
@@ -1162,6 +1173,11 @@ const LAST_WORK_CONTEXT_SQL: &str = "SELECT context FROM events WHERE seq = MAX(
 const LAST_SAFETY_CHECK_SQL: &str = "SELECT kind FROM events WHERE seq = (
      SELECT MAX(seq) FROM events WHERE session_id = ?1
        AND json_extract(kind, '$.type') = 'safety_check_set')";
+
+/// [`safety_rules_in`]: every `safety_rule_set` event in log order, through
+/// `events_type`. Crate-visible so a test checks its plan.
+pub(crate) const SAFETY_RULES_SQL: &str = "SELECT kind FROM events
+     WHERE json_extract(kind, '$.type') = 'safety_rule_set' ORDER BY seq";
 
 /// [`call_shell_event_in`]: the newest approval request or safety check
 /// approval of one call of the session.
@@ -1548,6 +1564,35 @@ pub(crate) fn call_shell_event_in(
     Ok(Some(serde_json::from_str(&kind)?))
 }
 
+/// [`EventLog::safety_rules`]: folds the `SafetyRuleSet` events in seq order,
+/// so the newest event of each exact word list decides whether it is on. The
+/// fold keeps each rule at the position of its newest event, which orders the
+/// result by that seq. A stored rule `Rule::new` refuses is skipped with a
+/// warning: the server validates on accept, so this should not happen, and
+/// a failure here must not break an approval.
+pub(crate) fn safety_rules_in(conn: &Connection) -> Result<Vec<Rule>> {
+    let mut stmt = conn.prepare_cached(SAFETY_RULES_SQL)?;
+    let mut newest: Vec<(Vec<String>, bool)> = Vec::new();
+    for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        let kind: EventKind = serde_json::from_str(&row?)?;
+        let EventKind::SafetyRuleSet { words, on, .. } = kind else {
+            return Err(Error::Corrupt(
+                "a safety_rule_set row decodes as another event".into(),
+            ));
+        };
+        newest.retain(|(known, _)| *known != words);
+        newest.push((words, on));
+    }
+    let mut rules = Vec::new();
+    for (words, _) in newest.into_iter().filter(|(_, on)| *on) {
+        match Rule::new(words.clone()) {
+            Ok(rule) => rules.push(rule),
+            Err(error) => tracing::warn!(?words, %error, "skipping a stored safety rule"),
+        }
+    }
+    Ok(rules)
+}
+
 /// A `sessions` row's columns before its ids are parsed.
 struct SessionRow {
     workdir: String,
@@ -1753,6 +1798,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortChanged { .. } => "EffortChanged",
         EventKind::EffortRefused { .. } => "EffortRefused",
         EventKind::SafetyCheckSet { .. } => "SafetyCheckSet",
+        EventKind::SafetyRuleSet { .. } => "SafetyRuleSet",
         EventKind::SafetyCheckApproved { .. } => "SafetyCheckApproved",
         EventKind::SafetyCheckFeedback { .. } => "SafetyCheckFeedback",
         EventKind::ContextStarted { .. } => "ContextStarted",
@@ -1972,11 +2018,12 @@ mod tests {
             let plan = plan(&db, &sql);
             assert!(!scans_history(&plan), "{name} scans: {plan:#?}");
         }
-        // Positive control: the scan `offered_models` made before v18.
+        // Positive control: a scan of the log. `offered_models` made one before
+        // v18, but `events_type` (v26) now serves its type lookup; no index
+        // holds a call's `$.call`, so this query still scans.
         let old = plan(
             &db,
-            "SELECT kind FROM events WHERE json_extract(kind, '$.type') = 'models_offered' \
-             ORDER BY seq DESC LIMIT 1",
+            "SELECT kind FROM events WHERE json_extract(kind, '$.call') = 'x'",
         );
         assert!(scans_history(&old), "{old:#?}");
     }
