@@ -84,6 +84,9 @@ pub enum Action {
     /// screen (paired only); the screen shows the fresh report after. Nothing
     /// while one runs.
     ReclaimServerSpace,
+    /// Compact this device's database (`VACUUM`), on the storage screen. The
+    /// device report shows the result.
+    ReclaimDeviceSpace,
     /// Ask the server for its worktree list again, on the worktrees screen
     /// (paired only). The list shown stays until the answer; offline the
     /// screen is `Unavailable` at once and nothing is asked later.

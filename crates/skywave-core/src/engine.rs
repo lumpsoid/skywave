@@ -499,6 +499,25 @@ impl Engine {
                     }
                 });
             }
+            Request::ReclaimDeviceStorage { req } => {
+                let seam = self.seam.clone();
+                let data_dir = self.seam.data_dir();
+                self.seam.spawn("a device storage reclaim", async move {
+                    let reclaiming = seam.clone();
+                    // Off the async workers: VACUUM holds the state lock for seconds.
+                    match tokio::task::spawn_blocking(move || {
+                        reclaiming.reclaim_device_space()?;
+                        crate::store::read_device_storage(&data_dir)
+                    })
+                    .await
+                    {
+                        Ok(result) => seam.device_storage_read(req, result),
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot reclaim this device's storage")
+                        }
+                    }
+                });
+            }
             Request::ReclaimStorage { req } => {
                 let seam = self.seam.clone();
                 let Some(transport) = self.side_transport() else {

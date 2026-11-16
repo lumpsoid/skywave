@@ -984,6 +984,9 @@ pub struct StorageView {
     /// What this device keeps on its disk, read when the screen asks; `None`
     /// until the first answer.
     pub device: Option<DeviceStorage>,
+    /// A reclaim of this device's database is running; its answer replaces
+    /// [`Self::device`].
+    pub device_reclaiming: bool,
 }
 
 /// What this device keeps on its disk, read when the storage screen asks.

@@ -321,6 +321,7 @@ mod tests {
             pending: HashMap::new(),
             gone: HashSet::new(),
             device: None,
+            device_reclaiming: false,
         }
     }
 
