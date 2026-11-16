@@ -12,7 +12,7 @@
 
 use serde_json::{Map, Value};
 
-use super::protocol::DENY_MESSAGE;
+use super::protocol::{DENY_MESSAGE, SHELL_TOOL};
 use crate::agent::{BodyFormat, DisplayBody, ResultDisplay, ToolDisplay, ToolKind};
 
 /// Status of a call whose approval was denied.
@@ -84,7 +84,7 @@ pub fn call_display(name: &str, input: &Value) -> Option<ToolDisplay> {
                 &["file_path"],
             )
         }
-        "Bash" => display(
+        SHELL_TOOL => display(
             input,
             ToolKind::Shell,
             &format!("$ {}", str_field(input, "command")?),
@@ -216,7 +216,7 @@ fn failure(message: &str) -> (Option<String>, Option<String>) {
 /// Status and preview of a structured result of `tool`.
 fn success(tool: Option<&str>, fields: &Map<String, Value>) -> (Option<String>, Option<String>) {
     match tool {
-        Some("Bash") => {
+        Some(SHELL_TOOL) => {
             let stdout = str_field(fields, "stdout").unwrap_or("");
             let stderr = str_field(fields, "stderr").unwrap_or("");
             let preview = match (stdout.is_empty(), stderr.is_empty()) {

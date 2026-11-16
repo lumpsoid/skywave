@@ -452,6 +452,9 @@ pub fn deny_response(request_id: &str, message: &str) -> Value {
 /// `QuestionAsked`, not as an approval.
 pub const ASK_TOOL: &str = "AskUserQuestion";
 
+/// The tool whose `input.command` is a shell command.
+pub const SHELL_TOOL: &str = "Bash";
+
 /// The questions of an [`ASK_TOOL`] call's `input`, uncut. `None` when the
 /// input holds none, or a question with no text or no options: such a
 /// call is asked as a plain approval instead.
@@ -1372,6 +1375,10 @@ impl Protocol {
             .map(str::to_owned);
         let request = AgentRequestId(request_id.to_owned());
         let call = tool_use_id.as_deref().map(AgentCallId::from);
+        let shell = (tool == SHELL_TOOL)
+            .then(|| input.get("command").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_owned);
         let asked = (tool == ASK_TOOL).then(|| questions(&input)).flatten();
         self.pending.push(Pending {
             request: request.clone(),
@@ -1396,6 +1403,7 @@ impl Protocol {
             input,
             suggestions,
             task,
+            shell,
         });
     }
 

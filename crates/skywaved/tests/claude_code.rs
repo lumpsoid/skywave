@@ -1123,6 +1123,25 @@ fn replay_permissions_allow_then_deny() {
             .output
             .contains("file state is current in your context")
     );
+    // The Write approval names no shell command; each Bash approval names
+    // the command its `can_use_tool` request carries (permissions.ndjson).
+    assert!(matches!(
+        approval,
+        AdapterEvent::ApprovalRequested { shell: None, .. }
+    ));
+    let shells: Vec<Option<&str>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ApprovalRequested { tool, shell, .. } if tool == "Bash" => {
+                Some(shell.as_deref())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shells,
+        [Some("rm fridge-note.txt"), Some("touch oven-timer")]
+    );
 }
 
 /// AskUserQuestion (docs/agents/claude-code.md §3.14): each `can_use_tool`
@@ -2673,6 +2692,7 @@ fn write_approval() -> AdapterEvent {
         input: json!({ "file_path": "a.txt", "content": "hi" }),
         suggestions: Vec::new(),
         task: None,
+        shell: None,
     }
 }
 

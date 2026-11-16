@@ -401,6 +401,7 @@ impl EventMapper {
                 input,
                 suggestions,
                 task,
+                shell: _,
             } => {
                 let (call, summary, input) = match self.linked(call.as_ref()) {
                     Some(logged) => {
