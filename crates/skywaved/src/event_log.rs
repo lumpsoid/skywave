@@ -477,6 +477,8 @@ impl EventLog {
             // The adopting `CreateSession` logs the import, not the agent.
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
+            | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyCheckApproved { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => {
                 return Err(Error::InvalidAppend(format!(
@@ -1025,6 +1027,8 @@ pub(crate) fn append_in(
         | EventKind::AgentVersionUnconfirmed { .. }
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
+        | EventKind::SafetyCheckSet { .. }
+        | EventKind::SafetyCheckApproved { .. }
         | EventKind::ShellOutput { .. } => {}
         // Imported history is a record: an imported call opens nothing.
         EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
@@ -1698,6 +1702,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortRequested { .. } => "EffortRequested",
         EventKind::EffortChanged { .. } => "EffortChanged",
         EventKind::EffortRefused { .. } => "EffortRefused",
+        EventKind::SafetyCheckSet { .. } => "SafetyCheckSet",
+        EventKind::SafetyCheckApproved { .. } => "SafetyCheckApproved",
         EventKind::ContextStarted { .. } => "ContextStarted",
         EventKind::ContextSwitched { .. } => "ContextSwitched",
         EventKind::ContextMoved { .. } => "ContextMoved",
