@@ -3687,10 +3687,12 @@ impl Model {
     }
 
     /// The safety rules Settings lists: the rules the log holds on, then the
-    /// changes this device sent that the log does not hold yet, in outbox
-    /// order (a later one for the same words overwrites an earlier one). A
-    /// change is held once its accepted seq is folded in: a log position, not
-    /// the reply's arrival.
+    /// changes this device sent that the log does not hold yet. Only this
+    /// device's newest change for given words counts: an earlier one for the
+    /// same words is superseded, whatever its state, so once the newest is in
+    /// the replica the row has nothing pending. Rows only pending are listed
+    /// in outbox order of their newest change. A change is held once its
+    /// accepted seq is folded in: a log position, not the reply's arrival.
     fn safety_rule_views(&self) -> Vec<SafetyRuleView> {
         let mut rows: Vec<SafetyRuleView> = self
             .safety_rules
@@ -3702,7 +3704,20 @@ impl Model {
                 pending: None,
             })
             .collect();
+        let mut newest: Vec<&OutboxEntry> = Vec::new();
         for entry in &self.outbox {
+            let CommandKind::SetSafetyRule { words, .. } = &entry.command.kind else {
+                continue;
+            };
+            newest.retain(|kept| match &kept.command.kind {
+                CommandKind::SetSafetyRule {
+                    words: kept_words, ..
+                } => kept_words != words,
+                _ => true,
+            });
+            newest.push(entry);
+        }
+        for entry in newest {
             let CommandKind::SetSafetyRule {
                 session_id,
                 words,
@@ -3712,10 +3727,11 @@ impl Model {
                 continue;
             };
             let outgoing = Outgoing::from(&entry.status);
-            if self.in_replica(outgoing) {
-                continue;
-            }
-            let pending = Some(PendingSafetyRule { on: *on, outgoing });
+            let pending = (!self.in_replica(outgoing)).then_some(PendingSafetyRule {
+                command: entry.command.id,
+                on: *on,
+                outgoing,
+            });
             match rows.iter_mut().find(|row| row.words == *words) {
                 Some(row) => row.pending = pending,
                 None => rows.push(SafetyRuleView {
@@ -6512,7 +6528,11 @@ mod tests {
             words: git.clone(),
             session_id: sid,
             on: false,
-            pending: Some(PendingSafetyRule { on: true, outgoing }),
+            pending: Some(PendingSafetyRule {
+                command: command.id,
+                on: true,
+                outgoing,
+            }),
         };
         assert_eq!(safety_rules(&f), vec![pending(Outgoing::Queued)]);
 
@@ -6543,6 +6563,101 @@ mod tests {
                 pending: None,
             }]
         );
+    }
+
+    #[test]
+    fn a_failed_safety_rule_change_clears_once_a_later_one_is_logged() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let me = f.me;
+        let git = prefix(&["git", "status"]);
+        f.dispatch(Action::Navigate(Route::Settings));
+
+        // The add is refused: listed as failed, off in the log.
+        let first = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: sid,
+            words: git.clone(),
+            on: true,
+        }));
+        f.model.command_result(
+            first.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        let failed = SafetyRuleView {
+            words: git.clone(),
+            session_id: sid,
+            on: false,
+            pending: Some(PendingSafetyRule {
+                command: first.id,
+                on: true,
+                outgoing: Outgoing::Failed(FailReason::Rejected(RejectReason::UnknownSession)),
+            }),
+        };
+        assert_eq!(safety_rules(&f), vec![failed]);
+
+        // Trusted again: the newer add is accepted and logged, so the failed
+        // one no longer shows.
+        let second = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: sid,
+            words: git.clone(),
+            on: true,
+        }));
+        let seq = Seq(f.events.len() as u64 + 1);
+        f.model
+            .command_result(second.id, CommandResult::Accepted { seq }, Utc::now());
+        f.log_commands(
+            sid,
+            vec![(
+                Some(second.id),
+                EventKind::SafetyRuleSet {
+                    words: git.clone(),
+                    on: true,
+                    by: me,
+                },
+            )],
+        );
+        assert_eq!(
+            safety_rules(&f),
+            vec![SafetyRuleView {
+                words: git,
+                session_id: sid,
+                on: true,
+                pending: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_safety_rule_add_can_be_dismissed() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let git = prefix(&["git", "status"]);
+        f.dispatch(Action::Navigate(Route::Settings));
+        let command = queued(&f.dispatch(Action::SetSafetyRule {
+            session_id: sid,
+            words: git,
+            on: true,
+        }));
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        // The failed add is listed, and its command id is what dismisses it.
+        let listed = safety_rules(&f);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].pending.as_ref().map(|change| change.command),
+            Some(command.id)
+        );
+
+        f.dispatch(Action::Discard(command.id));
+        assert_eq!(safety_rules(&f), Vec::<SafetyRuleView>::new());
     }
 
     #[test]
@@ -6578,6 +6693,7 @@ mod tests {
             safety_rules(&f),
             vec![SafetyRuleView {
                 pending: Some(PendingSafetyRule {
+                    command: command.id,
                     on: false,
                     outgoing: Outgoing::Queued,
                 }),
@@ -6699,6 +6815,7 @@ mod tests {
             safety_rules(&f),
             vec![SafetyRuleView {
                 pending: Some(PendingSafetyRule {
+                    command: command.id,
                     on: false,
                     outgoing: Outgoing::Queued,
                 }),
