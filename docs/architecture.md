@@ -398,7 +398,9 @@ the daemon's appends, which would otherwise stop `serve` (below).
   what is not over (pending approvals, unfinished shell runs), or a
   session's newest event of one type through the `events_session_type`
   expression index (one `MAX(seq)` per type; an `IN` over types would read
-  every match). The supervisor's held and owed events are re-read from
+  every match). Safety rules, which apply in every session, are read per
+  approval through the `events_type` expression index (newest event per rule
+  across the log). The supervisor's held and owed events are re-read from
   their stored seqs on. A start thus costs the sessions and what is open,
   not the history: 100k events recovered in about 150 ms before, 3 ms
   after, and 3 ms at 1M (`recovery_on_a_large_log`, by hand). The
@@ -482,6 +484,15 @@ the daemon's appends, which would otherwise stop `serve` (below).
   given to `skywave_safety::check`: a `Safe` verdict answers the agent at
   once and logs `SafetyCheckApproved` instead of `ApprovalRequested`, so
   nothing is pending; `Ask` logs the approval as usual (D59).
+
+  Beside the read-only proof, the check takes the person's safety rules
+  (D61): every `SafetyRuleSet` across sessions, newest per `words` winning.
+  A simple command that starts with a rule's words is trusted, though its
+  redirections are still checked; a line passes only when every simple
+  command is covered. The approval's `reason` names the rules used. Devices
+  keep the rules in their replica (core's `safety_rules` table) for the
+  settings list, and a shell row offers its commands' literal words
+  (`skywave_safety::simple_commands`) as rule candidates.
 
   Both events carry the `shell` command. A device can then send
   `SafetyCheckFeedback` on such a call: `ShouldApprove` where a person was

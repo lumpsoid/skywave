@@ -1,9 +1,12 @@
-//! Proves a shell command read-only and confined to the session's workdir.
+//! Proves a shell command read-only and confined to the session's workdir,
+//! or covered by a person's rules.
 //!
 //! The checker answers only "safe" or "ask". Every unknown, unparsed or
 //! unsupported construct is "ask": an expansion, a glob, a write, a path
-//! outside the workdir, a program off the allowlist. It never denies; a
-//! human decides anything it cannot prove.
+//! outside the workdir, a program off the allowlist. A rule (a program and
+//! its literal leading words) trusts a simple command the proof can't
+//! cover, as the person's choice (D61). It never denies; a human decides
+//! anything it cannot prove or the person has not trusted.
 
 mod paths;
 mod programs;
