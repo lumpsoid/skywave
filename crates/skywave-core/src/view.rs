@@ -1886,6 +1886,9 @@ pub struct ToolView {
     /// Feedback on the safety check this call's row may send, if it is a
     /// shell call that asked a person or that the safety check approved.
     pub safety_feedback: Option<SafetyFeedbackView>,
+    /// The shell command this call runs, as the agent's approval request or
+    /// the safety check named it; `None` when neither did.
+    pub shell: Option<String>,
     /// How the call's own outcome stands. A [`ToolKind::Subagent`] call's
     /// says how its launch went (a background one is `Done` once launched);
     /// heads show [`subagent`](Self::subagent) instead.

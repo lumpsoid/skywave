@@ -1393,6 +1393,7 @@ mod tests {
                 }),
                 safety_check: None,
                 safety_feedback: None,
+                shell: None,
                 outcome: ToolOutcome::Running { since: Utc::now() },
                 subagent: None,
             })),
