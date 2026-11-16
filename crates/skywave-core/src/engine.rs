@@ -2482,12 +2482,13 @@ mod tests {
         )
         .unwrap();
         db.execute_batch(
-            "ALTER TABLE sessions DROP COLUMN safety_check;
+            "DROP TABLE safety_rules;
+             ALTER TABLE sessions DROP COLUMN safety_check;
              ALTER TABLE sessions DROP COLUMN worktree_removed;
              ALTER TABLE sessions DROP COLUMN worktree;",
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 8)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 9)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(
