@@ -136,6 +136,27 @@ pub enum ScreenView {
         /// What an empty list says; `None` when it has rows or there is
         /// no report.
         empty_label: Option<String>,
+        /// The server's disk by kind, for a stacked bar; empty without a
+        /// report.
+        server_kinds: Vec<StorageKindView>,
+        /// What the server's reclaim would give back, as `2.0 MiB`; `None`
+        /// when there is nothing to reclaim, or a reclaim is running.
+        server_reclaimable: Option<String>,
+        /// A reclaim on the server is running.
+        server_reclaiming: bool,
+        /// What the screen says above this device's storage while it has no
+        /// fresh answer; `None` once it has one.
+        device_status_label: Option<String>,
+        /// This device's totals, `Used` first; empty until its report.
+        device_totals: Vec<StorageTotalView>,
+        /// This device's disk by kind, for a stacked bar; empty until its
+        /// report.
+        device_kinds: Vec<StorageKindView>,
+        /// What this device's reclaim would give back, as `2.0 MiB`; `None`
+        /// when there is nothing to reclaim, or a reclaim is running.
+        device_reclaimable: Option<String>,
+        /// A reclaim of this device's database is running.
+        device_reclaiming: bool,
     },
     /// Every git worktree of the repositories sessions' worktrees came
     /// from, asked for on opening; `RefreshWorktrees` asks again.
@@ -276,6 +297,40 @@ pub struct StorageRowView {
     /// The blob a blob or shell run row stands for, and what may be done
     /// to it; `None` for a session row and a run kept as no blob.
     pub target: Option<BlobTargetView>,
+    /// The session a Sessions row stands for, for selecting and acting on
+    /// it; `None` for other rows.
+    pub session: Option<StorageSessionView>,
+}
+
+/// One part of a stacked bar of the storage screen: `Database`, `Blobs`, ….
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct StorageKindView {
+    pub label: String,
+    /// The bytes, for the bar's fractions. `i64` because Dart reads big
+    /// integers as one; Rust clamps to `i64::MAX`.
+    pub bytes: i64,
+    /// `18.6 GiB`.
+    pub size: String,
+}
+
+/// What a Sessions row of the storage screen stands for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct StorageSessionView {
+    pub session_id: String,
+    /// What the server keeps for the session, `2.0 MiB`; `None` when the
+    /// server's report does not list it.
+    pub server_size: Option<String>,
+    /// What this device keeps for the session; `None` when this device's
+    /// report does not list it.
+    pub device_size: Option<String>,
+    /// The session is in this replica.
+    pub here: bool,
+    /// On the archived list.
+    pub archived: bool,
+    /// Removable from this device, as the session list says.
+    pub deletable: bool,
+    /// Deletable everywhere, as the session list says.
+    pub deletable_everywhere: bool,
 }
 
 /// One repository of the worktrees screen.

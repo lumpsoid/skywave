@@ -1488,7 +1488,15 @@ logs) an event that no longer decodes rather than failing.
   within `RECLAIM_TIMEOUT` (610 s, above the server's 600 s `VACUUM`) and
   shows `Reclaiming` until its answer; a refresh or a second reclaim asks
   nothing meanwhile. The server's `507` (no free disk for a reclaim) is
-  `Unavailable(NoRoomToReclaim)`, the report before kept. `skywave_present::storage` words the
+  `Unavailable(NoRoomToReclaim)`, the report before kept.
+  `ReclaimDeviceSpace` (on this screen, no server needed) runs `VACUUM` and
+  a WAL truncate on the `Store`'s own connection under the state lock, on a
+  blocking thread, so dispatch waits for it rather than failing on the 5 s
+  busy timeout; then this device's report is read again and replaces
+  `StorageView::device`. `device_reclaiming` is true meanwhile: a refresh
+  asks no device report and a second reclaim nothing. Opening the screen
+  forgets a reclaim in flight; a failure keeps the report before it.
+  `skywave_present::storage` words the
   totals and the three lists (by session, largest blobs, shell runs) for
   both heads. The by-session list joins the server's sessions with this
   device's (largest by both sizes), so it shows offline too; each row
