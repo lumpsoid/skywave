@@ -12,8 +12,10 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// paired as, the link to it with its round trip, the fingerprint to
 /// compare with what `skywaved` prints, when the agent's login on the
 /// server expires, with Log in where the server offers a login from a
-/// device ([AgentLoginPanel] below it), and Re-pair. A paired server's tile opens its
-/// addresses ([ServerAddressesPage]), to reach it at another without
+/// device ([AgentLoginPanel] below it), and Re-pair. Below it, the safety
+/// rules the person trusts, each with a remove button (D61). A paired
+/// server's tile opens its addresses ([ServerAddressesPage]), to reach it at
+/// another without
 /// re-pairing.
 class SettingsPage extends StatelessWidget {
   const SettingsPage({

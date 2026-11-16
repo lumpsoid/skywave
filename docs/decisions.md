@@ -1556,6 +1556,7 @@ N` (absent = 0 = restart) and appends; any other N answers
   failure the feature exists for.
 
 ## D59. Skywave's safety check approves provably read-only shell commands (v38)
+**Amended by D61:** user-written rules approve commands beside the read-only proof, as trust rather than proof.
 A session that opts in lets `skywaved` answer some approvals itself: a
 shell command it can prove read-only and confined to the session's
 workdir is approved without a prompt, and the log says the safety check
@@ -1631,3 +1632,58 @@ note, shell, checked_safe, checked_reason, by }`, synced like any event."
 
 **Deferred:**
 - The TUI's way to send it (the GUI's row menu has it).
+
+## D61. A person's safety rules approve the commands they trust (v40)
+
+The safety check (D59) approves only what it can prove read-only, so a
+tuned workflow (build, test, commit) still asks at every step. A person
+who has watched it run can say which commands they trust; the check then
+approves those too, without Claude Code's auto mode.
+
+**Decided:**
+- A rule is a program and its literal leading words (`git commit`,
+  `cargo test -p skywave-core`). A simple command matches when it starts
+  with exactly those words. No patterns, no regex.
+- A rule is trust, not proof: it may approve a command that writes. A
+  match skips the read-only table and the path rule for that simple
+  command, but its redirections are still checked, so a `>` write outside
+  what the table proves still asks.
+- A shell line is approved only when every simple command in it is
+  covered, by a rule or by the read-only table. Rules are tried first, so
+  a rule can approve what the table asks about (`tail -f`).
+- `$(cmd)` passes when the inner command passes; its value is unknown, so
+  a rule accepts unknown words after its own, while a table program asks.
+  Backquote substitutions always ask: bash un-escapes `\\` and `\$`
+  inside them before parsing and `brush-parser` does not, so proving them
+  would prove a different command.
+- Rules only approve, never deny, so a wrong rule costs at most what the
+  person chose to trust.
+- A device sends `SetSafetyRule { session_id, words, on }`; the server
+  logs `SafetyRuleSet { words, on, by }` in that session. Rules apply in
+  every session: the newest event per `words`, across all sessions, wins.
+  They live in the server's event log (synced, audited), never in a
+  workdir the agent can edit.
+- `SafetyCheckApproved.reason` names what approved it: `read-only: cat,
+  grep; rules: git commit` (unchanged when no rule was used).
+- The GUI adds a rule from a shell row's menu ("Trust command…"): one
+  line per simple command, prefilled with its literal words; the person
+  taps a word to stop the rule there, and never edits the text, so a
+  quoted word like `-m "fix it"` stays exact. Settings lists the rules,
+  each with a remove button.
+- The server reads rules per approval through a new `events_type`
+  expression index; no cache to keep coherent.
+
+**Known gap:** a rule on `cd` makes later path checks in the same line
+relative to the wrong directory. Trusting `cd` is trusting where it goes.
+
+**Rejected:**
+- Generalizing a refused command into a pattern: guessing intent (simple
+  over smart).
+- Rules in a file in the workdir: the agent could edit its own trust.
+- A wrapper special case (`timeout 60 cargo test`): a literal rule
+  `timeout 60 cargo test` covers it.
+- Per-session or per-workdir scope: not needed yet; it can come later as
+  an optional field.
+
+**Deferred:**
+- The TUI's way to add and list rules.
