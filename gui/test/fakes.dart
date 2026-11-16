@@ -159,6 +159,12 @@ ScreenUpdate sessionScreen({SubagentHeaderView? subagent}) => ScreenUpdate(
       contextId: 'c1',
       rules: const [],
       agent: unknownAgent,
+      safetyCheck: const SafetyCheckView(
+        label: 'safety check off',
+        turnOn: true,
+        on: false,
+        pending: false,
+      ),
       usage: const [],
       composer: _composer,
       snippets: const [],

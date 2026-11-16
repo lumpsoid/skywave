@@ -2105,10 +2105,7 @@ void main() {
     const off = 'Conversation only: hide tool calls';
     const on = 'Conversation only is on: show tool calls';
     IconButton button(String tooltip) => tester.widget<IconButton>(
-      find.ancestor(
-        of: byTooltip(tooltip),
-        matching: find.byType(IconButton),
-      ),
+      find.ancestor(of: byTooltip(tooltip), matching: find.byType(IconButton)),
     );
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -2133,6 +2130,107 @@ void main() {
     expect(find.byIcon(Icons.forum), findsOneWidget);
     await tester.tap(byTooltip(on));
     expect(sent.last, const GuiIntentToggleConversationOnly());
+  });
+
+  testWidgets('the safety check is turned on and off from the bar', (
+    tester,
+  ) async {
+    IconButton button(String tooltip) => tester.widget<IconButton>(
+      find.ancestor(of: byTooltip(tooltip), matching: find.byType(IconButton)),
+    );
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([]),
+      sent: sent,
+    );
+    expect(button('Safety check').isSelected, isFalse);
+    expect(button('Safety check').style, isNull);
+    await tester.tap(byTooltip('Safety check'));
+    await tester.pumpAndSettle();
+    expect(find.text('safety check off'), findsOneWidget);
+    expect(
+      find.textContaining('Skywave approves a shell command'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+    expect(sent.whereType<GuiIntentAct>(), isEmpty);
+
+    await tester.tap(byTooltip('Safety check'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Turn on'));
+    await tester.pumpAndSettle();
+    expect(
+      sent.last,
+      const GuiIntentAct(
+        action: ActionIntentSetSafetyCheck(sessionId: 's1', on: true),
+      ),
+    );
+
+    await pumpSession(
+      tester,
+      screen: screenWith(
+        safetyCheck: const SafetyCheckView(
+          label: 'safety check on',
+          turnOn: false,
+          on: true,
+          pending: false,
+        ),
+      ),
+      timeline: holding([]),
+      sent: sent,
+    );
+    expect(button('Safety check is on').isSelected, isTrue);
+    expect(button('Safety check is on').style, isNotNull);
+    await tester.tap(byTooltip('Safety check is on'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Turn off'));
+    await tester.pumpAndSettle();
+    expect(
+      sent.last,
+      const GuiIntentAct(
+        action: ActionIntentSetSafetyCheck(sessionId: 's1', on: false),
+      ),
+    );
+  });
+
+  testWidgets('a refused safety check shows why', (tester) async {
+    const refusal = 'safety check on failed: offline';
+    const refused = SafetyCheckView(
+      label: 'safety check off',
+      refusal: refusal,
+      turnOn: true,
+      on: false,
+      pending: false,
+    );
+    Future<void> show(SessionScreen screen) =>
+        pumpSession(tester, screen: screen, timeline: holding([]), sent: []);
+    Finder snack(String text) =>
+        find.descendant(of: find.byType(SnackBar), matching: find.text(text));
+
+    await show(screenWith());
+    expect(find.byType(SnackBar), findsNothing);
+
+    await show(screenWith(safetyCheck: refused));
+    expect(snack(refusal), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.close));
+    await tester.pumpAndSettle();
+
+    // The same refusal again, as on any rebuild: said once.
+    await show(screenWith(safetyCheck: refused));
+    expect(find.byType(SnackBar), findsNothing);
+
+    await tester.tap(byTooltip('Safety check'));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.text(refusal),
+      ),
+      findsOneWidget,
+    );
   });
 
   testWidgets('the usage summary and the More menu open the session info', (
@@ -2307,6 +2405,21 @@ void main() {
         expect(find.byType(BottomSheet), findsNothing, reason: label);
         await more();
       }
+
+      // The safety check opens its dialog from the sheet rather than sending.
+      await tester.tap(byTooltip('Safety check'));
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.text('Safety check'),
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
+      await more();
 
       await tester.tap(find.text('Stop agent'));
       await tester.pumpAndSettle();
@@ -2504,10 +2617,7 @@ void main() {
         timeline: holding([]),
         sent: [],
       );
-      expect(
-        byTooltip('effort max refused: not for this model'),
-        findsOne,
-      );
+      expect(byTooltip('effort max refused: not for this model'), findsOne);
       await tester.tap(find.text('effort medium'));
       await tester.pumpAndSettle();
       expect(
@@ -2540,10 +2650,7 @@ void main() {
         sent: [],
       );
       expect(byTooltip('Effort'), findsNothing, reason: 'folded');
-      expect(
-        byTooltip('effort max refused: not for this model'),
-        findsOne,
-      );
+      expect(byTooltip('effort max refused: not for this model'), findsOne);
     });
 
     testWidgets('a refusal shows on its chip and in its picker', (

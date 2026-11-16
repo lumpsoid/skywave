@@ -21,7 +21,7 @@ use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
     bytes, context_moved_line, context_started_line, context_switched_line, decision_label,
     delivery_label, dollars, download_state, fail_reason, import_finished_line, moved_from_line,
-    outgoing_label, seconds, subagent_status, took_label, turn_time,
+    outgoing_label, safety_approval_label, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::markdown as md;
 use skywave_present::sections::{
@@ -671,6 +671,13 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (ToolState, String) {
         Some(ApprovalStatus::Cancelled { .. }) => Some("approval cancelled".to_owned()),
         Some(ApprovalStatus::Pending) | None => None,
     };
+    // Skywave's own check approved it, when no human did: the same words'
+    // place as a human's answer, and a human's answer wins if both are set.
+    let answered = answered.or_else(|| {
+        view.safety_check
+            .as_deref()
+            .map(|reason| safety_approval_label(&clean_line(reason)))
+    });
     let asks = view.approval.as_ref().is_some_and(|a| a.question);
     match &view.outcome {
         ToolOutcome::Running { .. } if approval == Some(&ApprovalStatus::Pending) => {
@@ -1071,6 +1078,8 @@ mod tests {
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
+            safety_check: false,
+            safety_check_change: None,
             contexts: Vec::new(),
             context: ContextId::new(),
             viewing: None,
@@ -1352,6 +1361,7 @@ mod tests {
                     answer: None,
                     input: Some(asked),
                 }),
+                safety_check: None,
                 outcome: ToolOutcome::Running { since: Utc::now() },
                 subagent: None,
             })),

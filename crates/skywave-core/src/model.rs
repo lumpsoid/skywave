@@ -1077,6 +1077,12 @@ impl Model {
                     Vec::new(),
                 )
             }
+            Action::SetSafetyCheck { session_id, on } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::SetSafetyCheck { session_id, on }, Vec::new())
+            }
             Action::StopTask { session_id, task } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
@@ -3269,6 +3275,8 @@ impl Model {
             rules,
             usage: summary.usage.clone(),
             agent: self.agent_view(summary),
+            safety_check: summary.safety_check,
+            safety_check_change: self.safety_check_change(id),
             contexts,
             context,
             viewing,
@@ -3554,20 +3562,23 @@ impl Model {
         }
     }
 
+    /// This device's newest outbox command that `is` takes, with its outgoing
+    /// state, while the replica does not hold its result yet.
+    fn local(&self, is: &dyn Fn(&CommandKind) -> bool) -> Option<(CommandKind, Outgoing)> {
+        self.outbox
+            .iter()
+            .rev()
+            .find(|e| is(&e.command.kind))
+            .map(|e| (e.command.kind.clone(), Outgoing::from(&e.status)))
+            .filter(|(_, outgoing)| !self.in_replica(*outgoing))
+    }
+
     /// The session's agent settings: the summary's fold, with this device's
     /// switches still on their way in front.
     fn agent_view(&self, summary: &SessionSummary) -> AgentView {
         let id = summary.id;
         let agent = &summary.agent;
-        let local = |is: &dyn Fn(&CommandKind) -> bool| {
-            self.outbox
-                .iter()
-                .rev()
-                .find(|e| is(&e.command.kind))
-                .map(|e| (e.command.kind.clone(), Outgoing::from(&e.status)))
-                .filter(|(_, outgoing)| !self.in_replica(*outgoing))
-        };
-        let mode_change = match local(
+        let mode_change = match self.local(
             &|kind| matches!(kind, CommandKind::SetPermissionMode { session_id, .. } if *session_id == id),
         ) {
             Some((CommandKind::SetPermissionMode { mode, .. }, outgoing)) => Some(SettingChange {
@@ -3579,7 +3590,7 @@ impl Model {
                 outgoing: None,
             }),
         };
-        let model_change = match local(
+        let model_change = match self.local(
             &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
         ) {
             Some((CommandKind::SetModel { model, .. }, outgoing)) => Some(SettingChange {
@@ -3591,7 +3602,7 @@ impl Model {
                 outgoing: None,
             }),
         };
-        let effort_change = match local(
+        let effort_change = match self.local(
             &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
         ) {
             Some((CommandKind::SetEffort { effort, .. }, outgoing)) => Some(SettingChange {
@@ -3615,6 +3626,21 @@ impl Model {
             model_refused: agent.model.refused.clone(),
             models: self.models.clone(),
             bypass_allowed: self.settings.server.bypass_allowed,
+        }
+    }
+
+    /// The session's safety check switch still on its way in front: this
+    /// device's newest `SetSafetyCheck` for the session, until the replica
+    /// holds its result.
+    fn safety_check_change(&self, id: SessionId) -> Option<SettingChange<bool>> {
+        match self.local(
+            &|kind| matches!(kind, CommandKind::SetSafetyCheck { session_id, .. } if *session_id == id),
+        ) {
+            Some((CommandKind::SetSafetyCheck { on, .. }, outgoing)) => Some(SettingChange {
+                value: on,
+                outgoing: Some(outgoing),
+            }),
+            _ => None,
         }
     }
 
@@ -4218,6 +4244,15 @@ impl Model {
                     by: self.asker(&asked_by, *answers),
                     refused: Some(reason.clone()),
                 }),
+                // A safety-check approval shows on its call. One without a
+                // call, or whose call is not in the timeline, shows nowhere.
+                EventKind::SafetyCheckApproved { call, reason, .. } => {
+                    if let Some((_, view, _)) = tools.call(&mut items, *call) {
+                        view.safety_check = Some(reason.clone());
+                    }
+                    None
+                }
+                EventKind::SafetyCheckSet { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -4307,6 +4342,7 @@ impl Model {
             }),
             input: input.as_ref().map(|f| self.full_view(f)),
             approval: None,
+            safety_check: None,
             outcome,
             subagent: None,
         }
@@ -4937,6 +4973,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetPermissionMode { session_id, .. }
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }
+        | CommandKind::SetSafetyCheck { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
         | CommandKind::SwitchContext { session_id, .. }
         | CommandKind::MoveContext { session_id, .. }
@@ -6217,6 +6254,52 @@ mod tests {
         assert_eq!(f.session_view().task_stops, vec![]);
         // The task is still listed: it can be stopped again.
         assert_eq!(f.session_view().work.tasks.len(), 1);
+    }
+
+    #[test]
+    fn a_safety_check_switch_shows_until_it_is_logged() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        assert!(!f.session_view().safety_check);
+
+        let command = queued(&f.dispatch(Action::SetSafetyCheck {
+            session_id: sid,
+            on: true,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::SetSafetyCheck {
+                session_id: sid,
+                on: true
+            }
+        );
+        // On its way: this device's switch, the flag still off.
+        let view = f.session_view();
+        assert!(!view.safety_check);
+        assert_eq!(
+            view.safety_check_change,
+            Some(SettingChange {
+                value: true,
+                outgoing: Some(Outgoing::Queued),
+            })
+        );
+
+        // Logged and accepted: the log holds it, so it is in effect.
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::SafetyCheckSet { on: true, by: me },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        let view = f.session_view();
+        assert!(view.safety_check);
+        assert_eq!(view.safety_check_change, None);
     }
 
     #[test]
@@ -9775,6 +9858,43 @@ mod tests {
     }
 
     #[test]
+    fn a_safety_check_approval_shows_on_its_call_and_nowhere_else() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let call = CallId::new();
+        f.log(
+            sid,
+            vec![
+                tool_call(Some(call), ToolKind::Shell, "cat notes.txt"),
+                EventKind::SafetyCheckApproved {
+                    call: Some(call),
+                    tool: "agent-tool".into(),
+                    summary: "cat notes.txt".into(),
+                    reason: "read-only: cat".into(),
+                },
+            ],
+        );
+        f.open(sid);
+        let views = tools(&f);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].safety_check.as_deref(), Some("read-only: cat"));
+        assert_eq!(views[0].approval, None, "nobody was asked");
+
+        // Without a call it has nowhere to show.
+        f.log(
+            sid,
+            vec![EventKind::SafetyCheckApproved {
+                call: None,
+                tool: "agent-tool".into(),
+                summary: "ls".into(),
+                reason: "read-only: ls".into(),
+            }],
+        );
+        assert_eq!(entries(&f).len(), 1, "no entry for an unlinked approval");
+        assert_eq!(tools(&f)[0].safety_check.as_deref(), Some("read-only: cat"));
+    }
+
+    #[test]
     fn an_unconfirmed_agent_version_shows_as_an_entry_but_is_no_news() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
@@ -9895,6 +10015,7 @@ mod tests {
                 answer: None,
                 input: None,
             }),
+            safety_check: None,
             outcome: ToolOutcome::Running { since: minute(2) },
         };
         assert_eq!(entries(&f), vec![Entry::Tool(Box::new(waiting.clone()))]);

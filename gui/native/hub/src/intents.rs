@@ -108,6 +108,10 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             session_id: id("session", &session_id)?,
             mode: permission_mode(mode),
         },
+        ActionIntent::SetSafetyCheck { session_id, on } => Action::SetSafetyCheck {
+            session_id: id("session", &session_id)?,
+            on,
+        },
         ActionIntent::SetModel { session_id, model } => Action::SetModel {
             session_id: id("session", &session_id)?,
             model,
@@ -326,6 +330,23 @@ mod tests {
                 session_id: session,
                 mode: PermissionMode::DontAsk,
             })
+        );
+        assert_eq!(
+            action(ActionIntent::SetSafetyCheck {
+                session_id: session.0.to_string(),
+                on: true,
+            }),
+            Ok(Action::SetSafetyCheck {
+                session_id: session,
+                on: true,
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::SetSafetyCheck {
+                session_id: "nope".into(),
+                on: false,
+            }),
+            Err("not a session id: \"nope\"".to_owned())
         );
         assert_eq!(
             action(ActionIntent::SetModel {

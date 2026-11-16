@@ -25,8 +25,8 @@ use skywaved::agent::claude_code::protocol::{
 };
 use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{
-    ALLOW_BYPASS_ARG, ClaudeCodeAdapter, CliSession, KEEP_TRANSCRIPTS_SETTINGS, NO_AUTOUPDATE_ENV,
-    REQUIRED_ARGS,
+    ALLOW_BYPASS_ARG, ClaudeCodeAdapter, CliSession, KEEP_BASH_CWD_ENV, KEEP_TRANSCRIPTS_SETTINGS,
+    NO_AUTOUPDATE_ENV, REQUIRED_ARGS,
 };
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
@@ -1122,6 +1122,25 @@ fn replay_permissions_allow_then_deny() {
         result
             .output
             .contains("file state is current in your context")
+    );
+    // The Write approval names no shell command; each Bash approval names
+    // the command its `can_use_tool` request carries (permissions.ndjson).
+    assert!(matches!(
+        approval,
+        AdapterEvent::ApprovalRequested { shell: None, .. }
+    ));
+    let shells: Vec<Option<&str>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ApprovalRequested { tool, shell, .. } if tool == "Bash" => {
+                Some(shell.as_deref())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shells,
+        [Some("rm fridge-note.txt"), Some("touch oven-timer")]
     );
 }
 
@@ -2673,6 +2692,7 @@ fn write_approval() -> AdapterEvent {
         input: json!({ "file_path": "a.txt", "content": "hi" }),
         suggestions: Vec::new(),
         task: None,
+        shell: None,
     }
 }
 
@@ -3006,9 +3026,19 @@ fn every_process_is_started_with_the_auto_updater_off() {
     let set: Vec<_> = command.as_std().get_envs().collect();
     assert_eq!(
         set,
-        [(OsStr::new("DISABLE_AUTOUPDATER"), Some(OsStr::new("1")))]
+        [
+            (
+                OsStr::new("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR"),
+                Some(OsStr::new("1"))
+            ),
+            (OsStr::new("DISABLE_AUTOUPDATER"), Some(OsStr::new("1"))),
+        ]
     );
     assert_eq!(NO_AUTOUPDATE_ENV, ("DISABLE_AUTOUPDATER", "1"));
+    assert_eq!(
+        KEEP_BASH_CWD_ENV,
+        ("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1")
+    );
 }
 
 #[test]

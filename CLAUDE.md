@@ -12,6 +12,9 @@ below before designing anything.
   (`src/agent/claude_code/`), pairing and the CA.
 - `crates/skywave-core`: device side: replica, outbox, sync, link state.
 - `crates/skywave-present`: presentation decisions shared by every head.
+- `crates/skywave-safety`: the safety check (D59): proves a shell command
+  read-only inside a workdir. No side effects (reads only file metadata);
+  used by `skywaved`.
 - `crates/skywave-tui`: terminal head. `crates/skywave-testkit`: test helpers.
 - `crates/skywave-claude-compat`: run after a `claude` upgrade. It checks the
   real CLI against the adapter (`--quick`, then `--full`).

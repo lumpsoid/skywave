@@ -208,7 +208,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// interrupted upload; a `PUT` with that header sends the rest, and
 /// [`UploadResult::OffsetMismatch`] answers one whose offset is not what the
 /// server holds.
-pub const PROTOCOL_VERSION: u32 = 37;
+///
+/// v38: the safety check: [`CommandKind::SetSafetyCheck`],
+/// [`EventKind::SafetyCheckSet`] and [`EventKind::SafetyCheckApproved`].
+pub const PROTOCOL_VERSION: u32 = 38;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -691,6 +694,24 @@ pub enum EventKind {
         reason: String,
         answers: Option<CommandId>,
     },
+    /// A `SetSafetyCheck` command turned Skywave's safety check on (`true`)
+    /// or off. Skywave's own check: no agent is asked, so there is no
+    /// request or answer event, only this one. Not notable.
+    SafetyCheckSet {
+        on: bool,
+        by: DeviceId,
+    },
+    /// Skywave's safety check, not the agent and not a device, approved this
+    /// tool call without asking anyone; `reason` says why it is safe. Never
+    /// pending, never notified. `call` is the [`ToolCall`] approved, when
+    /// one was logged. Not notable.
+    SafetyCheckApproved {
+        #[serde(default)]
+        call: Option<CallId>,
+        tool: String,
+        summary: String,
+        reason: String,
+    },
     /// The agent's live background tasks after a change, in the agent's
     /// order: the whole set, replacing the last one logged (see
     /// [`AgentWork::apply`]). At most [`limits::TASKS_MAX`]. Not notable.
@@ -931,6 +952,7 @@ impl EventKind {
             | EventKind::PermissionModeRequested { by, .. }
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
+            | EventKind::SafetyCheckSet { by, .. }
             | EventKind::ContextStarted { by, .. }
             | EventKind::ContextSwitched { by }
             | EventKind::ContextMoved { by, .. }
@@ -962,6 +984,7 @@ impl EventKind {
             | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
+            | EventKind::SafetyCheckApproved { .. }
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRefused { .. }
@@ -995,6 +1018,7 @@ impl EventKind {
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
+            | EventKind::SafetyCheckSet { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
@@ -1021,6 +1045,7 @@ impl EventKind {
             | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
+            | EventKind::SafetyCheckApproved { .. }
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRefused { .. }
@@ -1068,6 +1093,8 @@ impl EventKind {
             | EventKind::EffortRequested { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
+            | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyCheckApproved { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
@@ -1168,6 +1195,8 @@ impl EventKind {
             | EventKind::ImportFinished { .. }
             // It names a blob it deleted; it references none.
             | EventKind::BlobDeleted { .. }
+            | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyCheckApproved { .. }
             | EventKind::FileWritten { .. } => (None, None),
         };
         let attachments: &[Attachment] = match self {
@@ -2113,6 +2142,11 @@ pub enum CommandKind {
         session_id: SessionId,
         effort: Effort,
     },
+    /// Turn Skywave's safety check on (`true`) or off for the session. It
+    /// is Skywave's own, so no agent is asked: the answer is the
+    /// `SafetyCheckSet` this logs, naming this device. Accepted for any
+    /// known session, even when it is already so. Never starts the agent.
+    SetSafetyCheck { session_id: SessionId, on: bool },
     /// Start a new, empty context `context` (an id the client chose) named
     /// `name` and make it current: the agent starts afresh. The server logs
     /// the name as [`normalise_context_name`] leaves it, or a generated one

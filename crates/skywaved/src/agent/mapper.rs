@@ -401,25 +401,13 @@ impl EventMapper {
                 input,
                 suggestions,
                 task,
+                shell: _,
             } => {
-                let (call, summary, input) = match self.linked(call.as_ref()) {
-                    Some(logged) => {
-                        let blob = if logged.input == input {
-                            None
-                        } else {
-                            Some(input_blob(&mut stored(storage), &input)?)
-                        };
-                        (Some(logged.id), logged.title.clone(), blob)
-                    }
-                    None => {
-                        let (summary, shown_whole) = generic_title(&input);
-                        let blob = if shown_whole {
-                            None
-                        } else {
-                            Some(input_blob(&mut stored(storage), &input)?)
-                        };
-                        (None, summary, blob)
-                    }
+                let (call, summary, input_known) = self.approval_view(call.as_ref(), &input);
+                let input = if input_known {
+                    None
+                } else {
+                    Some(input_blob(&mut stored(storage), &input)?)
                 };
                 let id = ApprovalId::new();
                 seqs.push(self.append(
@@ -706,6 +694,31 @@ impl EventMapper {
         Ok(seqs)
     }
 
+    /// Logs that Skywave's safety check approved the approval of `call` (a
+    /// `tool` asking to run `input`) for `reason`, instead of a person. Nothing
+    /// is pending, so no approval is recorded and no input blob is stored.
+    pub fn safety_approved(
+        &mut self,
+        log: &EventLog,
+        storage: &mut Storage,
+        call: Option<AgentCallId>,
+        tool: String,
+        input: &Value,
+        reason: String,
+    ) -> Result<Seq> {
+        let (call, summary, _) = self.approval_view(call.as_ref(), input);
+        self.append(
+            log,
+            storage,
+            EventKind::SafetyCheckApproved {
+                call,
+                tool,
+                summary,
+                reason,
+            },
+        )
+    }
+
     fn append(&mut self, log: &EventLog, storage: &mut Storage, kind: EventKind) -> Result<Seq> {
         if AgentSettings::folds(&kind) {
             self.settings.apply(None, &kind);
@@ -781,6 +794,28 @@ impl EventMapper {
             seqs.push(self.append(log, storage, kind)?);
         }
         Ok(())
+    }
+
+    /// The call an approval of `call` (asking to run `input`) belongs to, and
+    /// the summary it shows. The flag is `true` when `input` needs no blob of
+    /// its own: the linked call logged that same input, or the summary shows
+    /// all of it.
+    fn approval_view(
+        &self,
+        call: Option<&AgentCallId>,
+        input: &Value,
+    ) -> (Option<CallId>, String, bool) {
+        match self.linked(call) {
+            Some(logged) => (
+                Some(logged.id),
+                logged.title.clone(),
+                logged.input == *input,
+            ),
+            None => {
+                let (summary, shown_whole) = generic_title(input);
+                (None, summary, shown_whole)
+            }
+        }
     }
 
     /// The call remembered for the agent's `call`, if any.

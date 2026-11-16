@@ -45,6 +45,7 @@ Android app; the Kotlin head it replaced is gone (D28).
 | `skywaved`         | Server daemon: agent supervisor, event log, HTTPS API, admin CLI |
 | `skywave-core`     | All client logic: state machine, sync, outbox, local replica, transport |
 | `skywave-present`  | Head-side presentation every head shares: timeline sections, neutral wording, UTF-16 cursors, the display filter for agent content (control characters dropped, bidi controls escaped visibly); pure, on `skywave-core` only |
+| `skywave-safety`   | The safety check (D59): proves a shell command read-only and inside a workdir, on a parsed AST. No side effects (reads only file metadata); used by `skywaved` |
 | `skywave-tui`      | First head |
 | `skywave-testkit`  | Test-only: the link harness proxy (latency, jitter, bandwidth, drops); a dev-dependency only |
 | `skywave-claude-compat` | Manual tool: runs the real Claude Code CLI through the adapter's `Protocol` and reports broken contracts and newly available features (docs/agents/claude-code.md) |
@@ -476,7 +477,12 @@ the daemon's appends, which would otherwise stop `serve` (below).
   start a new context. A clear or switch stops a running agent like `StopSession`.
   The session's grants pass to every start of its contexts, never to
   another session. An approval waits with no timeout but ends with the agent
-  process. A question the agent asks with options (`QuestionAsked`, D47)
+  process. When the session's safety check is on (its newest
+  `SafetyCheckSet`), an approval that carries a `shell` command is first
+  given to `skywave_safety::check`: a `Safe` verdict answers the agent at
+  once and logs `SafetyCheckApproved` instead of `ApprovalRequested`, so
+  nothing is pending; `Ask` logs the approval as usual (D59).
+  A question the agent asks with options (`QuestionAsked`, D47)
   is an approval in all but its answer: the same ids, pending list,
   cancels and first answer wins. `AnswerQuestion` answers it with one
   `QuestionAnswer` per question, checked against the questions in the

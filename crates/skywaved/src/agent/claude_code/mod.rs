@@ -15,7 +15,9 @@
 //! ```
 //!
 //! with `DISABLE_AUTOUPDATER=1` in its environment ([`NO_AUTOUPDATE_ENV`]),
-//! so the CLI never updates itself under the adapter. The `--settings`
+//! so the CLI never updates itself under the adapter, and with
+//! `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` ([`KEEP_BASH_CWD_ENV`]), so
+//! a Bash call starts in the workdir. The `--settings`
 //! ([`KEEP_TRANSCRIPTS_SETTINGS`]) keeps the CLI's own retention sweep from
 //! deleting the transcripts a resume needs. A CLI that still
 //! reports another version than [`protocol::PINNED_VERSION`] is reported as
@@ -237,6 +239,11 @@ pub fn bypass_arg(args: &[String]) -> Option<String> {
 /// §1.
 pub const NO_AUTOUPDATE_ENV: (&str, &str) = ("DISABLE_AUTOUPDATER", "1");
 
+/// The environment variable (name, value) every CLI process gets so each
+/// Bash call starts in the workdir, as `shell` on an approval promises
+/// (probed on 2.1.310: without it a `cd` carries into the next call).
+pub const KEEP_BASH_CWD_ENV: (&str, &str) = ("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1");
+
 /// How long shutdown waits for a turn to end, and then for the exit.
 pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// How long start waits for the initialize handshake.
@@ -334,8 +341,8 @@ impl ClaudeCodeAdapter {
     }
 
     /// The command for a process taking up `session` in `workdir`: the
-    /// [`command_args`](Self::command_args) and [`NO_AUTOUPDATE_ENV`] on
-    /// top of the server's environment.
+    /// [`command_args`](Self::command_args), [`NO_AUTOUPDATE_ENV`] and
+    /// [`KEEP_BASH_CWD_ENV`] on top of the server's environment.
     pub fn command(
         &self,
         workdir: &Path,
@@ -347,6 +354,7 @@ impl ClaudeCodeAdapter {
         command
             .args(self.command_args(session, session_rules, mode))
             .env(NO_AUTOUPDATE_ENV.0, NO_AUTOUPDATE_ENV.1)
+            .env(KEEP_BASH_CWD_ENV.0, KEEP_BASH_CWD_ENV.1)
             .current_dir(workdir);
         command
     }

@@ -2,6 +2,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
+import 'package:skywave_gui/session/agent_pickers.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
 import 'package:skywave_gui/session/question_panel.dart';
 import 'package:skywave_gui/session/background_sheet.dart';
@@ -81,7 +82,7 @@ class _SessionPageState extends State<SessionPage> {
   }
 
   /// What the agent or server refused, in words, for each thing this page
-  /// asks of it: an interrupt, a mode, a model.
+  /// asks of it: an interrupt, a mode, a model, the safety check.
   static List<String?> _refusalsOf(SessionScreen screen) => [
     if (screen.interruptRefusal case final refusal?)
       'Interrupt failed: $refusal'
@@ -89,6 +90,7 @@ class _SessionPageState extends State<SessionPage> {
       null,
     screen.agent.modeRefusal,
     screen.agent.modelRefusal,
+    screen.safetyCheck.refusal,
   ];
 
   /// Says each refusal that arrived since [before] once, in a snack bar;
@@ -243,6 +245,16 @@ class _SessionPageState extends State<SessionPage> {
                         label: 'Conversation only',
                         selected: screen.conversationOnly,
                         onPressed: closing(toggleConversationOnly),
+                      ),
+                      _QuickAction(
+                        icon: screen.safetyCheck.on
+                            ? Icons.health_and_safety
+                            : Icons.health_and_safety_outlined,
+                        label: 'Safety check',
+                        selected: screen.safetyCheck.on,
+                        onPressed: closing(
+                          () => pickSafetyCheck(context, screen, widget.send),
+                        ),
                       ),
                     ],
                   ),
@@ -492,6 +504,25 @@ class _SessionPageState extends State<SessionPage> {
                         icon: const Icon(Icons.forum_outlined),
                         selectedIcon: const Icon(Icons.forum),
                       ),
+                      // A subagent's view spends its room on its own
+                      // controls; the switch is reached on the session's page.
+                      if (screen.subagent == null)
+                        IconButton(
+                          tooltip: screen.safetyCheck.on
+                              ? 'Safety check is on'
+                              : 'Safety check',
+                          isSelected: screen.safetyCheck.on,
+                          style: screen.safetyCheck.on
+                              ? IconButton.styleFrom(
+                                  backgroundColor: theme.colorScheme.primary,
+                                  foregroundColor: theme.colorScheme.onPrimary,
+                                )
+                              : null,
+                          onPressed: () =>
+                              pickSafetyCheck(context, screen, widget.send),
+                          icon: const Icon(Icons.health_and_safety_outlined),
+                          selectedIcon: const Icon(Icons.health_and_safety),
+                        ),
                       IconButton(
                         tooltip: 'Search (Ctrl+F)',
                         onPressed: _openSearch,
