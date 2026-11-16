@@ -121,6 +121,7 @@ mod tests {
                     input: None,
                 }),
                 safety_check: None,
+                safety_feedback: None,
                 outcome: ToolOutcome::Running {
                     since: chrono::Utc::now(),
                 },

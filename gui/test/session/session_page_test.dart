@@ -400,6 +400,137 @@ void main() {
     expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.call));
   });
 
+  testWidgets(
+    'a shell row the safety check judged sends feedback with a note',
+    (tester) async {
+      tall(tester);
+      final timeline = holding([
+        anyRow(
+          's:1',
+          RowKind.tool,
+          '',
+          tool: shellFacts(
+            'cat a',
+            feedback: const SafetyFeedbackFacts(
+              call: 'c1',
+              judgment: SafetyJudgmentView.shouldAsk,
+            ),
+          ),
+          expandable: true,
+        ),
+        anyRow(
+          's:2',
+          RowKind.tool,
+          '',
+          tool: shellFacts('cat b'),
+          expandable: true,
+        ),
+        anyRow(
+          's:3',
+          RowKind.tool,
+          '',
+          tool: shellFacts(
+            'cat c',
+            feedback: const SafetyFeedbackFacts(
+              call: 'c2',
+              judgment: SafetyJudgmentView.shouldApprove,
+            ),
+          ),
+          expandable: true,
+        ),
+      ]);
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: timeline,
+        sent: sent,
+      );
+      sent.clear();
+
+      Future<void> openMenu(String label) async {
+        await tester.tapAt(
+          tester.getCenter(find.text(label, findRichText: true)),
+          buttons: kSecondaryButton,
+        );
+        await tester.pumpAndSettle();
+      }
+
+      Finder dialogButton(String label) => find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.text(label),
+      );
+
+      // A row the hub does not mark has no feedback item. The menu is open
+      // (Copy call shows), so the absence is not an empty check.
+      await openMenu('Bash  cat b');
+      expect(find.text('Copy call'), findsOneWidget);
+      expect(find.text('Safety feedback…'), findsNothing);
+      await tester.tapAt(Offset.zero);
+      await tester.pumpAndSettle();
+
+      // Cancel sends nothing.
+      await openMenu('Bash  cat a');
+      await tester.tap(find.text('Safety feedback…'));
+      await tester.pumpAndSettle();
+      expect(find.text('Should have asked'), findsOneWidget);
+      await tester.tap(dialogButton('Cancel'));
+      await tester.pumpAndSettle();
+      expect(sent, isEmpty);
+
+      // Send trims the note.
+      await openMenu('Bash  cat a');
+      await tester.tap(find.text('Safety feedback…'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const Key('safety-feedback-note')),
+        '  too broad  ',
+      );
+      await tester.tap(dialogButton('Send'));
+      await tester.pumpAndSettle();
+      expect(sent, hasLength(1));
+      expect(
+        sent.last,
+        const GuiIntentAct(
+          action: ActionIntentSafetyCheckFeedback(
+            sessionId: 's1',
+            call: 'c1',
+            judgment: SafetyJudgmentView.shouldAsk,
+            note: 'too broad',
+          ),
+        ),
+      );
+
+      // A blank note is sent as no note.
+      await openMenu('Bash  cat a');
+      await tester.tap(find.text('Safety feedback…'));
+      await tester.pumpAndSettle();
+      await tester.tap(dialogButton('Send'));
+      await tester.pumpAndSettle();
+      expect(sent, hasLength(2));
+      expect(
+        sent.last,
+        const GuiIntentAct(
+          action: ActionIntentSafetyCheckFeedback(
+            sessionId: 's1',
+            call: 'c1',
+            judgment: SafetyJudgmentView.shouldAsk,
+          ),
+        ),
+      );
+
+      // The other judgment names itself in the dialog.
+      await openMenu('Bash  cat c');
+      await tester.tap(find.text('Safety feedback…'));
+      await tester.pumpAndSettle();
+      expect(find.text('Should have been approved'), findsOneWidget);
+      expect(find.text('Should have asked'), findsNothing);
+      await tester.tap(dialogButton('Cancel'));
+      await tester.pumpAndSettle();
+      expect(sent, hasLength(2));
+    },
+  );
+
   testWidgets('a message\'s text selects; its menu copies it or the whole '
       'message; a tap and the row menu still work', (tester) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.linux;

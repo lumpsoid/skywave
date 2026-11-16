@@ -1,7 +1,7 @@
 {
-  "protocol_version": 38,
+  "protocol_version": 39,
   "hello": {
-    "protocol_version": 38,
+    "protocol_version": 39,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -460,7 +460,8 @@
               "label": "allow exec(cargo:*)",
               "scope": "user"
             }
-          ]
+          ],
+          "shell": "rm -rf target"
         }
       },
       {
@@ -481,7 +482,8 @@
               "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
             }
           },
-          "suggestions": []
+          "suggestions": [],
+          "shell": null
         }
       },
       {
@@ -496,7 +498,8 @@
           "tool": "put",
           "summary": "src/main.rs",
           "input": "lost",
-          "suggestions": []
+          "suggestions": [],
+          "shell": null
         }
       },
       {
@@ -944,7 +947,8 @@
           "call": "01920000-0000-7000-8000-000000000007",
           "tool": "Bash",
           "summary": "git status",
-          "reason": "read-only git command"
+          "reason": "read-only git command",
+          "shell": "git status"
         }
       },
       {
@@ -957,7 +961,40 @@
           "call": null,
           "tool": "Bash",
           "summary": "ls",
-          "reason": "read-only command"
+          "reason": "read-only command",
+          "shell": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "safety_check_feedback",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "judgment": "should_approve",
+          "note": "a plain listing",
+          "shell": "ls -la",
+          "checked_safe": false,
+          "checked_reason": "not on the read-only list",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "safety_check_feedback",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "judgment": "should_ask",
+          "note": null,
+          "shell": "git status",
+          "checked_safe": true,
+          "checked_reason": "read-only git command",
+          "by": "01920000-0000-7000-8000-000000000003"
         }
       },
       {
@@ -1719,6 +1756,16 @@
     {
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
+        "type": "safety_check_feedback",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "call": "01920000-0000-7000-8000-000000000007",
+        "judgment": "should_ask",
+        "note": "it wrote a file"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
         "type": "clear_context",
         "session_id": "01920000-0000-7000-8000-000000000001",
         "context": "01920000-0000-7000-8000-000000000008",
@@ -1866,6 +1913,10 @@
     {
       "result": "rejected",
       "reason": "approval_cancelled"
+    },
+    {
+      "result": "rejected",
+      "reason": "not_a_shell_call"
     },
     {
       "result": "rejected",

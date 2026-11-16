@@ -188,6 +188,18 @@ async fn status_reports_a_running_serve_and_fails_without_one() {
 }
 
 #[tokio::test]
+async fn safety_feedback_prints_nothing_without_feedback() {
+    let d = Daemon::new();
+    let output = d.cli(&["safety-feedback"]).await;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
 async fn sighup_reopens_a_moved_log_file() {
     let d = Daemon::new();
     let mut serve = d.serve();

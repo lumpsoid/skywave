@@ -631,7 +631,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
-    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38,
+    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -765,6 +765,14 @@ fn v36_to_v37(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// check: a command and two events, all new, so no stored event or command
 /// result changes.
 fn v37_to_v38(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v38 to v39. v39 added safety check feedback (a command, an event, a reject
+/// reason, all new) and an optional `shell` on `ApprovalRequested` and
+/// `SafetyCheckApproved`, which v38 JSON lacks and reads as `None`; nothing
+/// stored changes.
+fn v38_to_v39(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 

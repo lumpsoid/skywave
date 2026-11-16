@@ -350,6 +350,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::UnknownApproval => "the server does not know this approval",
         RejectReason::ApprovalAlreadyResolved => "already answered on another device",
         RejectReason::ApprovalCancelled => "the approval was cancelled first",
+        RejectReason::NotAShellCall => "that call has no shell command to check",
         RejectReason::NoActiveTurn => "the agent was not working",
         RejectReason::UnknownRule => "the agent did not offer that rule",
         RejectReason::BadAnswer => "that answer does not fit the question",

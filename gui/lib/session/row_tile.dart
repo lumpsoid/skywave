@@ -7,6 +7,7 @@ import 'package:skywave_gui/session/highlight.dart';
 import 'package:skywave_gui/session/images.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/markdown_body.dart';
+import 'package:skywave_gui/session/safety_feedback.dart';
 import 'package:skywave_gui/session/section_block.dart';
 import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -14,8 +15,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// One timeline row as Rust sent it: the turn separator or "new" rule
 /// above it, its time, then the item by kind, with its content sections.
 /// A tap selects it and expands or collapses it; a long press or right
-/// click opens its menu (copy, save as snippet, download, edit or
-/// discard). A message's
+/// click opens its menu (copy, save as snippet, safety feedback, download,
+/// edit or discard). A message's
 /// text selects, with its own menu. A call that starts a subagent has an
 /// Open that shows the subagent's own steps.
 class RowTile extends StatelessWidget {
@@ -83,6 +84,19 @@ class RowTile extends StatelessWidget {
       if (!context.mounted) return;
       final name = await askSnippetName(context);
       if (name != null) send(GuiIntentSaveSnippet(key: row.key, name: name));
+    } else if (chosen case GuiIntentAct(
+      action: final ActionIntentSafetyCheckFeedback action,
+    )) {
+      // The note comes first; the menu only says which judgment.
+      if (!context.mounted) return;
+      final text = await askSafetyFeedbackNote(context, action.judgment);
+      if (text != null) {
+        send(
+          GuiIntentAct(
+            action: action.copyWith(note: () => text.isEmpty ? null : text),
+          ),
+        );
+      }
     } else if (chosen != null) {
       send(chosen);
     }
@@ -106,6 +120,18 @@ class RowTile extends StatelessWidget {
         'Copy call',
         Icons.data_object,
         GuiIntentCopy(key: row.key, what: CopyWhat.call),
+      ),
+    if (row.tool?.feedback case final feedback?)
+      (
+        'Safety feedback…',
+        Icons.flag_outlined,
+        GuiIntentAct(
+          action: ActionIntentSafetyCheckFeedback(
+            sessionId: sessionId,
+            call: feedback.call,
+            judgment: feedback.judgment,
+          ),
+        ),
       ),
     if (row.expandable && !row.expanded) ...[
       ('Expand', Icons.unfold_more, GuiIntentExpandItem(key: row.key)),

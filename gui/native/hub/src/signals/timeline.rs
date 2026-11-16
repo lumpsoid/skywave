@@ -1,5 +1,5 @@
 use rinf::{RustSignal, SignalPiece};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::crop::BlobTargetView;
 
@@ -215,6 +215,27 @@ pub struct ToolFacts {
     /// `state_label`, which then says how the launch itself went; `None`
     /// for any other call, and while its approval is pending or it failed.
     pub status: Option<String>,
+    /// Feedback on the safety check this row can send: set only for a
+    /// shell call that asked a person or that the safety check approved.
+    pub feedback: Option<SafetyFeedbackFacts>,
+}
+
+/// Feedback on the safety check a shell call's row can send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct SafetyFeedbackFacts {
+    /// The call to send it on, for `ActionIntent::SafetyCheckFeedback`.
+    pub call: String,
+    /// The judgment the row sends; fixed by how the call was approved.
+    pub judgment: SafetyJudgmentView,
+}
+
+/// How the safety check judged a shell call wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+pub enum SafetyJudgmentView {
+    /// It asked a person, but the check should have approved it.
+    ShouldApprove,
+    /// The check approved it, but it should have asked.
+    ShouldAsk,
 }
 
 /// Which kind of tool, for its icon. Never its name.

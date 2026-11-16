@@ -211,7 +211,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v38: the safety check: [`CommandKind::SetSafetyCheck`],
 /// [`EventKind::SafetyCheckSet`] and [`EventKind::SafetyCheckApproved`].
-pub const PROTOCOL_VERSION: u32 = 38;
+///
+/// v39: feedback on the safety check: [`CommandKind::SafetyCheckFeedback`],
+/// [`EventKind::SafetyCheckFeedback`], [`RejectReason::NotAShellCall`], and
+/// the `shell` of [`EventKind::ApprovalRequested`] and
+/// [`EventKind::SafetyCheckApproved`].
+pub const PROTOCOL_VERSION: u32 = 39;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -547,6 +552,11 @@ pub enum EventKind {
         /// index. Empty in events from before v4.
         #[serde(default)]
         suggestions: Vec<RuleSuggestion>,
+        /// The shell command the call would run, when the adapter named one
+        /// (D59); feedback on the safety check is allowed only for such a
+        /// call.
+        #[serde(default)]
+        shell: Option<String>,
     },
     /// First answer wins (D5). `rule` is the index of the suggestion of the
     /// request granted along with an approval; never set with a denial.
@@ -711,6 +721,25 @@ pub enum EventKind {
         tool: String,
         summary: String,
         reason: String,
+        /// The shell command the call would run, when the adapter named one
+        /// (D59); feedback on the safety check is allowed only for such a
+        /// call.
+        #[serde(default)]
+        shell: Option<String>,
+    },
+    /// A user's judgment of the safety check on `call`, with the command and
+    /// what the checker says of it when the feedback was logged
+    /// (`checked_safe`, and its reason or why it would ask). Not notable,
+    /// not activity.
+    SafetyCheckFeedback {
+        call: CallId,
+        judgment: SafetyJudgment,
+        #[serde(default)]
+        note: Option<String>,
+        shell: String,
+        checked_safe: bool,
+        checked_reason: String,
+        by: DeviceId,
     },
     /// The agent's live background tasks after a change, in the agent's
     /// order: the whole set, replacing the last one logged (see
@@ -953,6 +982,7 @@ impl EventKind {
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
             | EventKind::SafetyCheckSet { by, .. }
+            | EventKind::SafetyCheckFeedback { by, .. }
             | EventKind::ContextStarted { by, .. }
             | EventKind::ContextSwitched { by }
             | EventKind::ContextMoved { by, .. }
@@ -1019,6 +1049,7 @@ impl EventKind {
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyCheckFeedback { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
@@ -1095,6 +1126,7 @@ impl EventKind {
             | EventKind::EffortRefused { .. }
             | EventKind::SafetyCheckSet { .. }
             | EventKind::SafetyCheckApproved { .. }
+            | EventKind::SafetyCheckFeedback { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
@@ -1197,6 +1229,7 @@ impl EventKind {
             | EventKind::BlobDeleted { .. }
             | EventKind::SafetyCheckSet { .. }
             | EventKind::SafetyCheckApproved { .. }
+            | EventKind::SafetyCheckFeedback { .. }
             | EventKind::FileWritten { .. } => (None, None),
         };
         let attachments: &[Attachment] = match self {
@@ -1347,6 +1380,8 @@ pub mod limits {
     /// longer one as `BadShellCommand` rather than cut it, as a cut command
     /// would run something else.
     pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
+    /// Longest note a safety check feedback carries.
+    pub const SAFETY_FEEDBACK_NOTE_MAX_BYTES: usize = 2000;
     /// Longest `SendMessage::text`, in UTF-8 bytes; the server refuses a
     /// longer one as `MessageTooLong` rather than cut it, as a cut message
     /// would ask something else. Generous for anything typed or pasted (a
@@ -2009,6 +2044,16 @@ pub enum Decision {
     Deny,
 }
 
+/// A user's judgment of the safety check on one shell call.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyJudgment {
+    /// It asked a human, but the command is safe: the check should have approved it.
+    ShouldApprove,
+    /// The check approved it, but it should have asked.
+    ShouldAsk,
+}
+
 /// Body of `GET /v1/events`: consecutive events starting at seq `from`.
 ///
 /// Seqs are contiguous (D12), so the i-th event has seq `from + i`. An empty
@@ -2147,6 +2192,19 @@ pub enum CommandKind {
     /// `SafetyCheckSet` this logs, naming this device. Accepted for any
     /// known session, even when it is already so. Never starts the agent.
     SetSafetyCheck { session_id: SessionId, on: bool },
+    /// A user's judgment of the safety check on `call`, a tool call of the
+    /// session. The answer is the `SafetyCheckFeedback` event this logs,
+    /// naming this device. `ShouldApprove` needs the call's logged
+    /// `ApprovalRequested` to name a shell command, `ShouldAsk` its
+    /// `SafetyCheckApproved` to; otherwise `NotAShellCall`. Never starts the
+    /// agent.
+    SafetyCheckFeedback {
+        session_id: SessionId,
+        call: CallId,
+        judgment: SafetyJudgment,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Start a new, empty context `context` (an id the client chose) named
     /// `name` and make it current: the agent starts afresh. The server logs
     /// the name as [`normalise_context_name`] leaves it, or a generated one
@@ -2398,6 +2456,9 @@ pub enum RejectReason {
     /// ended, its agent was stopped, or the daemon restarted. No answer can
     /// apply any more.
     ApprovalCancelled,
+    /// The call named no shell command, or not the kind of check the
+    /// judgment is about.
+    NotAShellCall,
     /// `Interrupt` arrived while the session had no running turn.
     NoActiveTurn,
     /// `ResolveApproval.rule` came with a denial, or names no suggestion of

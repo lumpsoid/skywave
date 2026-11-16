@@ -1690,6 +1690,7 @@ mod tests {
                     input: call_input,
                     approval: None,
                     safety_check: None,
+                    safety_feedback: None,
                     outcome: skywave_core::ToolOutcome::Running {
                         since: chrono::Utc::now(),
                     },
@@ -1755,6 +1756,7 @@ mod tests {
                         input: asked.clone(),
                     }),
                     safety_check: None,
+                    safety_feedback: None,
                     outcome: skywave_core::ToolOutcome::Running {
                         since: chrono::Utc::now(),
                     },

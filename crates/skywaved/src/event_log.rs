@@ -481,6 +481,7 @@ impl EventLog {
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyCheckFeedback { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => {
                 return Err(Error::InvalidAppend(format!(
@@ -1046,6 +1047,7 @@ pub(crate) fn append_in(
         | EventKind::TaskStopRefused { .. }
         | EventKind::SafetyCheckSet { .. }
         | EventKind::SafetyCheckApproved { .. }
+        | EventKind::SafetyCheckFeedback { .. }
         | EventKind::ShellOutput { .. } => {}
         // Imported history is a record: an imported call opens nothing.
         EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
@@ -1160,6 +1162,13 @@ const LAST_WORK_CONTEXT_SQL: &str = "SELECT context FROM events WHERE seq = MAX(
 const LAST_SAFETY_CHECK_SQL: &str = "SELECT kind FROM events WHERE seq = (
      SELECT MAX(seq) FROM events WHERE session_id = ?1
        AND json_extract(kind, '$.type') = 'safety_check_set')";
+
+/// [`call_shell_event_in`]: the newest approval request or safety check
+/// approval of one call of the session.
+const CALL_SHELL_EVENT_SQL: &str = "SELECT kind FROM events WHERE seq = (
+     SELECT MAX(seq) FROM events WHERE session_id = ?1
+       AND json_extract(kind, '$.type') IN ('approval_requested', 'safety_check_approved')
+       AND json_extract(kind, '$.call') = ?2)";
 
 /// [`worktree_in`]: the session's `SessionCreated`, the only event that
 /// names a worktree.
@@ -1520,6 +1529,25 @@ pub(crate) fn last_state_event_in(
     Ok(Some((serde_json::from_str(&kind)?, parse_id(&context)?)))
 }
 
+/// The newest `ApprovalRequested` or `SafetyCheckApproved` of `call` in
+/// session `session_id`, as the log has it; `None` when neither names it.
+pub(crate) fn call_shell_event_in(
+    conn: &Connection,
+    session_id: SessionId,
+    call: CallId,
+) -> Result<Option<EventKind>> {
+    let row: Option<String> = conn
+        .prepare_cached(CALL_SHELL_EVENT_SQL)?
+        .query_row(params![session_id.0.to_string(), call.0.to_string()], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(kind) = row else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(&kind)?))
+}
+
 /// A `sessions` row's columns before its ids are parsed.
 struct SessionRow {
     workdir: String,
@@ -1726,6 +1754,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortRefused { .. } => "EffortRefused",
         EventKind::SafetyCheckSet { .. } => "SafetyCheckSet",
         EventKind::SafetyCheckApproved { .. } => "SafetyCheckApproved",
+        EventKind::SafetyCheckFeedback { .. } => "SafetyCheckFeedback",
         EventKind::ContextStarted { .. } => "ContextStarted",
         EventKind::ContextSwitched { .. } => "ContextSwitched",
         EventKind::ContextMoved { .. } => "ContextMoved",
