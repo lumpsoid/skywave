@@ -383,7 +383,7 @@ impl Budget {
         let mut got = 0;
         let _ = self
             .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 got = left.min(want as u64);
                 Some(if left == u64::MAX { left } else { left - got })
             });

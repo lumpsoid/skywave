@@ -3073,7 +3073,7 @@ mod tests {
                 let stalled = workdir == "/slow"
                     && self
                         .stalls
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_ok();
                 if stalled {
                     tokio::time::sleep(StallingServer::STALL).await;

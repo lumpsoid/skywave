@@ -1275,10 +1275,7 @@ impl<A: AgentAdapter> Supervisor<A> {
     async fn drain(&mut self, first: SessionId) -> Result<()> {
         let mut todo = vec![first];
         while let Some(id) = todo.pop() {
-            loop {
-                let Some(held) = self.held.get_mut(&id) else {
-                    break;
-                };
+            while let Some(held) = self.held.get_mut(&id) {
                 if held.op.is_some() {
                     break;
                 }

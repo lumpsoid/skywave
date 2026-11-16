@@ -10,7 +10,7 @@ pub(crate) struct Snippets(Vec<Snippet>);
 
 impl Snippets {
     pub(crate) fn new(mut stored: Vec<Snippet>) -> Snippets {
-        stored.sort_by(|a, b| b.used.cmp(&a.used));
+        stored.sort_by_key(|a| std::cmp::Reverse(a.used));
         Snippets(stored)
     }
 
