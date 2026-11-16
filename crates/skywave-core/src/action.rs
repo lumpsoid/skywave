@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use skywave_proto::ContentHash;
+use skywave_proto::{ContentHash, SafetyJudgment};
 
 use crate::attachment::{AttachedFile, AttachedImage};
 use crate::login::LoginCode;
@@ -337,6 +337,15 @@ pub enum Action {
     SetSafetyCheck {
         session_id: SessionId,
         on: bool,
+    },
+    /// Tell the server the safety check judged shell call `call` wrong
+    /// (`judgment`), with an optional note; the server keeps it for
+    /// improving the check.
+    SafetyCheckFeedback {
+        session_id: SessionId,
+        call: CallId,
+        judgment: SafetyJudgment,
+        note: Option<String>,
     },
     /// Ask the session's agent to stop its background `task` (one the
     /// view's [`work`](crate::SessionView::work) lists). The session view's

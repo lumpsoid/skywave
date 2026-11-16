@@ -103,6 +103,7 @@ mod tests {
             input: None,
             approval: None,
             safety_check: None,
+            safety_feedback: None,
             outcome: ToolOutcome::Done {
                 is_error: false,
                 status: None,

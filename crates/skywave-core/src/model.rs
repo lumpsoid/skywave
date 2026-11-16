@@ -15,8 +15,8 @@ use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ContentHash, ConversationsResult,
     DeviceInfo, DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem,
     LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RepoListing, RuleSuggestion,
-    SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, WorktreeList,
-    answers_fit,
+    SafetyJudgment, SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind,
+    ToolResult, WorktreeList, answers_fit,
 };
 
 use crate::action::{Action, Route};
@@ -46,16 +46,16 @@ use crate::view::{
     BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobUse, BlobView, BodyView, CallId,
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
-    FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
-    LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
+    FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan,
+    Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
     PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession,
-    QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER, Screen, Seq,
-    ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow,
-    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
-    ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
-    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
-    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload,
-    WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
+    QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER, SafetyFeedbackView,
+    Screen, Seq, ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef,
+    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun,
+    ShellRunState, ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader,
+    SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView,
+    UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody,
+    WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -1082,6 +1082,25 @@ impl Model {
                     return Vec::new();
                 }
                 self.enqueue(CommandKind::SetSafetyCheck { session_id, on }, Vec::new())
+            }
+            Action::SafetyCheckFeedback {
+                session_id,
+                call,
+                judgment,
+                note,
+            } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(
+                    CommandKind::SafetyCheckFeedback {
+                        session_id,
+                        call,
+                        judgment,
+                        note,
+                    },
+                    Vec::new(),
+                )
             }
             Action::StopTask { session_id, task } => {
                 if self.summary(session_id).is_none() {
@@ -3980,7 +3999,7 @@ impl Model {
                     summary,
                     input,
                     suggestions,
-                    ..
+                    shell,
                 } => match tools.offer(*id, suggestions).call(&mut items, *call) {
                     Some((item, view, _)) if view.approval.is_none() => {
                         view.approval = Some(ToolApproval {
@@ -3990,6 +4009,12 @@ impl Model {
                             answer: None,
                             input: input.as_ref().map(|f| self.full_view(f)),
                         });
+                        if shell.is_some() {
+                            view.safety_feedback = Some(SafetyFeedbackView {
+                                judgment: SafetyJudgment::ShouldApprove,
+                                sent: None,
+                            });
+                        }
                         tools.approvals.insert(*id, item);
                         None
                     }
@@ -4248,13 +4273,40 @@ impl Model {
                 }),
                 // A safety-check approval shows on its call. One without a
                 // call, or whose call is not in the timeline, shows nowhere.
-                EventKind::SafetyCheckApproved { call, reason, .. } => {
+                EventKind::SafetyCheckApproved {
+                    call,
+                    reason,
+                    shell,
+                    ..
+                } => {
                     if let Some((_, view, _)) = tools.call(&mut items, *call) {
                         view.safety_check = Some(reason.clone());
+                        if shell.is_some() {
+                            view.safety_feedback = Some(SafetyFeedbackView {
+                                judgment: SafetyJudgment::ShouldAsk,
+                                sent: None,
+                            });
+                        }
                     }
                     None
                 }
-                EventKind::SafetyCheckSet { .. } | EventKind::SafetyCheckFeedback { .. } => None,
+                // The feedback is the newest on its call, from any device. It
+                // is logged, so this device's outbox copy no longer shows.
+                EventKind::SafetyCheckFeedback { call, note, .. } => {
+                    if let Some(command_id) = event.command_id {
+                        logged.insert(command_id);
+                    }
+                    if let Some((_, view, _)) = tools.call(&mut items, Some(*call))
+                        && let Some(feedback) = &mut view.safety_feedback
+                    {
+                        feedback.sent = Some(FeedbackSent {
+                            note: note.clone(),
+                            outgoing: None,
+                        });
+                    }
+                    None
+                }
+                EventKind::SafetyCheckSet { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -4291,6 +4343,31 @@ impl Model {
             let offered = tools.offered.get(&approval).map_or(&[][..], Vec::as_slice);
             let pending = *status == ApprovalStatus::Pending;
             *answer = self.local_answer(approval, offered, pending);
+        }
+
+        // This device's feedback still on its way; outbox order, so the
+        // newest one on a call is the one left.
+        for e in &self.outbox {
+            let CommandKind::SafetyCheckFeedback {
+                session_id,
+                call,
+                note,
+                ..
+            } = &e.command.kind
+            else {
+                continue;
+            };
+            if *session_id != id || logged.contains(&e.command.id) {
+                continue;
+            }
+            if let Some((_, view, _)) = tools.call(&mut items, Some(*call))
+                && let Some(feedback) = &mut view.safety_feedback
+            {
+                feedback.sent = Some(FeedbackSent {
+                    note: note.clone(),
+                    outgoing: Some(Outgoing::from(&e.status)),
+                });
+            }
         }
 
         items.extend(self.outbox.iter().filter_map(|e| {
@@ -4345,6 +4422,7 @@ impl Model {
             input: input.as_ref().map(|f| self.full_view(f)),
             approval: None,
             safety_check: None,
+            safety_feedback: None,
             outcome,
             subagent: None,
         }
@@ -9906,6 +9984,192 @@ mod tests {
     }
 
     #[test]
+    fn safety_feedback_is_offered_on_shell_calls_only() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (asked, approved, unasked, plain) =
+            (CallId::new(), CallId::new(), CallId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                tool_call(Some(asked), ToolKind::Shell, "rm x"),
+                EventKind::ApprovalRequested {
+                    id: ApprovalId::new(),
+                    call: Some(asked),
+                    tool: "agent-tool".into(),
+                    summary: "rm x".into(),
+                    input: None,
+                    suggestions: Vec::new(),
+                    shell: Some("rm x".into()),
+                },
+                tool_call(Some(approved), ToolKind::Shell, "ls"),
+                EventKind::SafetyCheckApproved {
+                    call: Some(approved),
+                    tool: "agent-tool".into(),
+                    summary: "ls".into(),
+                    reason: "read-only: ls".into(),
+                    shell: Some("ls".into()),
+                },
+                // Asked, but no shell command was named: nothing to judge.
+                tool_call(Some(unasked), ToolKind::Shell, "curl x"),
+                approval_requested(ApprovalId::new(), Some(unasked)),
+                tool_call(Some(plain), ToolKind::Shell, "cat notes.txt"),
+            ],
+        );
+        f.open(sid);
+        let feedback: Vec<Option<SafetyFeedbackView>> = tools(&f)
+            .into_iter()
+            .map(|view| view.safety_feedback)
+            .collect();
+        assert_eq!(
+            feedback,
+            vec![
+                Some(SafetyFeedbackView {
+                    judgment: SafetyJudgment::ShouldApprove,
+                    sent: None,
+                }),
+                Some(SafetyFeedbackView {
+                    judgment: SafetyJudgment::ShouldAsk,
+                    sent: None,
+                }),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn safety_feedback_shows_until_logged_then_the_log() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let call = CallId::new();
+        f.log(
+            sid,
+            vec![
+                tool_call(Some(call), ToolKind::Shell, "rm x"),
+                EventKind::ApprovalRequested {
+                    id: ApprovalId::new(),
+                    call: Some(call),
+                    tool: "agent-tool".into(),
+                    summary: "rm x".into(),
+                    input: None,
+                    suggestions: Vec::new(),
+                    shell: Some("rm x".into()),
+                },
+            ],
+        );
+        f.open(sid);
+
+        let command = queued(&f.dispatch(Action::SafetyCheckFeedback {
+            session_id: sid,
+            call,
+            judgment: SafetyJudgment::ShouldApprove,
+            note: Some("fine".into()),
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::SafetyCheckFeedback {
+                session_id: sid,
+                call,
+                judgment: SafetyJudgment::ShouldApprove,
+                note: Some("fine".into()),
+            }
+        );
+        // On its way: this device's feedback, on the call's row.
+        assert_eq!(
+            tools(&f)[0].safety_feedback,
+            Some(SafetyFeedbackView {
+                judgment: SafetyJudgment::ShouldApprove,
+                sent: Some(FeedbackSent {
+                    note: Some("fine".into()),
+                    outgoing: Some(Outgoing::Queued),
+                }),
+            })
+        );
+
+        // Logged and accepted: the log holds it, so it is no longer pending.
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::SafetyCheckFeedback {
+                    call,
+                    judgment: SafetyJudgment::ShouldApprove,
+                    note: Some("fine".into()),
+                    shell: "rm x".into(),
+                    checked_safe: true,
+                    checked_reason: "read-only".into(),
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        assert_eq!(
+            tools(&f)[0]
+                .safety_feedback
+                .as_ref()
+                .and_then(|v| v.sent.clone()),
+            Some(FeedbackSent {
+                note: Some("fine".into()),
+                outgoing: None,
+            })
+        );
+
+        // Another device's feedback after it is the newest, and not pending.
+        f.log(
+            sid,
+            vec![EventKind::SafetyCheckFeedback {
+                call,
+                judgment: SafetyJudgment::ShouldApprove,
+                note: None,
+                shell: "rm x".into(),
+                checked_safe: true,
+                checked_reason: "read-only".into(),
+                by: DeviceId::new(),
+            }],
+        );
+        assert_eq!(
+            tools(&f)[0]
+                .safety_feedback
+                .as_ref()
+                .and_then(|v| v.sent.clone()),
+            Some(FeedbackSent {
+                note: None,
+                outgoing: None,
+            })
+        );
+    }
+
+    #[test]
+    fn safety_feedback_needs_a_known_session() {
+        let mut f = Fixture::paired();
+        let unknown = f.dispatch(Action::SafetyCheckFeedback {
+            session_id: SessionId::new(),
+            call: CallId::new(),
+            judgment: SafetyJudgment::ShouldAsk,
+            note: None,
+        });
+        assert!(unknown.is_empty(), "no command for a session not known");
+
+        // Positive control: the same action for a known session is queued.
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let command = queued(&f.dispatch(Action::SafetyCheckFeedback {
+            session_id: sid,
+            call: CallId::new(),
+            judgment: SafetyJudgment::ShouldAsk,
+            note: None,
+        }));
+        assert!(matches!(
+            command.kind,
+            CommandKind::SafetyCheckFeedback { session_id, .. } if session_id == sid
+        ));
+    }
+
+    #[test]
     fn an_unconfirmed_agent_version_shows_as_an_entry_but_is_no_news() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
@@ -10027,6 +10291,7 @@ mod tests {
                 input: None,
             }),
             safety_check: None,
+            safety_feedback: None,
             outcome: ToolOutcome::Running { since: minute(2) },
         };
         assert_eq!(entries(&f), vec![Entry::Tool(Box::new(waiting.clone()))]);
