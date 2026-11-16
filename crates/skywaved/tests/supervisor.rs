@@ -805,6 +805,7 @@ async fn the_safety_check_approves_a_read_only_command() {
         tool: "shell".into(),
         summary: "cat notes.txt".into(),
         reason: "read-only: cat".into(),
+        shell: None,
     }));
     assert!(!kinds.iter().any(is_approval_requested));
     assert!(kinds.contains(&EventKind::AgentMessage {

@@ -510,7 +510,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// fail to compile. Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
-    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38,
+    v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
 ];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
@@ -627,6 +627,14 @@ fn v36_to_v37(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// v37 to v38. v38 added the safety check: a command and two events, all
 /// new, so no stored event or command result changes.
 fn v37_to_v38(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v38 to v39. v39 added safety check feedback (a command, an event, a reject
+/// reason, all new) and an optional `shell` on `ApprovalRequested` and
+/// `SafetyCheckApproved`, which v38 JSON lacks and reads as `None`; nothing
+/// stored changes.
+fn v38_to_v39(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -2021,6 +2029,45 @@ mod tests {
                 worktree: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn v39_reads_what_v38_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v38 = r#"{"type":"approval_requested","id":"01920000-0000-7000-8000-000000000004","call":"01920000-0000-7000-8000-000000000007","tool":"Bash","summary":"ls","input":null,"suggestions":[]}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 38)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, 's', 't', 'c', ?1)",
+                [v38],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let kind: String = db
+            .conn()
+            .query_row("SELECT kind FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, v38);
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::ApprovalRequested { shell: None, .. }
         ));
     }
 

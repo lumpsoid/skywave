@@ -3163,6 +3163,7 @@ impl Model {
                     summary,
                     input,
                     suggestions,
+                    ..
                 } if *id == approval => Some(ApprovalPrompt {
                     id: *id,
                     call: *call,
@@ -3979,6 +3980,7 @@ impl Model {
                     summary,
                     input,
                     suggestions,
+                    ..
                 } => match tools.offer(*id, suggestions).call(&mut items, *call) {
                     Some((item, view, _)) if view.approval.is_none() => {
                         view.approval = Some(ToolApproval {
@@ -4252,7 +4254,7 @@ impl Model {
                     }
                     None
                 }
-                EventKind::SafetyCheckSet { .. } => None,
+                EventKind::SafetyCheckSet { .. } | EventKind::SafetyCheckFeedback { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -4974,6 +4976,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }
         | CommandKind::SetSafetyCheck { session_id, .. }
+        | CommandKind::SafetyCheckFeedback { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
         | CommandKind::SwitchContext { session_id, .. }
         | CommandKind::MoveContext { session_id, .. }
@@ -5808,6 +5811,7 @@ mod tests {
                     summary: "rm -rf build".into(),
                     input: Some(Full::Blob(input.clone())),
                     suggestions: Vec::new(),
+                    shell: None,
                 },
             ],
         );
@@ -5944,6 +5948,7 @@ mod tests {
                 summary: "ls".into(),
                 input: None,
                 suggestions: Vec::new(),
+                shell: None,
             }],
         );
         f.open(sid);
@@ -6018,6 +6023,7 @@ mod tests {
             summary: "ls".into(),
             input: None,
             suggestions,
+            shell: None,
         };
         f.log(sid, vec![request(first, vec![ls.clone(), edits.clone()])]);
         f.open(sid);
@@ -6673,6 +6679,7 @@ mod tests {
                     summary: "main.rs".into(),
                     input: None,
                     suggestions: Vec::new(),
+                    shell: None,
                 },
                 EventKind::ApprovalResolved {
                     id: approval,
@@ -6794,6 +6801,7 @@ mod tests {
                 summary: "main.rs".into(),
                 input: None,
                 suggestions: Vec::new(),
+                shell: None,
             }],
         );
         f.open(sid);
@@ -9842,6 +9850,7 @@ mod tests {
             summary: "the call's title".into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         }
     }
 
@@ -9871,6 +9880,7 @@ mod tests {
                     tool: "agent-tool".into(),
                     summary: "cat notes.txt".into(),
                     reason: "read-only: cat".into(),
+                    shell: None,
                 },
             ],
         );
@@ -9888,6 +9898,7 @@ mod tests {
                 tool: "agent-tool".into(),
                 summary: "ls".into(),
                 reason: "read-only: ls".into(),
+                shell: None,
             }],
         );
         assert_eq!(entries(&f).len(), 1, "no entry for an unlinked approval");
@@ -10097,6 +10108,7 @@ mod tests {
                     summary: "make".into(),
                     input: Some(Full::Blob(asked.clone())),
                     suggestions: Vec::new(),
+                    shell: None,
                 },
                 // Positive control: one asking what its call holds.
                 tool_call(Some(other), ToolKind::Shell, "ls"),
