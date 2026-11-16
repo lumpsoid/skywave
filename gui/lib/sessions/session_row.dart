@@ -64,11 +64,9 @@ class SessionRow extends StatelessWidget {
           child: compact
               ? Tooltip(
                   message: row.badgeLabel,
-                  child: Icon(
-                    agentIcon(row.state),
+                  child: AgentStateIcon(
+                    state: row.state,
                     key: Key('row-state-${row.sessionId}'),
-                    size: 20,
-                    color: SkyColors.of(context).agent(row.state),
                   ),
                 )
               : StateBadge(state: row.state, label: row.badgeLabel),
