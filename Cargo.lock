@@ -2075,6 +2075,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "skywave-proto",
+ "skywave-safety",
  "socket2",
  "tempfile",
  "thiserror",
