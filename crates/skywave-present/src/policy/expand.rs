@@ -104,6 +104,7 @@ mod tests {
             approval: None,
             safety_check: None,
             safety_feedback: None,
+            shell: None,
             outcome: ToolOutcome::Done {
                 is_error: false,
                 status: None,

@@ -1691,6 +1691,7 @@ mod tests {
                     approval: None,
                     safety_check: None,
                     safety_feedback: None,
+                    shell: None,
                     outcome: skywave_core::ToolOutcome::Running {
                         since: chrono::Utc::now(),
                     },
@@ -1757,6 +1758,7 @@ mod tests {
                     }),
                     safety_check: None,
                     safety_feedback: None,
+                    shell: None,
                     outcome: skywave_core::ToolOutcome::Running {
                         since: chrono::Utc::now(),
                     },

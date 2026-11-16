@@ -4025,6 +4025,7 @@ impl Model {
                             input: input.as_ref().map(|f| self.full_view(f)),
                         });
                         if shell.is_some() {
+                            view.shell.clone_from(shell);
                             view.safety_feedback = Some(SafetyFeedbackView {
                                 judgment: SafetyJudgment::ShouldApprove,
                                 sent: None,
@@ -4297,6 +4298,7 @@ impl Model {
                     if let Some((_, view, _)) = tools.call(&mut items, *call) {
                         view.safety_check = Some(reason.clone());
                         if shell.is_some() {
+                            view.shell.clone_from(shell);
                             view.safety_feedback = Some(SafetyFeedbackView {
                                 judgment: SafetyJudgment::ShouldAsk,
                                 sent: None,
@@ -4439,6 +4441,7 @@ impl Model {
             approval: None,
             safety_check: None,
             safety_feedback: None,
+            shell: None,
             outcome,
             subagent: None,
         }
@@ -10161,6 +10164,47 @@ mod tests {
         );
     }
 
+    /// A shell row keeps the raw command its approval request or safety
+    /// check named, for a head to prefill a rule from. A row neither named
+    /// has none.
+    #[test]
+    fn a_shell_row_keeps_its_command() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (asked, approved, unnamed) = (CallId::new(), CallId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                tool_call(Some(asked), ToolKind::Shell, "$ git status"),
+                EventKind::ApprovalRequested {
+                    id: ApprovalId::new(),
+                    call: Some(asked),
+                    tool: "agent-tool".into(),
+                    summary: "git status".into(),
+                    input: None,
+                    suggestions: Vec::new(),
+                    shell: Some("git status".into()),
+                },
+                tool_call(Some(approved), ToolKind::Shell, "$ ls -la"),
+                EventKind::SafetyCheckApproved {
+                    call: Some(approved),
+                    tool: "agent-tool".into(),
+                    summary: "ls -la".into(),
+                    reason: "read-only: ls".into(),
+                    shell: Some("ls -la".into()),
+                },
+                tool_call(Some(unnamed), ToolKind::Shell, "$ make"),
+                approval_requested(ApprovalId::new(), Some(unnamed)),
+            ],
+        );
+        f.open(sid);
+        let shells: Vec<Option<String>> = tools(&f).into_iter().map(|view| view.shell).collect();
+        assert_eq!(
+            shells,
+            vec![Some("git status".into()), Some("ls -la".into()), None]
+        );
+    }
+
     #[test]
     fn safety_feedback_needs_a_known_session() {
         let mut f = Fixture::paired();
@@ -10310,6 +10354,7 @@ mod tests {
             }),
             safety_check: None,
             safety_feedback: None,
+            shell: None,
             outcome: ToolOutcome::Running { since: minute(2) },
         };
         assert_eq!(entries(&f), vec![Entry::Tool(Box::new(waiting.clone()))]);
