@@ -229,6 +229,12 @@ SessionScreen screenWith({
   switchLabel: switchLabel,
   rules: const [],
   agent: agent ?? askAgent,
+  safetyCheck: const SafetyCheckView(
+    label: 'safety check off',
+    turnOn: true,
+    on: false,
+    pending: false,
+  ),
   usage: usage,
   composer: composer,
   snippets: snippets,

@@ -625,6 +625,8 @@ pub struct SessionScreen {
     pub rules_label: Option<String>,
     /// The agent's mode and model, and what switches them.
     pub agent: AgentSettingsView,
+    /// Skywave's safety check: its switch and what a tap on it asks for.
+    pub safety_check: SafetyCheckView,
     /// `last turn 12.4s`, `3.1k in / 812 out`, `$0.04`, `ctx 19k/1M · 2%`
     /// (`ctx ?` while unknown), `session $1.27`, `<model>` until the agent
     /// names its model in `agent`: drop from the front when short of room.
@@ -780,6 +782,24 @@ pub struct AgentSettingsView {
     /// The efforts the running model takes, least to most; empty when it
     /// takes none.
     pub efforts: Vec<EffortOption>,
+}
+
+/// The session's safety check switch: on or off, and this device's switch
+/// while it waits for the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct SafetyCheckView {
+    /// `safety check off`, `safety check off → on` while this device's
+    /// switch waits.
+    pub label: String,
+    /// What a tap asks for: the opposite of the switch as it will be once
+    /// a waiting switch lands (so a tap while `off → on` asks for off).
+    pub turn_on: bool,
+    /// The switch is on (or this device's waiting switch turns it on).
+    pub on: bool,
+    /// A switch of this device's is still waiting.
+    pub pending: bool,
+    /// `safety check on failed: <why>` until the next switch.
+    pub refusal: Option<String>,
 }
 
 /// A mode the picker lists.
