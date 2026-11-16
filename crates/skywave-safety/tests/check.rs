@@ -405,13 +405,34 @@ fn substitution_of_a_proven_command_passes_under_a_rule() -> TestResult {
 }
 
 #[test]
-fn backquotes_are_substitutions_too() -> TestResult {
+fn backquote_substitutions_ask() -> TestResult {
     let (_dir, root) = workdir()?;
-    let rules = rules_from(&["git -C"])?;
+    let why = "expansions are not checked yet";
+    let git_c = rules_from(&["git -C"])?;
+    let git_log = rules_from(&["git log"])?;
     assert_eq!(
-        check_with("git -C `pwd` status", &root, &rules),
+        check_with("git -C `pwd` status", &root, &git_c),
+        Verdict::Ask { why: why.into() }
+    );
+    // bash un-escapes `\\` and `\$` inside backquotes before it parses them;
+    // the parser does not, so the proven text would differ from what runs.
+    for command in [
+        "git log `echo \"\\$(touch /tmp/pwned)\"`",
+        "git log `echo \\\\'$(touch p) \\\\'`",
+        "git log `cat \\$HOME/.ssh/id_rsa`",
+        "git log \"`pwd`\"",
+    ] {
+        assert_eq!(
+            check_with(command, &root, &git_log),
+            Verdict::Ask { why: why.into() },
+            "{command}"
+        );
+    }
+    // Positive control: the `$(...)` form of the same substitution is proven.
+    assert_eq!(
+        check_with("git log \"$(pwd)\"", &root, &git_log),
         Verdict::Safe {
-            reason: "read-only: pwd; rules: git -C".into()
+            reason: "read-only: pwd; rules: git log".into()
         }
     );
     Ok(())
