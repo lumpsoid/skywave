@@ -350,8 +350,8 @@ impl EventLog {
     /// recorded, and its old one's row deleted, only if the old blob is
     /// still stored; its old file goes after the commit. A message's images
     /// are recorded as its attachments' blobs, and their staged files go
-    /// after the commit. A `DeleteSession` erases the session's events and
-    /// its blobs' rows, and its blob files go after the commit too. Whatever
+    /// after the commit. A `DeleteSession` frees nothing: it marks the session
+    /// requested, and the supervisor erases it later (D62). Whatever
     /// is not logged and committed, a stored or refused command or a failed
     /// transaction included, has its blob files removed.
     pub fn handle_with(
@@ -767,9 +767,9 @@ impl EventLog {
                 if let Some(reason) = event_log::session_busy_in(tx, *session_id)? {
                     return Ok(Err(reason));
                 }
-                // The files go once this commits (`handle_with`). Before the
-                // tombstone is appended below, so the tombstone is not erased.
-                freed.extend(event_log::erase_session_in(tx, *session_id)?);
+                // Requested from this commit on; the supervisor erases it
+                // (D62). Nothing is freed here.
+                event_log::request_deletion_in(tx, *session_id)?;
                 let kind = EventKind::SessionDeleted { by: device };
                 (*session_id, session.context, kind)
             }

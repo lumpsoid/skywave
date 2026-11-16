@@ -1697,25 +1697,35 @@ events, blobs and agent transcript there for good. A device that deletes
 a session means it to be gone everywhere, so the server erases it.
 
 **Decided:** `DeleteSession { session_id }` is accepted for a known session
-with no running turn, no message owed to its agent, no unfinished shell
-run and no open approval or question. The first of those that holds
-refuses it, as `TurnRunning`, `ShellRunning` or `ApprovalPending`; an
-unknown session is `UnknownSession`. Archived is not checked here: the
-client deletes only an archived session. An accepted delete, in one
-transaction:
+with no running turn, no message or setting request the supervisor has not
+handed to its agent, no unfinished shell run, no open approval or question,
+and no worktree still on disk (one its `RemoveWorktree` has not removed).
+The first of those that holds refuses it, as `TurnRunning`, `ShellRunning`,
+`ApprovalPending` or `WorktreeNotRemoved`; an unknown session is
+`UnknownSession`. Archived is not checked here: the client deletes only an
+archived session. An accepted delete, in one transaction, frees nothing:
+- marks the session `requested` (`sessions.deletion`). Every later command
+  on it is `UnknownSession`, and it is in no storage report. The supervisor
+  still lists it, so it can finish the erase, and appends for it still
+  succeed.
+- logs `SessionDeleted { by }`: the tombstone, the one event of the session
+  that is not erased.
+
+The supervisor then erases it once its agent is stopped (a later change).
+Erasing, in one transaction:
 - erases the session's events in place. Each keeps its seq, session,
   time, command and context, and its kind becomes `Erased`. The log stays
   contiguous (`EventLog::read` rejects a gap), so the rows are not removed.
+  The `session_created` and `worktree_removed` rows stay: the worktree state
+  of other sessions at a path is read from them. So does the tombstone.
 - deletes the blob rows its events name, and its `event_blobs`,
   `workdir_answer_blobs`, `open_calls`, `supervisor_held`, `approvals` and
   `shell_runs` rows. An event blob is never shared (D44), so its file goes
-  too, once the delete commits. A workdir blob is shared by content, so it
+  too, once the erase commits. A workdir blob is shared by content, so it
   stays until the workdir collection finds nothing names it.
-- marks the session `deleted`. Its `sessions` and `contexts` rows stay,
-  because other rows reference them. Every later command on it is
-  `UnknownSession`, and it is in no session list and no storage report.
-- logs `SessionDeleted { by }`: the tombstone, the one event of the session
-  that is not erased.
+- marks the session `erased`. Its `sessions` and `contexts` rows stay,
+  because other rows reference them. Appends for it are refused from then
+  on, and it is in no session list.
 
 The delete is irreversible.
 

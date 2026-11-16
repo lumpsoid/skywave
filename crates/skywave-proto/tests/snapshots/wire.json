@@ -1973,6 +1973,10 @@
     },
     {
       "result": "rejected",
+      "reason": "worktree_not_removed"
+    },
+    {
+      "result": "rejected",
       "reason": "not_a_shell_call"
     },
     {

@@ -351,6 +351,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::ApprovalAlreadyResolved => "already answered on another device",
         RejectReason::ApprovalCancelled => "the approval was cancelled first",
         RejectReason::ApprovalPending => "the session is waiting for an answer",
+        RejectReason::WorktreeNotRemoved => {
+            "the session's worktree is still there: remove it first"
+        }
         RejectReason::NotAShellCall => "that call has no shell command to check",
         RejectReason::NoActiveTurn => "the agent was not working",
         RejectReason::UnknownRule => "the agent did not offer that rule",

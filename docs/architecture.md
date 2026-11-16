@@ -625,7 +625,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
   stops it at its 8 s deadline (a progress handler), a 503; the reply
   gives up at 10 s. The report itself removes nothing: deleting a blob
   is a command (`DeleteBlob`, above). A deleted session (`DeleteSession`,
-  D62) is in no report: its rows stay as erased rows until the database is
+  D62) is in no report from the moment its delete is logged. The supervisor
+  then erases its rows, which stay as erased rows until the database is
   compacted, and nothing compacts it yet.
 - **Usage limits** (`GET /v1/usage-limits`): the account's limits belong to
   no session, so the API asks a `UsageLimitsSource` (agent-agnostic;
