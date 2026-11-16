@@ -879,8 +879,9 @@ impl EventLog {
                     ) => shell,
                     _ => return Ok(Err(RejectReason::NotAShellCall)),
                 };
+                let rules = event_log::safety_rules_in(tx)?;
                 let (checked_safe, checked_reason) =
-                    match skywave_safety::check(&shell, Path::new(&session.workdir)) {
+                    match skywave_safety::check_with(&shell, Path::new(&session.workdir), &rules) {
                         Verdict::Safe { reason } => (true, reason),
                         Verdict::Ask { why } => (false, why),
                     };

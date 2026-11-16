@@ -491,6 +491,14 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE workdir_answer_blobs_v25 RENAME TO workdir_answer_blobs;
     CREATE INDEX workdir_answer_blobs_by_blob ON workdir_answer_blobs (blob_id);
     "#,
+    // v26: the safety rules, read on every shell approval (protocol v40). Additive:
+    // the index only makes the lookup cheap.
+    r#"
+    -- An event's type with its seq, so `safety_rules_in` reads the
+    -- `safety_rule_set` events without reading the rest of the log. A query
+    -- uses it only with the expression written exactly so.
+    CREATE INDEX events_type ON events (json_extract(kind, '$.type'), seq);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -875,7 +883,7 @@ mod tests {
     use skywave_proto::{ContextRef, SessionOrigin};
 
     use super::*;
-    use crate::event_log::parse_id;
+    use crate::event_log::{SAFETY_RULES_SQL, parse_id};
 
     const TABLES: [&str; 16] = [
         "approvals",
@@ -2115,6 +2123,39 @@ mod tests {
             serde_json::from_str(&kind).unwrap(),
             EventKind::SafetyCheckFeedback { .. }
         ));
+    }
+
+    /// The plan `SAFETY_RULES_SQL` runs, as `EXPLAIN QUERY PLAN` details.
+    fn safety_rules_plan(db: &Db) -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {SAFETY_RULES_SQL}"))
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn safety_rules_query_uses_the_type_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Positive control first: without the index the same query scans
+        // the log, so the assertion on the indexed database can fail.
+        let bare = Db::open(&tmp.path().join("bare.db")).unwrap();
+        bare.conn().execute_batch("DROP INDEX events_type").unwrap();
+        let scan = safety_rules_plan(&bare);
+        assert!(
+            scan.iter().all(|row| !row.contains("events_type")),
+            "{scan:#?}"
+        );
+
+        let indexed = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        let plan = safety_rules_plan(&indexed);
+        assert!(
+            plan.iter().any(|row| row.contains("events_type")),
+            "{plan:#?}"
+        );
     }
 
     /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records

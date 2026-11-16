@@ -2210,6 +2210,37 @@ fn set_safety_rule_validates_and_logs_the_device() {
     );
 }
 
+/// Sends a `SetSafetyRule` of `session` for `words`, turning it on or off.
+fn send_rule(f: &mut Fixture, session: SessionId, words: &[&str], on: bool) {
+    let words = words.iter().map(|word| word.to_string()).collect();
+    accepted(f.handle(CommandKind::SetSafetyRule {
+        session_id: session,
+        words,
+        on,
+    }));
+}
+
+#[test]
+fn safety_rules_fold_the_newest_per_words_across_sessions() {
+    let mut f = Fixture::new();
+    let a = f.create_session();
+    let b = f.create_session();
+    send_rule(&mut f, a, &["git", "commit"], true);
+    send_rule(&mut f, b, &["ruff", "check"], true);
+    send_rule(&mut f, b, &["cargo", "test"], true);
+    send_rule(&mut f, a, &["ruff", "check"], false);
+    send_rule(&mut f, b, &["git", "commit"], true);
+
+    // `ruff check` is off by its newest event; `git commit` is on again, so
+    // it comes last: the order of its newest event.
+    let rules = f.log.safety_rules(&f.storage.db).unwrap();
+    let words: Vec<Vec<&str>> = rules
+        .iter()
+        .map(|rule| rule.words().iter().map(String::as_str).collect())
+        .collect();
+    assert_eq!(words, [vec!["cargo", "test"], vec!["git", "commit"]]);
+}
+
 // --- SafetyCheckFeedback -----------------------------------------------------
 
 /// An `ApprovalRequested` of `call`, naming `shell` as its command if given.
@@ -2288,6 +2319,36 @@ fn safety_feedback_on_an_asked_shell_call_logs_the_check() {
             shell: "rm notes.txt".into(),
             checked_safe: false,
             checked_reason: why,
+            by: device,
+        }
+    );
+}
+
+#[test]
+fn safety_feedback_rechecks_with_the_rules() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let call = CallId::new();
+    f.agent(session, asked_shell(call, Some("rm notes.txt")));
+    send_rule(&mut f, session, &["rm"], true);
+
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: feedback(session, call, SafetyJudgment::ShouldApprove),
+    };
+    accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(
+        event.kind,
+        EventKind::SafetyCheckFeedback {
+            call,
+            judgment: SafetyJudgment::ShouldApprove,
+            note: None,
+            shell: "rm notes.txt".into(),
+            checked_safe: true,
+            checked_reason: "rules: rm".into(),
             by: device,
         }
     );
