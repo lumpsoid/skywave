@@ -2160,6 +2160,8 @@ pub struct SafetyRuleView {
 /// yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingSafetyRule {
+    /// This device's command, for `Action::Discard` once it failed.
+    pub command: CommandId,
     /// The state the change sets the rule to.
     pub on: bool,
     pub outgoing: Outgoing,

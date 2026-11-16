@@ -971,12 +971,18 @@ fn safety_rule_row(rule: &SafetyRuleView) -> SafetyRuleRow {
         _ if change.on => "adding".to_owned(),
         _ => "removing".to_owned(),
     });
+    let discard = rule
+        .pending
+        .as_ref()
+        .filter(|change| matches!(change.outgoing, Outgoing::Failed(_)))
+        .map(|change| change.command.0.to_string());
     SafetyRuleRow {
         session_id: rule.session_id.0.to_string(),
         words: rule.words.clone(),
         label: rule.words.join(" "),
         on: rule.on,
         pending,
+        discard,
     }
 }
 
@@ -1346,8 +1352,9 @@ mod tests {
     /// refused.
     #[test]
     fn settings_list_the_safety_rules_as_they_stand() {
-        use skywave_core::{FailReason, PendingSafetyRule, SafetyRuleView};
+        use skywave_core::{CommandId, FailReason, PendingSafetyRule, SafetyRuleView};
         let session_id = SessionId::new();
+        let failed = CommandId::new();
         let rule = |words: &[&str], on: bool, pending: Option<PendingSafetyRule>| SafetyRuleView {
             words: words.iter().map(|word| word.to_string()).collect(),
             session_id,
@@ -1368,6 +1375,7 @@ mod tests {
                     &["cargo", "test"],
                     true,
                     Some(PendingSafetyRule {
+                        command: CommandId::new(),
                         on: false,
                         outgoing: Outgoing::Queued,
                     }),
@@ -1376,6 +1384,7 @@ mod tests {
                     &["ls"],
                     false,
                     Some(PendingSafetyRule {
+                        command: failed,
                         on: true,
                         outgoing: Outgoing::Failed(FailReason::Undeliverable),
                     }),
@@ -1395,23 +1404,27 @@ mod tests {
             agent_logged_out: false,
         };
         let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
-        let row = |words: &[&str], on: bool, pending: Option<&str>| SafetyRuleRow {
-            session_id: session_id.0.to_string(),
-            words: words.iter().map(|word| word.to_string()).collect(),
-            label: words.join(" "),
-            on,
-            pending: pending.map(str::to_owned),
+        let row = |words: &[&str], on: bool, pending: Option<&str>, discard: Option<String>| {
+            SafetyRuleRow {
+                session_id: session_id.0.to_string(),
+                words: words.iter().map(|word| word.to_string()).collect(),
+                label: words.join(" "),
+                on,
+                pending: pending.map(str::to_owned),
+                discard,
+            }
         };
         match settings_view(&settings, &view, None, now.timestamp_millis()) {
             ScreenView::Settings { safety_rules, .. } => assert_eq!(
                 safety_rules,
                 vec![
-                    row(&["git", "commit"], true, None),
-                    row(&["cargo", "test"], true, Some("removing")),
+                    row(&["git", "commit"], true, None, None),
+                    row(&["cargo", "test"], true, Some("removing"), None),
                     row(
                         &["ls"],
                         false,
                         Some("could not add: the server could not take it"),
+                        Some(failed.0.to_string()),
                     ),
                 ]
             ),

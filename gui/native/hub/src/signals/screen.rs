@@ -821,6 +821,9 @@ pub struct SafetyRuleRow {
     /// `adding`, `removing` while this device's change waits; `could not
     /// add: <why>` or `could not remove: <why>` when the server refused it.
     pub pending: Option<String>,
+    /// The failed change's command id, to dismiss it with
+    /// `ActionIntent::Discard`; `None` otherwise.
+    pub discard: Option<String>,
 }
 
 /// A mode the picker lists.

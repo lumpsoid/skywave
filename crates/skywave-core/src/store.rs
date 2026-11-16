@@ -1116,13 +1116,13 @@ pub struct OutboxFile {
 
 impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
-    /// message, shell run, session creation, context move, or blob delete
-    /// or crop the server has not answered, or refused. One already sent may have reached the
-    /// server, and withdrawing cannot stop it there; it only stops the
-    /// resends, so a command whose request keeps failing no longer holds
-    /// back every later one. If the server took it, its event shows it in
-    /// the log like any other, and its answer, if one still comes, settles
-    /// nothing.
+    /// message, shell run, session creation, context move, blob delete or
+    /// crop, or safety rule change the server has not answered, or refused.
+    /// One already sent may have reached the server, and withdrawing cannot
+    /// stop it there; it only stops the resends, so a command whose request
+    /// keeps failing no longer holds back every later one. If the server took
+    /// it, its event shows it in the log like any other, and its answer, if
+    /// one still comes, settles nothing.
     pub fn discardable(&self) -> bool {
         let kind = matches!(
             self.command.kind,
@@ -1132,6 +1132,7 @@ impl OutboxEntry {
                 | CommandKind::MoveContext { .. }
                 | CommandKind::DeleteBlob { .. }
                 | CommandKind::CropBlob { .. }
+                | CommandKind::SetSafetyRule { .. }
         );
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
