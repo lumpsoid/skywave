@@ -150,7 +150,8 @@ fn read(conn: &mut Connection, dir: &DataDir) -> Result<StorageReport> {
     let mut sessions: HashMap<String, SessionStorage> = HashMap::new();
     let mut stmt = tx.prepare(
         "SELECT session_id, COUNT(*), SUM(LENGTH(CAST(kind AS BLOB)))
-         FROM events GROUP BY session_id",
+         FROM events WHERE session_id IN (SELECT id FROM sessions WHERE deleted = 0)
+         GROUP BY session_id",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {

@@ -3647,6 +3647,116 @@ async fn deleting_a_session_with_a_running_turn_is_refused() {
     accepted_seq(&device.command(&delete_command(session)).await);
 }
 
+/// `DeleteSession` erases the session in place: each of its events before
+/// the tombstone keeps its seq and reads `Erased`, its output blob's file and
+/// row go, and another session's events are left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_erases_its_events_and_blobs() {
+    let mut f = Fixture::start_with_shell(true).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let other = new_session(&f, &mut device).await;
+    let (_, blob, _, _) =
+        finished_run(&mut f, &mut device, creds.id, session, &numbers(1..=3000)).await;
+    assert!(
+        blob_file(&f, blob.id).exists(),
+        "the run's output is stored"
+    );
+
+    let tombstone = accepted_seq(&device.command(&delete_command(session)).await);
+
+    assert!(
+        !blob_file(&f, blob.id).exists(),
+        "the blob's file is removed"
+    );
+    assert_eq!(
+        device.get(&path::blob(blob.id)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let batch = device.events(Seq::ZERO, 0).await;
+    let before: Vec<_> = batch
+        .iter()
+        .filter(|(seq, e)| e.session_id == session && seq.0 < tombstone.0)
+        .collect();
+    assert!(
+        !before.is_empty(),
+        "the session had events before its delete"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|(_, e)| matches!(e.kind, EventKind::Erased)),
+        "every event of the session before the tombstone is erased"
+    );
+    let (_, last) = batch
+        .iter()
+        .find(|(seq, _)| *seq == tombstone)
+        .expect("the tombstone is in the log");
+    assert!(matches!(last.kind, EventKind::SessionDeleted { .. }));
+    assert!(
+        batch
+            .iter()
+            .any(|(_, e)| e.session_id == other && !matches!(e.kind, EventKind::Erased)),
+        "another session's events are not erased"
+    );
+}
+
+/// Once deleted, a session is unknown: a later command on it and a second
+/// delete are refused `UnknownSession`. Positive control: before the delete,
+/// the same archive is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_session_is_unknown() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let archive = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetSessionArchived {
+            session_id: session,
+            archived: true,
+        },
+    };
+    accepted_seq(&device.command(&archive).await);
+
+    accepted_seq(&device.command(&delete_command(session)).await);
+
+    let again = Command {
+        id: CommandId::new(),
+        ..archive
+    };
+    assert_eq!(
+        device.command(&again).await,
+        rejected(RejectReason::UnknownSession)
+    );
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::UnknownSession)
+    );
+}
+
+/// The storage report lists a session until it is deleted, and not after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_session_leaves_the_storage_report() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let lists = |report: &StorageReport| report.sessions.iter().any(|s| s.session == session);
+
+    let before: StorageReport = device.get(path::STORAGE).await.json();
+    assert!(
+        lists(&before),
+        "the session is in the report before the delete"
+    );
+
+    accepted_seq(&device.command(&delete_command(session)).await);
+
+    let after: StorageReport = device.get(path::STORAGE).await.json();
+    assert!(!lists(&after), "the deleted session is not in the report");
+}
+
 fn delete_command(session: SessionId) -> Command {
     Command {
         id: CommandId::new(),

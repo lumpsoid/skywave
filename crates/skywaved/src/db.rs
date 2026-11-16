@@ -499,6 +499,11 @@ const MIGRATIONS: &[&str] = &[
     -- uses it only with the expression written exactly so.
     CREATE INDEX events_type ON events (json_extract(kind, '$.type'), seq);
     "#,
+    // v27: a DeleteSession marks the session deleted; its rows stay for the foreign keys (D62).
+    r#"
+    ALTER TABLE sessions ADD COLUMN
+        deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1));
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
