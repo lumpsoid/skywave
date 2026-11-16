@@ -745,11 +745,11 @@ impl EventLog {
         workdir_shell_busy_in(db.conn(), workdir)
     }
 
-    /// Every session, oldest first.
+    /// Every session not deleted, oldest first.
     pub fn sessions(&self, db: &Db) -> Result<Vec<SessionInfo>> {
         let mut stmt = db.conn().prepare_cached(
             "SELECT id, workdir, turn_active, current_context, turn_context
-             FROM sessions ORDER BY rowid",
+             FROM sessions WHERE deleted = 0 ORDER BY rowid",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, SessionRow::from_row(r, 1)?))
@@ -1395,7 +1395,8 @@ pub(crate) fn head_in(conn: &Connection) -> Result<Seq> {
 
 pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<SessionInfo>> {
     conn.prepare_cached(
-        "SELECT workdir, turn_active, current_context, turn_context FROM sessions WHERE id = ?1",
+        "SELECT workdir, turn_active, current_context, turn_context FROM sessions
+         WHERE id = ?1 AND deleted = 0",
     )?
     .query_row([id.0.to_string()], |r| SessionRow::from_row(r, 0))
     .optional()?
@@ -1800,6 +1801,44 @@ pub(crate) fn event_blob_in(conn: &Connection, id: BlobId) -> Result<Option<Even
 pub(crate) fn delete_blob_row_in(conn: &Connection, id: BlobId) -> Result<()> {
     conn.execute("DELETE FROM blobs WHERE id = ?1", [id.0.to_string()])?;
     Ok(())
+}
+
+/// Erases session `id` for `DeleteSession` (D62), in the command's
+/// transaction. Its events keep their seq, session, time, command and
+/// context, and their kind becomes [`EventKind::Erased`], so the log stays
+/// contiguous. Its event blobs' rows go, and the rows only its live state
+/// needs. The `sessions` and `contexts` rows stay, since other rows
+/// reference them; `sessions.deleted` hides it. Returns the blobs its events
+/// named: their files are the caller's to remove after commit.
+pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<BlobId>> {
+    let session = id.0.to_string();
+    let blobs = conn
+        .prepare("SELECT blob_id FROM event_blobs WHERE session_id = ?1")?
+        .query_map([&session], |r| r.get::<_, String>(0))?
+        .map(|text| parse_id::<BlobId>(&text?))
+        .collect::<Result<Vec<BlobId>>>()?;
+    for blob in &blobs {
+        delete_blob_row_in(conn, *blob)?;
+    }
+    conn.execute("DELETE FROM event_blobs WHERE session_id = ?1", [&session])?;
+    conn.execute(
+        "DELETE FROM workdir_answer_blobs WHERE session_id = ?1",
+        [&session],
+    )?;
+    conn.execute("DELETE FROM open_calls WHERE session_id = ?1", [&session])?;
+    conn.execute(
+        "DELETE FROM supervisor_held WHERE session_id = ?1",
+        [&session],
+    )?;
+    conn.execute("DELETE FROM approvals WHERE session_id = ?1", [&session])?;
+    conn.execute("DELETE FROM shell_runs WHERE session_id = ?1", [&session])?;
+    let erased = serde_json::to_string(&EventKind::Erased)?;
+    conn.execute(
+        "UPDATE events SET kind = ?2 WHERE session_id = ?1",
+        params![session, erased],
+    )?;
+    conn.execute("UPDATE sessions SET deleted = 1 WHERE id = ?1", [&session])?;
+    Ok(blobs)
 }
 
 fn kind_name(kind: &EventKind) -> &'static str {

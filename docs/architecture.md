@@ -577,7 +577,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
     Control is taken as usual (`ResolveApproval`, `AnswerQuestion`, `Interrupt`,
     `StopSession`, `StopTask`, `StopShell`), and so is what logs one small
     event and starts nothing (`RenameSession`, `SetSessionArchived`,
-    `RemoveWorktree`, `SwitchContext`, `DeleteBlob`, `CropBlob`). Reads and long-polls are untouched. The refusal is
+    `DeleteSession`, `RemoveWorktree`, `SwitchContext`, `DeleteBlob`,
+    `CropBlob`). Reads and long-polls are untouched. The refusal is
     stored like any other; the heads show its reason, which is how a
     device learns the server is paused.
   - The supervisor stops reading its agents' events. An adapter reports on
@@ -623,7 +624,9 @@ the daemon's appends, which would otherwise stop `serve` (below).
   in one read transaction (appends go on beside it under WAL), and SQLite
   stops it at its 8 s deadline (a progress handler), a 503; the reply
   gives up at 10 s. The report itself removes nothing: deleting a blob
-  is a command (`DeleteBlob`, above).
+  is a command (`DeleteBlob`, above). A deleted session (`DeleteSession`,
+  D62) is in no report: its rows stay as erased rows until the database is
+  compacted, and nothing compacts it yet.
 - **Usage limits** (`GET /v1/usage-limits`): the account's limits belong to
   no session, so the API asks a `UsageLimitsSource` (agent-agnostic;
   `NoUsageLimits` answers `Unavailable`). The Claude Code one

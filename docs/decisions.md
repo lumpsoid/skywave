@@ -39,6 +39,8 @@ Not platform-specific.
 - Blob policy knob: `Eager` (download alongside metadata) or `OnDemand`
   (download on explicit user intent).
 - Retention: forever; user can delete sessions locally (they stay on the server).
+  Superseded by D62 for delete: a deleted session is erased on the server.
+  Archive stays a flag.
 **Deferred:** retention policies, storage limits.
 
 ## D7. Reconnect and resend
@@ -1687,3 +1689,38 @@ relative to the wrong directory. Trusting `cd` is trusting where it goes.
 
 **Deferred:**
 - The TUI's way to add and list rules.
+
+## D62. Deleting a session erases it on the server (v41)
+
+D6 kept every session on the server forever, so deleting one left its
+events, blobs and agent transcript there for good. A device that deletes
+a session means it to be gone everywhere, so the server erases it.
+
+**Decided:** `DeleteSession { session_id }` is accepted for a known session
+with no running turn, no message owed to its agent, no unfinished shell
+run and no open approval or question. The first of those that holds
+refuses it, as `TurnRunning`, `ShellRunning` or `ApprovalPending`; an
+unknown session is `UnknownSession`. Archived is not checked here: the
+client deletes only an archived session. An accepted delete, in one
+transaction:
+- erases the session's events in place. Each keeps its seq, session,
+  time, command and context, and its kind becomes `Erased`. The log stays
+  contiguous (`EventLog::read` rejects a gap), so the rows are not removed.
+- deletes the blob rows its events name, and its `event_blobs`,
+  `workdir_answer_blobs`, `open_calls`, `supervisor_held`, `approvals` and
+  `shell_runs` rows. An event blob is never shared (D44), so its file goes
+  too, once the delete commits. A workdir blob is shared by content, so it
+  stays until the workdir collection finds nothing names it.
+- marks the session `deleted`. Its `sessions` and `contexts` rows stay,
+  because other rows reference them. Every later command on it is
+  `UnknownSession`, and it is in no session list and no storage report.
+- logs `SessionDeleted { by }`: the tombstone, the one event of the session
+  that is not erased.
+
+The delete is irreversible.
+
+**Deferred here:**
+- The supervisor stopping the agent and deleting its transcript (the
+  session's `contexts.agent_state` stays for that).
+- Devices dropping their copy of an erased session.
+- Compacting the database file: an erased row's space is not given back.
