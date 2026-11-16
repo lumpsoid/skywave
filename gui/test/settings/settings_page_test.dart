@@ -5,6 +5,11 @@ import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
+/// The page's one list, which the sections below the fold scroll.
+Finder pageScrollable() => find
+    .descendant(of: find.byType(ListView), matching: find.byType(Scrollable))
+    .first;
+
 void main() {
   testWidgets('settings shows the device and the toggle sets the policy', (
     tester,
@@ -69,6 +74,7 @@ void main() {
     List<GuiIntent> sent, {
     String? serverAddresses,
     bool? stayConnected,
+    List<SafetyRuleRow> safetyRules = const [],
   }) => MaterialApp(
     home: SettingsPage(
       screen: ScreenViewSettings(
@@ -80,7 +86,7 @@ void main() {
         fingerprint: null,
         agentLogin: null,
         stayConnected: stayConnected,
-        safetyRules: const [],
+        safetyRules: safetyRules,
       ),
       link: LinkHolder(),
       send: sent.add,
@@ -127,6 +133,69 @@ void main() {
   testWidgets('an unpaired device has no address to change', (tester) async {
     await tester.pumpWidget(settings([]));
     expect(find.byKey(const Key('server-addresses')), findsNothing);
+  });
+
+  testWidgets('safety rules list with a remove button', (tester) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      settings(
+        sent,
+        safetyRules: const [
+          SafetyRuleRow(
+            sessionId: 's1',
+            words: ['git', 'commit'],
+            label: 'git commit',
+            on: true,
+          ),
+          SafetyRuleRow(
+            sessionId: 's2',
+            words: ['cargo', 'test'],
+            label: 'cargo test',
+            on: false,
+            pending: 'adding',
+          ),
+        ],
+      ),
+    );
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('remove-safety-rule-cargo test')),
+      200,
+      scrollable: pageScrollable(),
+    );
+    expect(find.text('Safety rules'), findsOneWidget);
+    expect(find.text('git commit'), findsOneWidget);
+    expect(find.text('cargo test'), findsOneWidget);
+    expect(find.text('adding'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('remove-safety-rule-git commit')));
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentSetSafetyRule(
+          sessionId: 's1',
+          words: ['git', 'commit'],
+          on: false,
+        ),
+      ),
+    ]);
+
+    // A pending add has nothing logged to remove yet: its button is disabled.
+    await tester.tap(find.byKey(const Key('remove-safety-rule-cargo test')));
+    expect(sent, hasLength(1));
+  });
+
+  testWidgets('no safety rules shows how to add one', (tester) async {
+    const hint =
+        'Commands you trust run without asking. Add one from a shell row\'s '
+        'menu.';
+    await tester.pumpWidget(settings([]));
+    // Below the fold, so the lazy list has not built it yet.
+    await tester.scrollUntilVisible(
+      find.text(hint),
+      200,
+      scrollable: pageScrollable(),
+    );
+    expect(find.text('Safety rules'), findsOneWidget);
+    expect(find.text(hint), findsOneWidget);
   });
 
   testWidgets('the connection tile follows the link and its latency', (
