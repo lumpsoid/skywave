@@ -161,6 +161,8 @@ pub(crate) mod tests {
             rules: Vec::new(),
             usage: None,
             agent: Default::default(),
+            safety_check: false,
+            safety_check_change: None,
             contexts: Vec::new(),
             context: ContextId::new(),
             viewing: None,

@@ -548,6 +548,17 @@ CREATE TABLE IF NOT EXISTS outbox_files (
     PRIMARY KEY (command_id, position)
 );
 "#),
+    // `SessionSummary::safety_check`: on if the session's newest
+    // `SafetyCheckSet` turned it on, off if it has none. Backfilled from the
+    // stored log.
+    Sql(r#"
+ALTER TABLE sessions ADD COLUMN safety_check INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET safety_check = COALESCE((SELECT json_extract(event, '$.kind.on') FROM events
+    WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'safety_check_set'
+    ORDER BY seq DESC
+    LIMIT 1), 0);
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -3420,7 +3431,7 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
     stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted, \
-    last_message_seq, worktree, worktree_removed";
+    last_message_seq, worktree, worktree_removed, safety_check";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -3435,7 +3446,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
         ),
         params![
             summary.id.0.to_string(),
@@ -3458,6 +3469,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             seq_sql(summary.last_message_seq)?,
             summary.worktree.as_ref().map(to_json).transpose()?,
             summary.worktree_removed,
+            summary.safety_check,
         ],
     )?;
     Ok(())
@@ -3485,6 +3497,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         last_message_seq: seq_col(row, 17)?,
         worktree: opt_json_col(row, 18)?,
         worktree_removed: row.get(19)?,
+        safety_check: row.get(20)?,
     })
 }
 
