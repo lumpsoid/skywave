@@ -18,8 +18,8 @@ pub use skywave_proto::{
     ChangesResult, CommandId, ContextId, Decision, DeviceId, DiffBody, DirEntry, Effort, EntryKind,
     FileBody, FileChange, FileResult, ImportOutcome, LinkTarget, ListResult, LogResult,
     ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, Refusal, RejectReason,
-    RuleScope, RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, ShellEnd,
-    SubagentUsage, TaskId, TaskKind, ToolKind, TurnUsage,
+    RuleScope, RuleSuggestion, RunWhen, SafetyJudgment, Schedule, ScheduleId, Seq, SessionId,
+    ShellEnd, SubagentUsage, TaskId, TaskKind, ToolKind, TurnUsage,
 };
 pub use skywave_proto::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport,
@@ -1883,6 +1883,9 @@ pub struct ToolView {
     /// Skywave's safety check approved the call without asking anyone, for
     /// this reason.
     pub safety_check: Option<String>,
+    /// Feedback on the safety check this call's row may send, if it is a
+    /// shell call that asked a person or that the safety check approved.
+    pub safety_feedback: Option<SafetyFeedbackView>,
     /// How the call's own outcome stands. A [`ToolKind::Subagent`] call's
     /// says how its launch went (a background one is `Done` once launched);
     /// heads show [`subagent`](Self::subagent) instead.
@@ -1971,6 +1974,25 @@ pub struct ToolApproval {
     /// server logs one only when it differs from the call's input, so
     /// `None` means the call's input is what was asked.
     pub input: Option<FullView>,
+}
+
+/// Feedback on Skywave's safety check that a shell call's row can send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyFeedbackView {
+    /// The judgment the row may send: `ShouldApprove` for a shell call that
+    /// asked a person, `ShouldAsk` for one the safety check approved.
+    pub judgment: SafetyJudgment,
+    /// The newest feedback on the call: logged from any device, or this
+    /// device's own while it is on its way.
+    pub sent: Option<FeedbackSent>,
+}
+
+/// One feedback sent on a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackSent {
+    pub note: Option<String>,
+    /// Where this device's feedback stands; `None` once the log holds it.
+    pub outgoing: Option<Outgoing>,
 }
 
 /// How a tool call stands.

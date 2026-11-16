@@ -1915,6 +1915,7 @@ fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
         summary: "ls".into(),
         input: None,
         suggestions: Vec::new(),
+        shell: None,
     };
     let (in_a, in_b) = (ApprovalId::new(), ApprovalId::new());
     let (shown_a, none) = notifications(&rig.log_in(a, vec![approval(in_a)]));
@@ -3777,11 +3778,148 @@ fn a_call_the_safety_check_approved_says_so() {
             tool: "Bash".into(),
             summary: "cat notes.txt".into(),
             reason: "read-only: cat".into(),
+            shell: None,
         },
         result(call),
     ]);
     let row = rig.tool_row("Bash");
     assert!(row.state_label.contains(approved), "{}", row.state_label);
+}
+
+/// The result of `call` as the agent logs it, for a call the tests make.
+fn a_result(call: skywave_proto::CallId) -> EventKind {
+    EventKind::ToolResult(skywave_proto::ToolResult {
+        call: Some(call),
+        is_error: false,
+        status: None,
+        preview: "notes".into(),
+        lines: 1,
+        output: None,
+    })
+}
+
+#[test]
+fn a_call_the_safety_check_approved_offers_should_have_asked() {
+    use crate::signals::{SafetyFeedbackFacts, SafetyJudgmentView};
+    use skywave_proto::{CallId, SafetyJudgment, ToolKind};
+    let mut rig = Rig::new();
+    let call = CallId::new();
+    rig.log(vec![
+        a_call(None, call, "Bash", ToolKind::Shell, "cat a"),
+        EventKind::SafetyCheckApproved {
+            call: Some(call),
+            tool: "Bash".into(),
+            summary: "cat a".into(),
+            reason: "read-only: cat".into(),
+            shell: Some("cat a".into()),
+        },
+        a_result(call),
+    ]);
+    let row = rig.tool_row("Bash");
+    assert_eq!(
+        row.feedback,
+        Some(SafetyFeedbackFacts {
+            call: call.0.to_string(),
+            judgment: SafetyJudgmentView::ShouldAsk,
+        })
+    );
+    assert!(
+        !row.state_label.contains("feedback:"),
+        "{}",
+        row.state_label
+    );
+
+    rig.log(vec![EventKind::SafetyCheckFeedback {
+        call,
+        judgment: SafetyJudgment::ShouldAsk,
+        note: None,
+        shell: "cat a".into(),
+        checked_safe: true,
+        checked_reason: "read-only: cat".into(),
+        by: rig.me,
+    }]);
+    let label = rig.tool_row("Bash").state_label;
+    assert!(label.ends_with(" · feedback: should have asked"), "{label}");
+}
+
+#[test]
+fn a_safety_check_feedback_on_its_way_shows_its_outgoing_state() {
+    use crate::signals::SafetyJudgmentView;
+    use skywave_proto::{CallId, SafetyJudgment, ToolKind};
+    let mut rig = Rig::new();
+    let call = CallId::new();
+    rig.log(vec![
+        a_call(None, call, "Bash", ToolKind::Shell, "cat a"),
+        EventKind::SafetyCheckApproved {
+            call: Some(call),
+            tool: "Bash".into(),
+            summary: "cat a".into(),
+            reason: "read-only: cat".into(),
+            shell: Some("cat a".into()),
+        },
+        a_result(call),
+    ]);
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SafetyCheckFeedback {
+            session_id: rig.session.0.to_string(),
+            call: call.0.to_string(),
+            judgment: SafetyJudgmentView::ShouldAsk,
+            note: Some("x".into()),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::SafetyCheckFeedback {
+            session_id: rig.session,
+            call,
+            judgment: SafetyJudgment::ShouldAsk,
+            note: Some("x".into()),
+        }]
+    );
+    rig.results();
+    rig.view();
+    let label = rig.tool_row("Bash").state_label;
+    assert!(
+        label.ends_with(" · feedback: should have asked · queued"),
+        "{label}"
+    );
+}
+
+#[test]
+fn a_shell_call_that_asked_offers_should_have_been_approved() {
+    use crate::signals::{SafetyFeedbackFacts, SafetyJudgmentView};
+    use skywave_proto::{ApprovalId, CallId, ToolKind};
+    let approval = |call: CallId, shell: Option<String>| EventKind::ApprovalRequested {
+        id: ApprovalId::new(),
+        call: Some(call),
+        tool: "Bash".into(),
+        summary: "rm -rf build".into(),
+        input: None,
+        suggestions: Vec::new(),
+        shell,
+    };
+    let mut rig = Rig::new();
+    let call = CallId::new();
+    rig.log(vec![
+        a_call(None, call, "Bash", ToolKind::Shell, "rm -rf build"),
+        approval(call, Some("rm -rf build".into())),
+    ]);
+    assert_eq!(
+        rig.tool_row("Bash").feedback,
+        Some(SafetyFeedbackFacts {
+            call: call.0.to_string(),
+            judgment: SafetyJudgmentView::ShouldApprove,
+        })
+    );
+
+    // The control: an approval naming no shell command is offered none.
+    let mut plain = Rig::new();
+    let plain_call = CallId::new();
+    plain.log(vec![
+        a_call(None, plain_call, "Bash", ToolKind::Shell, "rm -rf build"),
+        approval(plain_call, None),
+    ]);
+    assert_eq!(plain.tool_row("Bash").feedback, None);
 }
 
 #[test]
@@ -4526,6 +4664,7 @@ fn a_background_subagent_opens_from_its_task_and_says_where_its_approval_is() {
             summary: "src/sync.rs".into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         },
     ]);
     let session = rig.open_session();

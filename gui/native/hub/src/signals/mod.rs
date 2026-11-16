@@ -59,8 +59,8 @@ pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};
 pub use timeline::{
     BlobFacts, BlobStateKind, LineStyle, MarkdownAlign, MarkdownBlock, MarkdownCell, MarkdownKind,
     MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowFile, RowImage, RowKind,
-    SectionFormat, SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView,
-    ToolState,
+    SafetyFeedbackFacts, SafetyJudgmentView, SectionFormat, SectionLine, SectionView, TimelineRow,
+    TimelineUpdate, ToolFacts, ToolKindView, ToolState,
 };
 pub use workdir::{
     WorkdirChangeKind, WorkdirChangeRow, WorkdirCommitRow, WorkdirContent, WorkdirDownloadRow,

@@ -7,6 +7,7 @@ use super::crop::{BlobUseView, LineSpanView};
 use super::screen::{
     EffortView, PermissionModeView, StorageGroupingView, UsageGroupingView, UsageSpanView,
 };
+use super::timeline::SafetyJudgmentView;
 use super::workdir::WorkdirPaneKind;
 
 /// Everything the GUI tells the hub after boot, in one type: rinf orders
@@ -395,6 +396,14 @@ pub enum ActionIntent {
     SetSafetyCheck {
         session_id: String,
         on: bool,
+    },
+    /// Tell the server the safety check judged shell call `call` (a row's
+    /// `feedback.call`) wrong, with an optional note.
+    SafetyCheckFeedback {
+        session_id: String,
+        call: String,
+        judgment: SafetyJudgmentView,
+        note: Option<String>,
     },
     /// Switch the session's agent to `model`: an offered model's `id`, or
     /// a name typed in. Blank does nothing.

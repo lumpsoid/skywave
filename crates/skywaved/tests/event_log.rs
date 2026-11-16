@@ -9,9 +9,10 @@ use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
     ContentHash, ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind,
     ImportOutcome, ImportedItem, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen,
-    Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind,
-    ToolCall, ToolDisplay, ToolKind, ToolResult, limits,
+    SafetyJudgment, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, ShellEnd,
+    TaskId, TaskKind, ToolCall, ToolDisplay, ToolKind, ToolResult, limits,
 };
+use skywave_safety::Verdict;
 use skywaved::agent::fake::FakeOutside;
 use skywaved::agent::import::{self, IMPORT_DEADLINE, Prepared};
 use skywaved::agent::{
@@ -128,6 +129,7 @@ impl Fixture {
                 summary: "ls".into(),
                 input: None,
                 suggestions,
+                shell: None,
             },
         );
         id
@@ -2144,6 +2146,291 @@ fn set_safety_check_needs_a_known_session_and_logs_the_device() {
     );
 }
 
+// --- SafetyCheckFeedback -----------------------------------------------------
+
+/// An `ApprovalRequested` of `call`, naming `shell` as its command if given.
+fn asked_shell(call: CallId, shell: Option<&str>) -> EventKind {
+    EventKind::ApprovalRequested {
+        id: ApprovalId::new(),
+        call: Some(call),
+        tool: "shell".into(),
+        summary: "shell".into(),
+        input: None,
+        suggestions: vec![],
+        shell: shell.map(Into::into),
+    }
+}
+
+/// A `SafetyCheckApproved` of `call` for `ls`.
+fn approved_shell(call: CallId) -> EventKind {
+    EventKind::SafetyCheckApproved {
+        call: Some(call),
+        tool: "shell".into(),
+        summary: "ls".into(),
+        reason: "read-only: ls".into(),
+        shell: Some("ls".into()),
+    }
+}
+
+fn feedback(session: SessionId, call: CallId, judgment: SafetyJudgment) -> CommandKind {
+    CommandKind::SafetyCheckFeedback {
+        session_id: session,
+        call,
+        judgment,
+        note: None,
+    }
+}
+
+/// The note of the `SafetyCheckFeedback` event `event`.
+fn logged_note(event: &Event) -> Option<&str> {
+    match &event.kind {
+        EventKind::SafetyCheckFeedback { note, .. } => note.as_deref(),
+        other => panic!("expected a SafetyCheckFeedback, got {other:?}"),
+    }
+}
+
+#[test]
+fn safety_feedback_on_an_asked_shell_call_logs_the_check() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let call = CallId::new();
+    f.agent(session, asked_shell(call, Some("rm notes.txt")));
+    let workdir = f.root.join("project").canonicalize().unwrap();
+    let Verdict::Ask { why } = skywave_safety::check("rm notes.txt", &workdir) else {
+        panic!("rm notes.txt should be asked");
+    };
+
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SafetyCheckFeedback {
+            session_id: session,
+            call,
+            judgment: SafetyJudgment::ShouldApprove,
+            note: Some("  fine here \n".into()),
+        },
+    };
+    let head = f.log.head();
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    assert_eq!(seq, head.next(), "one event, nothing else");
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(
+        event.kind,
+        EventKind::SafetyCheckFeedback {
+            call,
+            judgment: SafetyJudgment::ShouldApprove,
+            note: Some("fine here".into()),
+            shell: "rm notes.txt".into(),
+            checked_safe: false,
+            checked_reason: why,
+            by: device,
+        }
+    );
+}
+
+#[test]
+fn safety_feedback_on_a_check_approved_call_logs_the_check() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let call = CallId::new();
+    f.agent(session, approved_shell(call));
+    let workdir = f.root.join("project").canonicalize().unwrap();
+    let Verdict::Safe { reason } = skywave_safety::check("ls", &workdir) else {
+        panic!("ls should be proven read-only");
+    };
+
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: feedback(session, call, SafetyJudgment::ShouldAsk),
+    };
+    let head = f.log.head();
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    assert_eq!(seq, head.next(), "one event, nothing else");
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(
+        event.kind,
+        EventKind::SafetyCheckFeedback {
+            call,
+            judgment: SafetyJudgment::ShouldAsk,
+            note: None,
+            shell: "ls".into(),
+            checked_safe: true,
+            checked_reason: reason,
+            by: device,
+        }
+    );
+}
+
+#[test]
+fn safety_feedback_needs_the_matching_shell_call() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let asked = CallId::new();
+    let approved = CallId::new();
+    let no_shell = CallId::new();
+    let elsewhere = CallId::new();
+    f.agent(session, asked_shell(asked, Some("rm notes.txt")));
+    f.agent(session, approved_shell(approved));
+    f.agent(session, asked_shell(no_shell, None));
+    let other = f.create_session();
+    f.agent(other, asked_shell(elsewhere, Some("rm notes.txt")));
+    let head = f.log.head();
+
+    assert_eq!(
+        f.handle(feedback(
+            SessionId::new(),
+            asked,
+            SafetyJudgment::ShouldApprove
+        )),
+        rejected(RejectReason::UnknownSession)
+    );
+    let refused = [
+        (
+            session,
+            CallId::new(),
+            SafetyJudgment::ShouldApprove,
+            "an unknown call",
+        ),
+        (
+            session,
+            asked,
+            SafetyJudgment::ShouldAsk,
+            "the wrong judgment for an asked call",
+        ),
+        (
+            session,
+            approved,
+            SafetyJudgment::ShouldApprove,
+            "the wrong judgment for a check approval",
+        ),
+        (
+            session,
+            no_shell,
+            SafetyJudgment::ShouldApprove,
+            "an approval naming no command",
+        ),
+        (
+            session,
+            elsewhere,
+            SafetyJudgment::ShouldApprove,
+            "a call of another session",
+        ),
+    ];
+    for (from, call, judgment, why) in refused {
+        assert_eq!(
+            f.handle(feedback(from, call, judgment)),
+            rejected(RejectReason::NotAShellCall),
+            "{why}"
+        );
+    }
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+
+    // The same kind of command on the call it is about is accepted.
+    accepted(f.handle(feedback(session, asked, SafetyJudgment::ShouldApprove)));
+    assert_eq!(f.log.head(), head.next());
+}
+
+#[test]
+fn safety_feedback_caps_the_note() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let call = CallId::new();
+    f.agent(session, asked_shell(call, Some("rm notes.txt")));
+    let head = f.log.head();
+    let with_note = |text: String| CommandKind::SafetyCheckFeedback {
+        session_id: session,
+        call,
+        judgment: SafetyJudgment::ShouldApprove,
+        note: Some(text),
+    };
+
+    let too_long = "x".repeat(limits::SAFETY_FEEDBACK_NOTE_MAX_BYTES + 1);
+    assert_eq!(
+        f.handle(with_note(too_long)),
+        rejected(RejectReason::MessageTooLong)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+
+    let longest = "x".repeat(limits::SAFETY_FEEDBACK_NOTE_MAX_BYTES);
+    accepted(f.handle(with_note(longest.clone())));
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(logged_note(&event), Some(longest.as_str()));
+
+    accepted(f.handle(with_note("  \n\t ".into())));
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(logged_note(&event), None, "a blank note is no note");
+}
+
+#[test]
+fn safety_feedback_exports_json_lines() {
+    let mut f = Fixture::new();
+    let first = f.create_session();
+    let asked = CallId::new();
+    f.agent(first, asked_shell(asked, Some("rm notes.txt")));
+    accepted(f.handle(CommandKind::SafetyCheckFeedback {
+        session_id: first,
+        call: asked,
+        judgment: SafetyJudgment::ShouldApprove,
+        note: Some("fine".into()),
+    }));
+    let second = f.create_session();
+    let approved = CallId::new();
+    f.agent(second, approved_shell(approved));
+    accepted(f.handle(feedback(second, approved, SafetyJudgment::ShouldAsk)));
+
+    let lines = skywaved::safety_feedback::lines(f.storage.db.conn()).unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let workdir = f.root.join("project").canonicalize().unwrap();
+    let workdir = workdir.to_str().unwrap();
+
+    let line: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let mut keys: Vec<&str> = line
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "at",
+            "by",
+            "call",
+            "checked_reason",
+            "checked_safe",
+            "judgment",
+            "note",
+            "session",
+            "shell",
+            "workdir"
+        ]
+    );
+    assert_eq!(line["session"], first.0.to_string());
+    assert_eq!(line["workdir"], workdir);
+    assert_eq!(line["call"], asked.0.to_string());
+    assert_eq!(line["shell"], "rm notes.txt");
+    assert_eq!(line["judgment"], "should_approve");
+    assert_eq!(line["note"], "fine");
+    assert_eq!(line["checked_safe"], false);
+    assert!(!line["checked_reason"].as_str().unwrap().is_empty());
+    assert!(line["by"].is_string());
+    let at = line["at"].as_str().unwrap();
+    chrono::DateTime::parse_from_rfc3339(at).unwrap_or_else(|e| panic!("{at}: {e}"));
+
+    let line: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(line["session"], second.0.to_string());
+    assert_eq!(line["workdir"], workdir);
+    assert_eq!(line["call"], approved.0.to_string());
+    assert_eq!(line["shell"], "ls");
+    assert_eq!(line["judgment"], "should_ask");
+    assert!(line["note"].is_null());
+    assert_eq!(line["checked_safe"], true);
+}
+
 #[test]
 fn run_shell_is_checked_in_order_and_logged_verbatim() {
     let mut f = Fixture::with_shell();
@@ -2814,6 +3101,7 @@ fn agent_appends_are_checked() {
             summary: "again".into(),
             input: None,
             suggestions: Vec::new(),
+            shell: None,
         },
     );
     assert!(matches!(duplicate, Err(Error::InvalidAppend(_))));

@@ -922,6 +922,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
                 summary: "ls".into(),
                 input: None,
                 suggestions: Vec::new(),
+                shell: None,
             },
         )
     };

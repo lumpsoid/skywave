@@ -13,8 +13,8 @@ use skywave_core::store::OutboxFile;
 use skywave_core::{
     Answer, ApprovalStatus, AttachmentRefusal, BlobId, BlobState, BlobView, BodyFormat, Decision,
     DeviceRef, Entry, FailReason, FullView, ImportedEntry, MessageImage, Outgoing, QUESTION_TOOL,
-    RuleSuggestion, Seq, SessionId, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
-    read_head,
+    RuleSuggestion, SafetyJudgment, Seq, SessionId, SessionView, TimelineItem, ToolKind,
+    ToolOutcome, ToolView, read_head,
 };
 use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
@@ -34,8 +34,8 @@ use crate::crop::target_view;
 use crate::signals::{
     BlobFacts, BlobStateKind, LineStyle, MarkdownAlign, MarkdownBlock, MarkdownCell, MarkdownKind,
     MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowFile, RowImage, RowKind,
-    SectionFormat, SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView,
-    ToolState,
+    SafetyFeedbackFacts, SafetyJudgmentView, SectionFormat, SectionLine, SectionView, TimelineRow,
+    TimelineUpdate, ToolFacts, ToolKindView, ToolState,
 };
 
 /// Most of a blob an expanded section shows.
@@ -586,6 +586,18 @@ fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> T
     {
         label = format!("{label} · {note}");
     }
+    let feedback = view.safety_feedback.as_ref().map(|f| SafetyFeedbackFacts {
+        call: view.call.0.to_string(),
+        judgment: safety_judgment_view(f.judgment),
+    });
+    if let Some(facts) = &feedback
+        && let Some(sent) = view.safety_feedback.as_ref().and_then(|f| f.sent.as_ref())
+    {
+        label = format!("{label} · feedback: {}", feedback_words(facts.judgment));
+        if let Some(outgoing) = &sent.outgoing {
+            label = format!("{label} · {}", outgoing_label(outgoing));
+        }
+    }
     let (state, status) = match subagent_state(view) {
         Some((state, status)) => (state, Some(status)),
         None => (state, None),
@@ -600,6 +612,23 @@ fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> T
         aside: (!expanded).then(|| unseen_blob(entry)).flatten(),
         opens: view.subagent.as_ref().map(|_| view.call.0.to_string()),
         status,
+        feedback,
+    }
+}
+
+/// The safety check's judgment as the head sends it.
+fn safety_judgment_view(judgment: SafetyJudgment) -> SafetyJudgmentView {
+    match judgment {
+        SafetyJudgment::ShouldApprove => SafetyJudgmentView::ShouldApprove,
+        SafetyJudgment::ShouldAsk => SafetyJudgmentView::ShouldAsk,
+    }
+}
+
+/// The words a sent feedback's row says it sent.
+fn feedback_words(judgment: SafetyJudgmentView) -> &'static str {
+    match judgment {
+        SafetyJudgmentView::ShouldApprove => "should have been approved",
+        SafetyJudgmentView::ShouldAsk => "should have asked",
     }
 }
 
@@ -643,6 +672,7 @@ fn plain_facts(name: &str, summary: &str, expanded: bool, entry: &Entry) -> Tool
         aside: (!expanded).then(|| unseen_blob(entry)).flatten(),
         opens: None,
         status: None,
+        feedback: None,
     }
 }
 
@@ -1362,6 +1392,7 @@ mod tests {
                     input: Some(asked),
                 }),
                 safety_check: None,
+                safety_feedback: None,
                 outcome: ToolOutcome::Running { since: Utc::now() },
                 subagent: None,
             })),

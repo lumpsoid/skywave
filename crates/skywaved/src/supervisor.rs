@@ -339,6 +339,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
+use crate::agent::mapper::SafetyApproval;
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
     Conversation, EventMapper, ImageInput, LoginSeen, LoginSource, LoginState, StartSpec,
@@ -1950,18 +1951,21 @@ impl<A: AgentAdapter> Supervisor<A> {
                     call,
                     tool,
                     input,
+                    shell,
                     ..
                 },
             ) => {
                 tracing::debug!(session = %id.0, %reason, "safety check approves a shell command");
-                let seq = running.mapper.safety_approved(
-                    &self.log,
-                    &mut self.storage,
+                let approval = SafetyApproval {
                     call,
                     tool,
-                    &input,
+                    input,
                     reason,
-                )?;
+                    shell,
+                };
+                let seq = running
+                    .mapper
+                    .safety_approved(&self.log, &mut self.storage, approval)?;
                 (vec![seq], Some(request))
             }
             (_, event) => (

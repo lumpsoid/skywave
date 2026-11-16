@@ -406,6 +406,7 @@ impl SessionSummary {
             | EventKind::BlobCropped { .. }
             | EventKind::SafetyCheckSet { .. }
             | EventKind::SafetyCheckApproved { .. }
+            | EventKind::SafetyCheckFeedback { .. }
             | EventKind::FileWritten { .. } => {}
         }
     }
@@ -506,6 +507,7 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::BlobCropped { .. }
         | EventKind::SafetyCheckSet { .. }
         | EventKind::SafetyCheckApproved { .. }
+        | EventKind::SafetyCheckFeedback { .. }
         | EventKind::FileWritten { .. } => false,
     }
 }
@@ -825,6 +827,7 @@ mod tests {
                 summary: "ls".into(),
                 input: None,
                 suggestions: Vec::new(),
+                shell: None,
             },
             EventKind::ApprovalRequested {
                 id: a2,
@@ -833,6 +836,7 @@ mod tests {
                 summary: "pwd".into(),
                 input: None,
                 suggestions: Vec::new(),
+                shell: None,
             },
         ];
         for (i, kind) in steps.into_iter().enumerate() {

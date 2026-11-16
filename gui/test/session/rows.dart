@@ -54,14 +54,18 @@ TimelineRow anyRow(
   canResendReplacing: canResendReplacing,
 );
 
-ToolFacts shellFacts(String title, {ToolState state = ToolState.done}) =>
-    ToolFacts(
-      kind: ToolKindView.shell,
-      name: 'Bash',
-      title: title,
-      state: state,
-      stateLabel: 'exit 0 · 0.4s',
-    );
+ToolFacts shellFacts(
+  String title, {
+  ToolState state = ToolState.done,
+  SafetyFeedbackFacts? feedback,
+}) => ToolFacts(
+  kind: ToolKindView.shell,
+  name: 'Bash',
+  title: title,
+  state: state,
+  stateLabel: 'exit 0 · 0.4s',
+  feedback: feedback,
+);
 
 SectionView lines(
   List<String> texts, {

@@ -5,14 +5,15 @@ use std::path::PathBuf;
 
 use skywave_core::{
     Action, BlobPolicy, BlobUse, ContentHash, Decision, Effort, LineSpan, LoginCode,
-    PermissionMode, QuestionAnswer, Route, ServerAddress, TaskId, WorkdirPane,
+    PermissionMode, QuestionAnswer, Route, SafetyJudgment, ServerAddress, TaskId, WorkdirPane,
 };
 use skywave_present::crop::normalise;
 use uuid::Uuid;
 
 use crate::signals::{
     ActionIntent, BlobPolicyChoice, BlobUseView, DecisionView, EffortView, LineSpanView,
-    PastedCode, PermissionModeView, QuestionAnswerView, RouteView, WorkdirPaneKind,
+    PastedCode, PermissionModeView, QuestionAnswerView, RouteView, SafetyJudgmentView,
+    WorkdirPaneKind,
 };
 
 /// `intent` as a core action, or why it is not one.
@@ -111,6 +112,17 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::SetSafetyCheck { session_id, on } => Action::SetSafetyCheck {
             session_id: id("session", &session_id)?,
             on,
+        },
+        ActionIntent::SafetyCheckFeedback {
+            session_id,
+            call,
+            judgment,
+            note,
+        } => Action::SafetyCheckFeedback {
+            session_id: id("session", &session_id)?,
+            call: id("call", &call)?,
+            judgment: safety_judgment(judgment),
+            note,
         },
         ActionIntent::SetModel { session_id, model } => Action::SetModel {
             session_id: id("session", &session_id)?,
@@ -260,6 +272,13 @@ fn permission_mode(mode: PermissionModeView) -> PermissionMode {
     }
 }
 
+fn safety_judgment(judgment: SafetyJudgmentView) -> SafetyJudgment {
+    match judgment {
+        SafetyJudgmentView::ShouldApprove => SafetyJudgment::ShouldApprove,
+        SafetyJudgmentView::ShouldAsk => SafetyJudgment::ShouldAsk,
+    }
+}
+
 fn effort(effort: EffortView) -> Effort {
     match effort {
         EffortView::Low => Effort::Low,
@@ -302,9 +321,37 @@ pub fn id<T: From<Uuid>>(what: &str, text: &str) -> Result<T, String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use skywave_core::SessionId;
+    use skywave_core::{CallId, SessionId};
 
     use super::*;
+
+    #[test]
+    fn safety_check_feedback_maps_its_ids_and_judgment() {
+        let (session, call) = (SessionId::new(), CallId::new());
+        assert_eq!(
+            action(ActionIntent::SafetyCheckFeedback {
+                session_id: session.0.to_string(),
+                call: call.0.to_string(),
+                judgment: SafetyJudgmentView::ShouldAsk,
+                note: Some("x".into()),
+            }),
+            Ok(Action::SafetyCheckFeedback {
+                session_id: session,
+                call,
+                judgment: SafetyJudgment::ShouldAsk,
+                note: Some("x".into()),
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::SafetyCheckFeedback {
+                session_id: session.0.to_string(),
+                call: "nope".into(),
+                judgment: SafetyJudgmentView::ShouldAsk,
+                note: None,
+            }),
+            Err("not a call id: \"nope\"".to_owned())
+        );
+    }
 
     #[test]
     fn ids_parse_and_malformed_ones_are_errors() {
