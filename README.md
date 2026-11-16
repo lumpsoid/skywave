@@ -111,7 +111,7 @@ show up on all of them, in the same order.
 > pass end-to-end tests under a simulated bad link; the full acceptance pass
 > against real Claude Code is still in progress.
 
-Requires Rust 1.89+ and, on the server, the [`claude`](https://docs.anthropic.com/en/docs/claude-code)
+Requires Rust 1.100+ and, on the server, the [`claude`](https://docs.anthropic.com/en/docs/claude-code)
 CLI on `PATH`.
 
 ```sh

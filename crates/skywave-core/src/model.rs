@@ -2114,7 +2114,7 @@ impl Model {
             }
         }
         self.sessions
-            .sort_by(|a, b| b.last_message_seq.cmp(&a.last_message_seq));
+            .sort_by_key(|a| std::cmp::Reverse(a.last_message_seq));
         self.note_new_approvals()
     }
 
