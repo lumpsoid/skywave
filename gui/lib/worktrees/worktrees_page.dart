@@ -7,9 +7,9 @@ import 'package:skywave_gui/sessions/remove_worktree_dialog.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Worktrees: each repository the server knows, with its worktrees, their
-/// branch and tags, and the sessions working in each. Read-only, except
-/// Remove worktree on a worktree that can go; the server still refuses a
-/// busy, dirty or unmerged one.
+/// branch and tags, and the sessions working in each; a session opens on tap.
+/// Otherwise read-only, except Remove worktree on a worktree that can go; the
+/// server still refuses a busy, dirty or unmerged one.
 class WorktreesPage extends StatelessWidget {
   const WorktreesPage({
     required this.screen,
@@ -85,13 +85,22 @@ class WorktreesPage extends StatelessWidget {
   }
 }
 
-/// One worktree: its path, branch, removal and tags, with Remove worktree when
-/// it can go, then its sessions; the archived ones are marked.
-class _WorktreeCard extends StatelessWidget {
+/// One worktree: its branch, path, tags and removal, with Remove worktree when
+/// it can go. Its active sessions are listed; the archived ones sit behind a
+/// fold, collapsed until asked for.
+class _WorktreeCard extends StatefulWidget {
   const _WorktreeCard({required this.worktree, required this.send});
 
   final WorktreeView worktree;
   final SendIntent send;
+
+  @override
+  State<_WorktreeCard> createState() => _WorktreeCardState();
+}
+
+class _WorktreeCardState extends State<_WorktreeCard> {
+  /// The archived sessions are listed.
+  bool _expanded = false;
 
   @override
   Widget build(BuildContext context) {
@@ -99,6 +108,7 @@ class _WorktreeCard extends StatelessWidget {
     final muted = theme.textTheme.bodySmall?.copyWith(
       color: theme.colorScheme.onSurfaceVariant,
     );
+    final worktree = widget.worktree;
     final remove = worktree.remove;
     return Card(
       margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
@@ -114,14 +124,15 @@ class _WorktreeCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
+                        worktree.branch,
+                        style: theme.textTheme.bodyMedium?.merge(monoText),
+                      ),
+                      Text(
                         worktree.path,
-                        style: monoText,
+                        style: muted?.merge(monoText),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      Text(worktree.branch, style: muted?.merge(monoText)),
-                      if (worktree.removalLabel case final label?)
-                        Text(label, style: muted),
                       if (worktree.tags.isNotEmpty)
                         Padding(
                           padding: const EdgeInsets.only(top: 4),
@@ -137,6 +148,8 @@ class _WorktreeCard extends StatelessWidget {
                             ],
                           ),
                         ),
+                      if (worktree.removalLabel case final label?)
+                        Text(label, style: muted),
                     ],
                   ),
                 ),
@@ -150,9 +163,25 @@ class _WorktreeCard extends StatelessWidget {
               ],
             ),
             for (final session in worktree.sessions)
-              _SessionLine(session: session, archived: false),
-            for (final session in worktree.archived)
-              _SessionLine(session: session, archived: true),
+              _SessionLine(
+                session: session,
+                send: widget.send,
+                archived: false,
+              ),
+            if (worktree.archived.isNotEmpty)
+              TextButton.icon(
+                key: Key('archived-${worktree.path}'),
+                onPressed: () => setState(() => _expanded = !_expanded),
+                icon: Icon(_expanded ? Icons.expand_less : Icons.expand_more),
+                label: Text('${worktree.archived.length} archived'),
+              ),
+            if (_expanded)
+              for (final session in worktree.archived)
+                _SessionLine(
+                  session: session,
+                  send: widget.send,
+                  archived: true,
+                ),
           ],
         ),
       ),
@@ -163,19 +192,25 @@ class _WorktreeCard extends StatelessWidget {
     final confirmed = await confirmRemoveWorktree(
       context,
       title: remove.title,
-      branch: worktree.branch,
+      branch: widget.worktree.branch,
     );
     if (confirmed) {
-      send.act(ActionIntentRemoveWorktree(sessionId: remove.sessionId));
+      widget.send.act(ActionIntentRemoveWorktree(sessionId: remove.sessionId));
     }
   }
 }
 
-/// A session working in a worktree; an archived one says so.
+/// A session working in a worktree; a tap opens it. An archived one is drawn
+/// muted, the fold above it already says so.
 class _SessionLine extends StatelessWidget {
-  const _SessionLine({required this.session, required this.archived});
+  const _SessionLine({
+    required this.session,
+    required this.send,
+    required this.archived,
+  });
 
   final WorktreeSessionView session;
+  final SendIntent send;
   final bool archived;
 
   @override
@@ -184,15 +219,18 @@ class _SessionLine extends StatelessWidget {
     final muted = theme.textTheme.bodySmall?.copyWith(
       color: theme.colorScheme.onSurfaceVariant,
     );
-    return Padding(
-      padding: const EdgeInsets.only(top: 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(session.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-          if (archived) Text('archived', style: muted),
-        ],
+    return ListTile(
+      key: Key('worktree-session-${session.sessionId}'),
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      title: Text(
+        session.title,
+        style: archived ? muted : null,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
       ),
+      onTap: () =>
+          send.act(ActionIntentOpenSession(sessionId: session.sessionId)),
     );
   }
 }
