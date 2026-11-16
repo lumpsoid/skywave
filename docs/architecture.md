@@ -1803,7 +1803,11 @@ skywave-core                 all logic, sync, replica
   one. Timeline rows, shell runs and storage rows carry a
   `BlobTargetView` (present's `BlobTarget`, worded), so Dart's delete and
   crop menu decides nothing; every delete or crop goes through an
-  `AlertDialog` with present's question first.
+  `AlertDialog` with present's question first. On the storage page the
+  sessions' ticks are Dart-local state; each bulk action (archive, remove
+  from this device, delete everywhere) acts only on the ticked rows whose
+  flags (`here`/`archived`, `deletable`, `deletableEverywhere`) allow it,
+  and the two deletes ask first.
 - **Agent messages are markdown** (D48). The hub parses an agent message's
   text, live or imported, into flat blocks (present's `markdown::blocks`)
   sent as `TimelineRow.markdown` beside the raw `text`; an expanded long
