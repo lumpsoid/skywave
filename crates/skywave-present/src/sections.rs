@@ -754,6 +754,7 @@ mod tests {
             input,
             approval: None,
             safety_check: None,
+            safety_feedback: None,
             outcome: ToolOutcome::Running { since: Utc::now() },
             subagent: None,
         }
