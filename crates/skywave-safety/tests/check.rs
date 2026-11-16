@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use skywave_safety::{Rule, Verdict, check, check_with};
+use skywave_safety::{Rule, Verdict, check, check_with, simple_commands};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -528,4 +528,45 @@ fn nested_substitution_is_proven() -> TestResult {
         }
     );
     Ok(())
+}
+
+#[test]
+fn simple_commands_lists_literal_words() {
+    let rows: &[(&str, &[&[&str]])] = &[
+        ("git status", &[&["git", "status"]]),
+        (
+            "cargo test -p x 2>&1 | tail -n 20",
+            &[&["cargo", "test", "-p", "x"], &["tail", "-n", "20"]],
+        ),
+        (
+            "cd a && git log --oneline; ls",
+            &[&["cd", "a"], &["git", "log", "--oneline"], &["ls"]],
+        ),
+        (
+            "git commit -m \"$(cat msg)\" --amend",
+            &[&["git", "commit", "-m"], &["cat", "msg"]],
+        ),
+        ("FOO=1 make build > out.txt", &[&["make", "build"]]),
+        ("echo 'a b' $HOME c", &[&["echo", "a b"]]),
+        ("$EDITOR file", &[]),
+        ("echo `id`", &[&["echo"]]),
+        ("(cd x && ls)", &[]),
+        ("echo 'unterminated", &[]),
+        ("", &[]),
+        // A background job still lists its words.
+        ("cat a.txt &", &[&["cat", "a.txt"]]),
+        // A process substitution cuts the list.
+        ("cat <(ls a)", &[&["cat"]]),
+        // A substitution in the program word is listed, with no entry for it.
+        ("$(echo ls) a.txt", &[&["echo", "ls"]]),
+        // Nested: the outer command's entry comes before the inner ones.
+        ("echo $(echo $(pwd))", &[&["echo"], &["echo"], &["pwd"]]),
+    ];
+    for (command, expected) in rows {
+        let want: Vec<Vec<String>> = expected
+            .iter()
+            .map(|words| words.iter().map(|word| word.to_string()).collect())
+            .collect();
+        assert_eq!(simple_commands(command), want, "{command:?}");
+    }
 }

@@ -49,6 +49,126 @@ pub(crate) fn check(command: &str, workdir: &Path, rules: &[Rule]) -> Verdict {
     }
 }
 
+/// The literal words of each simple command in `command`, in source order.
+/// Runs like `check`: on the large stack, and no entries if the worker fails.
+pub(crate) fn simple_commands(command: &str) -> Vec<Vec<String>> {
+    if command.len() > MAX_COMMAND_BYTES {
+        return Vec::new();
+    }
+    let command = command.to_owned();
+    let worker = thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(move || {
+            let mut entries = Vec::new();
+            words_into(&command, &mut entries);
+            entries
+        });
+    match worker {
+        Ok(handle) => handle.join().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Appends the entries of `command`: each simple command, then the entries of
+/// the `$(...)` commands inside its words. A line that does not parse adds
+/// nothing.
+fn words_into(command: &str, entries: &mut Vec<Vec<String>>) {
+    let Ok(program) = parse(command) else {
+        return;
+    };
+    let items = program.complete_commands.iter().flat_map(|list| &list.0);
+    for CompoundListItem(and_or, _) in items {
+        pipeline_words(&and_or.first, entries);
+        for next in &and_or.additional {
+            match next {
+                AndOr::And(later) | AndOr::Or(later) => pipeline_words(later, entries),
+            }
+        }
+    }
+}
+
+fn pipeline_words(pipeline: &ast::Pipeline, entries: &mut Vec<Vec<String>>) {
+    for command in &pipeline.seq {
+        // Compound commands, functions and `[[ ]]` tests have no entry and are
+        // not entered.
+        if let ast::Command::Simple(simple) = command {
+            simple_words(simple, entries);
+        }
+    }
+}
+
+/// One simple command: its entry, then the entries of the `$(...)` commands in
+/// its words, in order. The entry is only the literal words; an assignment or
+/// a redirection is not a word and is skipped.
+fn simple_words(simple: &ast::SimpleCommand, entries: &mut Vec<Vec<String>>) {
+    // The program must be literal, or there is no entry and no argument is read.
+    let program = simple
+        .word_or_name
+        .as_ref()
+        .and_then(|word| literal(word).ok());
+    let mut cut = program.is_none();
+    let mut words: Vec<String> = program.into_iter().collect();
+    let mut inner = Vec::new();
+    if let Some(word) = &simple.word_or_name {
+        substitutions_into(word, &mut inner);
+    }
+    let items = simple
+        .prefix
+        .iter()
+        .flat_map(|prefix| &prefix.0)
+        .chain(simple.suffix.iter().flat_map(|suffix| &suffix.0));
+    for item in items {
+        match item {
+            ast::CommandPrefixOrSuffixItem::Word(word) => {
+                if !cut {
+                    match literal(word) {
+                        Ok(text) => words.push(text),
+                        Err(_) => cut = true,
+                    }
+                }
+                substitutions_into(word, &mut inner);
+            }
+            ast::CommandPrefixOrSuffixItem::ProcessSubstitution(..) => cut = true,
+            ast::CommandPrefixOrSuffixItem::IoRedirect(_)
+            | ast::CommandPrefixOrSuffixItem::AssignmentWord(..) => {}
+        }
+    }
+    if !words.is_empty() {
+        entries.push(words);
+    }
+    // The substitutions come after the command that holds them, in order.
+    for text in &inner {
+        words_into(text, entries);
+    }
+}
+
+/// The text of each `$(...)` in `word`, at top level and inside double quotes,
+/// in order. Backquotes are not returned: they are never proven.
+fn substitutions_into(word: &ast::Word, found: &mut Vec<String>) {
+    let Ok(parts) = pieces(word) else {
+        return;
+    };
+    for part in &parts {
+        match &part.piece {
+            WordPiece::DoubleQuotedSequence(inner) => {
+                found.extend(
+                    inner
+                        .iter()
+                        .filter_map(|nested| substitution_text(&nested.piece)),
+                );
+            }
+            other => found.extend(substitution_text(other)),
+        }
+    }
+}
+
+fn substitution_text(piece: &WordPiece) -> Option<String> {
+    match piece {
+        WordPiece::CommandSubstitution(inner) => Some(inner.clone()),
+        _ => None,
+    }
+}
+
 /// What a passing command was proven by: the table programs and the rules it
 /// used, each listed once, in first-seen order.
 #[derive(Default)]

@@ -66,3 +66,12 @@ pub fn check(command: &str, workdir: &Path) -> Verdict {
 pub fn check_with(command: &str, workdir: &Path, rules: &[Rule]) -> Verdict {
     shell::check(command, workdir, rules)
 }
+
+/// The literal words of each simple command in `command`, in source order.
+/// Each entry starts with the program, then its arguments, cut at the first
+/// word that is not literal. A `$(...)` inside a word gives its own entries,
+/// right after the command that holds it. Parse only: nothing runs and no
+/// file is read. A line that does not parse, or is too long, gives no entries.
+pub fn simple_commands(command: &str) -> Vec<Vec<String>> {
+    shell::simple_commands(command)
+}
