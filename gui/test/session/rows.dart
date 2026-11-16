@@ -58,6 +58,7 @@ ToolFacts shellFacts(
   String title, {
   ToolState state = ToolState.done,
   SafetyFeedbackFacts? feedback,
+  List<List<String>> ruleCandidates = const [],
 }) => ToolFacts(
   kind: ToolKindView.shell,
   name: 'Bash',
@@ -65,7 +66,7 @@ ToolFacts shellFacts(
   state: state,
   stateLabel: 'exit 0 · 0.4s',
   feedback: feedback,
-  ruleCandidates: const <List<String>>[],
+  ruleCandidates: ruleCandidates,
 );
 
 SectionView lines(
