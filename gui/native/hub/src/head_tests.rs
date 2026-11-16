@@ -676,6 +676,53 @@ fn the_list_groups_worktree_sessions_by_repo() {
     assert_eq!(position(in_worktree).abs_diff(position(plain)), 1);
 }
 
+#[test]
+fn a_session_row_says_whether_it_may_be_deleted_everywhere() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    // The row of the session on `list`, which is the active or archived one.
+    let row = |rig: &Rig| match rig.list() {
+        ScreenView::SessionList { rows, .. } => rows
+            .into_iter()
+            .find(|r| r.session_id == rig.session.0.to_string())
+            .unwrap(),
+        _ => unreachable!(),
+    };
+    let live = row(&rig);
+    assert!(!live.archived && !live.deletable && !live.deletable_everywhere);
+
+    // Archived in the log, with nothing waiting and no worktree: deletable
+    // everywhere. (An archive sent from here would stay unsettled with no
+    // server to answer it, and an unsettled command blocks deletion.)
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 2, 0).unwrap();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(
+                rig.session,
+                at,
+                EventKind::SessionArchived {
+                    archived: true,
+                    by: rig.me,
+                },
+            )],
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::ArchivedSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    let archived = row(&rig);
+    assert!(archived.archived && archived.deletable && archived.deletable_everywhere);
+}
+
 impl Rig {
     fn new() -> Rig {
         Rig::on(Head::new(Prefs::default()))
@@ -2151,6 +2198,26 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
         action: ActionIntent::RefreshStorage,
     });
     assert_eq!(rig.actions.last(), Some(&Action::RefreshStorage));
+}
+
+#[test]
+fn the_storage_intents_reach_the_core() {
+    let mut rig = Rig::new();
+    for (action, expected) in [
+        (ActionIntent::ReclaimServerSpace, Action::ReclaimServerSpace),
+        (ActionIntent::ReclaimDeviceSpace, Action::ReclaimDeviceSpace),
+        (
+            ActionIntent::DeleteSessionEverywhere {
+                session_id: rig.session.0.to_string(),
+            },
+            Action::DeleteSessionEverywhere {
+                session_id: rig.session,
+            },
+        ),
+    ] {
+        rig.intent(GuiIntent::Act { action });
+        assert_eq!(rig.actions.last(), Some(&expected));
+    }
 }
 
 #[test]

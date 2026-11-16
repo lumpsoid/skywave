@@ -464,6 +464,9 @@ pub struct SessionRowView {
     pub importing_label: Option<String>,
     /// `DeleteSessionLocally` would remove it (archived, nothing waiting).
     pub deletable: bool,
+    /// `DeleteSessionEverywhere` would delete it: `deletable`, and no worktree
+    /// of it on disk.
+    pub deletable_everywhere: bool,
     /// Why it cannot be deleted yet, for an archived row that is not
     /// deletable.
     pub delete_blocked_label: Option<String>,
