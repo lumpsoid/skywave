@@ -65,6 +65,7 @@ ToolFacts shellFacts(
   state: state,
   stateLabel: 'exit 0 · 0.4s',
   feedback: feedback,
+  ruleCandidates: const <List<String>>[],
 );
 
 SectionView lines(

@@ -3332,6 +3332,7 @@ void main() {
       stateLabel: 'Async agent launched · 0.1s',
       opens: opens,
       status: opens == null ? null : 'running · 3 steps · Write src/sync.rs',
+      ruleCandidates: const <List<String>>[],
     );
 
     testWidgets('a subagent row shows how it stands; Open sends '

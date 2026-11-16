@@ -7,10 +7,10 @@ use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, Candidate, CandidateSource, Completion,
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
     LoginFlowView, LoginOutcome, LoginView, Outgoing, PairingStatus, PairingView, PendingSession,
-    PermissionMode, QuestionPrompt, RuleSuggestion, Screen, SessionId, SessionInfoView,
-    SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet, StorageView,
-    SubagentHeader, TimelineItem, UsageLimitsView, UsageView, ViewState, WorktreeSession,
-    WorktreesView,
+    PermissionMode, QuestionPrompt, RuleSuggestion, SafetyRuleView, Screen, SessionId,
+    SessionInfoView, SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet,
+    StorageView, SubagentHeader, TimelineItem, UsageLimitsView, UsageView, ViewState,
+    WorktreeSession, WorktreesView,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -44,11 +44,11 @@ use crate::signals::{
     ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView,
     InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState, ModeOption,
     ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
-    QuestionView, RenamePrompt, RepairNotice, RuleOption, SafetyCheckView, ScheduleRow,
-    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, StopHeadings,
-    StorageGroupingView, StorageRowView, StorageTotalView, SubagentHeaderView, SubagentRowView,
-    TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView,
-    WorktreeRepoView, WorktreeSessionView, WorktreeView,
+    QuestionView, RenamePrompt, RepairNotice, RuleOption, SafetyCheckView, SafetyRuleRow,
+    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
+    StopHeadings, StorageGroupingView, StorageRowView, StorageTotalView, SubagentHeaderView,
+    SubagentRowView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView,
+    WorktreeRemoveView, WorktreeRepoView, WorktreeSessionView, WorktreeView,
 };
 use skywave_present::text::{clean, clean_line};
 
@@ -956,6 +956,27 @@ fn settings_view(
             .device_id
             .map(|_| agent_login_view(&settings.login, now)),
         stay_connected,
+        safety_rules: settings.safety_rules.iter().map(safety_rule_row).collect(),
+    }
+}
+
+/// A safety rule as Settings lists it, with this device's change to it while
+/// it is on its way or was refused.
+fn safety_rule_row(rule: &SafetyRuleView) -> SafetyRuleRow {
+    let pending = rule.pending.as_ref().map(|change| match &change.outgoing {
+        Outgoing::Failed(reason) => {
+            let verb = if change.on { "add" } else { "remove" };
+            format!("could not {verb}: {}", fail_reason(*reason))
+        }
+        _ if change.on => "adding".to_owned(),
+        _ => "removing".to_owned(),
+    });
+    SafetyRuleRow {
+        session_id: rule.session_id.0.to_string(),
+        words: rule.words.clone(),
+        label: rule.words.join(" "),
+        on: rule.on,
+        pending,
     }
 }
 
@@ -1318,6 +1339,84 @@ mod tests {
             Some("no expiry reported")
         );
         assert_eq!(settings(None, None), None, "unpaired: no server to ask");
+    }
+
+    /// Settings list each safety rule in the order the core gives, with its
+    /// logged state and this device's change to it while on its way or
+    /// refused.
+    #[test]
+    fn settings_list_the_safety_rules_as_they_stand() {
+        use skywave_core::{FailReason, PendingSafetyRule, SafetyRuleView};
+        let session_id = SessionId::new();
+        let rule = |words: &[&str], on: bool, pending: Option<PendingSafetyRule>| SafetyRuleView {
+            words: words.iter().map(|word| word.to_string()).collect(),
+            session_id,
+            on,
+            pending,
+        };
+        let settings = SettingsView {
+            blob_policy: BlobPolicy::OnDemand,
+            blobs_disk_full: false,
+            server_address: None,
+            other_addresses: Vec::new(),
+            device_id: None,
+            server_fingerprint: None,
+            login: idle(false),
+            safety_rules: vec![
+                rule(&["git", "commit"], true, None),
+                rule(
+                    &["cargo", "test"],
+                    true,
+                    Some(PendingSafetyRule {
+                        on: false,
+                        outgoing: Outgoing::Queued,
+                    }),
+                ),
+                rule(
+                    &["ls"],
+                    false,
+                    Some(PendingSafetyRule {
+                        on: true,
+                        outgoing: Outgoing::Failed(FailReason::Undeliverable),
+                    }),
+                ),
+            ],
+        };
+        let view = ViewState {
+            link: Link::Online { latency_ms: 1 },
+            queued: 0,
+            attention: Attention::default(),
+            screen: Screen::Settings(settings.clone()),
+            can_go_back: true,
+            snippets: Vec::new(),
+            shell_history: Default::default(),
+            login_expires: None,
+            agent_login_offered: false,
+            agent_logged_out: false,
+        };
+        let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
+        let row = |words: &[&str], on: bool, pending: Option<&str>| SafetyRuleRow {
+            session_id: session_id.0.to_string(),
+            words: words.iter().map(|word| word.to_string()).collect(),
+            label: words.join(" "),
+            on,
+            pending: pending.map(str::to_owned),
+        };
+        match settings_view(&settings, &view, None, now.timestamp_millis()) {
+            ScreenView::Settings { safety_rules, .. } => assert_eq!(
+                safety_rules,
+                vec![
+                    row(&["git", "commit"], true, None),
+                    row(&["cargo", "test"], true, Some("removing")),
+                    row(
+                        &["ls"],
+                        false,
+                        Some("could not add: the server could not take it"),
+                    ),
+                ]
+            ),
+            other => panic!("not settings: {other:?}"),
+        }
     }
 
     /// The settings' login tile, for `login`, paired or not.
