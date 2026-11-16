@@ -481,6 +481,7 @@ impl EventLog {
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => {
@@ -1046,6 +1047,7 @@ pub(crate) fn append_in(
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
         | EventKind::SafetyCheckSet { .. }
+        | EventKind::SafetyRuleSet { .. }
         | EventKind::SafetyCheckApproved { .. }
         | EventKind::SafetyCheckFeedback { .. }
         | EventKind::ShellOutput { .. } => {}
@@ -1753,6 +1755,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortChanged { .. } => "EffortChanged",
         EventKind::EffortRefused { .. } => "EffortRefused",
         EventKind::SafetyCheckSet { .. } => "SafetyCheckSet",
+        EventKind::SafetyRuleSet { .. } => "SafetyRuleSet",
         EventKind::SafetyCheckApproved { .. } => "SafetyCheckApproved",
         EventKind::SafetyCheckFeedback { .. } => "SafetyCheckFeedback",
         EventKind::ContextStarted { .. } => "ContextStarted",

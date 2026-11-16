@@ -216,7 +216,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`EventKind::SafetyCheckFeedback`], [`RejectReason::NotAShellCall`], and
 /// the `shell` of [`EventKind::ApprovalRequested`] and
 /// [`EventKind::SafetyCheckApproved`].
-pub const PROTOCOL_VERSION: u32 = 39;
+///
+/// v40: safety rules, which a person teaches the safety check to trust:
+/// [`CommandKind::SetSafetyRule`], [`EventKind::SafetyRuleSet`] and
+/// [`RejectReason::BadSafetyRule`], with [`limits::SAFETY_RULE_WORDS_MAX`] and
+/// [`limits::SAFETY_RULE_MAX_BYTES`].
+pub const PROTOCOL_VERSION: u32 = 40;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -711,6 +716,15 @@ pub enum EventKind {
         on: bool,
         by: DeviceId,
     },
+    /// A `SetSafetyRule` command taught the safety check that the program and
+    /// literal leading words `words` are trusted (`on`), or no longer are. It
+    /// applies in every session; the newest `SafetyRuleSet` for the same
+    /// `words` decides whether the rule is on. Not notable.
+    SafetyRuleSet {
+        words: Vec<String>,
+        on: bool,
+        by: DeviceId,
+    },
     /// Skywave's safety check, not the agent and not a device, approved this
     /// tool call without asking anyone; `reason` says why it is safe. Never
     /// pending, never notified. `call` is the [`ToolCall`] approved, when
@@ -982,6 +996,7 @@ impl EventKind {
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
             | EventKind::SafetyCheckSet { by, .. }
+            | EventKind::SafetyRuleSet { by, .. }
             | EventKind::SafetyCheckFeedback { by, .. }
             | EventKind::ContextStarted { by, .. }
             | EventKind::ContextSwitched { by }
@@ -1049,6 +1064,7 @@ impl EventKind {
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
@@ -1125,6 +1141,7 @@ impl EventKind {
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::ContextStarted { .. }
@@ -1228,6 +1245,7 @@ impl EventKind {
             // It names a blob it deleted; it references none.
             | EventKind::BlobDeleted { .. }
             | EventKind::SafetyCheckSet { .. }
+            | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::FileWritten { .. } => (None, None),
@@ -1382,6 +1400,10 @@ pub mod limits {
     pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
     /// Longest note a safety check feedback carries.
     pub const SAFETY_FEEDBACK_NOTE_MAX_BYTES: usize = 2000;
+    /// Most words in a safety rule (`SetSafetyRule::words`).
+    pub const SAFETY_RULE_WORDS_MAX: usize = 16;
+    /// Most bytes in a safety rule's words together (the sum of their lengths).
+    pub const SAFETY_RULE_MAX_BYTES: usize = 512;
     /// Longest `SendMessage::text`, in UTF-8 bytes; the server refuses a
     /// longer one as `MessageTooLong` rather than cut it, as a cut message
     /// would ask something else. Generous for anything typed or pasted (a
@@ -2192,6 +2214,18 @@ pub enum CommandKind {
     /// `SafetyCheckSet` this logs, naming this device. Accepted for any
     /// known session, even when it is already so. Never starts the agent.
     SetSafetyCheck { session_id: SessionId, on: bool },
+    /// Teach the safety check that a shell command starting with `words` (a
+    /// program, then literal leading words, such as `["git", "commit"]`) is
+    /// trusted (`on: true`), or stop trusting it (`false`). The rule applies in
+    /// every session; `session_id` only says where the change is logged. The
+    /// answer is the `SafetyRuleSet` this logs, naming this device. Accepted
+    /// for any known session, even when it changes nothing. Never starts the
+    /// agent.
+    SetSafetyRule {
+        session_id: SessionId,
+        words: Vec<String>,
+        on: bool,
+    },
     /// A user's judgment of the safety check on `call`, a tool call of the
     /// session. The answer is the `SafetyCheckFeedback` event this logs,
     /// naming this device. `ShouldApprove` needs the call's logged
@@ -2544,6 +2578,10 @@ pub enum RejectReason {
     /// A `SendMessage` with an image over [`limits::ATTACHMENT_MAX_BYTES`],
     /// or whose images together exceed [`limits::ATTACHMENTS_MAX_TOTAL_BYTES`].
     AttachmentsTooLarge,
+    /// `SetSafetyRule.words` is empty, has an empty word, has more than
+    /// [`limits::SAFETY_RULE_WORDS_MAX`] words, or more than
+    /// [`limits::SAFETY_RULE_MAX_BYTES`] bytes in all.
+    BadSafetyRule,
 }
 
 impl RejectReason {

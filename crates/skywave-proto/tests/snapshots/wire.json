@@ -1,7 +1,7 @@
 {
-  "protocol_version": 39,
+  "protocol_version": 40,
   "hello": {
-    "protocol_version": 39,
+    "protocol_version": 40,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -940,6 +940,21 @@
       {
         "session_id": "01920000-0000-7000-8000-000000000001",
         "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "safety_rule_set",
+          "words": [
+            "git",
+            "commit"
+          ],
+          "on": true,
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
         "command_id": null,
         "context": "01920000-0000-7000-8000-000000000008",
         "kind": {
@@ -1756,6 +1771,18 @@
     {
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
+        "type": "set_safety_rule",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "words": [
+          "git",
+          "commit"
+        ],
+        "on": true
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
         "type": "safety_check_feedback",
         "session_id": "01920000-0000-7000-8000-000000000001",
         "call": "01920000-0000-7000-8000-000000000007",
@@ -2025,6 +2052,10 @@
     {
       "result": "rejected",
       "reason": "attachments_too_large"
+    },
+    {
+      "result": "rejected",
+      "reason": "bad_safety_rule"
     }
   ],
   "workdir_query": {

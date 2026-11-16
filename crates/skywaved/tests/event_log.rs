@@ -2146,6 +2146,70 @@ fn set_safety_check_needs_a_known_session_and_logs_the_device() {
     );
 }
 
+// --- SetSafetyRule -----------------------------------------------------------
+
+/// A `SetSafetyRule` turning on the rule `words`, in `session`.
+fn set_rule_kind(session: SessionId, words: Vec<String>) -> CommandKind {
+    CommandKind::SetSafetyRule {
+        session_id: session,
+        words,
+        on: true,
+    }
+}
+
+#[test]
+fn set_safety_rule_validates_and_logs_the_device() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(set_rule_kind(SessionId::new(), vec!["git".into()])),
+        rejected(RejectReason::UnknownSession)
+    );
+
+    let refused: [Vec<String>; 4] = [
+        vec![],
+        vec!["git".into(), String::new()],
+        vec!["a".into(); 17],
+        vec!["a".repeat(513)],
+    ];
+    for words in refused {
+        assert_eq!(
+            f.handle(set_rule_kind(session, words)),
+            rejected(RejectReason::BadSafetyRule)
+        );
+    }
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+
+    // The limits are inclusive: 16 words, and 512 bytes, are accepted.
+    let seq = accepted(f.handle(set_rule_kind(session, vec!["a".into(); 16])));
+    assert_eq!(seq, head.next());
+    accepted(f.handle(set_rule_kind(session, vec!["a".repeat(512)])));
+
+    let head = f.log.head();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetSafetyRule {
+            session_id: session,
+            words: vec!["git".into(), "commit".into()],
+            on: true,
+        },
+    };
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    assert_eq!(seq, head.next(), "one event, nothing else");
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(
+        event.kind,
+        EventKind::SafetyRuleSet {
+            words: vec!["git".into(), "commit".into()],
+            on: true,
+            by: device,
+        }
+    );
+}
+
 // --- SafetyCheckFeedback -----------------------------------------------------
 
 /// An `ApprovalRequested` of `call`, naming `shell` as its command if given.
