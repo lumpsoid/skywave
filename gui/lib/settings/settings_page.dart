@@ -200,29 +200,40 @@ class SettingsPage extends StatelessWidget {
                   style: muted,
                 ),
               ),
-            for (final rule in screen.safetyRules)
+            // Keyed by position: two rules can share a label.
+            for (final (index, rule) in screen.safetyRules.indexed)
               ListTile(
-                key: Key('safety-rule-${rule.label}'),
+                key: Key('safety-rule-$index'),
                 leading: const Icon(Icons.verified_user_outlined),
                 title: Text(rule.label, style: monoText),
                 subtitle: switch (rule.pending) {
                   final pending? => Text(pending),
                   null => null,
                 },
-                trailing: IconButton(
-                  key: Key('remove-safety-rule-${rule.label}'),
-                  icon: const Icon(Icons.close),
-                  tooltip: 'Stop trusting this command',
-                  onPressed: rule.on
-                      ? () => send.act(
-                          ActionIntentSetSafetyRule(
-                            sessionId: rule.sessionId,
-                            words: rule.words,
-                            on: false,
-                          ),
-                        )
-                      : null,
-                ),
+                trailing: switch (rule.discard) {
+                  // A failed change is dismissed, not removed.
+                  final discard? => IconButton(
+                    key: Key('dismiss-safety-rule-$index'),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Dismiss',
+                    onPressed: () =>
+                        send.act(ActionIntentDiscard(commandId: discard)),
+                  ),
+                  null => IconButton(
+                    key: Key('remove-safety-rule-$index'),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Stop trusting this command',
+                    onPressed: rule.on
+                        ? () => send.act(
+                            ActionIntentSetSafetyRule(
+                              sessionId: rule.sessionId,
+                              words: rule.words,
+                              on: false,
+                            ),
+                          )
+                        : null,
+                  ),
+                },
               ),
           ],
         ),

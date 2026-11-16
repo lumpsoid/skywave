@@ -158,7 +158,7 @@ void main() {
       ),
     );
     await tester.scrollUntilVisible(
-      find.byKey(const Key('remove-safety-rule-cargo test')),
+      find.byKey(const Key('remove-safety-rule-1')),
       200,
       scrollable: pageScrollable(),
     );
@@ -167,7 +167,7 @@ void main() {
     expect(find.text('cargo test'), findsOneWidget);
     expect(find.text('adding'), findsOneWidget);
 
-    await tester.tap(find.byKey(const Key('remove-safety-rule-git commit')));
+    await tester.tap(find.byKey(const Key('remove-safety-rule-0')));
     expect(sent, [
       const GuiIntentAct(
         action: ActionIntentSetSafetyRule(
@@ -179,8 +179,82 @@ void main() {
     ]);
 
     // A pending add has nothing logged to remove yet: its button is disabled.
-    await tester.tap(find.byKey(const Key('remove-safety-rule-cargo test')));
+    await tester.tap(find.byKey(const Key('remove-safety-rule-1')));
     expect(sent, hasLength(1));
+  });
+
+  testWidgets('a failed safety rule change can be dismissed', (tester) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      settings(
+        sent,
+        safetyRules: const [
+          SafetyRuleRow(
+            sessionId: 's1',
+            words: ['ls'],
+            label: 'ls',
+            on: false,
+            pending: 'could not add: refused',
+            discard: 'c9',
+          ),
+        ],
+      ),
+    );
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('dismiss-safety-rule-0')),
+      200,
+      scrollable: pageScrollable(),
+    );
+    expect(find.byKey(const Key('remove-safety-rule-0')), findsNothing);
+
+    await tester.tap(find.byKey(const Key('dismiss-safety-rule-0')));
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c9')),
+    ]);
+  });
+
+  testWidgets('safety rules with the same label are both listed', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      settings(
+        sent,
+        safetyRules: const [
+          SafetyRuleRow(
+            sessionId: 's1',
+            words: ['git', 'commit', '-m', 'fix it'],
+            label: 'git commit -m fix it',
+            on: true,
+          ),
+          SafetyRuleRow(
+            sessionId: 's1',
+            words: ['git', 'commit', '-m', 'fix', 'it'],
+            label: 'git commit -m fix it',
+            on: true,
+          ),
+        ],
+      ),
+    );
+    // Below the fold: the lazy list builds the rows only once scrolled to.
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('remove-safety-rule-1')),
+      200,
+      scrollable: pageScrollable(),
+    );
+    expect(tester.takeException(), isNull);
+    expect(find.text('git commit -m fix it'), findsNWidgets(2));
+
+    await tester.tap(find.byKey(const Key('remove-safety-rule-1')));
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentSetSafetyRule(
+          sessionId: 's1',
+          words: ['git', 'commit', '-m', 'fix', 'it'],
+          on: false,
+        ),
+      ),
+    ]);
   });
 
   testWidgets('no safety rules shows how to add one', (tester) async {
