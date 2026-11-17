@@ -1060,9 +1060,13 @@ logs) an event that no longer decodes rather than failing.
   replies, tool calls, approvals and state changes do not, so a row does
   not jump while it is being read. `last_seq` and `last_activity` still
   follow every activity event, for read marks and the row's time. The GUI
-  then groups the list by repo (the key is under **Worktrees** below): a
-  group sits where its newest row does, and its rows keep this order within
-  it.
+  groups the list by repo (the key is under **Worktrees** below) unless the
+  user picked the plain layout, a per-device preference
+  (`GuiIntent::SetPlainList`): a group sits where its newest row does, and
+  its rows keep this order within it. The list has three scopes,
+  `ListKind::Active`, `Archived` and `All`; the all list marks its archived
+  rows, and back from a session returns to the all list when it was the one
+  last shown.
 - **Worktrees** (D52): the replica's `sessions` table has a `worktree`
   column (the JSON `{repo, branch}` of the session's `SessionCreated`, NULL
   when it has none) and a `worktree_removed` column (set by
@@ -1431,7 +1435,7 @@ logs) an event that no longer decodes rather than failing.
   registered and purged in the same update. Back walks file → its
   directory, diff → changes, directory → its parent, and the changes, the
   commits or the workdir root → the session; a session deleted here falls back to the
-  archived list.
+  archived list, or to the all list when that was the list last shown.
 - **Workdir downloads and pushes** (D54, D56). `Action::DownloadWorkdirFile`
   asks for one file as a `WorkdirAsk::Download`, stored under its own kind so
   it never replaces a file view's answer; the stored `WorkdirAnswer::File`
@@ -1912,8 +1916,9 @@ skywave-core                 all logic, sync, replica
   it, and resumes it then retries the link when something holds it again
   (D21's rule); a report that changes no holder does nothing. Coming on
   screen while the service held the link only retries, to cut short a
-  backoff wait. With Stay connected on (Android only; the hub keeps the
-  preference in `<app support>/skywave-gui.json`), the hub asks Dart to
+  backoff wait. With Stay connected on (Android only; the hub keeps its
+  preferences, this one and the session list layout, in
+  `<app support>/skywave-gui.json`), the hub asks Dart to
   start the service on the toggle, on `AppForegrounded` and on `AppReady`,
   and only Kotlin's `running` report sets the service holder; switched
   off, the service holds until its `stopped` report. Desktop never

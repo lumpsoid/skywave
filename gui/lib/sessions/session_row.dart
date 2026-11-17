@@ -12,10 +12,19 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// the title takes two lines, the workdir is its last component and the
 /// menu is a sheet.
 class SessionRow extends StatelessWidget {
-  const SessionRow({required this.row, required this.send, super.key});
+  const SessionRow({
+    required this.row,
+    required this.send,
+    this.markArchived = false,
+    super.key,
+  });
 
   final SessionRowView row;
   final SendIntent send;
+
+  /// Mark the row when it is archived: on the all list, where archived and
+  /// active rows mix.
+  final bool markArchived;
 
   @override
   Widget build(BuildContext context) {
@@ -31,7 +40,7 @@ class SessionRow extends StatelessWidget {
     // A screen reader reads the row as one sentence, title first; the
     // parts it is drawn from stay out of it. The menu keeps its own node.
     return Semantics(
-      label: rowSemanticsLabel(row),
+      label: rowSemanticsLabel(row, markArchived: markArchived),
       child: ListTile(
         leading: ExcludeSemantics(
           child: Tooltip(
@@ -78,6 +87,14 @@ class SessionRow extends StatelessWidget {
                 spacing: 12,
                 crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
+                  if (markArchived && row.archived)
+                    _Marker(
+                      key: const Key('row-archived'),
+                      icon: Icons.archive_outlined,
+                      text: 'archived',
+                      semanticLabel: 'archived',
+                      color: colors.onSurfaceVariant,
+                    ),
                   if (row.importingLabel case final importing?)
                     _Marker(
                       key: const Key('row-importing'),
@@ -149,9 +166,9 @@ const _draftLabel = 'draft saved';
 const _worktreeRemovedLabel = 'worktree removed';
 
 /// What a screen reader says for [row]: its title, a rename on its way,
-/// its state (unless a marker says it), the markers, where it works, and
-/// its cost and last activity.
-String rowSemanticsLabel(SessionRowView row) {
+/// "archived" when [markArchived] marks it, its state (unless a marker says
+/// it), the markers, where it works, and its cost and last activity.
+String rowSemanticsLabel(SessionRowView row, {bool markArchived = false}) {
   final rename = row.renameLabel;
   final saysState =
       !(row.state == AgentState.awaitingApproval &&
@@ -160,6 +177,7 @@ String rowSemanticsLabel(SessionRowView row) {
   return [
     row.title,
     if (rename != null) rename.startsWith('rename') ? rename : 'rename $rename',
+    if (markArchived && row.archived) 'archived',
     if (saysState) row.badgeLabel,
     ?row.importingLabel,
     if (row.unread > 0) _unreadLabel(row.unread),
