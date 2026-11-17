@@ -5,12 +5,14 @@ use serde::Serialize;
 /// and keeps nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, RustSignal)]
 pub enum PlatformEffect {
-    /// New approvals came in, or a long shell run finished: a system
-    /// notification. `id` is the notification's, one per session and kind
-    /// (showing it again replaces it); `title` is the session's, sanitised
-    /// (may be empty); `body` the line to show, `approval needed · <title>`;
-    /// `session_id` the session to open on a tap. Also the hub saying it
-    /// stopped off screen (`notify::STOPPED`, no session).
+    /// A system notification, one per session and kind (showing it again
+    /// replaces it), for three things: an approval needed, `approval needed ·
+    /// <title>`; a long shell run of this device's finished, e.g. `make test ·
+    /// exit 1 · <title>`; an agent gone idle, `agent idle · <title>`. `id` is
+    /// the notification's; `title` is the session's, sanitised (may be
+    /// empty); `body` the line to show; `session_id` the session to open on a
+    /// tap. Also the hub saying it stopped off screen (`notify::STOPPED`, no
+    /// session).
     Notify {
         id: i32,
         title: String,
@@ -18,8 +20,8 @@ pub enum PlatformEffect {
         session_id: Option<String>,
     },
     /// Take down notification `id` if it is up: its session no longer
-    /// waits on an approval (answered or cancelled from any device, or the
-    /// session is gone).
+    /// waits on an approval, or its idle session works again, or the
+    /// session is gone.
     Dismiss { id: i32 },
     /// Put `text` on the clipboard.
     CopyToClipboard { text: String },
