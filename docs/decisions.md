@@ -1755,7 +1755,7 @@ answers it there, without opening each session.
   the session's, so the item says where it is answered.
 - The facts come from the replica on demand, not from a new store table.
   The page reads a session's events only while it is shown, and only for a
-  session with a waiting approval it holds no facts for. A request missing
+  session with a pending approval it holds no facts for. A request missing
   from those events is cached as unknown, so it is not read again. No
   store or wire change.
 - Facts are cached raw, and the input's blob state and this device's answer
