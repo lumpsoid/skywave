@@ -50,11 +50,14 @@ otherwise.
 2. Read the new `## [X.Y.Z]` section of `CHANGELOG.md` as a user would and
    fix it up.
 3. `git commit -m "chore(release): X.Y.Z" Cargo.toml Cargo.lock gui/pubspec.yaml CHANGELOG.md`
-4. `scripts/release.sh`: checks the branch, the tree, the versions, the
-   changelog and that the `versionCode` is above every earlier tag's, runs
-   every gate, and tags `vX.Y.Z` with the changelog section as the message.
-   It never pushes.
-5. `git push origin main vX.Y.Z`
+4. `git push origin main`: CI runs every gate on the release commit.
+5. `scripts/release.sh`: checks the branch, the tree, that `HEAD` is
+   `origin/main`, the versions, the changelog and that the `versionCode` is
+   above every earlier tag's. Then it waits for CI on that commit (`gh`,
+   signed in) and tags `vX.Y.Z`, with the changelog section as the message,
+   only if CI passed. It runs no gates itself and never pushes. If CI
+   fails, fix it on `main` and start again from step 4.
+6. `git push origin vX.Y.Z`
 
 The tag starts `.github/workflows/release.yml`. Its `verify` job runs
 `scripts/release.sh verify vX.Y.Z`: the same release checks, plus that the

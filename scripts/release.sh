@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Tags a release of the version already committed (scripts/version.sh bump,
-# then a `chore(release): X.Y.Z` commit), and checks a pushed tag in CI.
+# then a `chore(release): X.Y.Z` commit, pushed to main), and checks a
+# pushed tag in CI. The gates run in CI, not here.
 #
-#   usage: release.sh [--no-gui]   check main and the release, run every
-#                                  gate (--no-gui is passed to check.sh),
-#                                  then make the annotated tag vX.Y.Z with
-#                                  the changelog section as its message.
-#                                  Never pushes: it prints the push command.
+#   usage: release.sh              check the release and that CI passed on
+#                                  this commit (waiting for a run still
+#                                  going), then make the annotated tag
+#                                  vX.Y.Z with the changelog section as its
+#                                  message. Never pushes: it prints the push
+#                                  command. Needs `gh`, signed in.
 #          release.sh verify TAG   what .github/workflows/release.yml runs
 #                                  on a pushed tag: the same release checks,
 #                                  plus that TAG is annotated, names this
@@ -81,10 +83,27 @@ verify() {
   echo "$version"
 }
 
+# Waits for CI (.github/workflows/ci.yml) on main's push of HEAD and
+# fails unless it passed. GitHub's result for this exact commit decides.
+ci_passed() {
+  local sha run
+  sha=$(git rev-parse HEAD)
+  run=$(gh run list --workflow ci.yml --branch main --event push \
+    --commit "$sha" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+  [ -n "$run" ] ||
+    die "no CI run for $sha yet: push main, then run this again once CI has started"
+  echo "release.sh: waiting for CI run $run on $sha" >&2
+  gh run watch "$run" --exit-status >/dev/null ||
+    die "CI run $run did not pass: $(gh run view "$run" --json url --jq .url)"
+}
+
 tag() {
   local full version tag
   [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || die "not on main"
   [ -z "$(git status --porcelain)" ] || die "the working tree is not clean"
+  git fetch --quiet origin main
+  [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] ||
+    die "HEAD is not origin/main: push main first, so CI runs on it"
 
   scripts/version.sh check
   full=$(scripts/version.sh show)
@@ -93,8 +112,7 @@ tag() {
 
   git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "$tag already exists"
   check_release "$tag"
-
-  scripts/check.sh "$@"
+  ci_passed
 
   # --cleanup=verbatim: the default would drop `### Added` as a comment.
   git tag -a --cleanup=verbatim -F - "$tag" <<EOF
@@ -111,5 +129,6 @@ if [ "${1:-}" = verify ]; then
   [ $# -eq 2 ] || die "usage: release.sh verify TAG"
   verify "$2"
 else
-  tag "$@"
+  [ $# -eq 0 ] || die "usage: release.sh | release.sh verify TAG"
+  tag
 fi
