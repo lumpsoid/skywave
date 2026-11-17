@@ -29,8 +29,9 @@ amend that decision; say so in the issue.
 
 - Rust: the version in `rust-version` in [`Cargo.toml`](Cargo.toml), via
   rustup.
-- For the GUI: Flutter (stable), and the rinf CLI pinned to the rinf crate's
-  version: `cargo install rinf_cli --version 8.11.0 --locked`. Run
+- For the GUI: Flutter 3.47.9 (not 3.50, see `docs/maintaining.md`), and
+  the rinf CLI pinned to the rinf crate's version:
+  `cargo install rinf_cli --version 8.11.0 --locked`. Run
   `rinf gen` in `gui/` after a fresh checkout and after changing
   `gui/native/hub/src/signals`; the generated Dart bindings are not
   committed. [`gui/README.md`](gui/README.md) has the per-platform steps.
