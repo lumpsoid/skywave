@@ -477,7 +477,8 @@ own, true because both heads render a per-task stop.
 - durable schedules across sessions (listing them while no agent runs;
   reading `.claude/scheduled_tasks.json` would break D3), moot while the CLI
   ignores `durable`;
-- push/desktop notifications when background work finishes;
+- ~~push/desktop notifications when background work finishes~~ done for
+  going idle (D64); errors stay deferred (task b75f0a);
 - a per-task stop for tasks inside a subagent beyond what `stop_task` allows;
 - waking a stopped agent for a pending durable schedule;
 - showing a stop refusal's reason in the heads (core `task_stops` drops a
@@ -1771,3 +1772,58 @@ answers it there, without opening each session.
 
 **Deferred:**
 - The TUI's page. Its Approvals screen only counts them.
+
+## D64. Notify when an agent goes idle
+
+A turn or background job left running ends unseen, and nothing says it
+ended. A session's agent going from working to idle now rings once, on each
+device that saw it work. The count and the sessions are the core's
+`Attention::idle_alerts` and `idle`, so every head rings alike.
+
+**Working** is a foreground turn, a pending approval, or a background task
+that is not ambient (`SessionSummary::busy`). **Idle** is no work at all.
+Schedules (loops: `/loop`, `CronCreate`) and ambient tasks are not work
+(user decisions, 2026-11-17). This is separate from D51's display rule,
+which still shows a session with only schedules or ambient tasks as working.
+
+**Decided:**
+- Only work this device saw. A session counts as seen working if it was busy
+  in the stored replica at `Model::new`, or became busy after an event folded
+  while the link is `Online`. Nothing counts while catching up or offline, so
+  a fresh device's first sync alerts nothing, while a turn this device saw
+  start and that ends while it is offline alerts once the catch-up brings the
+  end. A resync (`Client::resync`, which calls `Model::reload`) keeps the set
+  and does not seed it, since it can run mid-catch-up. A replica reset for a
+  new server (`Model::replica_reset`, also used by a lost history) clears the
+  set and `idle`.
+- Settled per batch (`note_went_idle`, at the end of each applied batch). A
+  seen session that is no longer busy leaves the set, and rings only if
+  settled: log `Idle`, not stopped, not deleted. Stopped, errored and deleted
+  sessions never ring. A session that works again, is deleted or is gone
+  leaves `idle`.
+- In memory only: nothing stored, no migration, no protocol change. A restart
+  forgets what it saw: a turn busy at start alerts when it ends, while one
+  that ended with the app closed does not.
+- Heads: `IdleWatcher` (`skywave-present`, `policy/alert.rs`) counts from 0,
+  like the shell watcher, and turns growth into one notice per session,
+  `agent idle · <title>`. The hub posts it as `Notify` with `Kind::Idle` and
+  dismisses it once the session works again or is gone.
+- Switches, all on by default (user decision): `Prefs.notifications` in
+  `skywave-gui.json` holds `{ all, approvals, idle, shell }`. An older file
+  without the field keeps them on. A notice posts only if `all` and its kind
+  are on. The switches stop new notices only: dismissals and watchers go on,
+  and the hub-stopped notice is not affected. They are edited on the
+  Settings → Notifications page.
+- Android: the idle notice has its own `activity` channel ("Agent activity",
+  default importance), not the `approvals` one (high). Android fixes a
+  channel's importance once it is created, so the idle notice cannot share
+  the urgent channel without being urgent too.
+
+**Rejected:**
+- Schedules and ambient tasks as work (user decision, 2026-11-17): a loop
+  never ends on its own, so counting it would mean the alert never comes.
+
+**Deferred:**
+- error notifications: an errored session does not ring (task b75f0a);
+- TUI parity: the TUI has approval and shell alerts only, no idle notice
+  (task d04c64).

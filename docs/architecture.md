@@ -1778,6 +1778,8 @@ enum CropContent {
 | Approval answered elsewhere | "Approved on <device>", controls removed. |
 | Question pending (`SessionView::pending_question`) | A question panel instead of the approval prompt: each question with its options, their descriptions and previews, and the user's own answer. The picks stay in the head (TUI: `skywave_present::question::QuestionDraft` behind `a`; GUI: the panel's state) until every question has an answer, then go as one `Action::AnswerQuestion`; `x` / Decline is a denial. Its call's row reads "needs an answer", then "answered here / on <device>" (`ApprovalStatus::Answered`), with what was picked in its result. |
 | New approval while `Online` (`attention.alerts` grows) | Bell or desktop notification naming the session, once; never at start, after a catch-up that resolved it, or for one answered here. The GUI keeps one notification per session (ids from the hub, `PlatformEffect::Notify { id }`) and takes it down (`Dismiss`) once that session has no approval pending, however it went (`AlertUpdate::cleared`); a terminal bell has nothing to take down. |
+| Long shell run of this device's finished, at least 10 s (`attention.shell_alerts` grows; `last_shell`), not while its session is open in shell mode | Notification naming the command, how it ended and the session, once per run, on the `shell` switch and the `activity` channel (D64). Read from the `ShellFinished` alone, so a catch-up's finish alerts too; heads count from 0. A terminal bell or OSC, as for approvals. |
+| An agent went from working to idle (`attention.idle_alerts` grows; `attention.idle` lists the sessions) | Notification `agent idle · <title>`, once per session, on the `idle` switch and the `activity` channel (D64). Only work this device saw, online or busy at start; stopped, errored and deleted sessions never ring. Taken down (`Dismiss`) once the session works again or is gone. In memory only. The TUI has none yet (D64). |
 | Approvals pending in other sessions (`attention.elsewhere`) | TUI: banner: N approvals elsewhere. GUI: a bell badged with N among every page's app bar actions. A tap opens the Approvals page, which answers them all; Ctrl+G opens the next one instead. |
 | `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |
 | `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. In the GUI the banner shows only a rejected link and the agent login warnings (`LinkUpdate::label` is empty otherwise). |
@@ -1917,7 +1919,8 @@ skywave-core                 all logic, sync, replica
   (D21's rule); a report that changes no holder does nothing. Coming on
   screen while the service held the link only retries, to cut short a
   backoff wait. With Stay connected on (Android only; the hub keeps its
-  preferences, this one and the session list layout, in
+  preferences, this one, the notification switches (D64) and the session
+  list layout, in
   `<app support>/skywave-gui.json`), the hub asks Dart to
   start the service on the toggle, on `AppForegrounded` and on `AppReady`,
   and only Kotlin's `running` report sets the service holder; switched
@@ -1930,6 +1933,23 @@ skywave-core                 all logic, sync, replica
   desktop's exit request does. When a new Activity attaches to the live
   engine, Dart reports `AppForegrounded` and checks whether a notification
   tap launched it.
+- **Notifications** (D64). The hub's `PlatformEffect::Notify` carries a
+  `NotifyKind` (`Approval`, `Shell`, `Idle`, `Stopped`), and Dart picks its
+  channel in `gui/lib/effects/notifications.dart`: `Approval` and `Stopped` on
+  `approvals` (high importance), `Shell` and `Idle` on `activity` ("Agent
+  activity", default importance). Ids are `slot * 4 + kind` in `notify.rs`
+  (approval 0, shell 1, idle 2), one per kind per session, so a `Dismiss`
+  takes down only its kind. A notice of kind K posts only if `all && K` in
+  `Prefs.notifications` (`NotificationPrefs`, all on by default); dismissals,
+  the watchers and the hub-stopped notice go on regardless.
+  `GuiIntent::SetNotifications` carries the whole set, and `Head::prefs()`
+  saves every preference with it.
+- **Settings → Notifications** (`gui/lib/settings/notifications_page.dart`):
+  four switches, Notifications, Approvals, Agent idle and Long shell runs; the
+  three kinds are disabled while the first is off. No core route: the page is
+  Flutter-local, a page in `ScreenNavigator`'s pages list, opened by the
+  Settings tile through `Holders.notificationsOpen` and closed when the screen
+  leaves Settings. Back closes it without leaving Settings.
 - **Platforms:** Linux and Android verified; macOS, iOS and Windows
   scaffolded only; no web (D26).
 - **Shell history picker** (D53). The hub owns its state. In shell mode

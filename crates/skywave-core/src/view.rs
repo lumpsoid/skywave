@@ -106,6 +106,11 @@ pub struct Attention {
     pub shell_alerts: u64,
     /// The run [`shell_alerts`](Self::shell_alerts) was last bumped for.
     pub last_shell: Option<ShellAlert>,
+    /// Count of went-idle alerts since start, in memory only; grows only for
+    /// work this device saw while online or found busy at start.
+    pub idle_alerts: u64,
+    /// Sessions that went idle and have not worked since, oldest alert first.
+    pub idle: Vec<IdleAlert>,
 }
 
 /// How long a shell run of this device's must have run for its finish to
@@ -123,6 +128,17 @@ pub struct ShellAlert {
     /// server: heads sanitise it.
     pub command_line: String,
     pub end: ShellEnd,
+}
+
+/// A session whose agent went from working to idle; `at` is the
+/// `idle_alerts` count it rang at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleAlert {
+    pub session_id: SessionId,
+    /// The session's title, as [`SessionRow::title`]. Text from the server:
+    /// heads sanitise it before writing it anywhere raw.
+    pub title: String,
+    pub at: u64,
 }
 
 /// One pending approval, and which session waits on it.

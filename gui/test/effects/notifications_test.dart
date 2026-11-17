@@ -26,7 +26,9 @@ class FakePlugin extends Fake implements FlutterLocalNotificationsPlugin {
     String? body,
     NotificationDetails? notificationDetails,
     String? payload,
-  }) async => done.add('show $id: $body ($payload)');
+  }) async => done.add(
+    'show $id [${notificationDetails?.android?.channelId}]: $body ($payload)',
+  );
 
   @override
   Future<void> cancel({required int id, String? tag}) async =>
@@ -42,27 +44,50 @@ void main() {
       id: 4,
       title: 'a',
       body: 'approval needed · a',
+      kind: NotifyKind.approval,
       sessionId: 'sa',
     );
     await notifications.show(
       id: 8,
       title: 'b',
       body: 'approval needed · b',
+      kind: NotifyKind.approval,
       sessionId: 'sb',
     );
     await notifications.dismiss(4);
 
     expect(plugin.done, [
-      'show 4: approval needed · a (sa)',
-      'show 8: approval needed · b (sb)',
+      'show 4 [approvals]: approval needed · a (sa)',
+      'show 8 [approvals]: approval needed · b (sb)',
       'cancel 4',
+    ]);
+  });
+
+  test('each kind of notice goes to its channel', () async {
+    final plugin = FakePlugin();
+    final notifications = SystemNotifications((GuiIntent _) {}, plugin: plugin);
+    await notifications.init();
+    for (final kind in NotifyKind.values) {
+      await notifications.show(id: 1, title: 'a', body: kind.name, kind: kind);
+    }
+
+    expect(plugin.done, [
+      'show 1 [approvals]: approval (null)',
+      'show 1 [activity]: shell (null)',
+      'show 1 [activity]: idle (null)',
+      'show 1 [approvals]: stopped (null)',
     ]);
   });
 
   test('nothing reaches the plugin before it is set up', () async {
     final plugin = FakePlugin();
     final notifications = SystemNotifications((GuiIntent _) {}, plugin: plugin);
-    await notifications.show(id: 4, title: 'a', body: 'b');
+    await notifications.show(
+      id: 4,
+      title: 'a',
+      body: 'b',
+      kind: NotifyKind.approval,
+    );
     await notifications.dismiss(4);
     expect(plugin.done, isEmpty);
   });

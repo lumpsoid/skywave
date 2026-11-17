@@ -9,8 +9,8 @@ use skywave_proto::{CommandId, CommandKind, DirsResult, Event, EventBatch, Event
 use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
-    ActionIntent, ComposerFile, CreatePrompt, ListKindView, LoginFlowState, PastedCode, RouteView,
-    RowKind, ScreenView, ShellPromptView, ToolState, WorktreeSessionView,
+    ActionIntent, ComposerFile, CreatePrompt, ListKindView, LoginFlowState, NotificationsView,
+    PastedCode, RouteView, RowKind, ScreenView, ShellPromptView, ToolState, WorktreeSessionView,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -1160,6 +1160,7 @@ fn a_desktop_never_suspends_whatever_the_reports() {
 const ON: Prefs = Prefs {
     stay_connected: true,
     plain_list: false,
+    notifications: NotificationPrefs::ON,
 };
 
 impl Rig {
@@ -1330,6 +1331,83 @@ fn off_android_stay_connected_is_not_offered_and_asks_for_nothing() {
 fn stay_connected_is_offered_on_the_android_build_alone() {
     let shown = Head::new(ON).stay_connected.shown();
     assert_eq!(shown.is_some(), cfg!(target_os = "android"));
+}
+
+#[test]
+fn the_notification_switches_are_shown_saved_and_sent_again() {
+    let mut rig = Rig::android(Prefs::default());
+    rig.settings();
+    let shown = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::Settings { notifications, .. } => *notifications,
+        other => panic!("not settings: {other:?}"),
+    };
+    assert_eq!(
+        shown(&rig),
+        NotificationsView {
+            all: true,
+            approvals: true,
+            idle: true,
+            shell: true,
+        }
+    );
+    let outs = rig.intent(GuiIntent::SetNotifications {
+        all: true,
+        approvals: true,
+        idle: false,
+        shell: true,
+    });
+    assert_eq!(
+        saved(&outs),
+        [Prefs {
+            stay_connected: false,
+            plain_list: false,
+            notifications: NotificationPrefs {
+                idle: false,
+                ..NotificationPrefs::ON
+            },
+        }]
+    );
+    let sent = outs.iter().find_map(|out| match out {
+        Out::Screen(ScreenUpdate {
+            screen: ScreenView::Settings { notifications, .. },
+            ..
+        }) => Some(*notifications),
+        _ => None,
+    });
+    assert_eq!(
+        sent,
+        Some(NotificationsView {
+            all: true,
+            approvals: true,
+            idle: false,
+            shell: true,
+        })
+    );
+    assert!(!shown(&rig).idle);
+}
+
+/// The switches a head booted with are the ones it keeps when Stay
+/// connected is toggled.
+#[test]
+fn stay_connected_keeps_the_notification_switches() {
+    let idle_off = NotificationPrefs {
+        idle: false,
+        ..NotificationPrefs::ON
+    };
+    let mut rig = Rig::android(Prefs {
+        stay_connected: false,
+        plain_list: false,
+        notifications: idle_off,
+    });
+    let outs = rig.intent(GuiIntent::SetStayConnected { on: true });
+    assert_eq!(
+        saved(&outs),
+        [Prefs {
+            stay_connected: true,
+            plain_list: false,
+            notifications: idle_off,
+        }]
+    );
 }
 
 #[test]
@@ -1892,6 +1970,7 @@ fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
         notified,
         [(&"work".to_owned(), &"approval needed · work".to_owned())]
     );
+    assert_eq!(shown_kinds(&outs), [NotifyKind::Approval]);
     // A head that starts at that count does not alert.
     let mut fresh = Head::new(Prefs::default());
     let outs = fresh.on_view(rig.head.view.clone().unwrap(), rig.clock);
@@ -1956,6 +2035,16 @@ fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
             worktree: None,
         }],
     );
+    // Each agent is working when its approval comes in, as a real one does
+    // inside a turn: answered elsewhere, it is still working, not idle.
+    for session in [a, b] {
+        rig.log_in(
+            session,
+            vec![EventKind::SessionStateChanged(
+                skywave_proto::SessionState::AgentWorking,
+            )],
+        );
+    }
     let approval = |id| EventKind::ApprovalRequested {
         id,
         call: None,
@@ -2092,6 +2181,7 @@ fn switching_the_plain_list_saves_it_with_the_other_prefs() {
         [Prefs {
             stay_connected: true,
             plain_list: true,
+            notifications: NotificationPrefs::ON,
         }]
     );
     // Stay connected keeps the layout it was switched beside.
@@ -2101,6 +2191,7 @@ fn switching_the_plain_list_saves_it_with_the_other_prefs() {
         [Prefs {
             stay_connected: false,
             plain_list: true,
+            notifications: NotificationPrefs::ON,
         }]
     );
 }
@@ -5995,6 +6086,7 @@ fn a_long_shell_run_of_this_devices_notifies() {
             Some(rig.session.0.to_string())
         )]
     );
+    assert_eq!(shown_kinds(&outs), [NotifyKind::Shell]);
     // Once only.
     let outs = rig.head.on_view(view.clone(), rig.clock);
     assert!(
@@ -6009,6 +6101,176 @@ fn a_long_shell_run_of_this_devices_notifies() {
         outs.iter()
             .any(|o| matches!(o, Out::Effect(PlatformEffect::Notify { .. })))
     );
+}
+
+/// The notices `outs` shows, as `(id, title, body, session_id, kind)`.
+fn shown_notices(outs: &[Out]) -> Vec<(i32, String, String, Option<String>, NotifyKind)> {
+    outs.iter()
+        .filter_map(|o| match o {
+            Out::Effect(PlatformEffect::Notify {
+                id,
+                title,
+                body,
+                session_id,
+                kind,
+            }) => Some((*id, title.clone(), body.clone(), session_id.clone(), *kind)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The kinds of the notices `outs` shows.
+fn shown_kinds(outs: &[Out]) -> Vec<NotifyKind> {
+    shown_notices(outs)
+        .into_iter()
+        .map(|notice| notice.4)
+        .collect()
+}
+
+#[test]
+fn a_session_that_went_idle_notifies_once() {
+    use skywave_proto::SessionState;
+    let mut rig = Rig::new();
+    let title = rig.open_session().title;
+    rig.online_on_the_list();
+    let session = rig.session;
+    let working = rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    assert_eq!(notifications(&working), (vec![], vec![]));
+    let outs = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    let shown = shown_notices(&outs);
+    let [(id, shown_title, body, session_id, kind)] = shown.as_slice() else {
+        panic!("one idle notice: {shown:?}");
+    };
+    assert_eq!(shown_title, &title);
+    assert_eq!(body, &format!("agent idle · {title}"));
+    assert_eq!(session_id, &Some(session.0.to_string()));
+    assert_eq!(kind, &NotifyKind::Idle);
+    assert_eq!(*id, rig.head.notifications.id(session, Kind::Idle));
+    assert_ne!(*id, rig.head.notifications.id(session, Kind::Approval));
+    // Once only.
+    assert_eq!(shown_notices(&rig.view()), []);
+}
+
+#[test]
+fn an_idle_notice_is_taken_down_when_the_session_works_again() {
+    use skywave_proto::SessionState;
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    let idle = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    let shown = shown_notices(&idle);
+    let [(id, ..)] = shown.as_slice() else {
+        panic!("one idle notice: {shown:?}");
+    };
+    let outs = rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    assert_eq!(notifications(&outs), (vec![], vec![*id]));
+    // Once.
+    assert_eq!(notifications(&rig.view()), (vec![], vec![]));
+}
+
+#[test]
+fn a_turn_seen_only_in_a_catch_up_does_not_notify() {
+    use skywave_proto::SessionState;
+    // Not online: the core counts no turn it did not see online.
+    let mut rig = Rig::new();
+    rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    let outs = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    assert!(rig.core.view().attention.idle.is_empty());
+    assert_eq!(notifications(&outs), (vec![], vec![]));
+    assert_eq!(shown_notices(&outs), []);
+}
+
+#[test]
+fn with_idle_off_a_session_going_idle_posts_nothing_but_still_dismisses() {
+    use skywave_proto::SessionState;
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    let session = rig.session;
+    rig.intent(GuiIntent::SetNotifications {
+        all: true,
+        approvals: true,
+        idle: false,
+        shell: true,
+    });
+    rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    let idle = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    assert_eq!(shown_notices(&idle), []);
+    // The head never showed a notice, yet the session working again still
+    // sends its dismissal: the watcher observed the idle all the same.
+    let outs = rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    assert_eq!(
+        notifications(&outs),
+        (vec![], vec![rig.head.notifications.id(session, Kind::Idle)])
+    );
+    // Switched back on, the next time the agent goes idle rings once.
+    rig.intent(GuiIntent::SetNotifications {
+        all: true,
+        approvals: true,
+        idle: true,
+        shell: true,
+    });
+    let outs = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    let shown = shown_notices(&outs);
+    let [(id, _, _, session_id, _)] = shown.as_slice() else {
+        panic!("one idle notice: {shown:?}");
+    };
+    assert_eq!(*id, rig.head.notifications.id(session, Kind::Idle));
+    assert_eq!(session_id, &Some(session.0.to_string()));
+}
+
+#[test]
+fn with_all_off_an_approval_posts_nothing() {
+    use skywave_proto::{ApprovalId, SessionState};
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    let session = rig.session;
+    rig.intent(GuiIntent::SetNotifications {
+        all: false,
+        approvals: true,
+        idle: true,
+        shell: true,
+    });
+    rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    let approval = |id| EventKind::ApprovalRequested {
+        id,
+        call: None,
+        tool: "Bash".into(),
+        summary: "ls".into(),
+        input: None,
+        suggestions: Vec::new(),
+        shell: None,
+    };
+    let outs = rig.log(vec![approval(ApprovalId::new())]);
+    assert_eq!(notifications(&outs), (vec![], vec![]));
+
+    // Switched on again, the next approval rings once.
+    rig.intent(GuiIntent::SetNotifications {
+        all: true,
+        approvals: true,
+        idle: true,
+        shell: true,
+    });
+    let (shown, dismissed) = notifications(&rig.log(vec![approval(ApprovalId::new())]));
+    assert!(dismissed.is_empty());
+    let [(id, Some(session_id))] = shown.as_slice() else {
+        panic!("one approval notification: {shown:?}");
+    };
+    assert_eq!(*id, rig.head.notifications.id(session, Kind::Approval));
+    assert_eq!(session_id, &session.0.to_string());
 }
 
 #[test]

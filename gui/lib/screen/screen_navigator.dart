@@ -11,6 +11,7 @@ import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/session/info_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
+import 'package:skywave_gui/settings/notifications_page.dart';
 import 'package:skywave_gui/settings/server_addresses_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -45,7 +46,10 @@ class ScreenNavigator extends StatelessWidget {
               child: child!,
             ),
             child: ListenableBuilder(
-              listenable: holders.screen,
+              listenable: Listenable.merge([
+                holders.screen,
+                holders.notificationsOpen,
+              ]),
               builder: (context, _) {
                 final update = holders.screen.screen;
                 final kind = holders.screen.kind;
@@ -55,10 +59,24 @@ class ScreenNavigator extends StatelessWidget {
                 final repair = update.repair;
                 final covered = repair != null;
                 final subagent = covered ? null : _subagentCall(update);
+                // Settings' notifications page goes over Settings only, and
+                // only while it is open.
+                final notifications =
+                    covered || !holders.notificationsOpen.value
+                    ? null
+                    : switch (update.screen) {
+                        final ScreenViewSettings screen => screen,
+                        _ => null,
+                      };
                 return PopScope(
-                  canPop: !update.canGoBack,
+                  canPop: !update.canGoBack && notifications == null,
                   onPopInvokedWithResult: (didPop, _) {
-                    if (!didPop) send.act(const ActionIntentBack());
+                    if (didPop) return;
+                    if (notifications != null) {
+                      holders.notificationsOpen.value = false;
+                    } else {
+                      send.act(const ActionIntentBack());
+                    }
                   },
                   child: Navigator(
                     pages: [
@@ -66,7 +84,10 @@ class ScreenNavigator extends StatelessWidget {
                         key: ValueKey((kind, null, covered)),
                         child: repair != null
                             ? RepairPage(notice: repair, send: send)
-                            : _page(update, top: subagent == null),
+                            : _page(
+                                update,
+                                top: subagent == null && notifications == null,
+                              ),
                       ),
                       // A subagent's view goes over its session's, which
                       // stays: its composer keeps what was typed in it,
@@ -75,6 +96,16 @@ class ScreenNavigator extends StatelessWidget {
                         MaterialPage<void>(
                           key: ValueKey((kind, subagent, covered)),
                           child: _page(update, top: true),
+                        ),
+                      if (notifications != null)
+                        MaterialPage<void>(
+                          key: ValueKey((kind, 'notifications', covered)),
+                          child: NotificationsPage(
+                            view: notifications.notifications,
+                            send: send,
+                            onBack: () =>
+                                holders.notificationsOpen.value = false,
+                          ),
                         ),
                     ],
                     onDidRemovePage: (_) {},
@@ -126,6 +157,7 @@ class ScreenNavigator extends StatelessWidget {
           link: holders.link,
           canGoBack: update.canGoBack,
           send: send,
+          onNotifications: () => holders.notificationsOpen.value = true,
         ),
         final ScreenViewServerAddresses screen => ServerAddressesPage(
           screen: screen,

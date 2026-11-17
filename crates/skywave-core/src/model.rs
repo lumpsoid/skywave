@@ -47,16 +47,17 @@ use crate::view::{
     BodyView, CallId, ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView,
     CropContent, CropView, Decision, Delivery, DeviceId, DeviceRef, DeviceStorage, DiffBody, Draft,
     Entry, ErrorInfo, FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView,
-    ImportedEntry, LineSpan, Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice,
-    Outgoing, PairedInfo, PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef,
-    PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
-    SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView,
-    SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
-    SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
-    SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader, SubagentStatus,
-    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
-    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WaitingApproval, WorkdirBody,
-    WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
+    IdleAlert, ImportedEntry, LineSpan, Link, LinkRejection, ListKind, LoginView, MessageImage,
+    ModelChoice, Outgoing, PairedInfo, PairedLink, PairingStatus, PairingView, Pause,
+    PendingApprovalRef, PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt,
+    RunWhen, SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, Seq,
+    ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow,
+    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
+    ShellView, Snippet, SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader,
+    SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView,
+    UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WaitingApproval,
+    WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession,
+    WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -394,6 +395,15 @@ pub(crate) struct Model {
     /// ([`Attention::shell_alerts`]), and the last one; in memory only.
     shell_alerts: u64,
     last_shell: Option<ShellAlert>,
+    /// How often a session's agent went from working to idle
+    /// ([`Attention::idle_alerts`]); in memory only.
+    idle_alerts: u64,
+    /// Sessions this device saw working and that have not settled yet; in
+    /// memory only.
+    seen_working: HashSet<SessionId>,
+    /// The sessions that went idle, each with the `idle_alerts` count it
+    /// rang at, until they work again ([`Attention::idle`]); in memory only.
+    went_idle: HashMap<SessionId, u64>,
     /// Id of the latest [`Request::ListDirs`] for the session list's
     /// completion; never reused.
     dirs_req: u64,
@@ -492,6 +502,9 @@ impl Model {
             alerted_at: HashMap::new(),
             shell_alerts: 0,
             last_shell: None,
+            idle_alerts: 0,
+            seen_working: HashSet::new(),
+            went_idle: HashMap::new(),
             dirs_req: 0,
             conversations_req: 0,
             storage: Storage::default(),
@@ -510,6 +523,14 @@ impl Model {
         // An approval pending at start that no process alerted on yet (one
         // that came in during a catch-up cut short) alerts once online.
         model.reload(snapshot);
+        // A turn busy at start alerts when it ends. Only here, not in
+        // `reload`: a resync reloads mid-catch-up, and that work is not seen.
+        model.seen_working = model
+            .sessions
+            .iter()
+            .filter(|s| s.busy())
+            .map(|s| s.id)
+            .collect();
         model
     }
 
@@ -2248,6 +2269,14 @@ impl Model {
                 Some(summary) => summary.apply(seq, event),
                 None => self.sessions.push(SessionSummary::new(seq, event)),
             }
+            // Working only as seen online: a catch-up's past is no news.
+            if matches!(self.paired_link(), Some(PairedLink::Online { .. }))
+                && self
+                    .summary(event.session_id)
+                    .is_some_and(SessionSummary::busy)
+            {
+                self.seen_working.insert(event.session_id);
+            }
             self.note_shell_finish(event);
             self.turns.extend(TurnRecord::of(seq, event));
             // As the store decides it (`Store::apply_batch`): before a
@@ -2296,7 +2325,51 @@ impl Model {
         }
         self.sessions
             .sort_by_key(|a| std::cmp::Reverse(a.last_message_seq));
+        self.note_went_idle();
         self.note_new_approvals()
+    }
+
+    /// Settles the sessions this device saw working, once the batch is
+    /// folded: one no longer busy (or gone) leaves `seen_working`, and one
+    /// settled now (idle, not stopped) rings `idle_alerts`. Deciding per
+    /// batch means a turn ended and stopped in one batch does not alert.
+    /// A session deleted (tombstoned, in this batch or before) is never
+    /// settled: its summary is dropped by the seam after the fold, so it
+    /// must not ring with no entry to show. Then `went_idle` forgets the
+    /// sessions busy again or deleted or gone. Sorted, so the same batch
+    /// always gives the same counts.
+    fn note_went_idle(&mut self) {
+        let mut ended: Vec<SessionId> = self
+            .seen_working
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.deleted.contains(id) || !self.summary(*id).is_some_and(SessionSummary::busy)
+            })
+            .collect();
+        ended.sort();
+        for id in ended {
+            self.seen_working.remove(&id);
+            let settled = !self.deleted.contains(&id)
+                && self
+                    .summary(id)
+                    .is_some_and(|s| matches!(s.state, LogState::Idle) && !s.stopped);
+            if settled {
+                self.idle_alerts += 1;
+                self.went_idle.insert(id, self.idle_alerts);
+            }
+        }
+        let back: Vec<SessionId> = self
+            .went_idle
+            .keys()
+            .copied()
+            .filter(|id| {
+                self.deleted.contains(id) || self.summary(*id).is_none_or(SessionSummary::busy)
+            })
+            .collect();
+        for id in back {
+            self.went_idle.remove(&id);
+        }
     }
 
     /// Bumps `shell_alerts` for `event` if it finishes a run of this
@@ -2785,13 +2858,16 @@ impl Model {
     /// Mirrors [`Store::reset_for_server`](crate::Store::reset_for_server),
     /// which left the replica as `snapshot`: nothing of the previous
     /// server's log shows any more, nor what was kept for it — download
-    /// requests and failures, alerted approvals, listed directories. Heads replace the drafts they hold.
+    /// requests and failures, alerted approvals, sessions seen working and
+    /// idle alerts, listed directories. Heads replace the drafts they hold.
     pub(crate) fn replica_reset(&mut self, snapshot: Snapshot) {
         let had_drafts = !self.drafts.is_empty();
         self.reload(snapshot);
         self.wanted.clear();
         self.alerted.clear();
         self.alerted_at.clear();
+        self.seen_working.clear();
+        self.went_idle.clear();
         // Closed, the request ids kept: an answer from the old server
         // cannot match a later request.
         if let Place::SessionList(page) = &mut self.place {
@@ -2949,6 +3025,18 @@ impl Model {
                 })
             })
             .collect();
+        let mut idle: Vec<IdleAlert> = self
+            .went_idle
+            .iter()
+            .filter_map(|(&session_id, &at)| {
+                Some(IdleAlert {
+                    session_id,
+                    title: self.title(self.summary(session_id)?).text,
+                    at,
+                })
+            })
+            .collect();
+        idle.sort_by_key(|alert| alert.at);
         Attention {
             elsewhere: approvals
                 .iter()
@@ -2958,6 +3046,8 @@ impl Model {
             alerts: self.alerts,
             shell_alerts: self.shell_alerts,
             last_shell: self.last_shell.clone(),
+            idle_alerts: self.idle_alerts,
+            idle,
         }
     }
 
@@ -12206,6 +12296,247 @@ mod tests {
         f.log(sid, vec![approval_requested(quick, None), resolved(quick)]);
         assert_eq!(alerts(&f), 2);
         // A replayed batch changes nothing.
+        let before = f.model.clone();
+        f.model.apply_batch(&EventBatch {
+            from: Seq(1),
+            events: f.events.clone(),
+        });
+        assert_eq!(f.model, before);
+    }
+
+    /// The sessions the idle alerts name, each with the count it rang at.
+    fn idle(f: &Fixture) -> Vec<(SessionId, u64)> {
+        f.model
+            .view()
+            .attention
+            .idle
+            .iter()
+            .map(|alert| (alert.session_id, alert.at))
+            .collect()
+    }
+
+    fn idle_alerts(f: &Fixture) -> u64 {
+        f.model.view().attention.idle_alerts
+    }
+
+    #[test]
+    fn a_turn_seen_while_online_alerts_once_when_it_ends() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        assert_eq!(idle_alerts(&f), 0, "still working");
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle_alerts(&f), 1);
+        assert_eq!(idle(&f), vec![(sid, 1)]);
+        let title = f.model.view().attention.idle[0].title.clone();
+        assert_eq!(title, f.list_view().sessions[0].title);
+        f.log(sid, vec![agent("still here")]);
+        assert_eq!(idle_alerts(&f), 1, "an unrelated message is no news");
+        assert_eq!(idle(&f), vec![(sid, 1)]);
+    }
+
+    #[test]
+    fn working_again_takes_the_session_out_of_idle() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle(&f), vec![(sid, 1)]);
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        assert!(idle(&f).is_empty(), "working again leaves idle");
+        assert_eq!(idle_alerts(&f), 1);
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle(&f), vec![(sid, 2)]);
+        assert_eq!(idle_alerts(&f), 2);
+    }
+
+    #[test]
+    fn loops_and_ambient_tasks_are_not_work() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        let schedule = skywave_proto::Schedule {
+            id: skywave_proto::ScheduleId("s1".into()),
+            when: "*/5 * * * *".into(),
+            recurring: true,
+            prompt: "check".into(),
+            outlives_agent: None,
+        };
+        let ambient = skywave_proto::BackgroundTask {
+            ambient: true,
+            ..work_task("t2")
+        };
+        f.log(
+            sid,
+            vec![EventKind::SchedulesChanged {
+                schedules: vec![schedule],
+            }],
+        );
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged {
+                tasks: vec![ambient],
+            }],
+        );
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle_alerts(&f), 1, "the turn's end, once");
+        f.log(
+            sid,
+            vec![
+                EventKind::SchedulesChanged { schedules: vec![] },
+                EventKind::BackgroundTasksChanged { tasks: vec![] },
+            ],
+        );
+        assert_eq!(idle_alerts(&f), 1, "clearing them is no further alert");
+    }
+
+    #[test]
+    fn a_background_task_holds_the_alert_until_it_ends() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged {
+                tasks: vec![work_task("t1")],
+            }],
+        );
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle_alerts(&f), 0, "the task is still work");
+        assert!(idle(&f).is_empty());
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged { tasks: vec![] }],
+        );
+        assert_eq!(idle_alerts(&f), 1);
+        assert_eq!(idle(&f), vec![(sid, 1)]);
+    }
+
+    #[test]
+    fn a_turn_ended_and_stopped_in_one_batch_does_not_alert() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::Idle),
+                EventKind::SessionStopped,
+            ],
+        );
+        assert_eq!(idle_alerts(&f), 0, "stopped, not settled");
+        assert!(idle(&f).is_empty());
+        let errored = f.session("/srv/api");
+        f.log(
+            errored,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(
+            errored,
+            vec![EventKind::SessionStateChanged(LogState::Errored {
+                message: "boom".into(),
+            })],
+        );
+        assert_eq!(idle_alerts(&f), 0, "an error is not settled either");
+    }
+
+    #[test]
+    fn a_session_deleted_with_its_turn_end_does_not_alert() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::Idle),
+                EventKind::SessionDeleted { by: f.me },
+            ],
+        );
+        assert_eq!(idle_alerts(&f), 0, "deleted, so not settled");
+        assert!(idle(&f).is_empty());
+    }
+
+    #[test]
+    fn catch_up_alerts_only_for_work_seen_before() {
+        // Never online: a turn met only while catching up is past.
+        let mut f = Fixture::paired();
+        f.model.set_link(catching_up());
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle_alerts(&f), 0);
+        assert!(idle(&f).is_empty());
+        // Online at the start, then catching up: its end alerts.
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.model.set_link(catching_up());
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle(&f), vec![(sid, 1)]);
+    }
+
+    #[test]
+    fn work_found_at_start_alerts_when_it_ends() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        // A restart mid-turn: the turn was seen before, not in this process.
+        f.model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
+        f.model.set_link(catching_up());
+        assert!(idle(&f).is_empty(), "nothing has ended yet");
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle(&f), vec![(sid, 1)]);
+    }
+
+    #[test]
+    fn a_replayed_batch_changes_nothing() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(idle_alerts(&f), 1);
         let before = f.model.clone();
         f.model.apply_batch(&EventBatch {
             from: Seq(1),
