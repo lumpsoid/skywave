@@ -8,6 +8,8 @@ migrates the stored data (see the README).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-17
+
 The first public release.
 
 ### Added
@@ -36,3 +38,5 @@ The first public release.
 - Continuing a Claude Code conversation started outside Skywave.
 - Per-turn and per-session cost and token usage.
 - The version and commit in `--version` and on the app's settings page.
+- A Licenses page in the app's settings, with the bundled font's license
+  and every package's.
