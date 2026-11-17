@@ -1579,11 +1579,12 @@ logs) an event that no longer decodes rather than failing.
   memory, so the model caches each waiting approval's facts
   (`waiting_facts`). `Effect::LoadApprovals(SessionId)` reads a session's
   events from the store only while this screen is shown, and only for a
-  session with a waiting approval it has no facts for; the seam asks again
-  after each batch it applies. A request missing from those events is cached
-  `Unknown`, so it is not read again. Facts are cached raw: the input's blob
-  state and this device's answer are read at view time. An answered approval
-  leaves the list at once (`can_answer`). The TUI's screen only counts them.
+  session with a pending approval it has no facts for; the seam asks again
+  after each batch it applies and after a resync. A request missing from
+  those events is cached `Unknown`, so it is not read again. Facts are cached
+  raw: the input's blob state and this device's answer are read at view time.
+  An answered approval leaves the list at once (`can_answer`). The TUI's
+  screen only counts them.
 - **Agent login** (`ViewState::login_expires`, on every screen): Settings
   always say when the agent's login expires, once paired
   (`skywave_present::login::expiry_label`: `expires in 12 days ·
