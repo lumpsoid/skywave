@@ -21,7 +21,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # origin/main and the earlier tags, for scripts/release.sh verify.
           fetch-depth: 0
@@ -51,7 +51,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust (Cargo.toml's rust-version)
         run: |
           v=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
@@ -85,7 +85,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Refuse to build without the signing key
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -172,7 +172,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # actions/checkout drops the tag's annotation; fetch the tag itself.
       - name: Release notes from the tag
         run: |
