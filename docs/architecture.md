@@ -493,7 +493,11 @@ the daemon's appends, which would otherwise stop `serve` (below).
   command is covered. The approval's `reason` names the rules used. Devices
   keep the rules in their replica (core's `safety_rules` table) for the
   settings list, and a shell row offers its commands' literal words
-  (`skywave_safety::simple_commands`) as rule candidates.
+  (`skywave_safety::simple_commands`) as rule candidates. The approval panel
+  offers the same candidates for the approval's `shell` command (so a
+  subagent's too) as **Trust…**. **Trust and approve** sends one
+  `SetSafetyRule` per kept prefix, then approves: a rule is checked when a
+  call arrives, never against an approval already pending (D61).
 
   Both events carry the `shell` command. A device can then send
   `SafetyCheckFeedback` on such a call: `ShouldApprove` where a person was
@@ -1568,6 +1572,18 @@ logs) an event that no longer decodes rather than failing.
   did not report is left out. The TUI opens it with `L` (session list,
   usage screen); the GUI from the usage page. From a session the limits
   show on its info page instead.
+- **Approvals screen** (`Route::Approvals`, D63): every approval this device
+  can answer, from every session, oldest first (`Model::waiting_approvals`).
+  Each item's `Asks` is an `Approval` prompt, a `Question` (answered in its
+  session, not here) or `Unknown`. Only the open session's events are in
+  memory, so the model caches each waiting approval's facts
+  (`waiting_facts`). `Effect::LoadApprovals(SessionId)` reads a session's
+  events from the store only while this screen is shown, and only for a
+  session with a waiting approval it has no facts for; the seam asks again
+  after each batch it applies. A request missing from those events is cached
+  `Unknown`, so it is not read again. Facts are cached raw: the input's blob
+  state and this device's answer are read at view time. An answered approval
+  leaves the list at once (`can_answer`). The TUI's screen only counts them.
 - **Agent login** (`ViewState::login_expires`, on every screen): Settings
   always say when the agent's login expires, once paired
   (`skywave_present::login::expiry_label`: `expires in 12 days ·
@@ -1756,7 +1772,7 @@ enum CropContent {
 | Approval answered elsewhere | "Approved on <device>", controls removed. |
 | Question pending (`SessionView::pending_question`) | A question panel instead of the approval prompt: each question with its options, their descriptions and previews, and the user's own answer. The picks stay in the head (TUI: `skywave_present::question::QuestionDraft` behind `a`; GUI: the panel's state) until every question has an answer, then go as one `Action::AnswerQuestion`; `x` / Decline is a denial. Its call's row reads "needs an answer", then "answered here / on <device>" (`ApprovalStatus::Answered`), with what was picked in its result. |
 | New approval while `Online` (`attention.alerts` grows) | Bell or desktop notification naming the session, once; never at start, after a catch-up that resolved it, or for one answered here. The GUI keeps one notification per session (ids from the hub, `PlatformEffect::Notify { id }`) and takes it down (`Dismiss`) once that session has no approval pending, however it went (`AlertUpdate::cleared`); a terminal bell has nothing to take down. |
-| Approvals pending in other sessions (`attention.elsewhere`) | TUI: banner: N approvals elsewhere. GUI: a bell badged with N among every page's app bar actions. One key (Ctrl+G in the GUI) or a tap opens the next. |
+| Approvals pending in other sessions (`attention.elsewhere`) | TUI: banner: N approvals elsewhere. GUI: a bell badged with N among every page's app bar actions. A tap opens the Approvals page, which answers them all; Ctrl+G opens the next one instead. |
 | `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |
 | `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. In the GUI the banner shows only a rejected link and the agent login warnings (`LinkUpdate::label` is empty otherwise). |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
