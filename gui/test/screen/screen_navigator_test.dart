@@ -1,5 +1,6 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:skywave_gui/approvals/approvals_page.dart';
 import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
 import 'package:skywave_gui/screen/screen_holder.dart';
@@ -51,6 +52,27 @@ void main() {
     expect(find.text('hello'), findsOneWidget);
     // The session view reports that it shows the newest row.
     expect(sent, [const GuiIntentFollowingChanged(following: true)]);
+  });
+
+  testWidgets('the approvals screen shows its page, not the startup page', (
+    tester,
+  ) async {
+    final holders = fakeHolders();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ScreenNavigator(holders: holders, send: (_) {}),
+      ),
+    );
+    holders.screen.apply(
+      const ScreenUpdate(
+        screen: ScreenViewApprovals(items: []),
+        canGoBack: false,
+        repair: null,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(ApprovalsPage), findsOneWidget);
+    expect(find.byType(StartupPage), findsNothing);
   });
 
   testWidgets('the screen leaves the top inset to the banner while it shows', (

@@ -18,11 +18,13 @@ enum ScreenKind {
   sessionInfo,
   workdir,
   crop,
+  approvals,
 }
 
 /// The screen as Rust last sent it: what the navigator shows, and the
 /// data of the pairing, session list, session, settings, server addresses,
-/// usage, storage, usage limits, session info, workdir and crop pages. Lives for the app's lifetime.
+/// usage, storage, approvals, usage limits, session info, workdir and crop
+/// pages. Lives for the app's lifetime.
 class ScreenHolder extends ChangeNotifier {
   StreamSubscription<RustSignalPack<ScreenUpdate>>? _subscription;
 
@@ -44,6 +46,7 @@ class ScreenHolder extends ChangeNotifier {
     ScreenViewSessionInfo() => ScreenKind.sessionInfo,
     ScreenViewWorkdir() => ScreenKind.workdir,
     ScreenViewCrop() => ScreenKind.crop,
+    ScreenViewApprovals() => ScreenKind.approvals,
     _ => null,
   };
 
