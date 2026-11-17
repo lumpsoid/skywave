@@ -141,6 +141,34 @@ pub struct PendingApprovalRef {
     pub alerted_at: u64,
 }
 
+/// The Approvals screen: what waits on this device, from every session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalsView {
+    /// Oldest first, as [`Attention::approvals`].
+    pub items: Vec<WaitingApproval>,
+}
+
+/// One approval or question waiting on this device, and its session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitingApproval {
+    pub session_id: SessionId,
+    /// The session's title, as [`SessionRow::title`]. Text from the server.
+    pub session_title: String,
+    pub id: ApprovalId,
+    pub asks: Asks,
+}
+
+/// What a waiting approval asks of the person.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Asks {
+    /// A tool call to approve or deny, answerable here.
+    Approval(Box<ApprovalPrompt>),
+    /// A question (D47); answered in its session.
+    Question,
+    /// Its request was not found in the replica; open the session.
+    Unknown,
+}
+
 /// State of the connection to the server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Link {
@@ -558,6 +586,9 @@ pub enum Screen {
     SessionInfo(Box<SessionInfoView>),
     Workdir(WorkdirView),
     Crop(CropView),
+    /// Every approval this device can answer, from every session, oldest
+    /// first ([`Route::Approvals`](crate::Route::Approvals)).
+    Approvals(ApprovalsView),
 }
 
 /// The page choosing which lines of a blob's content to keep

@@ -823,6 +823,10 @@ impl State {
                     .store
                     .session_events(id)
                     .map(|events| self.model.session_loaded(id, events)),
+                Effect::LoadApprovals(id) => self
+                    .store
+                    .session_events(id)
+                    .map(|events| self.model.approvals_loaded(id, events)),
                 // The files go once the rows are gone; a download still
                 // writing one finds its blob unknown and removes it too.
                 Effect::DeleteLocally(id) => {
