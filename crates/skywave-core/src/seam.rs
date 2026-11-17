@@ -413,6 +413,14 @@ impl Seam {
             {
                 state.model.session_loaded(id, events);
             }
+            // The same for the sessions the Approvals screen waits on. A
+            // session whose read failed stays uncached, so the next batch
+            // reads it again.
+            for id in state.model.approvals_to_load() {
+                if let Ok(events) = state.store.session_events(id) {
+                    state.model.approvals_loaded(id, events);
+                }
+            }
             mark_alerted(state, &alerted);
             for blob in &applied.purged {
                 remove_blob_files(&data_dir, *blob);

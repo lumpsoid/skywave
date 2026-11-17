@@ -7,16 +7,19 @@ import 'package:skywave_gui/session/look.dart';
 /// them, so a quoted word like `-m "fix it"` stays exact.
 Future<List<List<String>>?> askTrustCommand(
   BuildContext context,
-  List<List<String>> candidates,
-) => showDialog<List<List<String>>>(
+  List<List<String>> candidates, {
+  String confirmLabel = 'Trust',
+}) => showDialog<List<List<String>>>(
   context: context,
-  builder: (context) => _TrustDialog(candidates: candidates),
+  builder: (context) =>
+      _TrustDialog(candidates: candidates, confirmLabel: confirmLabel),
 );
 
 class _TrustDialog extends StatefulWidget {
-  const _TrustDialog({required this.candidates});
+  const _TrustDialog({required this.candidates, required this.confirmLabel});
 
   final List<List<String>> candidates;
+  final String confirmLabel;
 
   @override
   State<_TrustDialog> createState() => _TrustDialogState();
@@ -100,7 +103,7 @@ class _TrustDialogState extends State<_TrustDialog> {
         FilledButton(
           key: const Key('trust-confirm'),
           onPressed: _included.any((included) => included) ? _submit : null,
-          child: const Text('Trust'),
+          child: Text(widget.confirmLabel),
         ),
       ],
     );

@@ -823,6 +823,10 @@ impl State {
                     .store
                     .session_events(id)
                     .map(|events| self.model.session_loaded(id, events)),
+                Effect::LoadApprovals(id) => self
+                    .store
+                    .session_events(id)
+                    .map(|events| self.model.approvals_loaded(id, events)),
                 // The files go once the rows are gone; a download still
                 // writing one finds its blob unknown and removes it too.
                 Effect::DeleteLocally(id) => {
@@ -878,6 +882,11 @@ impl State {
         let open = self.model.loaded_session();
         if let Some((id, Ok(events))) = open.map(|id| (id, self.store.session_events(id))) {
             self.model.session_loaded(id, events);
+        }
+        for id in self.model.approvals_to_load() {
+            if let Ok(events) = self.store.session_events(id) {
+                self.model.approvals_loaded(id, events);
+            }
         }
     }
 }

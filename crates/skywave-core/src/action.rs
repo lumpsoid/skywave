@@ -548,4 +548,7 @@ pub enum Route {
     /// stored answer, asked for on opening only when none is stored. Back
     /// returns to the session it was opened from, if any.
     UsageLimits,
+    /// Every approval this device can answer, from every session, oldest
+    /// first.
+    Approvals,
 }

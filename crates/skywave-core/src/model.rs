@@ -42,21 +42,21 @@ use crate::store::{
 use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
-    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention,
-    BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobUse, BlobView, BodyView, CallId,
-    ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
-    CropView, Decision, Delivery, DeviceId, DeviceRef, DeviceStorage, DiffBody, Draft, Entry,
-    ErrorInfo, FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView, ImportedEntry,
-    LineSpan, Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing,
-    PairedInfo, PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef,
+    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, ApprovalsView,
+    Asks, Attention, BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobUse, BlobView,
+    BodyView, CallId, ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView,
+    CropContent, CropView, Decision, Delivery, DeviceId, DeviceRef, DeviceStorage, DiffBody, Draft,
+    Entry, ErrorInfo, FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView,
+    ImportedEntry, LineSpan, Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice,
+    Outgoing, PairedInfo, PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef,
     PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
     SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView,
     SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
     SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
     SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader, SubagentStatus,
     SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
-    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload,
-    WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WaitingApproval, WorkdirBody,
+    WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -106,6 +106,9 @@ pub(crate) enum Effect {
     },
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
+    /// Read a session's events from the replica to learn its waiting
+    /// approvals (the Approvals screen).
+    LoadApprovals(SessionId),
     /// Delete the session from this device's replica, then from the model
     /// ([`Model::session_deleted`]), and remove its blobs' files.
     DeleteLocally(SessionId),
@@ -138,6 +141,7 @@ enum Place {
     Usage,
     Storage,
     Worktrees,
+    Approvals,
     /// The usage limits page, opened from the session on screen, if any:
     /// back returns there.
     UsageLimits(Option<SessionId>),
@@ -253,6 +257,7 @@ impl From<Route> for Place {
             Route::Usage => Place::Usage,
             Route::Storage => Place::Storage,
             Route::Worktrees => Place::Worktrees,
+            Route::Approvals => Place::Approvals,
             Route::UsageLimits => Place::UsageLimits(None),
         }
     }
@@ -266,6 +271,32 @@ struct OpenSession {
     /// opened, past this device's own messages, if agent output follows
     /// it. Marking read leaves it alone.
     unread_from: Option<Seq>,
+}
+
+/// What the model holds of an approval waiting on this device, read from
+/// its session's events ([`Model::approvals_loaded`]). The facts are kept
+/// raw: what the approval's answers look like is live, and is read at view
+/// time.
+#[derive(Debug, Clone, PartialEq)]
+enum Waiting {
+    Approval(Box<ApprovalFacts>),
+    Question,
+    /// Pending in the replica, but its request is not in the session's
+    /// events: cached so it is not read again.
+    Unknown,
+}
+
+/// An approval's facts as its `ApprovalRequested` event logged them, with
+/// the title of the subagent its call runs under.
+#[derive(Debug, Clone, PartialEq)]
+struct ApprovalFacts {
+    call: Option<CallId>,
+    from: Option<String>,
+    tool: String,
+    summary: String,
+    input: Option<Full>,
+    suggestions: Vec<RuleSuggestion>,
+    shell: Option<String>,
 }
 
 /// What the model holds of the device's pairing, taken from the record
@@ -393,6 +424,10 @@ pub(crate) struct Model {
     /// Id of the latest [`Request::CountLines`]; never reused, so the
     /// count of a page since closed or reopened is dropped.
     count_req: u64,
+    /// What the Approvals screen knows of each waiting approval, loaded
+    /// from its session while that screen is on show
+    /// ([`Model::approvals_to_load`]); in memory only.
+    waiting_facts: HashMap<ApprovalId, Waiting>,
 }
 
 impl Model {
@@ -463,6 +498,7 @@ impl Model {
             turns: Vec::new(),
             workdirs: Workdirs::default(),
             count_req: 0,
+            waiting_facts: HashMap::new(),
         };
         // An approval pending at start that no process alerted on yet (one
         // that came in during a catch-up cut short) alerts once online.
@@ -1393,7 +1429,15 @@ impl Model {
                     Place::UsageLimits(_) => self.usage_limits.open(online).into_iter().collect(),
                     _ => Vec::new(),
                 };
-                asked.into_iter().map(Effect::Request).collect()
+                let loads = self
+                    .approvals_to_load()
+                    .into_iter()
+                    .map(Effect::LoadApprovals);
+                asked
+                    .into_iter()
+                    .map(Effect::Request)
+                    .chain(loads)
+                    .collect()
             }
             Action::Back => {
                 // A subagent shown steps out to the one it runs under, then
@@ -1461,7 +1505,8 @@ impl Model {
             | Place::Pairing
             | Place::Usage
             | Place::Storage
-            | Place::Worktrees => Route::SessionList,
+            | Place::Worktrees
+            | Place::Approvals => Route::SessionList,
             Place::ServerAddresses => Route::Settings,
             Place::UsageLimits(from) => {
                 return Some(match from.filter(|id| self.summary(*id).is_some()) {
@@ -2014,15 +2059,21 @@ impl Model {
         pending && !answered
     }
 
-    /// Whether approval `id`, requested in the open session, offers a rule
-    /// at index `rule`.
+    /// Whether approval `id` offers a rule at index `rule`: requested in the
+    /// open session, or cached for the Approvals screen, which has no session
+    /// open.
     fn offers(&self, id: ApprovalId, rule: u8) -> bool {
-        self.shown_events().is_some_and(|(_, open)| {
+        let in_open_session = self.shown_events().is_some_and(|(_, open)| {
             open.events.iter().any(|(_, event)| {
                 matches!(&event.kind, EventKind::ApprovalRequested { id: requested, suggestions, .. }
                     if *requested == id && usize::from(rule) < suggestions.len())
             })
-        })
+        });
+        let cached = matches!(
+            self.waiting_facts.get(&id),
+            Some(Waiting::Approval(facts)) if usize::from(rule) < facts.suggestions.len()
+        );
+        in_open_session || cached
     }
 
     /// The questions of question `id`, asked in the open session; `None`
@@ -2079,6 +2130,27 @@ impl Model {
             .collect();
         approvals.sort_by_key(|(_, id)| *id);
         approvals
+    }
+
+    /// The sessions whose events the Approvals screen must read: those with
+    /// a pending approval not cached yet, each once, in the order of the
+    /// pending approvals' ids, oldest first. Pending rather than waiting, so
+    /// an approval this device answered, then refused for a retry, has its
+    /// facts when it waits again. None unless that screen is on show.
+    pub(crate) fn approvals_to_load(&self) -> Vec<SessionId> {
+        if self.place != Place::Approvals {
+            return Vec::new();
+        }
+        let mut pending: Vec<(SessionId, ApprovalId)> =
+            self.pending_approvals().map(|(s, id)| (s.id, id)).collect();
+        pending.sort_by_key(|(_, id)| *id);
+        let mut sessions = Vec::new();
+        for (session, id) in pending {
+            if !self.waiting_facts.contains_key(&id) && !sessions.contains(&session) {
+                sessions.push(session);
+            }
+        }
+        sessions
     }
 
     /// Bumps `alerts` once if approvals came in that nobody was alerted to
@@ -2257,6 +2329,54 @@ impl Model {
                 unread_from,
             });
         }
+    }
+
+    /// Caches what the Approvals screen shows of session `id`'s pending
+    /// approvals, from its events: each one's facts, a question, or
+    /// `Unknown` when its request is not among them (cached, so it is not
+    /// read again). Then forgets the cached approvals pending nowhere.
+    pub(crate) fn approvals_loaded(&mut self, id: SessionId, events: Vec<(Seq, Event)>) {
+        let ids: Vec<ApprovalId> = self
+            .summary(id)
+            .map(|summary| summary.pending_approvals.clone())
+            .unwrap_or_default();
+        let (timeline, _) = self.timeline(id, &events);
+        for approval in ids {
+            let waiting = events
+                .iter()
+                .find_map(|(_, event)| match &event.kind {
+                    EventKind::ApprovalRequested {
+                        id: requested,
+                        call,
+                        tool,
+                        summary,
+                        input,
+                        suggestions,
+                        shell,
+                    } if *requested == approval => {
+                        Some(Waiting::Approval(Box::new(ApprovalFacts {
+                            call: *call,
+                            from: call
+                                .and_then(|call| tool_item(&timeline, call)?.0)
+                                .and_then(|outer| subagent_item(&timeline, outer))
+                                .map(|(_, view)| view.title.clone()),
+                            tool: tool.clone(),
+                            summary: summary.clone(),
+                            input: input.clone(),
+                            suggestions: suggestions.clone(),
+                            shell: shell.clone(),
+                        })))
+                    }
+                    EventKind::QuestionAsked { id: asked, .. } if *asked == approval => {
+                        Some(Waiting::Question)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Waiting::Unknown);
+            self.waiting_facts.insert(approval, waiting);
+        }
+        let pending: HashSet<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
+        self.waiting_facts.retain(|id, _| pending.contains(id));
     }
 
     /// Where the divider goes in `unseen`: its first event, past any
@@ -2817,6 +2937,41 @@ impl Model {
         }
     }
 
+    /// The Approvals screen: every approval this device can answer, oldest
+    /// first, from the facts cached for it. Answers and inputs are read
+    /// now, as the live state they are.
+    fn approvals_view(&self) -> ApprovalsView {
+        let items = self
+            .waiting_approvals()
+            .into_iter()
+            .filter_map(|(session_id, id)| {
+                let session_title = self.title(self.summary(session_id)?).text;
+                let asks = match self.waiting_facts.get(&id) {
+                    Some(Waiting::Approval(facts)) => Asks::Approval(Box::new(ApprovalPrompt {
+                        id,
+                        call: facts.call,
+                        from: facts.from.clone(),
+                        tool: facts.tool.clone(),
+                        summary: facts.summary.clone(),
+                        input: facts.input.as_ref().map(|full| self.full_view(full)),
+                        suggestions: facts.suggestions.clone(),
+                        shell: facts.shell.clone(),
+                        answer: self.local_answer(id, &facts.suggestions, true),
+                    })),
+                    Some(Waiting::Question) => Asks::Question,
+                    Some(Waiting::Unknown) | None => Asks::Unknown,
+                };
+                Some(WaitingApproval {
+                    session_id,
+                    session_title,
+                    id,
+                    asks,
+                })
+            })
+            .collect();
+        ApprovalsView { items }
+    }
+
     fn screen(&self) -> Screen {
         if self.device().is_none() {
             return Screen::Pairing(self.pairing_view());
@@ -2857,6 +3012,7 @@ impl Model {
             Place::Usage => Screen::Usage(self.usage_view()),
             Place::Storage => Screen::Storage(self.storage_view()),
             Place::Worktrees => Screen::Worktrees(self.worktrees_view()),
+            Place::Approvals => Screen::Approvals(self.approvals_view()),
             Place::UsageLimits(_) => Screen::UsageLimits(self.usage_limits.view()),
             Place::Session { id, open, scope } => {
                 match self.session_view(*id, open.as_ref(), *scope) {
@@ -3292,7 +3448,7 @@ impl Model {
                     summary,
                     input,
                     suggestions,
-                    ..
+                    shell,
                 } if *id == approval => Some(ApprovalPrompt {
                     id: *id,
                     call: *call,
@@ -3304,6 +3460,7 @@ impl Model {
                     summary: summary.clone(),
                     input: input.as_ref().map(|f| self.full_view(f)),
                     suggestions: suggestions.clone(),
+                    shell: shell.clone(),
                     answer: self.local_answer(*id, suggestions, true),
                 }),
                 _ => None,
@@ -5434,6 +5591,19 @@ mod tests {
             self.model.session_loaded(id, events);
         }
 
+        /// Serves the `LoadApprovals` effect for session `id` from the log,
+        /// as [`Fixture::open`] serves `LoadSession`.
+        fn load_approvals(&mut self, id: SessionId) {
+            let events = self
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.session_id == id)
+                .map(|(i, e)| (Seq(i as u64 + 1), e.clone()))
+                .collect();
+            self.model.approvals_loaded(id, events);
+        }
+
         fn dispatch(&mut self, action: Action) -> Vec<Effect> {
             self.model.dispatch(action)
         }
@@ -6055,6 +6225,226 @@ mod tests {
     }
 
     #[test]
+    fn the_approvals_screen_loads_each_waiting_session_once_oldest_first() {
+        let mut f = Fixture::paired();
+        let mut ids = [ApprovalId::new(), ApprovalId::new(), ApprovalId::new()];
+        ids.sort();
+        let [older, middle, newest] = ids;
+        let a = f.session("/srv/a");
+        let b = f.session("/srv/b");
+        let (agent, gated) = (CallId::new(), CallId::new());
+        f.log(
+            a,
+            vec![
+                tool_call(Some(agent), ToolKind::Subagent, "explore"),
+                sub_call(Some(gated), agent, ToolKind::Shell, "git status"),
+                EventKind::ApprovalRequested {
+                    id: newest,
+                    call: Some(gated),
+                    tool: "bash".into(),
+                    summary: "git status".into(),
+                    input: None,
+                    suggestions: Vec::new(),
+                    shell: Some("git status".into()),
+                },
+            ],
+        );
+        f.log(
+            b,
+            vec![
+                approval_requested(older, None),
+                approval_requested(middle, None),
+            ],
+        );
+
+        assert_eq!(
+            f.dispatch(Action::Navigate(Route::Approvals)),
+            [Effect::LoadApprovals(b), Effect::LoadApprovals(a)]
+        );
+        f.load_approvals(b);
+        f.load_approvals(a);
+        let view = approvals_view(&f);
+        let listed: Vec<_> = view
+            .items
+            .iter()
+            .map(|item| (item.id, item.session_id))
+            .collect();
+        assert_eq!(listed, [(older, b), (middle, b), (newest, a)]);
+        match &view.items[2].asks {
+            Asks::Approval(prompt) => {
+                assert_eq!(prompt.from.as_deref(), Some("explore"));
+                assert_eq!(prompt.shell.as_deref(), Some("git status"));
+            }
+            other => panic!("expected an approval, got {other:?}"),
+        }
+        // Each session was read once: nothing is left to load.
+        assert!(f.model.approvals_to_load().is_empty());
+        assert!(f.dispatch(Action::Navigate(Route::Approvals)).is_empty());
+    }
+
+    #[test]
+    fn an_approval_arriving_on_the_approvals_screen_is_loaded_and_leaves_once_answered() {
+        let mut f = Fixture::paired();
+        assert!(f.dispatch(Action::Navigate(Route::Approvals)).is_empty());
+        assert!(approvals_view(&f).items.is_empty());
+
+        let sid = f.session("/srv/a");
+        let approval = ApprovalId::new();
+        f.log(sid, vec![approval_requested(approval, None)]);
+        assert_eq!(f.model.approvals_to_load(), [sid]);
+        f.load_approvals(sid);
+        let view = approvals_view(&f);
+        assert!(matches!(
+            view.items.as_slice(),
+            [WaitingApproval { asks: Asks::Approval(prompt), .. }] if prompt.id == approval
+        ));
+
+        f.dispatch(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: None,
+        });
+        assert!(approvals_view(&f).items.is_empty());
+    }
+
+    #[test]
+    fn always_allow_on_the_approvals_screen_queues_its_rule() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let approval = ApprovalId::new();
+        let rule = RuleSuggestion {
+            label: "bash(ls)".into(),
+            scope: RuleScope::Project,
+        };
+        f.log(
+            sid,
+            vec![EventKind::ApprovalRequested {
+                id: approval,
+                call: None,
+                tool: "bash".into(),
+                summary: "ls".into(),
+                input: None,
+                suggestions: vec![rule],
+                shell: None,
+            }],
+        );
+        assert_eq!(
+            f.dispatch(Action::Navigate(Route::Approvals)),
+            [Effect::LoadApprovals(sid)]
+        );
+        f.load_approvals(sid);
+
+        // No session is open here, so the rule is read from the cached facts.
+        // One out of range is still not sent.
+        assert!(
+            f.dispatch(Action::ResolveApproval {
+                id: approval,
+                decision: Decision::Approve,
+                rule: Some(1),
+            })
+            .is_empty()
+        );
+        let command = queued(&f.dispatch(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: Some(0),
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::ResolveApproval {
+                id: approval,
+                decision: Decision::Approve,
+                rule: Some(0),
+            }
+        );
+        assert!(approvals_view(&f).items.is_empty());
+    }
+
+    #[test]
+    fn an_answered_approval_s_facts_load_when_it_waits_again() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let approval = ApprovalId::new();
+        f.log(sid, vec![approval_requested(approval, None)]);
+        // Answered from this device before the screen is shown: the session
+        // has no waiting approval, so only its pending ones can bring it in.
+        let command = queued(&f.dispatch(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: None,
+        }));
+        assert_eq!(
+            f.dispatch(Action::Navigate(Route::Approvals)),
+            [Effect::LoadApprovals(sid)]
+        );
+        f.load_approvals(sid);
+        assert!(f.model.waiting_facts.contains_key(&approval));
+        assert!(approvals_view(&f).items.is_empty());
+
+        // A refused answer that may be retried makes it waiting again, with
+        // no batch in between: its facts are already cached.
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownRule,
+            },
+            Utc::now(),
+        );
+        assert!(matches!(
+            approvals_view(&f).items.as_slice(),
+            [WaitingApproval { id, asks: Asks::Approval(prompt), .. }]
+                if *id == approval && prompt.id == approval
+        ));
+    }
+
+    #[test]
+    fn a_question_waits_as_a_question() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let question = ApprovalId::new();
+        f.log(
+            sid,
+            vec![EventKind::QuestionAsked {
+                id: question,
+                call: None,
+                questions: vec![Question {
+                    header: String::new(),
+                    text: "Which bread?".into(),
+                    options: Vec::new(),
+                    multi_select: false,
+                }],
+            }],
+        );
+        assert_eq!(
+            f.dispatch(Action::Navigate(Route::Approvals)),
+            [Effect::LoadApprovals(sid)]
+        );
+        f.load_approvals(sid);
+        let view = approvals_view(&f);
+        assert!(matches!(
+            view.items.as_slice(),
+            [WaitingApproval { id, asks: Asks::Question, .. }] if *id == question
+        ));
+    }
+
+    #[test]
+    fn approvals_load_only_on_the_approvals_screen() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log(sid, vec![approval_requested(ApprovalId::new(), None)]);
+        assert!(
+            f.model.approvals_to_load().is_empty(),
+            "on the session list"
+        );
+        assert!(f.dispatch(Action::Navigate(Route::SessionList)).is_empty());
+        // The control: the same approval loads once the screen is shown.
+        assert_eq!(
+            f.dispatch(Action::Navigate(Route::Approvals)),
+            [Effect::LoadApprovals(sid)]
+        );
+    }
+
+    #[test]
     fn approval_prompt_answer_and_resolution_elsewhere() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
@@ -6102,6 +6492,7 @@ mod tests {
                 summary: "rm -rf build".into(),
                 input: Some(blob.clone()),
                 suggestions: Vec::new(),
+                shell: None,
                 answer: None,
             })
         );
@@ -12273,6 +12664,13 @@ mod tests {
         }
     }
 
+    fn approvals_view(f: &Fixture) -> ApprovalsView {
+        match f.model.view().screen {
+            Screen::Approvals(view) => view,
+            other => panic!("expected the approvals screen, got {other:?}"),
+        }
+    }
+
     /// The server's storage request among `effects`, if one is asked.
     fn storage_req(effects: &[Effect]) -> Option<u64> {
         effects.iter().find_map(|effect| match effect {
@@ -13332,6 +13730,7 @@ mod tests {
             Screen::Usage(_) => "usage",
             Screen::Storage(_) => "storage",
             Screen::Worktrees(_) => "worktrees",
+            Screen::Approvals(_) => "approvals",
             Screen::UsageLimits(_) => "usage limits",
             Screen::SessionInfo(_) => "session info",
             Screen::Workdir(_) => "workdir",
@@ -13384,6 +13783,7 @@ mod tests {
         assert_back(&mut f, nav(Route::Usage), "usage", "active list");
         assert_back(&mut f, nav(Route::Storage), "storage", "active list");
         assert_back(&mut f, nav(Route::Worktrees), "worktrees", "active list");
+        assert_back(&mut f, nav(Route::Approvals), "approvals", "active list");
         // Re-pairing a paired device can be cancelled.
         assert_back(&mut f, nav(Route::Pairing), "pairing", "active list");
         // A session goes back to the list it is on.
