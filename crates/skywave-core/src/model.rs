@@ -135,6 +135,7 @@ struct Title {
 enum Place {
     SessionList(ListPage),
     Archived,
+    All,
     Settings,
     ServerAddresses,
     Pairing,
@@ -212,6 +213,7 @@ struct Scope {
 enum OpeningFrom {
     SessionList,
     Archived,
+    All,
     Session(SessionId),
 }
 
@@ -251,6 +253,7 @@ impl From<Route> for Place {
         match route {
             Route::SessionList => Place::session_list(),
             Route::ArchivedSessions => Place::Archived,
+            Route::AllSessions => Place::All,
             Route::Settings => Place::Settings,
             Route::ServerAddresses => Place::ServerAddresses,
             Route::Pairing => Place::Pairing,
@@ -331,6 +334,9 @@ pub(crate) struct Model {
     paired: Option<Paired>,
     pairing: PairingStatus,
     place: Place,
+    /// The session list last shown, so back from a session returns to the
+    /// all list when that was the one.
+    last_list: ListKind,
     settings: Settings,
     cursor: Seq,
     /// Most recently written to (highest `last_message_seq`) first, like
@@ -462,6 +468,7 @@ impl Model {
             paired,
             pairing: PairingStatus::Idle,
             place: Place::session_list(),
+            last_list: ListKind::Active,
             settings: Settings::default(),
             cursor: Seq::ZERO,
             sessions: Vec::new(),
@@ -617,6 +624,7 @@ impl Model {
         match &self.place {
             Place::SessionList(_) => Some(OpeningFrom::SessionList),
             Place::Archived => Some(OpeningFrom::Archived),
+            Place::All => Some(OpeningFrom::All),
             Place::Session { id, .. } => Some(OpeningFrom::Session(*id)),
             _ => None,
         }
@@ -699,7 +707,7 @@ impl Model {
             }
             Action::CreateSessionLike(from) => {
                 let Some(at) = self.opening_from().filter(|at| match at {
-                    OpeningFrom::SessionList | OpeningFrom::Archived => true,
+                    OpeningFrom::SessionList | OpeningFrom::Archived | OpeningFrom::All => true,
                     OpeningFrom::Session(id) => *id == from,
                 }) else {
                     return Vec::new();
@@ -1419,6 +1427,12 @@ impl Model {
                     route => route.into(),
                 };
                 self.place = place;
+                match self.place {
+                    Place::SessionList(_) => self.last_list = ListKind::Active,
+                    Place::Archived => self.last_list = ListKind::Archived,
+                    Place::All => self.last_list = ListKind::All,
+                    _ => {}
+                }
                 if self.device().is_none() {
                     return Vec::new();
                 }
@@ -1501,6 +1515,7 @@ impl Model {
         let route = match &self.place {
             Place::SessionList(_) => return None,
             Place::Archived
+            | Place::All
             | Place::Settings
             | Place::Pairing
             | Place::Usage
@@ -1519,7 +1534,10 @@ impl Model {
                 return Some(Action::OpenSession(*id));
             }
             Place::Session { id, .. } => {
-                if self.archived(self.summary(*id)?) {
+                let archived = self.archived(self.summary(*id)?);
+                if self.last_list == ListKind::All {
+                    Route::AllSessions
+                } else if archived {
                     Route::ArchivedSessions
                 } else {
                     Route::SessionList
@@ -2489,7 +2507,11 @@ impl Model {
             | Place::SessionInfo { id: shown, .. }
             | Place::Workdir { id: shown, .. } if *shown == id)
         {
-            self.place = Place::Archived;
+            self.place = if self.last_list == ListKind::All {
+                Place::All
+            } else {
+                Place::Archived
+            };
         }
     }
 
@@ -3009,6 +3031,7 @@ impl Model {
                 Screen::SessionList(self.session_list(ListKind::Active, Some(page)))
             }
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived, None)),
+            Place::All => Screen::SessionList(self.session_list(ListKind::All, None)),
             Place::Usage => Screen::Usage(self.usage_view()),
             Place::Storage => Screen::Storage(self.storage_view()),
             Place::Worktrees => Screen::Worktrees(self.worktrees_view()),
@@ -3216,10 +3239,9 @@ impl Model {
     /// The `kind` list; `page` is what the active list on screen keeps,
     /// none when another place falls back to the list.
     fn session_list(&self, kind: ListKind, page: Option<&ListPage>) -> SessionListView {
-        let (listed, other): (Vec<_>, Vec<_>) = self
-            .sessions
-            .iter()
-            .partition(|s| self.archived(s) == (kind == ListKind::Archived));
+        let (listed, other): (Vec<_>, Vec<_>) = self.sessions.iter().partition(|s| {
+            kind == ListKind::All || self.archived(s) == (kind == ListKind::Archived)
+        });
         let sessions = listed
             .into_iter()
             .map(|s| {
@@ -3232,6 +3254,7 @@ impl Model {
                     workdir: s.workdir.clone(),
                     worktree: s.worktree.clone(),
                     worktree_removed: s.worktree_removed,
+                    archived: self.archived(s),
                     state: session_state(s),
                     pending_approvals: s.pending_approvals.len(),
                     last_activity: s.last_activity,
@@ -3255,7 +3278,7 @@ impl Model {
                 }
             })
             .collect();
-        if kind == ListKind::Archived {
+        if kind != ListKind::Active {
             return SessionListView {
                 kind,
                 sessions,
@@ -8141,6 +8164,40 @@ mod tests {
             f.dispatch(archive(SessionId::new(), true)).is_empty(),
             "unknown here"
         );
+    }
+
+    #[test]
+    fn the_all_list_shows_both_in_order_and_back_returns_to_it() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        let new = f.session("/srv/new");
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let before: Vec<SessionId> = f.list_view().sessions.iter().map(|r| r.id).collect();
+        assert_eq!(before, vec![new, old]);
+        queued(&f.dispatch(archive(old, true)));
+
+        f.dispatch(Action::Navigate(Route::AllSessions));
+        let all = f.list_view();
+        assert_eq!(all.kind, ListKind::All);
+        assert_eq!(
+            all.sessions.iter().map(|r| r.id).collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(
+            all.sessions.iter().map(|r| r.archived).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        assert_eq!(all.other_count, 0);
+        assert!(all.creating.is_empty());
+
+        f.open(old);
+        f.dispatch(Action::Back);
+        assert_eq!(f.list_view().kind, ListKind::All);
+
+        f.dispatch(Action::Navigate(Route::SessionList));
+        f.open(old);
+        f.dispatch(Action::Back);
+        assert_eq!(f.list_view().kind, ListKind::Archived);
     }
 
     #[test]

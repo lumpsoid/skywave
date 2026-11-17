@@ -494,6 +494,8 @@ pub struct PairForm {
 pub enum ListKindView {
     Active,
     Archived,
+    /// Active and archived together.
+    All,
 }
 
 /// One session on a list.

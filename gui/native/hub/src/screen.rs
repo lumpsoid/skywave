@@ -186,30 +186,26 @@ fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
     let kind = match list.kind {
         ListKind::Active => ListKindView::Active,
         ListKind::Archived => ListKindView::Archived,
+        ListKind::All => ListKindView::All,
     };
     let title = "Sessions".to_owned();
     let empty_label = list.sessions.is_empty().then(|| {
         match list.kind {
             ListKind::Archived => "No archived sessions.",
+            ListKind::All => "No sessions yet.",
             ListKind::Active if !list.creating.is_empty() => "No sessions yet.",
             ListKind::Active if list.other_count > 0 => "No active sessions.",
             ListKind::Active => "No sessions yet. Start one.",
         }
         .to_owned()
     });
-    let archived = list.kind == ListKind::Archived;
     ScreenView::SessionList {
         kind,
         title,
         empty_label,
         rows: by_repo(&list.sessions)
             .iter()
-            .flat_map(|group| {
-                group
-                    .rows
-                    .iter()
-                    .map(move |row| row_view(row, archived, group.key))
-            })
+            .flat_map(|group| group.rows.iter().map(move |row| row_view(row, group.key)))
             .collect(),
         other_count: count(list.other_count),
         creating: list.creating.iter().map(creating_view).collect(),
@@ -257,7 +253,7 @@ fn conversations_view(
 }
 
 /// `group` is the key [`by_repo`] put the row under.
-fn row_view(row: &SessionRow, archived: bool, group: &str) -> SessionRowView {
+fn row_view(row: &SessionRow, group: &str) -> SessionRowView {
     let title = clean_line(&row.title);
     SessionRowView {
         session_id: row.id.0.to_string(),
@@ -292,11 +288,11 @@ fn row_view(row: &SessionRow, archived: bool, group: &str) -> SessionRowView {
         importing_label: row.importing.then(|| IMPORTING_HISTORY.to_owned()),
         deletable: row.deletable,
         deletable_everywhere: row.deletable_everywhere,
-        delete_blocked_label: (archived && !row.deletable)
+        delete_blocked_label: (row.archived && !row.deletable)
             .then(|| format!("cannot delete {title} yet: answer or cancel first")),
         removable: row.worktree.is_some() && !row.worktree_removed,
         worktree_removed: row.worktree_removed,
-        archived,
+        archived: row.archived,
         title,
     }
 }

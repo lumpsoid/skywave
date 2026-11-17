@@ -363,11 +363,13 @@ fn render_session_list(
         (ListKind::Active, 0) => format!(" Sessions ({count}) "),
         (ListKind::Active, archived) => format!(" Sessions ({count}) · {archived} archived "),
         (ListKind::Archived, active) => format!(" Archived ({count}) · {active} active "),
+        (ListKind::All, _) => format!(" All sessions ({count}) "),
     };
     let block = Block::bordered().title(title);
     if list.sessions.is_empty() {
         let hint = match list.kind {
             ListKind::Archived => "No archived sessions. Press A or Esc for the active ones.",
+            ListKind::All => "No sessions. Press A or Esc for the active ones.",
             ListKind::Active if !list.creating.is_empty() => "No sessions yet.",
             ListKind::Active if list.other_count > 0 => {
                 "No active sessions. Press n to start one, A for the archived ones."

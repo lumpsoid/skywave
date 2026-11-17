@@ -604,6 +604,7 @@ pub enum BlobPolicyChoice {
 pub enum RouteView {
     SessionList,
     ArchivedSessions,
+    AllSessions,
     Settings,
     ServerAddresses,
     Pairing,

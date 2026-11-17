@@ -770,16 +770,16 @@ pub enum PairingStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionListView {
-    /// Which of the two lists this is.
+    /// Which list this is.
     pub kind: ListKind,
     /// The sessions of this list, most recently active first. Archiving
     /// moves a session between the lists without reordering either.
     pub sessions: Vec<SessionRow>,
-    /// How many sessions the other list holds.
+    /// How many sessions the other list holds; 0 on the all list.
     pub other_count: usize,
     /// Sessions this device asked for that are not in the replica yet, or
     /// that the server refused. Oldest first. Always empty on the archived
-    /// list: a new session is active.
+    /// and all lists: a new session is active.
     pub creating: Vec<PendingSession>,
     /// Workdir completion for the new-session prompt, while one is open
     /// ([`Action::CompleteWorkdir`](crate::Action::CompleteWorkdir)); only
@@ -853,8 +853,9 @@ pub struct ConversationItem {
     pub continued_in: Vec<SessionId>,
 }
 
-/// The session list's two halves: [`Route::SessionList`](crate::Route) and
-/// [`Route::ArchivedSessions`](crate::Route).
+/// The session list's three lists: [`Route::SessionList`](crate::Route),
+/// [`Route::ArchivedSessions`](crate::Route) and
+/// [`Route::AllSessions`](crate::Route).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
     Active,
@@ -862,6 +863,9 @@ pub enum ListKind {
     /// [`Action::SetSessionArchived`](crate::Action::SetSessionArchived)
     /// and not brought back since. They open and work as usual.
     Archived,
+    /// Every session, active and archived together, in the same order as
+    /// the other two lists. Each row says whether it is archived.
+    All,
 }
 
 /// Directories that complete what the user typed as a workdir.
@@ -973,6 +977,9 @@ pub struct SessionRow {
     pub worktree: Option<Worktree>,
     /// The worktree was removed: work for the session is refused.
     pub worktree_removed: bool,
+    /// The session is archived. Only the all list needs this to tell its
+    /// rows apart; the active and archived lists hold one kind each.
+    pub archived: bool,
 }
 
 /// What the usage screen totals: every turn in the replica that reported
