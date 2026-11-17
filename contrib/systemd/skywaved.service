@@ -1,6 +1,10 @@
 # skywaved as a systemd user service: the agent runs as you, with your
 # `claude` login and ~/.claude. See README.md, "Running it as a service".
 #
+#   scripts/deploy/deploy.sh <ssh-host>   # builds, copies and starts it
+#
+# Or by hand, with the binary in ~/.local/bin/skywaved:
+#
 #   cp contrib/systemd/skywaved.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now skywaved
@@ -10,7 +14,7 @@
 Description=Skywave server daemon
 
 [Service]
-ExecStart=%h/.cargo/bin/skywaved serve
+ExecStart=%h/.local/bin/skywaved serve
 # Reopens log_file (logrotate); without one, logs go to the journal.
 ExecReload=/bin/kill -HUP $MAINPID
 # `skywaved stop` exits 0, so it stays stopped; `skywaved restart` starts
