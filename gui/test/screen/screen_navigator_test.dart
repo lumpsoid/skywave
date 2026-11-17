@@ -28,6 +28,7 @@ ScreenUpdate settingsScreen({bool canGoBack = true}) => ScreenUpdate(
       shell: true,
     ),
     safetyRules: [],
+    version: '0.1.0 (abc1234)',
   ),
   canGoBack: canGoBack,
   repair: null,

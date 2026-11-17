@@ -255,6 +255,13 @@ class SettingsPage extends StatelessWidget {
                   ),
                 },
               ),
+            const _Section('About'),
+            ListTile(
+              key: const Key('version'),
+              leading: const Icon(Icons.info_outline),
+              title: const Text('Version'),
+              subtitle: SelectableText(screen.version),
+            ),
           ],
         ),
       ),

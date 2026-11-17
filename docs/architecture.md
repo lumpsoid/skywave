@@ -46,6 +46,7 @@ Android app; the Kotlin head it replaced is gone (D28).
 | `skywave-core`     | All client logic: state machine, sync, outbox, local replica, transport |
 | `skywave-present`  | Head-side presentation every head shares: timeline sections, neutral wording, UTF-16 cursors, the display filter for agent content (control characters dropped, bidi controls escaped visibly); pure, on `skywave-core` only |
 | `skywave-safety`   | The safety check (D59): proves a shell command read-only and inside a workdir, on a parsed AST. No side effects (reads only file metadata); used by `skywaved` |
+| `skywave-version`  | The build's version with its commit, `0.1.0 (2391c1d)`, from a `build.rs`; a leaf, so a new commit rebuilds only it and what prints it (`skywaved`, `skywave-tui`, `hub`) |
 | `skywave-tui`      | First head |
 | `skywave-testkit`  | Test-only: the link harness proxy (latency, jitter, bandwidth, drops); a dev-dependency only |
 | `skywave-claude-compat` | Manual tool: runs the real Claude Code CLI through the adapter's `Protocol` and reports broken contracts and newly available features (docs/agents/claude-code.md) |
