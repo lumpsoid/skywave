@@ -2,6 +2,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/section_block.dart';
+import 'package:skywave_gui/session/trust_command.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Below this width the panel docks to the composer: no side margin,
@@ -21,12 +22,14 @@ const approvalPreviewLines = 8;
 class ApprovalPanelView extends StatefulWidget {
   const ApprovalPanelView({
     required this.approval,
+    required this.sessionId,
     required this.send,
     this.onShowCall,
     super.key,
   });
 
   final ApprovalPanel approval;
+  final String sessionId;
   final SendIntent send;
 
   /// Reveals the gated call in the timeline; null when it is not there.
@@ -82,6 +85,28 @@ class _ApprovalPanelViewState extends State<ApprovalPanelView> {
       ),
     );
     if (rule != null) _resolve(DecisionView.approve, rule: rule);
+  }
+
+  /// Trusts the prefixes the person keeps, then approves: rules do not
+  /// re-check an approval already pending, so trusting alone would leave
+  /// this one waiting.
+  Future<void> _trust(BuildContext context) async {
+    final rules = await askTrustCommand(
+      context,
+      widget.approval.ruleCandidates,
+      confirmLabel: 'Trust and approve',
+    );
+    if (!mounted || rules == null || rules.isEmpty) return;
+    for (final words in rules) {
+      widget.send.act(
+        ActionIntentSetSafetyRule(
+          sessionId: widget.sessionId,
+          words: words,
+          on: true,
+        ),
+      );
+    }
+    _resolve(DecisionView.approve);
   }
 
   @override
@@ -256,6 +281,15 @@ class _ApprovalPanelViewState extends State<ApprovalPanelView> {
                       child: _Label(
                         approval.alwaysPicks ? 'Always allow…' : 'Always allow',
                       ),
+                    ),
+                  ),
+                if (approval.ruleCandidates.isNotEmpty)
+                  Expanded(
+                    child: TextButton(
+                      key: const Key('approval-trust'),
+                      style: _compact,
+                      onPressed: () => _trust(context),
+                      child: const _Label('Trust…'),
                     ),
                   ),
                 Expanded(

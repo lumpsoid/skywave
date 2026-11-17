@@ -105,6 +105,7 @@ class RowTile extends StatelessWidget {
       final rules = await askTrustCommand(
         context,
         row.tool?.ruleCandidates ?? const <List<String>>[],
+        confirmLabel: 'Trust',
       );
       for (final words in rules ?? const <List<String>>[]) {
         send(
