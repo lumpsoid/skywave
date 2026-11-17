@@ -48,6 +48,7 @@ SessionRowView sessionRow(
 
 ScreenViewSessionList list({
   ListKindView kind = ListKindView.active,
+  bool plain = false,
   List<SessionRowView> rows = const [],
   List<CreatingView> creating = const [],
   String? dismissable,
@@ -57,7 +58,7 @@ ScreenViewSessionList list({
   kind: kind,
   title: 'Sessions',
   rows: rows,
-  plain: false,
+  plain: plain,
   creating: creating,
   dismissable: dismissable,
   create: create,
@@ -134,6 +135,71 @@ void main() {
     expect(top(a), lessThan(top(b)));
     expect(top(b), lessThan(top(otherHeader)));
     expect(top(otherHeader), lessThan(top(c)));
+  });
+
+  testWidgets('the layout toggle switches to a plain list and back', (
+    tester,
+  ) async {
+    final rows = [sessionRow('a', group: '/srv/app')];
+    await pump(tester, list(rows: rows));
+    expect(find.byTooltip('Group by project'), findsOneWidget);
+    expect(
+      tester
+          .widget<IconButton>(find.byKey(const Key('list-grouped')))
+          .isSelected,
+      isTrue,
+    );
+    await tester.tap(find.byKey(const Key('list-grouped')));
+    expect(sent, [const GuiIntentSetPlainList(on: true)]);
+
+    await pump(tester, list(plain: true, rows: rows));
+    expect(
+      tester
+          .widget<IconButton>(find.byKey(const Key('list-grouped')))
+          .isSelected,
+      isFalse,
+    );
+    await tester.tap(find.byKey(const Key('list-grouped')));
+    expect(sent.last, const GuiIntentSetPlainList(on: false));
+  });
+
+  testWidgets('a plain list has no group headers', (tester) async {
+    // No workdir: the group is '' and its header reads 'no directory'.
+    final rows = [
+      sessionRow('a', hasWorkdir: false),
+      sessionRow('b', hasWorkdir: false),
+    ];
+    await pump(tester, list(plain: true, rows: rows));
+    expect(find.byKey(const ValueKey('group:')), findsNothing);
+    expect(find.text('no directory'), findsNothing);
+    double top(Finder finder) => tester.getTopLeft(finder).dy;
+    expect(
+      top(find.byKey(const ValueKey('a'))),
+      lessThan(top(find.byKey(const ValueKey('b')))),
+    );
+
+    // The same rows grouped: the finders above can match a header.
+    await pump(tester, list(rows: rows));
+    expect(find.byKey(const ValueKey('group:')), findsOneWidget);
+    expect(find.text('no directory'), findsOneWidget);
+  });
+
+  testWidgets('only the all list marks archived rows', (tester) async {
+    final rows = [sessionRow('a', archived: true), sessionRow('b')];
+    await pump(tester, list(kind: ListKindView.all, rows: rows));
+    expect(find.byKey(const Key('row-archived')), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('a')),
+        matching: find.byKey(const Key('row-archived')),
+      ),
+      findsOneWidget,
+    );
+
+    await pump(tester, list(kind: ListKindView.archived, rows: rows));
+    expect(find.byKey(const Key('row-archived')), findsNothing);
+    await pump(tester, list(kind: ListKindView.active, rows: rows));
+    expect(find.byKey(const Key('row-archived')), findsNothing);
   });
 
   testWidgets('the menu archives and unarchives', (tester) async {
@@ -333,10 +399,9 @@ void main() {
       find.descendant(of: scope, matching: find.textContaining('(')),
       findsNothing,
     );
-    expect(
-      tester.widget<SegmentedButton<ListKindView>>(scope).selected,
-      {ListKindView.all},
-    );
+    expect(tester.widget<SegmentedButton<ListKindView>>(scope).selected, {
+      ListKindView.all,
+    });
     expect(find.text('New session'), findsNothing);
 
     await tester.tap(find.text('Active'));
@@ -536,6 +601,44 @@ void main() {
     // No fragment is read on its own: not the bare count, not the badge.
     expect(find.bySemanticsLabel('3'), findsNothing);
     expect(find.bySemanticsLabel('approval'), findsNothing);
+    semantics.dispose();
+  });
+
+  testWidgets('an archived row on the all list says so', (tester) async {
+    final semantics = tester.ensureSemantics();
+    await pump(
+      tester,
+      list(kind: ListKindView.all, rows: [sessionRow('a', archived: true)]),
+    );
+    expect(
+      tester.getSemantics(find.byType(ListTile)),
+      matchesSemantics(
+        label:
+            r'title a, rename queued, archived, 3 unread, needs approval, '
+            r'1 approval pending, draft saved, /srv/proj-a, $1.27, '
+            'last active 2026-10-31 14:02 UTC',
+        isButton: true,
+        isFocusable: true,
+        hasEnabledState: true,
+        isEnabled: true,
+        hasSelectedState: true,
+        hasTapAction: true,
+        hasFocusAction: true,
+        // The menu keeps its own node, with its name.
+        children: [
+          matchesSemantics(
+            tooltip: 'Session actions',
+            isButton: true,
+            isFocusable: true,
+            hasEnabledState: true,
+            isEnabled: true,
+            hasExpandedState: true,
+            hasTapAction: true,
+            hasFocusAction: true,
+          ),
+        ],
+      ),
+    );
     semantics.dispose();
   });
 

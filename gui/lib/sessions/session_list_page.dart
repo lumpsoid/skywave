@@ -28,7 +28,9 @@ class SessionListPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final active = screen.kind == ListKindView.active;
-    final entries = _groupEntries(screen.rows);
+    final entries = screen.plain
+        ? [for (final row in screen.rows) _RowEntry(row)]
+        : _groupEntries(screen.rows);
     return Stack(
       children: [
         Scaffold(
@@ -129,6 +131,7 @@ class SessionListPage extends StatelessWidget {
                       key: ValueKey(row.sessionId),
                       row: row,
                       send: send,
+                      markArchived: screen.kind == ListKindView.all,
                     ),
                   },
                 ),
@@ -153,7 +156,8 @@ class SessionListPage extends StatelessWidget {
   }
 }
 
-/// Which sessions the list shows: active, archived or all.
+/// Which sessions the list shows (active, archived or all), and the layout
+/// toggle: grouped by project, or one plain list.
 class _ScopeBar extends StatelessWidget {
   const _ScopeBar({required this.screen, required this.send});
 
@@ -164,29 +168,46 @@ class _ScopeBar extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: SegmentedButton<ListKindView>(
-          showSelectedIcon: false,
-          segments: const [
-            ButtonSegment(value: ListKindView.active, label: Text('Active')),
-            ButtonSegment(
-              value: ListKindView.archived,
-              label: Text('Archived'),
-            ),
-            ButtonSegment(value: ListKindView.all, label: Text('All')),
-          ],
-          selected: {screen.kind},
-          onSelectionChanged: (selected) => send.act(
-            ActionIntentNavigate(
-              route: switch (selected.first) {
-                ListKindView.active => RouteView.sessionList,
-                ListKindView.archived => RouteView.archivedSessions,
-                ListKindView.all => RouteView.allSessions,
-              },
+      child: Row(
+        children: [
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: SegmentedButton<ListKindView>(
+                showSelectedIcon: false,
+                segments: const [
+                  ButtonSegment(
+                    value: ListKindView.active,
+                    label: Text('Active'),
+                  ),
+                  ButtonSegment(
+                    value: ListKindView.archived,
+                    label: Text('Archived'),
+                  ),
+                  ButtonSegment(value: ListKindView.all, label: Text('All')),
+                ],
+                selected: {screen.kind},
+                onSelectionChanged: (selected) => send.act(
+                  ActionIntentNavigate(
+                    route: switch (selected.first) {
+                      ListKindView.active => RouteView.sessionList,
+                      ListKindView.archived => RouteView.archivedSessions,
+                      ListKindView.all => RouteView.allSessions,
+                    },
+                  ),
+                ),
+              ),
             ),
           ),
-        ),
+          IconButton(
+            key: const Key('list-grouped'),
+            tooltip: 'Group by project',
+            isSelected: !screen.plain,
+            icon: const Icon(Icons.workspaces_outline),
+            selectedIcon: const Icon(Icons.workspaces),
+            onPressed: () => send(GuiIntentSetPlainList(on: !screen.plain)),
+          ),
+        ],
       ),
     );
   }
