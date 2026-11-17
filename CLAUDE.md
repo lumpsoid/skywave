@@ -29,6 +29,9 @@ below before designing anything.
 
 ## Gates
 
+`scripts/check.sh` runs them all in CI's order (`--no-gui` for Rust only);
+`scripts/version.sh check` must pass too. By hand:
+
 ```sh
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
@@ -50,11 +53,12 @@ cargo test --workspace
 
 ## Build setup
 
-- `.cargo/config.toml` sets `rustc-wrapper = "sccache"`. Each worktree keeps
-  its own `target/`. Don't point several worktrees at one target dir: cargo
-  then reuses another branch's test binaries as fresh.
-- `/tmp` is a 16 GB tmpfs that other agents share. Never put a
-  `CARGO_TARGET_DIR` or a build there.
+- Each worktree keeps its own `target/`. Don't point several worktrees at
+  one target dir: cargo then reuses another branch's test binaries as fresh.
+- On the maintainer's build machine, the user-level cargo config sets
+  `rustc-wrapper = "sccache"`, and `/tmp` is a 16 GB tmpfs that other agents
+  share. Never put a `CARGO_TARGET_DIR` or a build there.
+- Releases: `docs/maintaining.md` (version, tag, signing, CI).
 
 ## Tests
 
