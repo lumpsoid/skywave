@@ -306,6 +306,11 @@ pub enum GuiIntent {
     SetStayConnected {
         on: bool,
     },
+    /// The user switched the session list between plain (`on`) and grouped
+    /// by project.
+    SetPlainList {
+        on: bool,
+    },
     /// Dart got `HubFailed` with this `epoch`: every intent sent before
     /// this one was for the head that failed. Sent once per `HubFailed`,
     /// before anything else; never reaches a head.

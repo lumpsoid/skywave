@@ -1159,6 +1159,7 @@ fn a_desktop_never_suspends_whatever_the_reports() {
 
 const ON: Prefs = Prefs {
     stay_connected: true,
+    plain_list: false,
 };
 
 impl Rig {
@@ -2079,6 +2080,80 @@ fn the_all_list_marks_its_archived_rows() {
     rig.results();
     rig.view();
     assert_eq!(list(&rig), (ListKindView::Active, vec![]));
+}
+
+#[test]
+fn switching_the_plain_list_saves_it_with_the_other_prefs() {
+    let mut rig = Rig::android(ON);
+    let outs = rig.intent(GuiIntent::SetPlainList { on: true });
+    assert_eq!(
+        saved(&outs),
+        [Prefs {
+            stay_connected: true,
+            plain_list: true,
+        }]
+    );
+    // Stay connected keeps the layout it was switched beside.
+    let outs = rig.intent(GuiIntent::SetStayConnected { on: false });
+    assert_eq!(
+        saved(&outs),
+        [Prefs {
+            stay_connected: false,
+            plain_list: true,
+        }]
+    );
+}
+
+#[test]
+fn the_plain_list_keeps_recency_order_without_groups() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let (a, b, c) = (SessionId::new(), SessionId::new(), SessionId::new());
+    let created = |workdir: &str| EventKind::SessionCreated {
+        workdir: workdir.into(),
+        context_name: "start".into(),
+        from: None,
+        worktree: None,
+    };
+    // The list sorts by when a session was made, newest first: A, B, C, then
+    // the rig's own session in /srv/work.
+    for (session, workdir) in [(c, "/srv/app"), (b, "/srv/other"), (a, "/srv/app")] {
+        rig.seam
+            .apply_events(&EventBatch {
+                from: Seq(rig.seam.cursor().unwrap().0 + 1),
+                events: vec![event_at(session, at, created(workdir))],
+            })
+            .unwrap();
+    }
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    // Whether the list is plain, and its session ids and group keys in order.
+    let shown = |rig: &Rig| match rig.list() {
+        ScreenView::SessionList { plain, rows, .. } => (
+            plain,
+            rows.iter()
+                .map(|r| r.session_id.clone())
+                .collect::<Vec<_>>(),
+            rows.iter().map(|r| r.group.clone()).collect::<Vec<_>>(),
+        ),
+        _ => unreachable!(),
+    };
+    let id = |s: SessionId| s.0.to_string();
+    // Grouped, the default: C moves up to sit with A, its repo.
+    let (plain, ids, _) = shown(&rig);
+    assert!(!plain);
+    assert_eq!(ids, [id(a), id(c), id(b), id(rig.session)]);
+
+    rig.intent(GuiIntent::SetPlainList { on: true });
+    rig.results();
+    rig.view();
+    let (plain, ids, groups) = shown(&rig);
+    assert!(plain);
+    assert_eq!(ids, [id(a), id(b), id(c), id(rig.session)]);
+    assert!(groups.iter().all(String::is_empty), "{groups:?}");
 }
 
 #[test]

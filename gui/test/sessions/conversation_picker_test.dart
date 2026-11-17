@@ -13,6 +13,7 @@ ScreenViewSessionList withPicker(
   kind: ListKindView.active,
   title: 'Sessions',
   rows: const [],
+  plain: false,
   otherCount: 0,
   creating: const [],
   create: create,
