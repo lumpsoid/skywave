@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:rinf/rinf.dart';
 import 'package:skywave_gui/app.dart';
@@ -15,6 +17,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// the startup page until Rust answers [Booted].
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  LicenseRegistry.addLicense(_bundledFontLicense);
   await initializeRust(assignRustSignal);
 
   final messenger = GlobalKey<ScaffoldMessengerState>();
@@ -38,4 +41,12 @@ Future<void> main() async {
       onReattach: () => unawaited(notifications.openLaunching()),
     ),
   );
+}
+
+/// The bundled JetBrains Mono's license, which the OFL requires to ship with
+/// the font; the licenses page lists it beside the packages'.
+Stream<LicenseEntry> _bundledFontLicense() async* {
+  yield LicenseEntryWithLineBreaks(const [
+    'JetBrains Mono',
+  ], await rootBundle.loadString('fonts/jetbrains_mono/OFL.txt'));
 }

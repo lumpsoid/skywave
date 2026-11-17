@@ -121,6 +121,17 @@ void main() {
       scrollable: find.byType(Scrollable).first,
     );
     expect(find.text('0.1.0 (abc1234)'), findsOneWidget);
+
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('licenses')),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.ensureVisible(find.byKey(const Key('licenses')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('licenses')));
+    await tester.pumpAndSettle();
+    expect(find.byType(LicensePage), findsOneWidget);
   });
 
   testWidgets('stay connected shows only where offered, and toggles', (
