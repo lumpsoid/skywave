@@ -8,7 +8,7 @@ use skywave_tui::notify::VAR as NOTIFY_VAR;
 
 /// Skywave terminal client.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = skywave_version::VERSION)]
 struct Args {
     /// Where the local replica and the device identity live. Defaults to
     /// `$XDG_DATA_HOME/skywave-tui`, else `~/.local/share/skywave-tui`.

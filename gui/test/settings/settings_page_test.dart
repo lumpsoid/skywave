@@ -42,6 +42,7 @@ void main() {
               shell: true,
             ),
             safetyRules: [],
+            version: '0.1.0 (abc1234)',
           ),
           link: LinkHolder(),
           canGoBack: true,
@@ -104,12 +105,23 @@ void main() {
         stayConnected: stayConnected,
         notifications: notifications,
         safetyRules: safetyRules,
+        version: '0.1.0 (abc1234)',
       ),
       link: LinkHolder(),
       send: sent.add,
       onNotifications: onNotifications,
     ),
   );
+
+  testWidgets('the version shows under About', (tester) async {
+    await tester.pumpWidget(settings([]));
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('version')),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.text('0.1.0 (abc1234)'), findsOneWidget);
+  });
 
   testWidgets('stay connected shows only where offered, and toggles', (
     tester,

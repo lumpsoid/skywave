@@ -929,6 +929,7 @@ dependencies = [
  "skywave-present",
  "skywave-proto",
  "skywave-safety",
+ "skywave-version",
  "tempfile",
  "tokio",
  "tracing",
@@ -2044,11 +2045,16 @@ dependencies = [
  "skywave-present",
  "skywave-proto",
  "skywave-testkit",
+ "skywave-version",
  "skywaved",
  "tempfile",
  "tokio",
  "unicode-width 0.2.0",
 ]
+
+[[package]]
+name = "skywave-version"
+version = "0.1.0"
 
 [[package]]
 name = "skywaved"
@@ -2077,6 +2083,7 @@ dependencies = [
  "sha2",
  "skywave-proto",
  "skywave-safety",
+ "skywave-version",
  "socket2",
  "tempfile",
  "thiserror",
