@@ -1956,6 +1956,16 @@ fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
             worktree: None,
         }],
     );
+    // Each agent is working when its approval comes in, as a real one does
+    // inside a turn: answered elsewhere, it is still working, not idle.
+    for session in [a, b] {
+        rig.log_in(
+            session,
+            vec![EventKind::SessionStateChanged(
+                skywave_proto::SessionState::AgentWorking,
+            )],
+        );
+    }
     let approval = |id| EventKind::ApprovalRequested {
         id,
         call: None,
@@ -6009,6 +6019,81 @@ fn a_long_shell_run_of_this_devices_notifies() {
         outs.iter()
             .any(|o| matches!(o, Out::Effect(PlatformEffect::Notify { .. })))
     );
+}
+
+/// The notices `outs` shows, as `(id, title, body, session_id)`.
+fn shown_notices(outs: &[Out]) -> Vec<(i32, String, String, Option<String>)> {
+    outs.iter()
+        .filter_map(|o| match o {
+            Out::Effect(PlatformEffect::Notify {
+                id,
+                title,
+                body,
+                session_id,
+            }) => Some((*id, title.clone(), body.clone(), session_id.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_session_that_went_idle_notifies_once() {
+    use skywave_proto::SessionState;
+    let mut rig = Rig::new();
+    let title = rig.open_session().title;
+    rig.online_on_the_list();
+    let session = rig.session;
+    let working = rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    assert_eq!(notifications(&working), (vec![], vec![]));
+    let outs = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    let shown = shown_notices(&outs);
+    let [(id, shown_title, body, session_id)] = shown.as_slice() else {
+        panic!("one idle notice: {shown:?}");
+    };
+    assert_eq!(shown_title, &title);
+    assert_eq!(body, &format!("agent idle · {title}"));
+    assert_eq!(session_id, &Some(session.0.to_string()));
+    assert_eq!(*id, rig.head.notifications.id(session, Kind::Idle));
+    assert_ne!(*id, rig.head.notifications.id(session, Kind::Approval));
+    // Once only.
+    assert_eq!(shown_notices(&rig.view()), []);
+}
+
+#[test]
+fn an_idle_notice_is_taken_down_when_the_session_works_again() {
+    use skywave_proto::SessionState;
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    let idle = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    let shown = shown_notices(&idle);
+    let [(id, ..)] = shown.as_slice() else {
+        panic!("one idle notice: {shown:?}");
+    };
+    let outs = rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    assert_eq!(notifications(&outs), (vec![], vec![*id]));
+    // Once.
+    assert_eq!(notifications(&rig.view()), (vec![], vec![]));
+}
+
+#[test]
+fn a_turn_seen_only_in_a_catch_up_does_not_notify() {
+    use skywave_proto::SessionState;
+    // Not online: the core counts no turn it did not see online.
+    let mut rig = Rig::new();
+    rig.log(vec![EventKind::SessionStateChanged(
+        SessionState::AgentWorking,
+    )]);
+    let outs = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
+    assert!(rig.core.view().attention.idle.is_empty());
+    assert_eq!(notifications(&outs), (vec![], vec![]));
+    assert_eq!(shown_notices(&outs), []);
 }
 
 #[test]
