@@ -118,6 +118,9 @@ CLI on `PATH`.
 cargo build --release
 ```
 
+To build for a server reached over ssh and install it there as a service, see
+[`scripts/deploy/README.md`](scripts/deploy/README.md).
+
 ### 1. Start the server
 
 ```toml
@@ -335,9 +338,14 @@ stops it.
 ### Running it as a service
 
 [`contrib/systemd/skywaved.service`](contrib/systemd/skywaved.service) is a
-systemd user unit; its header says how to install it. It runs as you, so
-the agent finds your `claude` login. Before `systemctl --user stop`, which
-loses running work, run `skywaved stop --after-work`.
+systemd user unit that runs `~/.local/bin/skywaved`; its header says how to
+install it. It runs as you, so the agent finds your `claude` login.
+[`scripts/deploy/deploy.sh`](scripts/deploy/README.md) builds, installs and
+(re)starts it on a server reached over ssh. By hand, put the binary in place
+with `install -m 755 target/release/skywaved ~/.local/bin/`, creating that
+directory with `mkdir -p` first if needed, and follow the unit's header.
+Before `systemctl --user stop`, which loses running work, run
+`skywaved stop --after-work`.
 
 **Health.** `skywaved status` asks the running `serve` over its local
 socket and prints its protocol version, a stop that is waiting, a low disk
