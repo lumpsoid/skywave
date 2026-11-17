@@ -9,7 +9,6 @@ ScreenViewSessionList withPrompt(CreatePrompt? create) => ScreenViewSessionList(
   title: 'Sessions',
   rows: const [],
   plain: false,
-  otherCount: 0,
   creating: const [],
   create: create,
 );

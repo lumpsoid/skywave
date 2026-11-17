@@ -14,7 +14,6 @@ ScreenViewSessionList withPicker(
   title: 'Sessions',
   rows: const [],
   plain: false,
-  otherCount: 0,
   creating: const [],
   create: create,
   conversations: conversations,

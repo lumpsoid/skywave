@@ -58,7 +58,6 @@ ScreenViewSessionList list({
   title: 'Sessions',
   rows: rows,
   plain: false,
-  otherCount: 2,
   creating: creating,
   dismissable: dismissable,
   create: create,
@@ -89,8 +88,8 @@ void main() {
       '1 approval pending',
       'draft',
       r'$1.27 · 2026-10-31 14:02 UTC',
-      'Active (1)',
-      'Archived (2)',
+      'Active',
+      'Archived',
       'New session',
     ]) {
       expect(find.text(text), findsOneWidget, reason: text);
@@ -319,11 +318,49 @@ void main() {
     expect(sent, isEmpty);
   });
 
-  testWidgets('the toggle, new session, rename and settings send intents', (
+  testWidgets('the scope shows three plain choices and All navigates', (
+    tester,
+  ) async {
+    await pump(
+      tester,
+      list(kind: ListKindView.all, rows: [sessionRow('a', archived: true)]),
+    );
+    for (final text in ['Active', 'Archived', 'All']) {
+      expect(find.text(text), findsOneWidget, reason: text);
+    }
+    final scope = find.byType(SegmentedButton<ListKindView>);
+    expect(
+      find.descendant(of: scope, matching: find.textContaining('(')),
+      findsNothing,
+    );
+    expect(
+      tester.widget<SegmentedButton<ListKindView>>(scope).selected,
+      {ListKindView.all},
+    );
+    expect(find.text('New session'), findsNothing);
+
+    await tester.tap(find.text('Active'));
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentNavigate(route: RouteView.sessionList),
+      ),
+    ]);
+
+    await pump(tester, list(rows: [sessionRow('a')]));
+    await tester.tap(find.text('All'));
+    expect(
+      sent.last,
+      const GuiIntentAct(
+        action: ActionIntentNavigate(route: RouteView.allSessions),
+      ),
+    );
+  });
+
+  testWidgets('the scope, new session, rename and settings send intents', (
     tester,
   ) async {
     await pump(tester, list(rows: [sessionRow('a')]));
-    await tester.tap(find.text('Archived (2)'));
+    await tester.tap(find.text('Archived'));
     await tester.tap(find.text('New session'));
     await tester.tap(find.byTooltip('Settings'));
     await tester.tap(find.byKey(const Key('row-menu-a')));

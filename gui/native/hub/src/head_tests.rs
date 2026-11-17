@@ -2004,16 +2004,12 @@ fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
 }
 
 #[test]
-fn the_list_title_leaves_the_counts_to_the_toggle() {
+fn the_list_says_which_kind_it_shows() {
     let mut rig = Rig::new();
     let list = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
         ScreenView::SessionList {
-            kind,
-            title,
-            rows,
-            other_count,
-            ..
-        } => (*kind, title.clone(), rows.len(), *other_count),
+            kind, title, rows, ..
+        } => (*kind, title.clone(), rows.len()),
         other => panic!("not the list: {other:?}"),
     };
     rig.intent(GuiIntent::Act {
@@ -2021,7 +2017,7 @@ fn the_list_title_leaves_the_counts_to_the_toggle() {
     });
     rig.results();
     rig.view();
-    assert_eq!(list(&rig), (ListKindView::Active, "Sessions".into(), 1, 0));
+    assert_eq!(list(&rig), (ListKindView::Active, "Sessions".into(), 1));
     rig.intent(GuiIntent::Act {
         action: ActionIntent::Navigate {
             route: RouteView::ArchivedSessions,
@@ -2029,10 +2025,15 @@ fn the_list_title_leaves_the_counts_to_the_toggle() {
     });
     rig.results();
     rig.view();
-    assert_eq!(
-        list(&rig),
-        (ListKindView::Archived, "Sessions".into(), 0, 1)
-    );
+    assert_eq!(list(&rig), (ListKindView::Archived, "Sessions".into(), 0));
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::AllSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(list(&rig), (ListKindView::All, "Sessions".into(), 1));
 }
 
 #[test]
