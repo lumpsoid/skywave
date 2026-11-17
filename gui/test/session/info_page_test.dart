@@ -1,13 +1,15 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/session/info_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 ScreenViewSessionInfo infoScreen({
+  String sessionId = 's1',
   List<SubagentRowView> subagents = const [],
   String? subagentsEmptyLabel,
 }) => ScreenViewSessionInfo(
-  sessionId: 's1',
+  sessionId: sessionId,
   sections: const [
     InfoSectionView(
       title: 'Session',
@@ -142,5 +144,42 @@ void main() {
     );
     expect(find.text('Subagents (0)'), findsOneWidget);
     expect(find.text('No subagents ran in this session.'), findsOneWidget);
+  });
+
+  testWidgets('the info page shows the session id and copies it', (
+    tester,
+  ) async {
+    const id = '0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: InfoPage(
+          screen: infoScreen(sessionId: id),
+          canGoBack: true,
+          send: (_) {},
+        ),
+      ),
+    );
+    expect(find.text('Id'), findsOneWidget);
+    expect(find.text(id), findsOneWidget);
+    await tester.tap(find.byTooltip('Copy session id'));
+    await tester.pump();
+    expect(copied, [id]);
+    expect(find.text('Session id copied'), findsOneWidget);
   });
 }

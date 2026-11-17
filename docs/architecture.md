@@ -1669,8 +1669,9 @@ logs) an event that no longer decodes rather than failing.
   joins the list. Back returns to the session. `skywave_present::session_info`
   words the sections (Session, Usage, Agent, Models) and a row per
   subagent with its timeline status (`finished · 14 steps · 4.3s · ctx
-  12k`). The TUI opens it with `I` on a session; the GUI from the usage
-  summary on the status line and the session's More menu.
+  12k`). The GUI also shows the session id under the Session section, with
+  a button that copies it. The TUI opens it with `I` on a session; the GUI
+  from the usage summary on the status line and the session's More menu.
 - **Crop screen** (`Action::OpenCrop { blob, session, holds, title }`,
   `Screen::Crop(CropView)`): chooses which lines of a tool's or shell
   run's output to keep. The head opening it names the blob as `CropBlob`
