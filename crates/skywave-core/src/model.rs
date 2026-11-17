@@ -1416,6 +1416,7 @@ impl Model {
             Action::ResetReplica => match self.link() {
                 Link::Rejected(LinkRejection::HistoryLost { .. }) => {
                     self.place = Place::session_list();
+                    self.last_list = ListKind::Active;
                     vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
                 }
                 _ => Vec::new(),
@@ -2816,6 +2817,7 @@ impl Model {
         self.paired = Some(paired);
         self.pairing = PairingStatus::Idle;
         self.place = Place::session_list();
+        self.last_list = ListKind::Active;
     }
 
     /// Mirrors the pairing's addresses as stored, after a failed write.
@@ -8198,6 +8200,17 @@ mod tests {
         f.open(old);
         f.dispatch(Action::Back);
         assert_eq!(f.list_view().kind, ListKind::Archived);
+    }
+
+    #[test]
+    fn re_pairing_forgets_the_all_list() {
+        let mut f = Fixture::paired();
+        let id = f.session("/srv/a");
+        f.dispatch(Action::Navigate(Route::AllSessions));
+        f.model.paired(paired_at(f.me, "host:7443"));
+        f.open(id);
+        f.dispatch(Action::Back);
+        assert_eq!(f.list_view().kind, ListKind::Active);
     }
 
     #[test]
