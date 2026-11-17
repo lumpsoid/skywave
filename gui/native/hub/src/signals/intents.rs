@@ -311,6 +311,14 @@ pub enum GuiIntent {
     SetPlainList {
         on: bool,
     },
+    /// The user changed Settings → Notifications: the whole set, saved on
+    /// this device.
+    SetNotifications {
+        all: bool,
+        approvals: bool,
+        idle: bool,
+        shell: bool,
+    },
     /// Dart got `HubFailed` with this `epoch`: every intent sent before
     /// this one was for the head that failed. Sent once per `HubFailed`,
     /// before anything else; never reaches a head.

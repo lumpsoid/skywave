@@ -301,7 +301,7 @@ pub(crate) mod tests {
         assert!(!running.prefs_path.starts_with(dir.path().join(DATA_DIR)));
         let on = Prefs {
             stay_connected: true,
-            plain_list: false,
+            ..Prefs::default()
         };
         prefs::save(&running.prefs_path, &on).unwrap();
         running.close();

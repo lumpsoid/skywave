@@ -820,6 +820,7 @@ mod tests {
         let on = prefs::Prefs {
             stay_connected: true,
             plain_list: true,
+            ..prefs::Prefs::default()
         };
         let (prepared, _) = unbounded_channel();
         perform(vec![Out::SavePrefs(on)], &hub, &mut None, &prepared);

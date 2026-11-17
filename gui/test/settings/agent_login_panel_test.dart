@@ -44,6 +44,12 @@ Widget settings(
       device: 'dev-1',
       agentLogin: 'expires in 12 days · 2026-11-21',
       login: login,
+      notifications: NotificationsView(
+        all: true,
+        approvals: true,
+        idle: true,
+        shell: true,
+      ),
       safetyRules: const [],
     ),
     link: LinkHolder(),
