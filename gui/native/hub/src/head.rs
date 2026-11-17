@@ -19,9 +19,9 @@ use skywave_core::{
 use skywave_present::crop::toggle;
 use skywave_present::format;
 use skywave_present::policy::{
-    AlertWatcher, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
-    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, search_history,
-    shell_stop,
+    AlertWatcher, ConversationOnly, DraftSaver, ExpandFetch, IdleWatcher, PromptHistory,
+    ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
+    search_history, shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::storage::Grouping as StorageGrouping;
@@ -348,6 +348,8 @@ pub struct Head {
     /// From 0, not from the first snapshot: a run that finished in a
     /// catch-up before it is still news.
     shell_alerts: ShellAlertWatcher,
+    /// From 0, like `shell_alerts`.
+    idle_alerts: IdleWatcher,
     /// Each session's system notification ids.
     notifications: NotificationIds,
     next_tag: Tag,
@@ -490,6 +492,20 @@ impl Head {
                 body: notice.notice(),
                 title: notice.title,
                 session_id: Some(last.session_id.0.to_string()),
+            }));
+        }
+        let update = self.idle_alerts.observe(&view.attention);
+        for session in update.cleared {
+            out.push(Out::Effect(PlatformEffect::Dismiss {
+                id: self.notifications.id(session, Kind::Idle),
+            }));
+        }
+        for notice in update.notices {
+            out.push(Out::Effect(PlatformEffect::Notify {
+                id: self.notifications.id(notice.session_id, Kind::Idle),
+                body: notice.notice(),
+                title: notice.title,
+                session_id: Some(notice.session_id.0.to_string()),
             }));
         }
         if repair_notice(&view).is_none() {

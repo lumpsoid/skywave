@@ -1,13 +1,14 @@
 //! The system notification ids Dart shows and cancels by: one approval
-//! notification and one shell notice per session, so two sessions waiting
-//! at once each keep theirs, and one answered anywhere can be taken down
-//! without touching the other.
+//! notification, one shell notice and one idle notice per session, so two
+//! sessions waiting at once each keep theirs, and one answered anywhere can
+//! be taken down without touching the other.
 //!
 //! An id is the session id hashed (FNV-1a, so the same in every process:
 //! a notification an earlier run left up is still taken down when its
 //! session is answered), moved on to the next free one if another session
-//! of this run already has it. Approval ids are even, shell ids odd, and
-//! all fit an Android `int` (positive `i32`).
+//! of this run already has it. A session's ids are its slot times four plus
+//! the kind: approval 0, shell 1, idle 2 (3 is spare). All fit an Android
+//! `int` (positive `i32`).
 
 use std::collections::HashMap;
 
@@ -18,6 +19,7 @@ use skywave_core::SessionId;
 pub enum Kind {
     Approval,
     Shell,
+    Idle,
 }
 
 /// The notification saying the hub stopped off screen: negative, apart
@@ -25,8 +27,9 @@ pub enum Kind {
 /// (`StayConnectedService.NOTIFICATION_ID`).
 pub const STOPPED: i32 = -2;
 
-/// Slots are 30 bits, so a slot doubled (plus one) stays a positive `i32`.
-const SLOT_MASK: i32 = (1 << 30) - 1;
+/// Slots are 29 bits, so a slot times four (plus a kind, 0 to 2) stays a
+/// positive `i32`, the largest one short of `i32::MAX`.
+const SLOT_MASK: i32 = (1 << 29) - 1;
 
 /// Each session's slot, for this run. Slots are never given back, so an id
 /// means one session for the hub's lifetime.
@@ -57,10 +60,11 @@ impl NotificationIds {
 
 /// The id of `kind` in `slot`.
 fn id_of(slot: i32, kind: Kind) -> i32 {
-    slot * 2
+    slot * 4
         + match kind {
             Kind::Approval => 0,
             Kind::Shell => 1,
+            Kind::Idle => 2,
         }
 }
 
@@ -83,12 +87,27 @@ mod tests {
         let (a, b) = (SessionId::new(), SessionId::new());
         let mut ids = NotificationIds::default();
         let approval = ids.id(a, Kind::Approval);
-        assert_eq!(approval % 2, 0);
+        assert_eq!(approval % 4, 0);
         assert_eq!(ids.id(a, Kind::Shell), approval + 1);
+        assert_eq!(ids.id(a, Kind::Idle), approval + 2);
         assert_eq!(ids.id(a, Kind::Approval), approval);
         assert_ne!(ids.id(b, Kind::Approval), approval);
         // The same in a later run.
         assert_eq!(NotificationIds::default().id(a, Kind::Approval), approval);
+    }
+
+    #[test]
+    fn a_session_has_three_distinct_ids() {
+        let a = SessionId::new();
+        let mut ids = NotificationIds::default();
+        let (approval, shell, idle) = (
+            ids.id(a, Kind::Approval),
+            ids.id(a, Kind::Shell),
+            ids.id(a, Kind::Idle),
+        );
+        assert_ne!(approval, shell);
+        assert_ne!(shell, idle);
+        assert_ne!(approval, idle);
     }
 
     #[test]
@@ -102,8 +121,10 @@ mod tests {
         let id = ids.id(a, Kind::Approval);
         assert_eq!(id, id_of((slot + 1) & SLOT_MASK, Kind::Approval));
         assert_ne!(id, ids.id(b, Kind::Approval));
-        // The last slot's ids still fit, and probing past it wraps to 0.
-        assert_eq!(id_of(SLOT_MASK, Kind::Shell), i32::MAX);
+        // The last slot's ids still fit (the spare value is `i32::MAX`), and
+        // probing past it wraps to 0.
+        assert_eq!(id_of(SLOT_MASK, Kind::Idle), i32::MAX - 1);
+        assert!(id_of(SLOT_MASK, Kind::Approval) >= 0);
         assert_eq!((SLOT_MASK + 1) & SLOT_MASK, 0);
     }
 }

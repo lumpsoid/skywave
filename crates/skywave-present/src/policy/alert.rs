@@ -1,8 +1,8 @@
-//! When the user is alerted that an approval came in, or that a long shell
-//! run of theirs finished, and the text naming it. How the alert goes out
-//! (a bell, a desktop notification) is the head's; an approval alert names
-//! the session, never what the agent wants to run. A shell alert names the
-//! command the user ran themselves.
+//! When the user is alerted that an approval came in, that a long shell run
+//! of theirs finished, or that a session's agent went idle, and the text
+//! naming it. How the alert goes out (a bell, a desktop notification) is the
+//! head's; an approval alert names the session, never what the agent wants
+//! to run. A shell alert names the command the user ran themselves.
 
 use skywave_core::{Attention, RunWhen, SessionId};
 
@@ -172,9 +172,81 @@ impl ShellAlertWatcher {
     }
 }
 
+/// A session whose agent went from working to idle; `title` is
+/// [`sanitise`]d.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleNotice {
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+impl IdleNotice {
+    /// The notice as a line of text: `agent idle · <title>`.
+    pub fn notice(&self) -> String {
+        format!("agent idle · {}", self.title)
+    }
+}
+
+/// What a new snapshot changed about sessions whose agent went idle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdleUpdate {
+    /// Sessions that rang since the last snapshot, one notice each, in the
+    /// order they rang.
+    pub notices: Vec<IdleNotice>,
+    /// Sessions idle in the last snapshot that are not idle now (they
+    /// worked again, or are gone), in the order they were idle: a head that
+    /// keeps a notice per session takes it down.
+    pub cleared: Vec<SessionId>,
+}
+
+/// Watches [`Attention::idle_alerts`] for growth, and which sessions are
+/// idle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdleWatcher {
+    /// The count last seen.
+    seen: u64,
+    /// The sessions in the last snapshot's [`Attention::idle`], in order.
+    idle: Vec<SessionId>,
+}
+
+impl IdleWatcher {
+    /// Starts from 0, not from the head's first snapshot, like
+    /// [`ShellAlertWatcher::new`]: what the core counted is news.
+    pub fn new() -> IdleWatcher {
+        IdleWatcher::default()
+    }
+
+    /// What a new snapshot's `attention` asks for: a notice for each session
+    /// that rang past what was seen, and the sessions no longer idle.
+    pub fn observe(&mut self, attention: &Attention) -> IdleUpdate {
+        let notices = attention
+            .idle
+            .iter()
+            .filter(|alert| alert.at > self.seen)
+            .map(|alert| IdleNotice {
+                session_id: alert.session_id,
+                title: sanitise(&alert.title),
+            })
+            .collect();
+        self.seen = self.seen.max(attention.idle_alerts);
+        let now = attention
+            .idle
+            .iter()
+            .map(|alert| alert.session_id)
+            .collect();
+        let cleared = std::mem::replace(&mut self.idle, now)
+            .into_iter()
+            .filter(|id| !self.idle.contains(id))
+            .collect();
+        IdleUpdate { notices, cleared }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use skywave_core::{ApprovalId, PendingApprovalRef, SessionId, ShellAlert, ShellEnd};
+    use skywave_core::{
+        ApprovalId, IdleAlert, PendingApprovalRef, SessionId, ShellAlert, ShellEnd,
+    };
 
     use super::*;
 
@@ -386,5 +458,97 @@ mod tests {
         assert_eq!(kept, format!("{}<U+2066>", "a".repeat(TITLE_MAX - 8)));
         assert_eq!(kept.chars().count(), TITLE_MAX);
         assert_eq!(sanitise(&"\u{202E}".repeat(50)).chars().count(), 96);
+    }
+
+    fn idled(session_id: SessionId, title: &str, at: u64) -> IdleAlert {
+        IdleAlert {
+            session_id,
+            title: title.into(),
+            at,
+        }
+    }
+
+    fn idle_on(idle_alerts: u64, idle: Vec<IdleAlert>) -> Attention {
+        Attention {
+            idle_alerts,
+            idle,
+            ..Attention::default()
+        }
+    }
+
+    fn notice(session_id: SessionId, title: &str) -> IdleNotice {
+        IdleNotice {
+            session_id,
+            title: title.into(),
+        }
+    }
+
+    #[test]
+    fn idle_notices_once_per_session_that_rang() {
+        let (a, b) = (SessionId::new(), SessionId::new());
+        let mut watcher = IdleWatcher::new();
+        assert_eq!(
+            watcher.observe(&Attention::default()),
+            IdleUpdate::default()
+        );
+        let both = idle_on(2, vec![idled(a, "alpha", 1), idled(b, "beta", 2)]);
+        assert_eq!(
+            watcher.observe(&both),
+            IdleUpdate {
+                notices: vec![notice(a, "alpha"), notice(b, "beta")],
+                cleared: vec![],
+            }
+        );
+        assert_eq!(watcher.observe(&both), IdleUpdate::default(), "once");
+    }
+
+    #[test]
+    fn a_session_counted_in_the_first_snapshot_still_notifies() {
+        let a = SessionId::new();
+        let mut watcher = IdleWatcher::new();
+        assert_eq!(
+            watcher
+                .observe(&idle_on(1, vec![idled(a, "alpha", 1)]))
+                .notices,
+            [notice(a, "alpha")]
+        );
+    }
+
+    #[test]
+    fn a_session_working_again_is_cleared_once() {
+        let (a, b) = (SessionId::new(), SessionId::new());
+        let mut watcher = IdleWatcher::new();
+        watcher.observe(&idle_on(2, vec![idled(a, "alpha", 1), idled(b, "beta", 2)]));
+        // `a` works again; `b` is still idle and is not cleared.
+        assert_eq!(
+            watcher.observe(&idle_on(2, vec![idled(b, "beta", 2)])),
+            IdleUpdate {
+                notices: vec![],
+                cleared: vec![a],
+            }
+        );
+        assert_eq!(
+            watcher.observe(&idle_on(2, vec![idled(b, "beta", 2)])),
+            IdleUpdate::default(),
+            "once"
+        );
+        assert_eq!(
+            watcher.observe(&idle_on(2, vec![])).cleared,
+            [b],
+            "gone too"
+        );
+        assert_eq!(watcher.observe(&idle_on(2, vec![])), IdleUpdate::default());
+    }
+
+    #[test]
+    fn an_idle_notice_names_the_sanitised_title() {
+        let a = SessionId::new();
+        let mut watcher = IdleWatcher::new();
+        let update = watcher.observe(&idle_on(1, vec![idled(a, "fix\u{1b}[2J; the tests", 1)]));
+        assert_eq!(
+            update.notices[0].notice(),
+            format!("agent idle · {}", sanitise("fix\u{1b}[2J; the tests"))
+        );
+        assert_eq!(update.notices[0].notice(), "agent idle · fix[2J the tests");
     }
 }
