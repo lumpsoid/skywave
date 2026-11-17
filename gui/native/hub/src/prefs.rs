@@ -21,6 +21,9 @@ pub struct Prefs {
     /// Keep the link open with the app in the background, through the
     /// Android foreground service (D21).
     pub stay_connected: bool,
+    /// Show the session list as one plain list, most recently active first,
+    /// instead of grouped by project.
+    pub plain_list: bool,
 }
 
 /// The preferences file for the directory Dart sent.
@@ -97,6 +100,7 @@ mod tests {
         let path = path_in(dir.path());
         let on = Prefs {
             stay_connected: true,
+            plain_list: true,
         };
         save(&path, &on).unwrap();
         assert_eq!(load(&path), on);
@@ -119,6 +123,23 @@ mod tests {
         // A field this build does not know is ignored.
         fs::write(&path, r#"{"stay_connected": true, "later": 1}"#).unwrap();
         assert!(load(&path).stay_connected);
+    }
+
+    #[test]
+    fn plain_list_is_kept_and_defaults_to_grouped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        // A file from before the field existed loads grouped.
+        fs::write(&path, r#"{"stay_connected": true}"#).unwrap();
+        assert!(!load(&path).plain_list);
+        fs::write(&path, r#"{"plain_list": true}"#).unwrap();
+        assert_eq!(
+            load(&path),
+            Prefs {
+                stay_connected: false,
+                plain_list: true,
+            }
+        );
     }
 
     #[test]

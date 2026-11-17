@@ -78,6 +78,7 @@ mod tests {
                 branch: branch.into(),
             }),
             worktree_removed: false,
+            archived: false,
         }
     }
 

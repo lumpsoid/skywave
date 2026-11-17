@@ -819,6 +819,7 @@ mod tests {
         let hub = reopen(dir.path()).await;
         let on = prefs::Prefs {
             stay_connected: true,
+            plain_list: true,
         };
         let (prepared, _) = unbounded_channel();
         perform(vec![Out::SavePrefs(on)], &hub, &mut None, &prepared);

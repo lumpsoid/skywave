@@ -382,6 +382,9 @@ pub struct Head {
     /// Who holds the link: whether the core runs.
     awake: Awake,
     stay_connected: StayConnected,
+    /// The session list shows as one plain list, not grouped by project
+    /// (`GuiIntent::SetPlainList`).
+    plain_list: bool,
 }
 
 impl Head {
@@ -400,8 +403,18 @@ impl Head {
                 on: prefs.stay_connected,
                 ..StayConnected::default()
             },
+            plain_list: prefs.plain_list,
             awake,
             ..Head::default()
+        }
+    }
+
+    /// Every preference the head keeps, as `SavePrefs` writes them whole:
+    /// switching one must not reset the others.
+    fn prefs(&self) -> Prefs {
+        Prefs {
+            stay_connected: self.stay_connected.on,
+            plain_list: self.plain_list,
         }
     }
 
@@ -424,6 +437,7 @@ impl Head {
                 offered: android,
                 on: prefs.stay_connected,
             },
+            plain_list: prefs.plain_list,
             ..Head::default()
         }
     }
@@ -1376,8 +1390,14 @@ impl Head {
                     return Ok(());
                 }
                 self.stay_connected.on = on;
-                out.push(Out::SavePrefs(Prefs { stay_connected: on }));
+                out.push(Out::SavePrefs(self.prefs()));
                 out.push(Out::Effect(PlatformEffect::BackgroundService { run: on }));
+            }
+            // Not platform-gated: the list reads the same everywhere. The
+            // screen goes out with the rest of the intent's result.
+            GuiIntent::SetPlainList { on } => {
+                self.plain_list = on;
+                out.push(Out::SavePrefs(self.prefs()));
             }
             // The hub task's, which keeps it from every head.
             GuiIntent::HubFailedSeen { .. } => {}
@@ -1625,6 +1645,7 @@ impl Head {
             wall_ms: clock.wall_ms,
             workdir_text,
             stay_connected: self.stay_connected.shown(),
+            plain_list: self.plain_list,
             conversation_only: self.conversation_only.on(),
         };
         let shown = screen::update(view, ui);

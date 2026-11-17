@@ -52,13 +52,15 @@ pub enum ScreenView {
     },
     SessionList {
         kind: ListKindView,
-        /// `Sessions`: the Active/Archived toggle carries the counts.
+        /// `Sessions`; the scope control says which list shows.
         title: String,
         /// What an empty list says; `None` when it has rows.
         empty_label: Option<String>,
         rows: Vec<SessionRowView>,
-        /// How many sessions the other list holds.
-        other_count: u32,
+        /// Show `rows` as one plain list in recency order: no project headers.
+        /// Otherwise rows come grouped by project, a header wherever `group`
+        /// changes.
+        plain: bool,
         /// Sessions this device asked for that are not in the replica yet,
         /// or that the server refused; oldest first.
         creating: Vec<CreatingView>,
@@ -494,6 +496,8 @@ pub struct PairForm {
 pub enum ListKindView {
     Active,
     Archived,
+    /// Active and archived together.
+    All,
 }
 
 /// One session on a list.
