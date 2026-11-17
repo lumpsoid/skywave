@@ -42,11 +42,11 @@ pub use intents::{
 };
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
-    AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView,
-    CompletionPopup, ComposerFile, ComposerImage, ComposerModeView, ComposerView, ContextRow,
-    ConversationRowView, ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView,
-    HistoryRowView, HistorySearchView, InfoFieldView, InfoSectionView, LimitRowView, LimitsView,
-    ListKindView, LoginFlowState, ModeOption, ModelOption, PairForm, PairingState,
+    AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, ApprovalsItem, BlobPolicyView,
+    CandidateView, CompletionPopup, ComposerFile, ComposerImage, ComposerModeView, ComposerView,
+    ContextRow, ConversationRowView, ConversationsView, CreatePrompt, CreatingView, EffortOption,
+    EffortView, HistoryRowView, HistorySearchView, InfoFieldView, InfoSectionView, LimitRowView,
+    LimitsView, ListKindView, LoginFlowState, ModeOption, ModelOption, PairForm, PairingState,
     PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView, RenamePrompt,
     RepairNotice, RuleOption, SafetyCheckView, SafetyRuleRow, ScheduleRow, ScreenUpdate,
     ScreenView, SessionRowView, SessionScreen, ShellPromptView, SnippetView, StopHeadings,

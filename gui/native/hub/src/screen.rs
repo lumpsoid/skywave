@@ -4,13 +4,13 @@
 
 use chrono::{DateTime, Local, Utc};
 use skywave_core::{
-    AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, Candidate, CandidateSource, Completion,
-    CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
-    LoginFlowView, LoginOutcome, LoginView, Outgoing, PairingStatus, PairingView, PendingSession,
-    PermissionMode, QuestionPrompt, RuleSuggestion, SafetyRuleView, Screen, SessionId,
-    SessionInfoView, SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet,
-    StorageStatus, StorageView, SubagentHeader, TimelineItem, UsageLimitsView, UsageView,
-    ViewState, WorktreeSession, WorktreesView,
+    AgentView, ApprovalPrompt, ApprovalStatus, ApprovalsView, Asks, BlobPolicy, Candidate,
+    CandidateSource, Completion, CompletionStatus, ConversationPicker, ConversationsStatus, Effort,
+    Entry, Link, ListKind, LoginFlowView, LoginOutcome, LoginView, Outgoing, PairingStatus,
+    PairingView, PendingSession, PermissionMode, QuestionPrompt, RuleSuggestion, SafetyRuleView,
+    Screen, SessionId, SessionInfoView, SessionListView, SessionRow, SessionState, SessionView,
+    SettingsView, Snippet, StorageStatus, StorageView, SubagentHeader, TimelineItem,
+    UsageLimitsView, UsageView, ViewState, WaitingApproval, WorktreeSession, WorktreesView,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -39,17 +39,17 @@ use skywave_proto::{RepoListing, RepoWorktrees, WorktreeEntry};
 
 use crate::link::count;
 use crate::signals::{
-    AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView,
-    CompletionPopup, ComposerModeView, ComposerView, ContextRow, ConversationRowView,
-    ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView,
-    InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState, ModeOption,
-    ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
-    QuestionView, RenamePrompt, RepairNotice, RuleOption, SafetyCheckView, SafetyRuleRow,
-    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, StorageGroupingView, StorageKindView, StorageRowView, StorageSessionView,
-    StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView,
-    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView,
-    WorktreeSessionView, WorktreeView,
+    AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, ApprovalsItem, BlobPolicyView,
+    CandidateView, CompletionPopup, ComposerModeView, ComposerView, ContextRow,
+    ConversationRowView, ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView,
+    InfoFieldView, InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState,
+    ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView,
+    QuestionPanel, QuestionView, RenamePrompt, RepairNotice, RuleOption, SafetyCheckView,
+    SafetyRuleRow, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
+    SnippetView, StopHeadings, StorageGroupingView, StorageKindView, StorageRowView,
+    StorageSessionView, StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow,
+    ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView,
+    WorktreeRepoView, WorktreeSessionView, WorktreeView,
 };
 use skywave_present::text::{clean, clean_line};
 
@@ -118,6 +118,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
         Screen::Worktrees(view) => worktrees_view(view),
+        Screen::Approvals(view) => approvals_view(view),
         Screen::UsageLimits(view) => ScreenView::UsageLimits {
             limits: limits_view(view, ui.wall_ms),
         },
@@ -516,7 +517,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
         approval: session
             .pending_approval
             .as_ref()
-            .map(|prompt| approval_panel(prompt, session)),
+            .map(|prompt| approval_panel(prompt, Some(session))),
         question: session
             .pending_question
             .as_ref()
@@ -761,9 +762,10 @@ fn mode_view(mode: PermissionMode) -> PermissionModeView {
 
 /// The panel over the composer while the agent is blocked: the call it
 /// gates as the timeline shows it, what it will do, the rules offered, and
-/// this device's answer.
-fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPanel {
-    let gated = gated_item(session);
+/// this device's answer. With no `session` on show (the approvals screen),
+/// no call is shown as gated.
+fn approval_panel(prompt: &ApprovalPrompt, session: Option<&SessionView>) -> ApprovalPanel {
+    let gated = session.and_then(gated_item);
     let gated_key = gated.map(|(_, item)| key_string(ItemKey::of(item)));
     // The legacy entry an approval with no logged call stands for.
     let standalone = Entry::Approval {
@@ -1177,6 +1179,32 @@ fn storage_session(facts: storage::SessionFacts) -> StorageSessionView {
 
 /// The worktrees screen: each repository's worktrees, with the sessions
 /// running in each. Repositories with a linked worktree in use come first.
+/// The approvals screen: each waiting approval with its panel, or the note
+/// that says where a question or an unknown request is answered.
+fn approvals_view(view: &ApprovalsView) -> ScreenView {
+    ScreenView::Approvals {
+        items: view.items.iter().map(approvals_item).collect(),
+    }
+}
+
+fn approvals_item(item: &WaitingApproval) -> ApprovalsItem {
+    let (panel, note) = match &item.asks {
+        Asks::Approval(prompt) => (Some(approval_panel(prompt, None)), None),
+        Asks::Question => (
+            None,
+            Some("a question · answer it in its session".to_owned()),
+        ),
+        Asks::Unknown => (None, Some("open its session to see it".to_owned())),
+    };
+    ApprovalsItem {
+        session_id: item.session_id.0.to_string(),
+        session_title: clean_line(&item.session_title),
+        approval_id: item.id.0.to_string(),
+        panel,
+        note,
+    }
+}
+
 fn worktrees_view(view: &WorktreesView) -> ScreenView {
     let mut repos: Vec<(u8, WorktreeRepoView)> = view
         .list
@@ -1825,7 +1853,7 @@ mod tests {
             shell: None,
             answer: None,
         };
-        let panel = approval_panel(&prompt(FullView::Lost), &session);
+        let panel = approval_panel(&prompt(FullView::Lost), Some(&session));
         assert_eq!(panel.lost.as_deref(), Some(INPUT_LOST));
         assert_eq!(panel.input_label, None, "no blob to offer");
 
@@ -1836,7 +1864,7 @@ mod tests {
             change: None,
             pending: None,
         });
-        let panel = approval_panel(&prompt(kept), &session);
+        let panel = approval_panel(&prompt(kept), Some(&session));
         assert_eq!(panel.lost, None);
         assert_eq!(panel.input_label.as_deref(), Some("full input 2.0 KiB"));
     }
@@ -1898,7 +1926,7 @@ mod tests {
             };
             // The gated call is found through the session's pending prompt.
             session.pending_approval = Some(prompt.clone());
-            let panel = approval_panel(&prompt, &session);
+            let panel = approval_panel(&prompt, Some(&session));
             assert_eq!(panel.title, "src/lib.rs", "the gated call shows");
             assert!(panel.gated_key.is_some(), "the gated call shows");
             panel.lost
@@ -1965,7 +1993,7 @@ mod tests {
                 answer: None,
             };
             session.pending_approval = Some(prompt.clone());
-            approval_panel(&prompt, &session)
+            approval_panel(&prompt, Some(&session))
         };
         let asked = FullView::Blob(skywave_core::BlobView {
             id: skywave_core::BlobId::new(),

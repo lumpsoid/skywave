@@ -171,6 +171,11 @@ pub enum ScreenView {
         /// list.
         empty_label: Option<String>,
     },
+    /// Every approval this device can answer, from every session, oldest
+    /// first.
+    Approvals {
+        items: Vec<ApprovalsItem>,
+    },
     /// The paired server's addresses: the one in use, then the others to
     /// switch to (`SetServerAddress`, also for a new one) or forget
     /// (`ForgetServerAddress`), in the order they were left.
@@ -206,6 +211,20 @@ pub enum ScreenView {
     Crop {
         crop: CropScreen,
     },
+}
+
+/// One approval or question on the approvals screen.
+#[derive(Debug, Clone, PartialEq, Serialize, SignalPiece)]
+pub struct ApprovalsItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub approval_id: String,
+    /// The approval to answer here; `None` for a question or a request the
+    /// replica lacks, which open in their session.
+    pub panel: Option<ApprovalPanel>,
+    /// What to say instead of a panel, e.g. "a question · answer it in its
+    /// session".
+    pub note: Option<String>,
 }
 
 /// Logging the server's agent in from this device, on the settings screen.
