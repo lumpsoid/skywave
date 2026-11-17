@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-17T19:45:06.094626+00:00",
+      "status": "2026-11-17T19:45:06.094626+00:00",
+      "title": "2026-11-17T19:45:06.094626+00:00"
+    },
+    "tags": {
+      "followup": [
+        "2026-11-17T19:45:06.094626+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "In a full --no-fail-fast run on the Pi, skywave-core tests/link.rs lossy_link_delivers_every_event_once (seed 5337517107190521814, link.rs:304) and tests/sync.rs an_answer_to_an_approval_cancelled_while_offline_is_shown_refused (seed 5153783473187736592, sync.rs:850) failed; both pass alone with the same seed. Something waits on wall-clock time.",
+  "created": "2026-11-17T19:45:06.094626+00:00",
+  "id": "be50cd",
+  "status": "open",
+  "tags": [
+    "followup"
+  ],
+  "title": "Find why two link-harness tests fail under load",
+  "updated": "2026-11-17T19:45:06.094626+00:00"
+}
