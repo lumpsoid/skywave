@@ -10,6 +10,8 @@ Finder pageScrollable() => find
     .descendant(of: find.byType(ListView), matching: find.byType(Scrollable))
     .first;
 
+void _ignore() {}
+
 void main() {
   testWidgets('settings shows the device and the toggle sets the policy', (
     tester,
@@ -44,6 +46,7 @@ void main() {
           link: LinkHolder(),
           canGoBack: true,
           send: sent.add,
+          onNotifications: _ignore,
         ),
       ),
     );
@@ -81,6 +84,13 @@ void main() {
     String? serverAddresses,
     bool? stayConnected,
     List<SafetyRuleRow> safetyRules = const [],
+    NotificationsView notifications = const NotificationsView(
+      all: true,
+      approvals: true,
+      idle: true,
+      shell: true,
+    ),
+    VoidCallback onNotifications = _ignore,
   }) => MaterialApp(
     home: SettingsPage(
       screen: ScreenViewSettings(
@@ -92,16 +102,12 @@ void main() {
         fingerprint: null,
         agentLogin: null,
         stayConnected: stayConnected,
-        notifications: const NotificationsView(
-          all: true,
-          approvals: true,
-          idle: true,
-          shell: true,
-        ),
+        notifications: notifications,
         safetyRules: safetyRules,
       ),
       link: LinkHolder(),
       send: sent.add,
+      onNotifications: onNotifications,
     ),
   );
 
@@ -127,6 +133,56 @@ void main() {
     await tester.tap(toggle);
     expect(sent, [const GuiIntentSetStayConnected(on: false)]);
   });
+
+  testWidgets(
+    'the notifications tile says off, some off or on, and opens its page',
+    (tester) async {
+      Finder label(String text) => find.descendant(
+        of: find.byKey(const Key('notifications')),
+        matching: find.text(text),
+      );
+      await tester.pumpWidget(settings([]));
+      expect(label('On'), findsOneWidget);
+
+      await tester.pumpWidget(
+        settings(
+          [],
+          notifications: const NotificationsView(
+            all: true,
+            approvals: true,
+            idle: false,
+            shell: true,
+          ),
+        ),
+      );
+      expect(label('Some off'), findsOneWidget);
+
+      await tester.pumpWidget(
+        settings(
+          [],
+          notifications: const NotificationsView(
+            all: false,
+            approvals: true,
+            idle: true,
+            shell: true,
+          ),
+        ),
+      );
+      expect(label('Off'), findsOneWidget);
+
+      var opened = 0;
+      await tester.pumpWidget(
+        settings(
+          [],
+          onNotifications: () {
+            opened++;
+          },
+        ),
+      );
+      await tester.tap(find.byKey(const Key('notifications')));
+      expect(opened, 1);
+    },
+  );
 
   testWidgets('a paired server tile opens its addresses', (tester) async {
     final sent = <GuiIntent>[];

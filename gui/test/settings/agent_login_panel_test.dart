@@ -54,6 +54,7 @@ Widget settings(
     ),
     link: LinkHolder(),
     send: sent.add,
+    onNotifications: () {},
   ),
 );
 

@@ -12,8 +12,9 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// paired as, the link to it with its round trip, the fingerprint to
 /// compare with what `skywaved` prints, when the agent's login on the
 /// server expires, with Log in where the server offers a login from a
-/// device ([AgentLoginPanel] below it), and Re-pair. Below it, the safety
-/// rules the person trusts, each with a remove button (D61). A paired
+/// device ([AgentLoginPanel] below it), and Re-pair. Below it, the
+/// Notifications tile, which opens its page ([NotificationsPage]), and the
+/// safety rules the person trusts, each with a remove button (D61). A paired
 /// server's tile opens its addresses ([ServerAddressesPage]), to reach it at
 /// another without
 /// re-pairing.
@@ -22,6 +23,7 @@ class SettingsPage extends StatelessWidget {
     required this.screen,
     required this.link,
     required this.send,
+    required this.onNotifications,
     this.canGoBack = false,
     super.key,
   });
@@ -30,6 +32,15 @@ class SettingsPage extends StatelessWidget {
   final LinkHolder link;
   final bool canGoBack;
   final SendIntent send;
+  final VoidCallback onNotifications;
+
+  /// What the Notifications tile says: `Off` when `all` is off, `On` when
+  /// every kind is on, else `Some off`.
+  static String _notificationsLabel(NotificationsView view) => switch (view) {
+    NotificationsView(all: false) => 'Off',
+    NotificationsView(approvals: true, idle: true, shell: true) => 'On',
+    _ => 'Some off',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -120,6 +131,15 @@ class SettingsPage extends StatelessWidget {
                     send(GuiIntentSetStayConnected(on: value)),
               ),
             ],
+            const _Section('Notifications'),
+            ListTile(
+              key: const Key('notifications'),
+              leading: const Icon(Icons.notifications_outlined),
+              title: const Text('Notifications'),
+              subtitle: Text(_notificationsLabel(screen.notifications)),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: onNotifications,
+            ),
             const _Section('This device'),
             switch (screen.serverAddresses) {
               final addresses? => ListTile(
