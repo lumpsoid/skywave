@@ -1,0 +1,13 @@
+[package]
+name = "skywave-version"
+description = "The build's version, with the commit it was built from"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

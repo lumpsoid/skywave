@@ -15,6 +15,8 @@ below before designing anything.
 - `crates/skywave-safety`: the safety check (D59): proves a shell command
   read-only inside a workdir. No side effects (reads only file metadata);
   used by `skywaved`.
+- `crates/skywave-version`: the build's version and commit (`0.1.0 (2391c1d)`)
+  for `--version` and the GUI's settings page.
 - `crates/skywave-tui`: terminal head. `crates/skywave-testkit`: test helpers.
 - `crates/skywave-claude-compat`: run after a `claude` upgrade. It checks the
   real CLI against the adapter (`--quick`, then `--full`).
@@ -26,6 +28,9 @@ below before designing anything.
   `agents/omp.md` (research for an omp adapter; none exists yet).
 
 ## Gates
+
+`scripts/check.sh` runs them all in CI's order (`--no-gui` for Rust only);
+`scripts/version.sh check` must pass too. By hand:
 
 ```sh
 cargo fmt --all
@@ -48,11 +53,12 @@ cargo test --workspace
 
 ## Build setup
 
-- `.cargo/config.toml` sets `rustc-wrapper = "sccache"`. Each worktree keeps
-  its own `target/`. Don't point several worktrees at one target dir: cargo
-  then reuses another branch's test binaries as fresh.
-- `/tmp` is a 16 GB tmpfs that other agents share. Never put a
-  `CARGO_TARGET_DIR` or a build there.
+- Each worktree keeps its own `target/`. Don't point several worktrees at
+  one target dir: cargo then reuses another branch's test binaries as fresh.
+- On the maintainer's build machine, the user-level cargo config sets
+  `rustc-wrapper = "sccache"`, and `/tmp` is a 16 GB tmpfs that other agents
+  share. Never put a `CARGO_TARGET_DIR` or a build there.
+- Releases: `docs/maintaining.md` (version, tag, signing, CI).
 
 ## Tests
 

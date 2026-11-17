@@ -21,7 +21,7 @@ def pull(out):
     os.makedirs(out, exist_ok=True)
     for name in ("core.db", "core.db-wal", "core.db-shm"):
         data = subprocess.run(
-            ["adb", "-s", SERIAL, "exec-out", "run-as", "dev.skywave.gui", "cat",
+            ["adb", "-s", SERIAL, "exec-out", "run-as", "io.github.lumpsoid.skywave", "cat",
              f"files/skywave/{name}"], capture_output=True).stdout
         with open(os.path.join(out, name), "wb") as f:
             f.write(data)

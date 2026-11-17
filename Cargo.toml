@@ -14,6 +14,7 @@ skywave-proto = { path = "crates/skywave-proto" }
 skywave-core = { path = "crates/skywave-core" }
 skywave-present = { path = "crates/skywave-present" }
 skywave-safety = { path = "crates/skywave-safety" }
+skywave-version = { path = "crates/skywave-version" }
 
 axum = "0.8.9"
 base64 = "0.22.1"

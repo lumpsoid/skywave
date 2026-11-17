@@ -200,6 +200,17 @@ async fn safety_feedback_prints_nothing_without_feedback() {
 }
 
 #[tokio::test]
+async fn version_prints_the_build_version() {
+    let d = Daemon::new();
+    let output = d.cli(&["--version"]).await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("skywaved {}\n", skywave_version::VERSION)
+    );
+}
+
+#[tokio::test]
 async fn sighup_reopens_a_moved_log_file() {
     let d = Daemon::new();
     let mut serve = d.serve();

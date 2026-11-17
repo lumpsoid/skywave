@@ -984,6 +984,7 @@ fn settings_view(
             shell: notifications.shell,
         },
         safety_rules: settings.safety_rules.iter().map(safety_rule_row).collect(),
+        version: skywave_version::VERSION.to_owned(),
     }
 }
 

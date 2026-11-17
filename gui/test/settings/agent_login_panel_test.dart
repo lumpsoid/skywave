@@ -51,6 +51,7 @@ Widget settings(
         shell: true,
       ),
       safetyRules: const [],
+      version: '0.1.0 (abc1234)',
     ),
     link: LinkHolder(),
     send: sent.add,

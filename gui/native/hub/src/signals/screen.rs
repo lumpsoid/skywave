@@ -112,6 +112,8 @@ pub enum ScreenView {
         /// with a change of this device still on its way; in the core's
         /// order.
         safety_rules: Vec<SafetyRuleRow>,
+        /// This build's version and commit, `0.1.0 (2391c1d)`.
+        version: String,
     },
     /// Cost and tokens across sessions, from the replica alone.
     Usage {

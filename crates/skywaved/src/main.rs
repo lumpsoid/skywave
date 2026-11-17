@@ -29,7 +29,7 @@ use skywaved::workdir::Git;
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig};
 
 #[derive(Parser)]
-#[command(name = "skywaved", version, about = "Skywave server daemon")]
+#[command(name = "skywaved", version = skywave_version::VERSION, about = "Skywave server daemon")]
 struct Cli {
     /// Config file [default: $XDG_CONFIG_HOME/skywave/skywaved.toml].
     #[arg(long, global = true, value_name = "PATH")]
