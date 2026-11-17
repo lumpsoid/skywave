@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-17T19:35:53.188271+00:00",
+      "status": "2026-11-17T19:35:53.188271+00:00",
+      "title": "2026-11-17T19:35:53.188271+00:00"
+    },
+    "tags": {
+      "followup": [
+        "2026-11-17T19:35:53.188271+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Four tests in skywaved/src/workdir/changes.rs (changes_are_capped_by_path_and_counted and three siblings) build 300-file trees and run under SNAPSHOT_DEADLINE (15 s). On the Pi with tests in parallel each takes >15 s and fails with Failed { reason: \"timed out\" }; alone 7 s, serially all pass. CLAUDE.md: decide outcomes from definitive signals, not timeouts. Give the tests a deadline they can't hit, or smaller trees.",
+  "created": "2026-11-17T19:35:53.188271+00:00",
+  "id": "786287",
+  "status": "open",
+  "tags": [
+    "followup"
+  ],
+  "title": "Make workdir::changes cap tests independent of the snapshot deadline",
+  "updated": "2026-11-17T19:35:53.188271+00:00"
+}
