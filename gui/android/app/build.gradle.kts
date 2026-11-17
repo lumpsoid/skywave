@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "dev.skywave.gui"
+    namespace = "io.github.lumpsoid.skywave"
     // 37, as the Kotlin head: ACCESS_LOCAL_NETWORK (MainActivity).
     compileSdk = 37
     ndkVersion = flutter.ndkVersion
@@ -18,7 +18,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "dev.skywave.gui"
+        applicationId = "io.github.lumpsoid.skywave"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

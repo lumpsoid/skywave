@@ -27,7 +27,7 @@ class SystemNotifications {
     linux: LinuxInitializationSettings(defaultActionName: 'Open session'),
     windows: WindowsInitializationSettings(
       appName: 'Skywave',
-      appUserModelId: 'dev.skywave.gui',
+      appUserModelId: 'io.github.lumpsoid.skywave',
       // Names this app's toast activation callback; fixed for good.
       guid: '3e909f5f-113a-4797-b77b-8c7d0cdb8dfb',
     ),

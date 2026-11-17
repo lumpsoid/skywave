@@ -10,7 +10,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 class BackgroundService {
   BackgroundService(
     this.send, {
-    this.channel = const MethodChannel('dev.skywave.gui/background'),
+    this.channel = const MethodChannel('io.github.lumpsoid.skywave/background'),
   });
 
   final SendIntent send;

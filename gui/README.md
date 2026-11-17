@@ -61,7 +61,7 @@ flutter build apk --debug    # or: flutter run -d <device>
 Gradle needs JDK 21–25: `flutter config --jdk-dir=/path/to/jdk` points
 Flutter at one (Android Studio's bundled `jbr` works).
 
-This is skywave's Android app (D28); its id is `dev.skywave.gui`. At
+This is skywave's Android app (D28); its id is `io.github.lumpsoid.skywave`. At
 launch it asks for ACCESS_LOCAL_NETWORK (API 37+, until granted) and
 POST_NOTIFICATIONS (API 33+, once). The pairing screen's **Scan QR code**
 opens ZXing's scanner (D20), which asks for the camera when it opens.
@@ -99,7 +99,7 @@ Needs Visual Studio with the C++ desktop workload and the Rust MSVC target.
 flutter build windows
 ```
 
-Notifications use the app user model id `dev.skywave.gui` and a fixed
+Notifications use the app user model id `io.github.lumpsoid.skywave` and a fixed
 GUID (`lib/effects/notifications.dart`). An unpackaged build shows them but
 cannot withdraw them; that needs MSIX packaging.
 
