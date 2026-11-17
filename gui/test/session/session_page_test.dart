@@ -1093,7 +1093,10 @@ void main() {
   });
 
   group('approval', () {
-    ApprovalPanel panel(List<RuleOption> suggestions) => ApprovalPanel(
+    ApprovalPanel panel(
+      List<RuleOption> suggestions, {
+      List<List<String>> ruleCandidates = const [],
+    }) => ApprovalPanel(
       approvalId: 'a1',
       gatedKey: 's:1',
       kind: ToolKindView.shell,
@@ -1101,7 +1104,7 @@ void main() {
       title: r'$ rm -rf build',
       canAnswer: true,
       suggestions: suggestions,
-      ruleCandidates: const [],
+      ruleCandidates: ruleCandidates,
       alwaysPicks: suggestions.length > 1,
       alwaysLabel: suggestions.isEmpty ? null : 'always allow · …',
     );
@@ -1156,6 +1159,77 @@ void main() {
       await tester.tap(find.text('Bash(*) (session)'));
       await tester.pumpAndSettle();
       expect(sent, [resolve(DecisionView.approve, 1)]);
+    });
+
+    testWidgets('a shell approval trusts its command and approves', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          approval: panel(
+            const [],
+            ruleCandidates: const [
+              ['git', 'status'],
+            ],
+          ),
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      sent.clear();
+      await tester.tap(find.byKey(const Key('approval-trust')));
+      await tester.pumpAndSettle();
+      expect(find.text('Trust and approve'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('trust-confirm')));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentSetSafetyRule(
+            sessionId: 's1',
+            words: ['git', 'status'],
+            on: true,
+          ),
+        ),
+        resolve(DecisionView.approve),
+      ]);
+    });
+
+    testWidgets('cancelling trust sends nothing', (tester) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          approval: panel(
+            const [],
+            ruleCandidates: const [
+              ['git', 'status'],
+            ],
+          ),
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      sent.clear();
+      await tester.tap(find.byKey(const Key('approval-trust')));
+      await tester.pumpAndSettle();
+      expect(find.text('Trust command'), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.text('Trust command'), findsNothing);
+      expect(sent, isEmpty);
+    });
+
+    testWidgets('no trust without a shell command', (tester) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: panel(const [])),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text('Approve'), findsOneWidget);
+      expect(find.byKey(const Key('approval-trust')), findsNothing);
     });
 
     testWidgets('a phone with the keyboard up: one button row, no overflow', (

@@ -686,6 +686,7 @@ class _SessionPageState extends State<SessionPage> {
                       if (screen.approval case final approval?)
                         ApprovalPanelView(
                           approval: approval,
+                          sessionId: screen.sessionId,
                           send: widget.send,
                           onShowCall: approval.gatedKey == null
                               ? null
