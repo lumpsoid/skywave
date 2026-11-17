@@ -930,6 +930,9 @@ pub struct SessionRow {
     /// would remove it: it is archived, has no pending approval, no running
     /// turn and no command from this device still unanswered.
     pub deletable: bool,
+    /// [`Action::DeleteSessionEverywhere`](crate::Action::DeleteSessionEverywhere)
+    /// would send: `deletable`, and no worktree of the session is on disk.
+    pub deletable_everywhere: bool,
     /// The session adopted an outside conversation whose imported history
     /// is not all in the replica yet (its `ImportFinished` has not been
     /// pulled): a long import arrives over several pulls. Its
@@ -957,6 +960,19 @@ pub struct UsageView {
     pub deleted: usize,
 }
 
+/// What this replica knows of a session the storage screen lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageSession {
+    /// As [`SessionRow::title`].
+    pub title: String,
+    /// On the archived list, as the session list sorts it.
+    pub archived: bool,
+    /// As [`SessionRow::deletable`].
+    pub deletable: bool,
+    /// As [`SessionRow::deletable_everywhere`].
+    pub deletable_everywhere: bool,
+}
+
 /// What the server's data takes on its disk, as the server last reported
 /// it ([`Route::Storage`](crate::Route::Storage)). In memory only: opening
 /// the screen asks again, and so does
@@ -967,10 +983,10 @@ pub struct StorageView {
     /// The latest report; `None` until one arrives. A failed refresh keeps
     /// the one before it.
     pub report: Option<StorageReport>,
-    /// The replica's title (as [`SessionRow::title`]) of each session the
+    /// What the replica knows of each session the report or this device's
     /// report names; one missing is not in this replica (deleted here, or
     /// not pulled yet).
-    pub titles: std::collections::HashMap<SessionId, String>,
+    pub sessions: std::collections::HashMap<SessionId, StorageSession>,
     /// This device's own delete or crop of each blob that has one, as a
     /// [`BlobView::pending`] shows it, so a row of it offers nothing more.
     pub pending: std::collections::HashMap<BlobId, BlobPending>,
@@ -978,6 +994,40 @@ pub struct StorageView {
     /// deleted or cropped, by any device: the report predates that, so a
     /// row of it offers nothing.
     pub gone: std::collections::HashSet<BlobId>,
+    /// What this device keeps on its disk, read when the screen asks; `None`
+    /// until the first answer.
+    pub device: Option<DeviceStorage>,
+    /// A reclaim of this device's database is running; its answer replaces
+    /// [`Self::device`].
+    pub device_reclaiming: bool,
+}
+
+/// What this device keeps on its disk, read when the storage screen asks.
+/// Bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceStorage {
+    /// `core.db` with its write-ahead log: the replica, drafts, outbox.
+    pub database: u64,
+    /// Of `database`, the free pages SQLite keeps after rows are deleted.
+    pub reclaimable: u64,
+    /// Blob files downloaded (complete) or partly downloaded.
+    pub blobs: u64,
+    /// Draft and outbox attachments (images and files).
+    pub attachments: u64,
+    /// Every session in the replica, largest (`event_bytes + blob_bytes`)
+    /// first, ties by session id.
+    pub sessions: Vec<DeviceSessionStorage>,
+}
+
+/// What one session takes on this device's disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSessionStorage {
+    pub session: SessionId,
+    /// The stored JSON of its events.
+    pub event_bytes: u64,
+    /// Its blobs' bytes on this disk (complete ones by size, partial ones by
+    /// what they got). A blob two of its events name counts once.
+    pub blob_bytes: u64,
 }
 
 /// Where the storage screen's report stands.
@@ -989,6 +1039,9 @@ pub enum StorageStatus {
     Ready,
     /// The last ask failed; the report shown, if any, is older.
     Unavailable(StorageUnavailable),
+    /// Asked the server to reclaim space; the report shown, if any, is the
+    /// one before.
+    Reclaiming,
 }
 
 /// Why the storage screen has no fresh report.
@@ -998,6 +1051,9 @@ pub enum StorageUnavailable {
     Offline,
     /// The request failed, worded by the transport.
     Failed(String),
+    /// The server's free disk is below what a reclaim needs (`507`): it did
+    /// nothing.
+    NoRoomToReclaim,
 }
 
 /// Where the worktrees screen's list stands.

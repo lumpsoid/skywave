@@ -9,7 +9,7 @@ use chrono::{TimeZone, Utc};
 use skywave_core::attachment::{
     AttachedFile, AttachedImage, attachment_dir, attachment_path, store_file,
 };
-use skywave_core::store::OutboxFile;
+use skywave_core::store::{OutboxFile, read_device_storage};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, AttachmentRefusal, BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError,
@@ -2269,6 +2269,42 @@ fn v40_opens_a_v39_replica_unchanged() {
     ));
 }
 
+/// A v40 replica's safety rule opens as v41 and reads back unchanged: v41
+/// added `DeleteSession` and two event kinds, which store nothing this event
+/// held.
+#[test]
+fn v41_opens_a_v40_replica_unchanged() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let session = "01920000-0000-7000-8000-000000000001";
+    let v40 = format!(
+        r#"{{"session_id":"{session}","at":"2026-10-29T12:00:00Z","command_id":null,"context":"{session}","kind":{{"type":"safety_rule_set","words":["git","status"],"on":true,"by":"01920000-0000-7000-8000-000000000009"}}}}"#
+    );
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute(
+        "INSERT INTO events (seq, session_id, event) VALUES (1, ?1, ?2)",
+        rusqlite::params![session, v40],
+    )
+    .unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 40", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let id = SessionId(session.parse().unwrap());
+    let kinds: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, event)| event.kind)
+        .collect();
+    assert!(matches!(
+        &kinds[..],
+        [EventKind::SafetyRuleSet { on: true, .. }]
+    ));
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
@@ -3626,10 +3662,10 @@ fn local_delete_is_one_transaction() {
     assert_eq!(drafts, [(log.b, AGENT), (log.b, SHELL)]);
     assert_eq!(after.composer_modes.keys().collect::<Vec<_>>(), [&log.b]);
     assert_eq!(after.read_marks.keys().collect::<Vec<_>>(), [&log.b]);
-    // Only A's answered command goes; an unanswered one is the caller's to
-    // refuse the delete over.
+    // All of A's commands go, answered or not. The core refuses a local
+    // delete while one is unanswered, so only a synced tombstone meets one.
     let left: Vec<CommandId> = after.outbox.iter().map(|e| e.command.id).collect();
-    assert_eq!(left, [commands[1].id, commands[2].id, commands[3].id]);
+    assert_eq!(left, [commands[2].id, commands[3].id]);
     assert_eq!(after.deleted, [log.a].into());
 }
 
@@ -3655,6 +3691,138 @@ fn events_for_deleted_session_advance_cursor_but_are_not_stored() {
     );
     assert!(store.session_events(log.a).unwrap().is_empty());
     assert!(store.blob(log.blob.id).unwrap().is_none());
+}
+
+fn tombstone(session_id: SessionId, minute: u32) -> Event {
+    event(
+        session_id,
+        minute,
+        EventKind::SessionDeleted {
+            by: DeviceId::new(),
+        },
+    )
+}
+
+#[test]
+fn a_tombstone_drops_the_session_like_a_local_delete() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    // A and B, and A's blob, arrive first.
+    store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
+    assert_eq!(store.load().unwrap().sessions.len(), 2);
+
+    // The server's tombstone for A comes with A's approval request and B's
+    // message; the batch's own events of A are dropped with the rest.
+    let batch = EventBatch {
+        from: Seq(5),
+        events: vec![
+            log.events[4].clone(),
+            log.events[5].clone(),
+            tombstone(log.a, 7),
+        ],
+    };
+    let applied = store.apply_batch(&batch, Utc::now()).unwrap();
+    assert_eq!(applied.cursor, Seq(7));
+    assert_eq!(applied.dropped, [(log.a, vec![log.blob.id])]);
+    let snapshot = store.load().unwrap();
+    assert_eq!(
+        snapshot.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [log.b],
+        "B is untouched"
+    );
+    assert!(store.session_events(log.a).unwrap().is_empty());
+    assert_eq!(store.session_events(log.b).unwrap().len(), 2);
+    assert!(store.blob(log.blob.id).unwrap().is_none());
+    assert!(snapshot.deleted.contains(&log.a));
+
+    // A later event of A is not stored, as after a local delete.
+    let late = EventBatch {
+        from: Seq(8),
+        events: vec![log.events[6].clone()],
+    };
+    let applied = store.apply_batch(&late, Utc::now()).unwrap();
+    assert_eq!(applied.new_events, 0);
+    assert_eq!(applied.cursor, Seq(8));
+    assert!(store.session_events(log.a).unwrap().is_empty());
+}
+
+#[test]
+fn a_ghost_session_never_appears() {
+    let mut store = Store::open_in_memory().unwrap();
+    // A session the replica never saw: its erased events and the tombstone
+    // come in one batch.
+    let ghost = SessionId::new();
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(ghost, 0, EventKind::Erased),
+            event(ghost, 1, EventKind::Erased),
+            tombstone(ghost, 2),
+        ],
+    };
+    let applied = store.apply_batch(&batch, Utc::now()).unwrap();
+    assert_eq!(applied.dropped, [(ghost, Vec::new())]);
+    assert_eq!(applied.cursor, Seq(3));
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.cursor, Seq(3));
+    assert!(snapshot.sessions.is_empty(), "no summary for the ghost");
+    assert!(store.session_events(ghost).unwrap().is_empty());
+    assert!(snapshot.deleted.contains(&ghost));
+}
+
+#[test]
+fn a_tombstone_takes_the_answered_outbox_rows_of_its_session() {
+    let log = Log::new();
+    let mut store = Store::open_in_memory().unwrap();
+    store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
+    let own = send(log.a, "answered by the batch");
+    store.enqueue(&own, &[]).unwrap();
+    let other = send(log.b, "B's, kept");
+    store.enqueue(&other, &[]).unwrap();
+
+    // An event of A carries this device's command, so the batch settles it;
+    // the tombstone then drops the session with its settled row.
+    let mut answer = event(log.a, 7, EventKind::SessionStateChanged(SessionState::Idle));
+    answer.command_id = Some(own.id);
+    let batch = EventBatch {
+        from: Seq(5),
+        events: vec![answer, tombstone(log.a, 8)],
+    };
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    let left: Vec<CommandId> = store
+        .outbox()
+        .unwrap()
+        .iter()
+        .map(|e| e.command.id)
+        .collect();
+    assert_eq!(left, [other.id]);
+}
+
+#[test]
+fn a_tombstone_drops_the_unanswered_outbox_rows_of_its_session() {
+    let log = Log::new();
+    let mut store = Store::open_in_memory().unwrap();
+    store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
+    // Queued for A and never answered: the server refuses it as an unknown
+    // session once A is gone, so it must not stay queued.
+    let queued = send(log.a, "queued for a deleted session");
+    store.enqueue(&queued, &[]).unwrap();
+    let other = send(log.b, "B's, kept");
+    store.enqueue(&other, &[]).unwrap();
+
+    let batch = EventBatch {
+        from: Seq(5),
+        events: vec![tombstone(log.a, 8)],
+    };
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    let left: Vec<CommandId> = store
+        .outbox()
+        .unwrap()
+        .iter()
+        .map(|e| e.command.id)
+        .collect();
+    assert_eq!(left, [other.id]);
 }
 
 #[test]
@@ -6599,4 +6767,67 @@ fn opening_the_store_removes_unneeded_image_files() {
     assert!(!present(".tmp-abc"), "a temporary file goes");
     let rows: HashSet<ContentHash> = store.attachments().unwrap().into_keys().collect();
     assert_eq!(rows, HashSet::from([kept.sha256]));
+}
+
+#[test]
+fn the_device_report_counts_events_blobs_and_attachments() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let draft = image("a draft");
+    store.attach_to_draft(log.a, &draft, at(0)).unwrap();
+
+    let before = read_device_storage(&dir).unwrap();
+    assert!(before.database > 0);
+    assert_eq!(before.attachments, draft.size);
+    assert_eq!(before.blobs, 0, "a blob not downloaded takes no bytes");
+
+    let available = BlobStatus::Available {
+        path: "/data/blobs/x".into(),
+    };
+    store.set_blob_status(log.blob.id, &available).unwrap();
+    let report = read_device_storage(&dir).unwrap();
+    assert_eq!(report.blobs, log.blob.size);
+    // The session whose event names the blob is largest, so first.
+    let sessions: Vec<SessionId> = report.sessions.iter().map(|s| s.session).collect();
+    assert_eq!(sessions, [log.a, log.b]);
+    let (a, b) = (&report.sessions[0], &report.sessions[1]);
+    assert_eq!(a.blob_bytes, log.blob.size);
+    assert_eq!(b.blob_bytes, 0);
+    assert!(a.event_bytes > 0 && b.event_bytes > 0);
+
+    store.delete_session_locally(log.b, at(2)).unwrap();
+    let after = read_device_storage(&dir).unwrap();
+    let sessions: Vec<SessionId> = after.sessions.iter().map(|s| s.session).collect();
+    assert_eq!(sessions, [log.a], "a deleted session is not listed");
+}
+
+#[test]
+fn reclaiming_space_gives_free_pages_back() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    // Seven small events leave no page empty once deleted: a big message in
+    // B does, so its overflow pages go to the freelist.
+    let mut batch = log.batch(1, 7);
+    batch.events.push(event(
+        log.b,
+        7,
+        EventKind::UserMessage {
+            device_id: DeviceId::new(),
+            text: "x".repeat(400_000),
+            attachments: Vec::new(),
+        },
+    ));
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    store.delete_session_locally(log.a, at(2)).unwrap();
+    store.delete_session_locally(log.b, at(3)).unwrap();
+
+    let before = read_device_storage(&dir).unwrap();
+    assert!(before.reclaimable > 0, "{before:?}");
+    store.reclaim_space().unwrap();
+    let after = read_device_storage(&dir).unwrap();
+    assert_eq!(after.reclaimable, 0, "{after:?}");
+    assert!(after.database < before.database, "{before:?} -> {after:?}");
 }

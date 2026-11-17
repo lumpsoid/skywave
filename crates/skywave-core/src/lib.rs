@@ -63,8 +63,8 @@ pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
     CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, LOGIN_TIMEOUT,
-    MAX_SERVER_ERRORS, STORAGE_TIMEOUT, USAGE_LIMITS_TIMEOUT, WALL_CHECK, WORKTREES_TIMEOUT,
-    WallClock, default_device_name,
+    MAX_SERVER_ERRORS, RECLAIM_TIMEOUT, STORAGE_TIMEOUT, USAGE_LIMITS_TIMEOUT, WALL_CHECK,
+    WORKTREES_TIMEOUT, WallClock, default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, Identity, IdentityError, PairedCredentials, Pairing};
@@ -108,8 +108,8 @@ pub use view::{
     WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirPush, WorkdirView,
 };
 pub use view::{
-    BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,
-    StorageUnavailable, StorageView,
+    BlobStorage, BlobUse, DeviceSessionStorage, DeviceStorage, LineSpan, SessionStorage,
+    ShellRunStorage, StorageReport, StorageSession, StorageStatus, StorageUnavailable, StorageView,
 };
 pub use view::{
     ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry, EntryKind, FileBody, FileChange,

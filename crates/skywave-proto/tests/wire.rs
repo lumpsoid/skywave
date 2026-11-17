@@ -371,6 +371,8 @@ fn all_event_kinds() -> Vec<EventKind> {
             archived: false,
             by: device(),
         },
+        EventKind::SessionDeleted { by: device() },
+        EventKind::Erased,
         EventKind::WorktreeRemoved { by: device() },
         EventKind::SessionStateChanged(SessionState::Idle),
         EventKind::SessionStateChanged(SessionState::AgentWorking),
@@ -736,6 +738,7 @@ fn all_conversations_results() -> Vec<ConversationsResult> {
 fn storage_report() -> StorageReport {
     StorageReport {
         database: 48_000_000,
+        reclaimable: 3_000_000,
         event_blobs: 310_000_000,
         workdir_blobs: 2_000_000,
         shell_running: 4096,
@@ -1025,6 +1028,9 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             archived: false,
         },
+        CommandKind::DeleteSession {
+            session_id: session(),
+        },
         CommandKind::RemoveWorktree {
             session_id: session(),
         },
@@ -1118,6 +1124,8 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::UnknownApproval,
             RejectReason::ApprovalAlreadyResolved,
             RejectReason::ApprovalCancelled,
+            RejectReason::ApprovalPending,
+            RejectReason::WorktreeNotRemoved,
             RejectReason::NotAShellCall,
             RejectReason::NoActiveTurn,
             RejectReason::UnknownRule,
@@ -2047,8 +2055,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v40() {
-    assert_eq!(PROTOCOL_VERSION, 40);
+fn protocol_is_v41() {
+    assert_eq!(PROTOCOL_VERSION, 41);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -2288,6 +2296,7 @@ fn api_paths() {
     assert_eq!(path::EVENTS, "/v1/events");
     assert_eq!(path::CONVERSATIONS, "/v1/conversations");
     assert_eq!(path::STORAGE, "/v1/storage");
+    assert_eq!(path::STORAGE_RECLAIM, "/v1/storage/reclaim");
     assert_eq!(path::USAGE_LIMITS, "/v1/usage-limits");
     assert_eq!(path::AGENT_LOGIN_START, "/v1/agent-login/start");
     assert_eq!(path::AGENT_LOGIN_FINISH, "/v1/agent-login/finish");

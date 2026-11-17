@@ -242,10 +242,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
-    BlobUse, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
-    DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, SafetyJudgment, Seq,
-    SessionId, SessionOrigin, Worktree, answers_fit, check_conversation_id, context_name, limits,
-    normalise_context_name,
+    BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef,
+    Decision, DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, SafetyJudgment,
+    Seq, SessionId, SessionOrigin, Worktree, answers_fit, check_conversation_id, context_name,
+    limits, normalise_context_name,
 };
 use skywave_safety::Verdict;
 
@@ -350,9 +350,10 @@ impl EventLog {
     /// recorded, and its old one's row deleted, only if the old blob is
     /// still stored; its old file goes after the commit. A message's images
     /// are recorded as its attachments' blobs, and their staged files go
-    /// after the commit. Whatever is not logged and committed, a stored or
-    /// refused command or a failed transaction included, has its blob files
-    /// removed.
+    /// after the commit. A `DeleteSession` frees nothing: it marks the session
+    /// requested, and the supervisor erases it later (D62). Whatever
+    /// is not logged and committed, a stored or refused command or a failed
+    /// transaction included, has its blob files removed.
     pub fn handle_with(
         &self,
         db: &mut Db,
@@ -364,7 +365,8 @@ impl EventLog {
         if let Some(stored) = stored_result(&tx, command.id)? {
             return Ok(stored);
         }
-        let result = match self.apply(&tx, device, command, prepared.as_mut())? {
+        let mut freed = Vec::new();
+        let result = match self.apply(&tx, device, command, prepared.as_mut(), &mut freed)? {
             Ok(seq) => CommandResult::Accepted { seq },
             Err(reason) => CommandResult::Rejected { reason },
         };
@@ -380,12 +382,12 @@ impl EventLog {
         if let Some(prepared) = prepared {
             prepared.kept();
         }
-        // Only once its row is gone for good: a crash before this leaves a
-        // file without a row, which the startup sweep removes.
-        if let (CommandKind::DeleteBlob { blob }, CommandResult::Accepted { .. }, Some(blobs)) =
-            (&command.kind, &result, self.blobs())
-        {
-            blobs.discard(*blob);
+        // Only once their rows are gone for good: a crash before this leaves
+        // a file without a row, which the startup sweep removes.
+        if let (CommandResult::Accepted { .. }, Some(blobs)) = (&result, self.blobs()) {
+            for blob in freed {
+                blobs.discard(blob);
+            }
         }
         match &result {
             CommandResult::Accepted { seq } => {
@@ -412,6 +414,7 @@ impl EventLog {
         device: DeviceId,
         command: &Command,
         prepared: Option<&mut Preparation>,
+        freed: &mut Vec<BlobId>,
     ) -> Result<Result<Seq, RejectReason>> {
         // Read only for work, at most once per check interval: control
         // and an idle server read nothing.
@@ -757,6 +760,19 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
+            CommandKind::DeleteSession { session_id } => {
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                if let Some(reason) = event_log::session_busy_in(tx, *session_id)? {
+                    return Ok(Err(reason));
+                }
+                // Requested from this commit on; the supervisor erases it
+                // (D62). Nothing is freed here.
+                event_log::request_deletion_in(tx, *session_id)?;
+                let kind = EventKind::SessionDeleted { by: device };
+                (*session_id, session.context, kind)
+            }
             CommandKind::RemoveWorktree { session_id } => {
                 let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
@@ -961,6 +977,7 @@ impl EventLog {
                 }
                 // The file goes once this commits (`handle_with`).
                 event_log::delete_blob_row_in(tx, *blob)?;
+                freed.push(*blob);
                 let kind = EventKind::BlobDeleted {
                     blob: *blob,
                     holds: row.holds,
@@ -1057,6 +1074,7 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::StopShell { .. }
         | CommandKind::RenameSession { .. }
         | CommandKind::SetSessionArchived { .. }
+        | CommandKind::DeleteSession { .. }
         | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         | CommandKind::SetSafetyCheck { .. }
@@ -1092,6 +1110,7 @@ fn work_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::StopShell { .. }
         | CommandKind::RenameSession { .. }
         | CommandKind::SetSessionArchived { .. }
+        | CommandKind::DeleteSession { .. }
         | CommandKind::RemoveWorktree { .. }
         | CommandKind::SwitchContext { .. }
         | CommandKind::SetSafetyCheck { .. }

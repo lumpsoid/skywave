@@ -432,6 +432,11 @@ pub enum ActionIntent {
     DeleteSessionLocally {
         session_id: String,
     },
+    /// Delete the session on the server and every device; irreversible.
+    /// Only for a row that is `deletable_everywhere`.
+    DeleteSessionEverywhere {
+        session_id: String,
+    },
     /// Give a snippet `name` (blank for none) and `text`.
     EditSnippet {
         snippet_id: String,
@@ -511,6 +516,10 @@ pub enum ActionIntent {
     RetryNow,
     /// Ask the server for its storage report again (the storage screen).
     RefreshStorage,
+    /// Compact the server's database (the storage screen).
+    ReclaimServerSpace,
+    /// Compact this device's database (the storage screen).
+    ReclaimDeviceSpace,
     /// Ask the agent for its usage limits again (the usage limits page).
     RefreshUsageLimits,
     /// After the server lost history ([`LinkState::HistoryLost`](crate::signals::LinkState)),

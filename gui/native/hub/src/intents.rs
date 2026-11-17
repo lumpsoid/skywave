@@ -154,6 +154,9 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::DeleteSessionLocally { session_id } => Action::DeleteSessionLocally {
             session_id: id("session", &session_id)?,
         },
+        ActionIntent::DeleteSessionEverywhere { session_id } => Action::DeleteSessionEverywhere {
+            session_id: id("session", &session_id)?,
+        },
         ActionIntent::EditSnippet {
             snippet_id,
             name,
@@ -233,6 +236,8 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::RetryNow => Action::RetryNow,
         ActionIntent::ResetReplica => Action::ResetReplica,
         ActionIntent::RefreshStorage => Action::RefreshStorage,
+        ActionIntent::ReclaimServerSpace => Action::ReclaimServerSpace,
+        ActionIntent::ReclaimDeviceSpace => Action::ReclaimDeviceSpace,
         ActionIntent::RefreshWorktrees => Action::RefreshWorktrees,
         ActionIntent::RefreshUsageLimits => Action::RefreshUsageLimits,
         // Checked here too so a typo is shown, not silently dropped.

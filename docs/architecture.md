@@ -167,6 +167,7 @@ every version.
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
+| `POST /v1/storage/reclaim` | Compacts the server's database (`VACUUM`, then the WAL truncated into it, no body), answering the fresh `StorageReport`, whose `reclaimable` is then 0. Explicit only. Refused with 507 when the free space is below the database's size plus `min_free`, nothing run; 503 when the connection is still held at the report's 8 s deadline, or past the 10-minute reply timeout. Since v41. |
 | `GET /v1/usage-limits` | The usage limits of the account the agent runs as, as a `UsageLimitsResult` read from the agent when asked: `Read { at, limits }` (each limit's window, `Session` or `Weekly`, its scope such as one model, percent used, severity and reset time, a figure the agent did not report left out), `Unavailable` for an agent that reports none, or `Failed { reason }`. Nothing is stored on the server. |
 | `POST /v1/agent-login/start` | No body. Starts logging the agent in from a device (D49), as a `LoginStartResult`: `Open { flow, url }` (the user signs in at `url`, at most `LOGIN_URL_MAX_BYTES`; a longer one is `Failed`, never cut), the same flow and URL to a start while one is starting or open, `Busy` while a finish runs, `Unavailable` when `agent_login_offered` is false, or `Failed { reason }`. The agent gets 15 s; 503 at 20 s. See "The agent's login". Since v29. |
 | `POST /v1/agent-login/finish` | A `LoginFinish { flow, code }` (the code the sign-in page showed; over `LOGIN_CODE_MAX_BYTES` a 400). Answers `LoggedIn { expires }`, `NoFlow` (no such flow, or given up on) or `Failed { reason }`. The first finish of a flow is the only one the agent sees: every later one gets its outcome, whatever code it carries. 503 after 20 s of waiting for the agent, while the finish goes on; a retry collects it. Since v29. |
@@ -223,7 +224,7 @@ every version.
   `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations`,
   `/v1/usage-limits`, `/v1/agent-login/*`, `/v1/attachments/{sha256}` (`PUT`) and `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
-  `/v1/conversations`, `/v1/storage` and `/v1/workdir/*` answer 503 when
+  `/v1/conversations`, `/v1/storage`, `/v1/storage/reclaim` and `/v1/workdir/*` answer 503 when
   they run out of time, or when 8 of their file-system reads are already
   running (a wait of at most 0.5 s first). Each read holds its permit until its blocking
   thread returns, even after its request gave up, so reads stuck on a hung
@@ -577,7 +578,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
     Control is taken as usual (`ResolveApproval`, `AnswerQuestion`, `Interrupt`,
     `StopSession`, `StopTask`, `StopShell`), and so is what logs one small
     event and starts nothing (`RenameSession`, `SetSessionArchived`,
-    `RemoveWorktree`, `SwitchContext`, `DeleteBlob`, `CropBlob`). Reads and long-polls are untouched. The refusal is
+    `DeleteSession`, `RemoveWorktree`, `SwitchContext`, `DeleteBlob`,
+    `CropBlob`). Reads and long-polls are untouched. The refusal is
     stored like any other; the heads show its reason, which is how a
     device learns the server is paused.
   - The supervisor stops reading its agents' events. An adapter reports on
@@ -623,7 +625,19 @@ the daemon's appends, which would otherwise stop `serve` (below).
   in one read transaction (appends go on beside it under WAL), and SQLite
   stops it at its 8 s deadline (a progress handler), a 503; the reply
   gives up at 10 s. The report itself removes nothing: deleting a blob
-  is a command (`DeleteBlob`, above).
+  is a command (`DeleteBlob`, above). A deleted session (`DeleteSession`,
+  D62) is in no report from the moment its delete is logged. The supervisor
+  then erases its rows and has the agent delete its transcripts of the
+  session's conversations (D62). The erased rows stay in the file as free
+  pages until it is compacted: `reclaimable` is their size (`freelist_count`
+  times `page_size`), and `POST /v1/storage/reclaim` compacts it. Reclaim is
+  a `VACUUM` then `PRAGMA wal_checkpoint(TRUNCATE)`, on the storage reader's
+  connection, answering the fresh report. It is explicit only, never
+  automatic: `VACUUM` blocks other writers (they wait out their busy
+  timeout) and writes a copy of the database, so it is refused with 507 when
+  the free space is below the database's size plus `min_free`, and nothing
+  runs. Only the wait for the connection has a deadline; the `VACUUM` itself
+  is not cut short, and its reply gives up at 10 minutes.
 - **Usage limits** (`GET /v1/usage-limits`): the account's limits belong to
   no session, so the API asks a `UsageLimitsSource` (agent-agnostic;
   `NoUsageLimits` answers `Unavailable`). The Claude Code one
@@ -1461,12 +1475,33 @@ logs) an event that no longer decodes rather than failing.
   screen is open (by its reply or, the reply lost, by the log).
   `StorageView` shows `Loading`, `Ready` or `Unavailable(Offline |
   Failed)`, the latest report (a failed refresh keeps the one before) and
-  the replica's title for each session it names; a session missing there
-  is not on this device. Only the latest request's answer is kept;
+  what the replica knows of each session it names (`StorageView::sessions`:
+  its title, whether it is archived, and the two delete gates); a session
+  missing there is not on this device. Only the latest request's answer is kept;
   offline nothing is asked. Nothing is stored: opening the screen drops
-  the last report and asks again. `skywave_present::storage` words the
+  the last report and asks again. The same asks also read this device's
+  own report (`StorageView::device`, `store::read_device_storage`: the
+  replica with its WAL, blob bytes on disk, attachment files, and each
+  session's event and blob bytes), off the state lock on a read-only
+  connection, and work offline too.
+  `ReclaimServerSpace` (paired, online) asks `POST /v1/storage/reclaim`
+  within `RECLAIM_TIMEOUT` (610 s, above the server's 600 s `VACUUM`) and
+  shows `Reclaiming` until its answer; a refresh or a second reclaim asks
+  nothing meanwhile. The server's `507` (no free disk for a reclaim) is
+  `Unavailable(NoRoomToReclaim)`, the report before kept.
+  `ReclaimDeviceSpace` (on this screen, no server needed) runs `VACUUM` and
+  a WAL truncate on the `Store`'s own connection under the state lock, on a
+  blocking thread, so dispatch waits for it rather than failing on the 5 s
+  busy timeout; then this device's report is read again and replaces
+  `StorageView::device`. `device_reclaiming` is true meanwhile: a refresh
+  asks no device report and a second reclaim nothing. Opening the screen
+  forgets a reclaim in flight; a failure keeps the report before it.
+  `skywave_present::storage` words the
   totals and the three lists (by session, largest blobs, shell runs) for
-  both heads, with what a blob or run row may do (`RowActions`: delete
+  both heads. The by-session list joins the server's sessions with this
+  device's (largest by both sizes), so it shows offline too; each row
+  carries its `SessionFacts` for selecting it. A blob or run row may do
+  (`RowActions`: delete
   any blob, crop tool or shell output of a session in this replica; a
   run acts on its `output_blob`). `skywave_present::blob_actions` holds
   the same rule for a timeline item's content and the confirmation
@@ -1768,7 +1803,11 @@ skywave-core                 all logic, sync, replica
   one. Timeline rows, shell runs and storage rows carry a
   `BlobTargetView` (present's `BlobTarget`, worded), so Dart's delete and
   crop menu decides nothing; every delete or crop goes through an
-  `AlertDialog` with present's question first.
+  `AlertDialog` with present's question first. On the storage page the
+  sessions' ticks are Dart-local state; each bulk action (archive, remove
+  from this device, delete everywhere) acts only on the ticked rows whose
+  flags (`here`/`archived`, `deletable`, `deletableEverywhere`) allow it,
+  and the two deletes ask first.
 - **Agent messages are markdown** (D48). The hub parses an agent message's
   text, live or imported, into flat blocks (present's `markdown::blocks`)
   sent as `TimelineRow.markdown` beside the raw `text`; an expanded long

@@ -624,6 +624,8 @@ pub struct FakeAgent {
     outside: Arc<Mutex<HashSet<String>>>,
     /// Gates the next start or shutdown of a session waits on.
     holds: Arc<Mutex<Holds>>,
+    /// Every [`AgentAdapter::forget`] call, in order.
+    forgotten: Arc<Mutex<Vec<(PathBuf, ResumeHandle)>>>,
 }
 
 #[derive(Debug, Default)]
@@ -649,6 +651,7 @@ impl FakeAgent {
             shared: Arc::default(),
             outside: Arc::default(),
             holds: Arc::default(),
+            forgotten: Arc::default(),
         }
     }
 
@@ -679,6 +682,12 @@ impl FakeAgent {
             .get(&session_id)
             .map(|p| p.inputs.clone())
             .unwrap_or_default()
+    }
+
+    /// Every [`AgentAdapter::forget`] call, in order: the workdir and the
+    /// handle it was given.
+    pub fn forgotten(&self) -> Vec<(PathBuf, ResumeHandle)> {
+        lock(&self.forgotten).clone()
     }
 
     /// The resume handle the fake reports for session context `context`.
@@ -811,6 +820,10 @@ impl AgentAdapter for FakeAgent {
             holds: Arc::clone(&self.holds),
         };
         Ok((session, events_rx))
+    }
+
+    fn forget(&self, workdir: &Path, handle: &ResumeHandle) {
+        lock(&self.forgotten).push((workdir.to_path_buf(), handle.clone()));
     }
 }
 

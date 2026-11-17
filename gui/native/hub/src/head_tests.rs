@@ -676,6 +676,53 @@ fn the_list_groups_worktree_sessions_by_repo() {
     assert_eq!(position(in_worktree).abs_diff(position(plain)), 1);
 }
 
+#[test]
+fn a_session_row_says_whether_it_may_be_deleted_everywhere() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    // The row of the session on `list`, which is the active or archived one.
+    let row = |rig: &Rig| match rig.list() {
+        ScreenView::SessionList { rows, .. } => rows
+            .into_iter()
+            .find(|r| r.session_id == rig.session.0.to_string())
+            .unwrap(),
+        _ => unreachable!(),
+    };
+    let live = row(&rig);
+    assert!(!live.archived && !live.deletable && !live.deletable_everywhere);
+
+    // Archived in the log, with nothing waiting and no worktree: deletable
+    // everywhere. (An archive sent from here would stay unsettled with no
+    // server to answer it, and an unsettled command blocks deletion.)
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 2, 0).unwrap();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(
+                rig.session,
+                at,
+                EventKind::SessionArchived {
+                    archived: true,
+                    by: rig.me,
+                },
+            )],
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::ArchivedSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    let archived = row(&rig);
+    assert!(archived.archived && archived.deletable && archived.deletable_everywhere);
+}
+
 impl Rig {
     fn new() -> Rig {
         Rig::on(Head::new(Prefs::default()))
@@ -2054,7 +2101,9 @@ fn the_usage_screen_totals_what_usage_show_picks() {
 
 #[test]
 fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
-    use crate::signals::{StorageGroupingView, StorageRowView, StorageTotalView};
+    use crate::signals::{
+        StorageGroupingView, StorageRowView, StorageSessionView, StorageTotalView,
+    };
 
     let mut rig = Rig::new();
     let requests = rig.seam.take_requests().unwrap();
@@ -2073,6 +2122,7 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
             totals,
             rows,
             empty_label,
+            ..
         } => (
             *grouping,
             status_label.clone(),
@@ -2097,6 +2147,7 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
         req,
         Ok(skywave_proto::StorageReport {
             database: 1024 * 1024,
+            reclaimable: 0,
             event_blobs: 0,
             workdir_blobs: 0,
             shell_running: 0,
@@ -2133,6 +2184,15 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
             detail: "2 events · 2.0 KiB in the log · no blobs".into(),
             size: "2.0 KiB".into(),
             target: None,
+            session: Some(StorageSessionView {
+                session_id: rig.session.0.to_string(),
+                server_size: Some("2.0 KiB".into()),
+                device_size: None,
+                here: true,
+                archived: false,
+                deletable: false,
+                deletable_everywhere: false,
+            }),
         }
     );
     assert_eq!(empty, None);
@@ -2150,6 +2210,154 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
         action: ActionIntent::RefreshStorage,
     });
     assert_eq!(rig.actions.last(), Some(&Action::RefreshStorage));
+}
+
+#[test]
+fn the_storage_screen_shows_this_devices_usage_and_what_may_be_reclaimed() {
+    use crate::signals::StorageKindView;
+
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::Storage,
+        },
+    });
+    rig.results();
+    rig.view();
+    let asked: Vec<skywave_core::Request> = requests.try_iter().collect();
+    let storage_req = asked
+        .iter()
+        .find_map(|r| match r {
+            skywave_core::Request::Storage { req } => Some(*req),
+            _ => None,
+        })
+        .expect("the core asked for the report");
+    let device_req = asked
+        .iter()
+        .find_map(|r| match r {
+            skywave_core::Request::DeviceStorage { req } => Some(*req),
+            _ => None,
+        })
+        .expect("the core asked for this device's storage");
+    rig.seam.storage_reported(
+        storage_req,
+        Ok(skywave_proto::StorageReport {
+            database: 8192,
+            reclaimable: 4096,
+            event_blobs: 0,
+            workdir_blobs: 0,
+            shell_running: 0,
+            log_file: None,
+            free: None,
+            min_free: 0,
+            sessions: vec![skywave_proto::SessionStorage {
+                session: rig.session,
+                events: 1,
+                event_bytes: 2048,
+                blobs: 0,
+                blob_bytes: 0,
+            }],
+            blobs: Vec::new(),
+            shell_runs: Vec::new(),
+        }),
+    );
+    rig.seam.device_storage_read(
+        device_req,
+        Ok(skywave_core::DeviceStorage {
+            database: 16384,
+            reclaimable: 2048,
+            blobs: 1024,
+            attachments: 0,
+            sessions: vec![skywave_core::DeviceSessionStorage {
+                session: rig.session,
+                event_bytes: 512,
+                blob_bytes: 0,
+            }],
+        }),
+    );
+    rig.view();
+    let screen = |rig: &Rig| rig.head.sent.screen.as_ref().unwrap().screen.clone();
+    let ScreenView::Storage {
+        server_reclaimable,
+        server_reclaiming,
+        device_totals,
+        device_kinds,
+        device_reclaimable,
+        device_reclaiming,
+        rows,
+        ..
+    } = screen(&rig)
+    else {
+        panic!("not the storage screen");
+    };
+    assert_eq!(server_reclaimable.as_deref(), Some("4.0 KiB"));
+    assert_eq!(device_reclaimable.as_deref(), Some("2.0 KiB"));
+    assert!(!server_reclaiming && !device_reclaiming);
+    assert_eq!(
+        device_totals.first().map(|t| t.label.as_str()),
+        Some("Used")
+    );
+    assert_eq!(
+        device_kinds,
+        vec![
+            StorageKindView {
+                label: "Database".into(),
+                bytes: 16384,
+                size: "16.0 KiB".into(),
+            },
+            StorageKindView {
+                label: "Blobs".into(),
+                bytes: 1024,
+                size: "1.0 KiB".into(),
+            },
+            StorageKindView {
+                label: "Attachments".into(),
+                bytes: 0,
+                size: "0 B".into(),
+            },
+        ]
+    );
+    let session = rows[0].session.clone().expect("a session row");
+    assert_eq!(session.device_size.as_deref(), Some("512 B"));
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::ReclaimDeviceSpace,
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(rig.actions.last(), Some(&Action::ReclaimDeviceSpace));
+    let ScreenView::Storage {
+        device_reclaimable,
+        device_reclaiming,
+        ..
+    } = screen(&rig)
+    else {
+        panic!("not the storage screen");
+    };
+    assert!(device_reclaiming);
+    assert_eq!(device_reclaimable, None);
+}
+
+#[test]
+fn the_storage_intents_reach_the_core() {
+    let mut rig = Rig::new();
+    for (action, expected) in [
+        (ActionIntent::ReclaimServerSpace, Action::ReclaimServerSpace),
+        (ActionIntent::ReclaimDeviceSpace, Action::ReclaimDeviceSpace),
+        (
+            ActionIntent::DeleteSessionEverywhere {
+                session_id: rig.session.0.to_string(),
+            },
+            Action::DeleteSessionEverywhere {
+                session_id: rig.session,
+            },
+        ),
+    ] {
+        rig.intent(GuiIntent::Act { action });
+        assert_eq!(rig.actions.last(), Some(&expected));
+    }
 }
 
 #[test]
@@ -7008,6 +7216,7 @@ mod blob_actions {
             req,
             Ok(skywave_proto::StorageReport {
                 database: 0,
+                reclaimable: 0,
                 event_blobs: 0,
                 workdir_blobs: 0,
                 shell_running: 0,

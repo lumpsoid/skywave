@@ -37,7 +37,7 @@ use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
     AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxFile, OutboxStatus,
-    ReadMark, SafetyRule, ServerFacts, Settings, Snapshot,
+    ReadMark, SafetyRule, ServerFacts, Settings, Snapshot, StoreError,
 };
 use crate::tls;
 use crate::transport::TransportError;
@@ -45,18 +45,18 @@ use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention,
     BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobUse, BlobView, BodyView, CallId,
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
-    CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
-    FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan,
-    Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
-    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
-    PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER,
-    SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView, SessionId,
-    SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
+    CropView, Decision, Delivery, DeviceId, DeviceRef, DeviceStorage, DiffBody, Draft, Entry,
+    ErrorInfo, FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView, ImportedEntry,
+    LineSpan, Link, LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing,
+    PairedInfo, PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef,
+    PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
+    SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, Seq, ServerAddressesView,
+    SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
     SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
-    SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult, UsageLimitsUnavailable,
-    UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane,
-    WorkdirView, WorktreeSession, WorktreesView,
+    SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader, SubagentStatus,
+    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirDownload,
+    WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -732,6 +732,27 @@ impl Model {
                 let online = self.online();
                 self.storage
                     .refresh(online)
+                    .into_iter()
+                    .map(Effect::Request)
+                    .collect()
+            }
+            Action::ReclaimServerSpace => {
+                if self.device().is_none() || self.place != Place::Storage {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.storage
+                    .reclaim(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::ReclaimDeviceSpace => {
+                if self.place != Place::Storage {
+                    return Vec::new();
+                }
+                self.storage
+                    .reclaim_device()
                     .map(Effect::Request)
                     .into_iter()
                     .collect()
@@ -1156,6 +1177,15 @@ impl Model {
                 }
                 vec![Effect::DeleteLocally(session_id)]
             }
+            Action::DeleteSessionEverywhere { session_id } => {
+                if !self
+                    .summary(session_id)
+                    .is_some_and(|s| self.deletable_everywhere(s))
+                {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::DeleteSession { session_id }, Vec::new())
+            }
             Action::OpenSession(id) => {
                 if self.device().is_none() || self.summary(id).is_none() {
                     return Vec::new();
@@ -1357,13 +1387,13 @@ impl Model {
                     return Vec::new();
                 }
                 let online = self.online();
-                let asked = match self.place {
+                let asked: Vec<Request> = match self.place {
                     Place::Storage => self.storage.open(online),
-                    Place::Worktrees => self.worktrees.open(online),
-                    Place::UsageLimits(_) => self.usage_limits.open(online),
-                    _ => None,
+                    Place::Worktrees => self.worktrees.open(online).into_iter().collect(),
+                    Place::UsageLimits(_) => self.usage_limits.open(online).into_iter().collect(),
+                    _ => Vec::new(),
                 };
-                asked.map(Effect::Request).into_iter().collect()
+                asked.into_iter().map(Effect::Request).collect()
             }
             Action::Back => {
                 // A subagent shown steps out to the one it runs under, then
@@ -2115,6 +2145,11 @@ impl Model {
             if self.deleted.contains(&event.session_id) {
                 continue;
             }
+            // As the store does: a tombstone ends its session for the rest of
+            // the batch. The seam drops the session after this fold.
+            if matches!(event.kind, EventKind::SessionDeleted { .. }) {
+                self.deleted.insert(event.session_id);
+            }
             if let EventKind::ShellRequested { command, .. } = &event.kind {
                 self.shell_history.record(command);
             }
@@ -2320,8 +2355,9 @@ impl Model {
         self.draft_files.remove(&id);
         self.composer_modes.remove(&id);
         self.read_marks.remove(&id);
+        // Unanswered ones too, as the store drops them.
         self.outbox
-            .retain(|e| !e.status.is_settled() || command_session(&e.command.kind) != Some(id));
+            .retain(|e| command_session(&e.command.kind) != Some(id));
         for blob in blobs {
             self.forget_blob(*blob);
             self.fates.remove(blob);
@@ -2358,8 +2394,10 @@ impl Model {
         id: CommandId,
         result: CommandResult,
         now: DateTime<Utc>,
-    ) -> Option<Request> {
-        let entry = self.outbox_entry(id).filter(|e| !e.status.is_settled())?;
+    ) -> Vec<Request> {
+        let Some(entry) = self.outbox_entry(id).filter(|e| !e.status.is_settled()) else {
+            return Vec::new();
+        };
         let accepted = matches!(result, CommandResult::Accepted { .. });
         let frees = accepted
             && matches!(
@@ -2373,8 +2411,10 @@ impl Model {
         let paired = self.device().is_some();
         match self.place {
             Place::Storage if frees && paired => self.storage.refresh(online),
-            Place::Worktrees if removes && paired => self.worktrees.refresh(online),
-            _ => None,
+            Place::Worktrees if removes && paired => {
+                self.worktrees.refresh(online).into_iter().collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -2497,6 +2537,22 @@ impl Model {
         result: Result<StorageReport, TransportError>,
     ) {
         self.storage.reported(req, result);
+    }
+
+    pub(crate) fn device_storage_read(
+        &mut self,
+        req: u64,
+        result: Result<DeviceStorage, StoreError>,
+    ) {
+        self.storage.device_read(req, result);
+    }
+
+    pub(crate) fn storage_reclaimed(
+        &mut self,
+        req: u64,
+        result: Result<StorageReport, TransportError>,
+    ) {
+        self.storage.reclaimed(req, result);
     }
 
     pub(crate) fn worktrees_listed(
@@ -3038,6 +3094,7 @@ impl Model {
                     },
                     cost_usd: s.usage.as_ref().and_then(|u| u.total.cost_usd),
                     deletable: self.deletable(s),
+                    deletable_everywhere: self.deletable_everywhere(s),
                     importing: s.importing,
                 }
             })
@@ -3140,11 +3197,25 @@ impl Model {
     }
 
     fn storage_view(&self) -> StorageView {
-        let (status, report) = self.storage.shown();
-        let titles = report
+        let (status, report, device) = self.storage.shown();
+        let sessions = report
             .iter()
             .flat_map(|report| report.sessions.iter().map(|s| s.session))
-            .filter_map(|id| Some((id, self.title(self.summary(id)?).text)))
+            .chain(
+                device
+                    .iter()
+                    .flat_map(|device| device.sessions.iter().map(|s| s.session)),
+            )
+            .filter_map(|id| {
+                let summary = self.summary(id)?;
+                let session = StorageSession {
+                    title: self.title(summary).text,
+                    archived: self.archived(summary),
+                    deletable: self.deletable(summary),
+                    deletable_everywhere: self.deletable_everywhere(summary),
+                };
+                Some((id, session))
+            })
             .collect();
         let gone = report
             .iter()
@@ -3157,9 +3228,11 @@ impl Model {
         StorageView {
             status,
             report,
-            titles,
+            sessions,
             pending: self.blob_pendings(),
             gone,
+            device,
+            device_reclaiming: self.storage.device_reclaiming(),
         }
     }
 
@@ -3430,6 +3503,13 @@ impl Model {
             && summary.pending_approvals.is_empty()
             && summary.state != LogState::AgentWorking
             && !unsettled
+    }
+
+    /// Whether [`Action::DeleteSessionEverywhere`] may send: `deletable`, and
+    /// its worktree is gone, since the server refuses a session whose
+    /// worktree is still on disk.
+    fn deletable_everywhere(&self, summary: &SessionSummary) -> bool {
+        self.deletable(summary) && (summary.worktree.is_none() || summary.worktree_removed)
     }
 
     /// The device whose request `answers` names, if it was seen.
@@ -4405,8 +4485,10 @@ impl Model {
                     }
                     None
                 }
-                EventKind::SafetyCheckSet { .. } => None,
-                EventKind::SafetyRuleSet { .. } => None,
+                EventKind::SafetyCheckSet { .. }
+                | EventKind::SafetyRuleSet { .. }
+                | EventKind::SessionDeleted { .. }
+                | EventKind::Erased => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -5150,6 +5232,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::StopSession { session_id }
         | CommandKind::RenameSession { session_id, .. }
         | CommandKind::SetSessionArchived { session_id, .. }
+        | CommandKind::DeleteSession { session_id }
         | CommandKind::RemoveWorktree { session_id }
         | CommandKind::SetPermissionMode { session_id, .. }
         | CommandKind::SetModel { session_id, .. }
@@ -8021,6 +8104,115 @@ mod tests {
             [kept]
         );
         assert_eq!(model.cursor, Seq(6));
+    }
+
+    /// Whether the archived list offers to delete the session everywhere.
+    fn shown_everywhere(f: &mut Fixture, id: SessionId) -> bool {
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        row(f, id).deletable_everywhere
+    }
+
+    #[test]
+    fn delete_everywhere_needs_archived_and_no_worktree() {
+        let mut f = Fixture::paired();
+        let active = f.session("/srv/active");
+        assert!(!row(&f, active).deletable_everywhere);
+        assert!(
+            f.dispatch(Action::DeleteSessionEverywhere { session_id: active })
+                .is_empty(),
+            "active"
+        );
+
+        // Archived as the log has it, so it may go everywhere.
+        let gone = f.session("/srv/gone");
+        f.log(gone, vec![archived_event(true, f.me)]);
+        assert!(shown_everywhere(&mut f, gone));
+        let command = queued(&f.dispatch(Action::DeleteSessionEverywhere { session_id: gone }));
+        assert_eq!(
+            command.kind,
+            CommandKind::DeleteSession { session_id: gone }
+        );
+        // Until the server answers, it is neither offered nor sent again.
+        assert!(!shown_everywhere(&mut f, gone));
+        assert!(
+            f.dispatch(Action::DeleteSessionEverywhere { session_id: gone })
+                .is_empty(),
+            "sent once"
+        );
+
+        // Its worktree is still on disk: the server would refuse the delete.
+        let in_worktree = SessionId::new();
+        f.log(in_worktree, vec![created_in_worktree("/srv/app")]);
+        f.log(in_worktree, vec![archived_event(true, f.me)]);
+        assert!(!shown_everywhere(&mut f, in_worktree));
+        let shown = row(&f, in_worktree);
+        assert!(shown.deletable, "locally it could go");
+        assert!(
+            f.dispatch(Action::DeleteSessionEverywhere {
+                session_id: in_worktree
+            })
+            .is_empty(),
+            "but not while the worktree is there"
+        );
+
+        // Removed, it may go everywhere.
+        f.log(in_worktree, vec![EventKind::WorktreeRemoved { by: f.me }]);
+        assert!(shown_everywhere(&mut f, in_worktree));
+        let command = queued(&f.dispatch(Action::DeleteSessionEverywhere {
+            session_id: in_worktree,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::DeleteSession {
+                session_id: in_worktree
+            }
+        );
+    }
+
+    #[test]
+    fn events_after_a_tombstone_in_its_batch_are_skipped() {
+        let mut f = Fixture::paired();
+        let gone = f.session("/srv/gone");
+        let blob = BlobRef {
+            id: BlobId::new(),
+            size: 10_000,
+            sha256: skywave_proto::ContentHash::of(b"out"),
+        };
+        let event = |kind| Event {
+            session_id: gone,
+            at: minute(2),
+            command_id: None,
+            context: skywave_proto::ContextId::first_of(gone),
+            kind,
+        };
+        // As the store does, the tombstone ends the session for the rest of
+        // its batch: the output and the approval after it register nothing.
+        let from = f.model.cursor.next();
+        let batch = EventBatch {
+            from,
+            events: vec![
+                event(message("before")),
+                event(EventKind::SessionDeleted { by: f.me }),
+                event(EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "out".into(),
+                    lines: 1,
+                    output: Some(Full::Blob(blob.clone())),
+                })),
+                event(approval_requested(ApprovalId::new(), None)),
+            ],
+        };
+        let alerted = f.model.apply_batch(&batch);
+        assert_eq!(f.model.cursor, Seq(from.0 + 3), "the batch is folded");
+        f.model.session_deleted(gone, &[]);
+        assert!(alerted.is_empty(), "nothing after the tombstone alerts");
+        assert!(
+            !f.model.blobs.contains_key(&blob.id),
+            "nor registers a blob"
+        );
+        assert!(!f.model.sessions.iter().any(|s| s.id == gone));
     }
 
     #[test]
@@ -12081,17 +12273,36 @@ mod tests {
         }
     }
 
+    /// The server's storage request among `effects`, if one is asked.
     fn storage_req(effects: &[Effect]) -> Option<u64> {
-        match effects {
-            [] => None,
-            [Effect::Request(Request::Storage { req })] => Some(*req),
-            other => panic!("expected a storage request, got {other:?}"),
+        effects.iter().find_map(|effect| match effect {
+            Effect::Request(Request::Storage { req }) => Some(*req),
+            _ => None,
+        })
+    }
+
+    /// This device's storage request among `effects`, if one is asked.
+    fn device_req(effects: &[Effect]) -> Option<u64> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Request(Request::DeviceStorage { req }) => Some(*req),
+            _ => None,
+        })
+    }
+
+    fn device_storage(database: u64) -> DeviceStorage {
+        DeviceStorage {
+            database,
+            reclaimable: 0,
+            blobs: 0,
+            attachments: 0,
+            sessions: Vec::new(),
         }
     }
 
     fn storage_report(sessions: &[SessionId]) -> StorageReport {
         StorageReport {
             database: 4096,
+            reclaimable: 0,
             event_blobs: 0,
             workdir_blobs: 0,
             shell_running: 0,
@@ -12128,9 +12339,9 @@ mod tests {
         let view = storage_view(&f);
         assert_eq!(view.status, StorageStatus::Ready);
         assert_eq!(view.report, Some(report.clone()));
-        // A session not in this replica has no title.
-        assert_eq!(view.titles.len(), 1);
-        assert!(view.titles.contains_key(&known));
+        // A session not in this replica has no entry.
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[&known].title, "a");
 
         // A refresh keeps the report until its answer, and a failure keeps it.
         let second = storage_req(&f.dispatch(Action::RefreshStorage)).unwrap();
@@ -12164,6 +12375,108 @@ mod tests {
         f.model.set_link(PairedLink::Online { latency_ms: 5 });
         f.dispatch(Action::Navigate(Route::Settings));
         assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
+    }
+
+    #[test]
+    fn the_storage_screen_asks_for_this_devices_report_too() {
+        let mut f = Fixture::paired();
+        let effects = f.dispatch(Action::Navigate(Route::Storage));
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        assert!(storage_req(&effects).is_some());
+        let device = device_req(&effects).unwrap();
+        assert_eq!(storage_view(&f).device, None);
+        f.model
+            .device_storage_read(device, Ok(device_storage(4096)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(4096)));
+
+        // A refresh asks for it again and keeps the one shown until the answer.
+        let again = device_req(&f.dispatch(Action::RefreshStorage)).unwrap();
+        assert_ne!(again, device);
+        assert_eq!(storage_view(&f).device, Some(device_storage(4096)));
+        // The answer to the request before is ignored.
+        f.model.device_storage_read(device, Ok(device_storage(1)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(4096)));
+        f.model.device_storage_read(again, Ok(device_storage(8192)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(8192)));
+
+        // Offline only this device's report is asked.
+        f.model.set_link(PairedLink::Reconnecting {
+            attempt: 1,
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
+        });
+        let offline = f.dispatch(Action::RefreshStorage);
+        assert_eq!(storage_req(&offline), None);
+        assert!(device_req(&offline).is_some(), "{offline:?}");
+        assert_eq!(offline.len(), 1, "{offline:?}");
+    }
+
+    fn reclaim_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::ReclaimStorage { req })] => Some(*req),
+            other => panic!("expected a reclaim request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reclaiming_asks_on_the_storage_screen_only() {
+        let mut f = Fixture::paired();
+        assert_eq!(reclaim_req(&f.dispatch(Action::ReclaimServerSpace)), None);
+
+        let first = storage_req(&f.dispatch(Action::Navigate(Route::Storage))).unwrap();
+        f.model.storage_reported(first, Ok(storage_report(&[])));
+        let reclaim = reclaim_req(&f.dispatch(Action::ReclaimServerSpace)).unwrap();
+        assert_eq!(storage_view(&f).status, StorageStatus::Reclaiming);
+        assert_eq!(storage_view(&f).report, Some(storage_report(&[])));
+        f.model.storage_reclaimed(reclaim, Ok(storage_report(&[])));
+        assert_eq!(storage_view(&f).status, StorageStatus::Ready);
+
+        // Elsewhere a reclaim asks nothing.
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(reclaim_req(&f.dispatch(Action::ReclaimServerSpace)), None);
+    }
+
+    fn device_reclaim_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::ReclaimDeviceStorage { req })] => Some(*req),
+            other => panic!("expected a device reclaim request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reclaiming_this_device_asks_on_the_storage_screen_only() {
+        let mut f = Fixture::paired();
+        assert_eq!(
+            device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)),
+            None
+        );
+
+        let effects = f.dispatch(Action::Navigate(Route::Storage));
+        let device = device_req(&effects).unwrap();
+        f.model
+            .device_storage_read(device, Ok(device_storage(4096)));
+        let reclaim = device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)).unwrap();
+        assert!(storage_view(&f).device_reclaiming);
+        // Nothing else is asked while it runs.
+        assert_eq!(
+            device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)),
+            None
+        );
+        assert_eq!(device_req(&f.dispatch(Action::RefreshStorage)), None);
+        f.model
+            .device_storage_read(reclaim, Ok(device_storage(2048)));
+        assert_eq!(storage_view(&f).device, Some(device_storage(2048)));
+        assert!(!storage_view(&f).device_reclaiming);
+
+        // Elsewhere a reclaim asks nothing.
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(
+            device_reclaim_req(&f.dispatch(Action::ReclaimDeviceSpace)),
+            None
+        );
     }
 
     fn worktrees_view(f: &Fixture) -> WorktreesView {
@@ -12324,9 +12637,10 @@ mod tests {
         let rejected = CommandResult::Rejected {
             reason: RejectReason::ShellRunning,
         };
-        assert_eq!(
-            f.model.command_result(refused.id, rejected, Utc::now()),
-            None
+        assert!(
+            f.model
+                .command_result(refused.id, rejected, Utc::now())
+                .is_empty()
         );
 
         let removed = queued(&f.dispatch(Action::RemoveWorktree { session_id: a }));
@@ -12614,9 +12928,13 @@ mod tests {
         }
     }
 
+    /// The first request the answer asks: the screen's own, before this
+    /// device's storage report that a storage refresh asks with it.
     fn accept(f: &mut Fixture, id: CommandId, seq: u64) -> Option<Request> {
         f.model
             .command_result(id, CommandResult::Accepted { seq: Seq(seq) }, Utc::now())
+            .into_iter()
+            .next()
     }
 
     #[test]
@@ -12794,9 +13112,10 @@ mod tests {
         let rejected = CommandResult::Rejected {
             reason: RejectReason::BlobGone,
         };
-        assert_eq!(
-            f.model.command_result(refused.id, rejected, Utc::now()),
-            None
+        assert!(
+            f.model
+                .command_result(refused.id, rejected, Utc::now())
+                .is_empty()
         );
         let rename = queued(&f.dispatch(Action::RenameSession {
             session_id: sid,
@@ -15263,7 +15582,11 @@ mod tests {
             live.core
                 .dispatch(Action::Navigate(Route::Storage))
                 .unwrap();
-            assert!(matches!(&live.requests()[..], [Request::Storage { .. }]));
+            assert!(
+                live.requests()
+                    .iter()
+                    .any(|r| matches!(r, Request::Storage { .. }))
+            );
             let output = blob(10);
             live.core.dispatch(Action::DeleteBlob(output.id)).unwrap();
             live.requests();

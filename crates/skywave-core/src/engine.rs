@@ -160,6 +160,10 @@ pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(12);
 /// Longest a storage report may take, connecting included: above the
 /// server's own 10 s, so its `503` arrives before this gives up.
 pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(12);
+/// Longest a storage reclaim may take, connecting included: above the
+/// server's own 600 s for the `VACUUM`, so its answer arrives before this
+/// gives up.
+pub const RECLAIM_TIMEOUT: Duration = Duration::from_secs(610);
 /// How long the worktrees screen waits for the list: the server runs git in
 /// every worktree.
 pub const WORKTREES_TIMEOUT: Duration = Duration::from_secs(20);
@@ -478,6 +482,53 @@ impl Engine {
                         .await
                         .unwrap_or(Err(TransportError::Timeout));
                     seam.storage_reported(req, result);
+                });
+            }
+            Request::DeviceStorage { req } => {
+                let seam = self.seam.clone();
+                let data_dir = self.seam.data_dir();
+                self.seam.spawn("a device storage report", async move {
+                    // Off the async workers: the scan of the events can take seconds.
+                    match tokio::task::spawn_blocking(move || {
+                        crate::store::read_device_storage(&data_dir)
+                    })
+                    .await
+                    {
+                        Ok(result) => seam.device_storage_read(req, result),
+                        Err(error) => tracing::warn!(%error, "cannot read this device's storage"),
+                    }
+                });
+            }
+            Request::ReclaimDeviceStorage { req } => {
+                let seam = self.seam.clone();
+                let data_dir = self.seam.data_dir();
+                self.seam.spawn("a device storage reclaim", async move {
+                    let reclaiming = seam.clone();
+                    // Off the async workers: VACUUM holds the state lock for seconds.
+                    match tokio::task::spawn_blocking(move || {
+                        reclaiming.reclaim_device_space()?;
+                        crate::store::read_device_storage(&data_dir)
+                    })
+                    .await
+                    {
+                        Ok(result) => seam.device_storage_read(req, result),
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot reclaim this device's storage")
+                        }
+                    }
+                });
+            }
+            Request::ReclaimStorage { req } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    seam.storage_reclaimed(req, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a storage reclaim", async move {
+                    let result = tokio::time::timeout(RECLAIM_TIMEOUT, transport.storage_reclaim())
+                        .await
+                        .unwrap_or(Err(TransportError::Timeout));
+                    seam.storage_reclaimed(req, result);
                 });
             }
             Request::Worktrees { req } => {

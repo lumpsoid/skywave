@@ -24,6 +24,7 @@ use skywaved::agent::claude_code::protocol::{
     self, INTERRUPT_REASON, Output, PINNED_VERSION, Protocol,
 };
 use skywaved::agent::claude_code::rules;
+use skywaved::agent::claude_code::transcripts::project_dir;
 use skywaved::agent::claude_code::{
     ALLOW_BYPASS_ARG, ClaudeCodeAdapter, CliSession, KEEP_BASH_CWD_ENV, KEEP_TRANSCRIPTS_SETTINGS,
     NO_AUTOUPDATE_ENV, REQUIRED_ARGS,
@@ -6115,4 +6116,57 @@ fn replay_login() {
     );
     assert_ne!(Some(manual), urls["automaticUrl"].as_str());
     assert!(answer(&callback).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Forgetting a conversation (D62)
+
+#[test]
+fn forget_deletes_the_conversations_transcript_and_its_sidecars() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let projects = base.join("projects");
+    let workdir = base.join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let dir = projects.join(project_dir(workdir.to_str().unwrap()));
+    let id = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let transcript = dir.join(format!("{id}.jsonl"));
+    let subagent = dir.join(id.to_string()).join("subagents/agent-a1.jsonl");
+    let sibling = dir.join(format!("{other}.jsonl"));
+    for file in [&transcript, &subagent, &sibling] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "{}\n").unwrap();
+    }
+
+    let adapter = adapter().with_projects(projects);
+    let handle = protocol::resume_handle(id);
+    adapter.forget(&workdir, &handle);
+    assert!(!transcript.exists(), "the transcript stayed");
+    assert!(!subagent.exists(), "the subagent transcript stayed");
+    assert!(!dir.join(id.to_string()).exists(), "the sidecar dir stayed");
+    assert!(sibling.exists(), "another conversation was deleted");
+
+    // Gone already: nothing to delete, no panic, nothing else removed.
+    adapter.forget(&workdir, &handle);
+    assert!(sibling.exists());
+}
+
+#[test]
+fn forget_with_an_unusable_handle_removes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let projects = base.join("projects");
+    let workdir = base.join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let dir = projects.join(project_dir(workdir.to_str().unwrap()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = Uuid::new_v4();
+    let transcript = dir.join(format!("{id}.jsonl"));
+    std::fs::write(&transcript, "{}\n").unwrap();
+
+    let adapter = adapter().with_projects(projects);
+    adapter.forget(&workdir, &ResumeHandle(json!({ "session_id": "../../x" })));
+    adapter.forget(&workdir, &ResumeHandle(json!({ "other": 1 })));
+    assert!(transcript.exists(), "a handle that is no id deleted a file");
 }
