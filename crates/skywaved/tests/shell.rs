@@ -1169,39 +1169,61 @@ impl FreeSpace for FakeSpace {
 /// While the disk is low a running run's output stays in its pipe, so the
 /// command blocks once the pipe is full; with room again it is read on and
 /// the run ends with all of it.
+///
+/// "Not finished yet" only means paused next to how long the same run takes
+/// with room, so the test first times that on this machine and then holds
+/// the paused run many times as long. The output is larger than any pipe
+/// (16 pages: 64 KiB to 1 MiB, by page size), so a paused run cannot end.
 #[tokio::test]
 async fn a_low_disk_pauses_a_runs_output_and_loses_none_of_it() {
     const FLOOR: u64 = 1 << 30;
+    const LINES: u32 = 1_000_000;
     let mut f = Fixture::new();
     let space = Arc::new(FakeSpace(AtomicU64::new(FLOOR)));
     let disk = Disk::new(space.clone(), FLOOR);
     f.log = f.log.clone().with_disk(disk.clone());
     let runner = f.start().await;
-    let gate = f.fifo("gate");
-    let done = f.dir().join("done");
-    // Far more than a pipe holds; `done` only once all of it was taken.
-    let run = f.run(&format!(
-        "cat '{}'; seq 1 100000; touch '{}'",
-        gate.display(),
-        done.display()
-    ));
-    f.started(run).await;
+    let all: String = (1..=LINES).map(|n| format!("{n}\n")).collect();
+    let gated_run = |f: &mut Fixture, name: &str| {
+        let gate = f.fifo(&format!("{name}-gate"));
+        let done = f.dir().join(format!("{name}-done"));
+        let run = f.run(&format!(
+            "cat '{}'; seq 1 {LINES}; touch '{}'",
+            gate.display(),
+            done.display()
+        ));
+        (run, gate, done)
+    };
 
+    // With room: how long the run takes here, from the gate to its end.
+    let (control, gate, _) = gated_run(&mut f, "control");
+    f.started(control).await;
+    let start = std::time::Instant::now();
+    open_gate(&gate).await;
+    let finished = f.finished(control).await;
+    let unpaused = start.elapsed();
+    assert_eq!(finished.lines, LINES, "the unpaused run takes all of it");
+
+    let (run, gate, done) = gated_run(&mut f, "paused");
+    f.started(run).await;
     space.0.store(FLOOR - 1, Ordering::SeqCst);
     assert!(disk.check());
     open_gate(&gate).await;
-    let finished = tokio::time::timeout(Duration::from_millis(300), f.finished(run)).await;
-    assert!(finished.is_err(), "the run cannot finish while paused");
+    let hold = (unpaused * 10).max(Duration::from_secs(1));
+    let finished = tokio::time::timeout(hold, f.finished(run)).await;
+    assert!(
+        finished.is_err(),
+        "the run ended while paused (unpaused it took {unpaused:?}): {finished:?}"
+    );
     assert!(!done.exists(), "the command blocks on its output");
 
     space.0.store(FLOOR, Ordering::SeqCst);
     assert!(!disk.check());
     let finished = f.finished(run).await;
     assert_eq!(finished.end, exited(0));
-    assert_eq!(finished.lines, 100_000);
+    assert_eq!(finished.lines, LINES);
     assert!(done.exists());
     let blob = finished.output.expect("a blob");
-    let all: String = (1..=100_000).map(|n| format!("{n}\n")).collect();
     assert_eq!(f.blob(&blob), all.as_bytes());
     runner.shutdown().await.unwrap();
 }
