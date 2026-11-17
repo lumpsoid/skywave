@@ -611,6 +611,7 @@ pub enum RouteView {
     Storage,
     Worktrees,
     UsageLimits,
+    Approvals,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, SignalPiece)]
