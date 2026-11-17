@@ -15,6 +15,7 @@ void main() {
           id: 6,
           title: 'work',
           body: 'approval needed · work',
+          kind: NotifyKind.approval,
           sessionId: 's1',
         ),
       )
@@ -27,7 +28,7 @@ void main() {
       ..apply(const PlatformEffectBackgroundService(run: false));
 
     expect(sink.done, [
-      'notify 6: approval needed · work (s1)',
+      'notify 6 approval: approval needed · work (s1)',
       'dismiss 6',
       'copy: cargo test',
       'open: /tmp/blob',

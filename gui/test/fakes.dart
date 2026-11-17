@@ -11,8 +11,9 @@ class FakeEffectSink implements EffectSink {
     required int id,
     required String title,
     required String body,
+    required NotifyKind kind,
     String? sessionId,
-  }) => done.add('notify $id: $body ($sessionId)');
+  }) => done.add('notify $id ${kind.name}: $body ($sessionId)');
 
   @override
   void dismiss(int id) => done.add('dismiss $id');

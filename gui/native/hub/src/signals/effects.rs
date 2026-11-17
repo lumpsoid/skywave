@@ -1,4 +1,4 @@
-use rinf::RustSignal;
+use rinf::{RustSignal, SignalPiece};
 use serde::Serialize;
 
 /// Something for Dart to do once: a command, not state. Dart performs it
@@ -18,6 +18,8 @@ pub enum PlatformEffect {
         title: String,
         body: String,
         session_id: Option<String>,
+        /// Which alert it is; Dart picks the Android channel by it.
+        kind: NotifyKind,
     },
     /// Take down notification `id` if it is up: its session no longer
     /// waits on an approval, or its idle session works again, or the
@@ -37,4 +39,17 @@ pub enum PlatformEffect {
     /// not assumed: Kotlin reports the outcome back as
     /// `GuiIntent::BackgroundService`, and only that report holds the link.
     BackgroundService { run: bool },
+}
+
+/// Which system notification a `PlatformEffect::Notify` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]
+pub enum NotifyKind {
+    /// An approval is waiting: needs the user now.
+    Approval,
+    /// A long shell run of this device's finished.
+    Shell,
+    /// An agent went idle.
+    Idle,
+    /// The hub stopped off screen.
+    Stopped,
 }

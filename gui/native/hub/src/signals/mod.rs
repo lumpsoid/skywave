@@ -35,7 +35,7 @@ pub use crop::{
     BlobTargetView, BlobUseView, CropContentKind, CropLine, CropLinesUpdate, CropPresetView,
     CropScreen, LineSpanView,
 };
-pub use effects::PlatformEffect;
+pub use effects::{NotifyKind, PlatformEffect};
 pub use intents::{
     ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, PastedCode,
     QuestionAnswerView, RouteView,

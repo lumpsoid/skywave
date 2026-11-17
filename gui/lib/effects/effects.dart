@@ -14,6 +14,7 @@ abstract interface class EffectSink {
     required int id,
     required String title,
     required String body,
+    required NotifyKind kind,
     String? sessionId,
   });
   void dismiss(int id);
@@ -45,6 +46,7 @@ class EffectsListener {
         id: effect.id,
         title: effect.title,
         body: effect.body,
+        kind: effect.kind,
         sessionId: effect.sessionId,
       );
     } else if (effect is PlatformEffectDismiss) {
@@ -80,9 +82,16 @@ class AppEffectSink implements EffectSink {
     required int id,
     required String title,
     required String body,
+    required NotifyKind kind,
     String? sessionId,
   }) => unawaited(
-    notifications.show(id: id, title: title, body: body, sessionId: sessionId),
+    notifications.show(
+      id: id,
+      title: title,
+      body: body,
+      kind: kind,
+      sessionId: sessionId,
+    ),
   );
 
   @override
