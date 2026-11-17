@@ -1,0 +1,39 @@
+name: Proposal
+description: Suggest a feature or a change, before writing the code.
+labels: [proposal]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks! Agreeing on the shape here first saves a rewrite later. See
+        [CONTRIBUTING.md](https://github.com/lumpsoid/skywave/blob/main/CONTRIBUTING.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you're trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: >-
+        What you'd change. Name the decision in docs/decisions.md it touches,
+        if any.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: implement
+    attributes:
+      label: Would you implement it?
+      options:
+        - Yes
+        - With some help
+        - No, just suggesting
+    validations:
+      required: true

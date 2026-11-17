@@ -173,7 +173,7 @@ dependency.
 CameraX + ZXing core stays the fallback if the embedded library's camera
 handling proves inadequate.
 **Superseded by D28, then restored:** the Flutter head scans with the same
-library, launched from `MainActivity` over the `dev.skywave.gui/scan`
+library, launched from `MainActivity` over the `io.github.lumpsoid.skywave/scan`
 method channel; the scanned text goes to the hub as `PairScanned`.
 
 ## D21. Background: suspend on stop, resume on start
@@ -295,7 +295,7 @@ platform name (mobile). On desktop too it never shares the TUI's data.
 **Why:** two processes driving one replica is outside D17 (one core per
 process): two engines would race on the cursor and the outbox. Separate
 devices is what the server already models (D5). On Android the app id is
-`dev.skywave.gui`.
+`io.github.lumpsoid.skywave`.
 
 ## D26. GUI platforms: Linux and Android verified, Apple and Windows scaffolded, no web
 - **Built and run:** Linux desktop and Android.
@@ -323,7 +323,7 @@ everything, so a rebuilt widget tree starts whole.
 ## D28. Flutter is the only Android head; the Kotlin head is removed
 `android/` (Kotlin, Compose) and `skywave-core-ffi` (its UniFFI bindings)
 are deleted, with the `release-android` profile and the `uniffi`
-dependency. The Flutter head (`gui/`, `dev.skywave.gui`) is the Android
+dependency. The Flutter head (`gui/`, `io.github.lumpsoid.skywave`) is the Android
 app. The acceptance rig in `scripts/android-acceptance/` targets it.
 **Why:** two Android heads meant every head-facing change landed twice, and
 the Kotlin one kept its own presentation outside `skywave-present` (D23).

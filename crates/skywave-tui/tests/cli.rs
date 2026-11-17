@@ -37,3 +37,16 @@ fn the_reset_flag_is_in_the_usage() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--reset-replica"));
 }
+
+#[test]
+fn version_prints_the_build_version() {
+    let out = Command::new(env!("CARGO_BIN_EXE_skywave-tui"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("skywave-tui {}\n", skywave_version::VERSION)
+    );
+}

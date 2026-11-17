@@ -1,5 +1,8 @@
 # Skywave
 
+[![CI](https://github.com/lumpsoid/skywave/actions/workflows/ci.yml/badge.svg)](https://github.com/lumpsoid/skywave/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 **Drive your coding agent from anywhere, even over a terrible connection.**
 
 Skywave is a remote client for coding agents (Claude Code first). The agent
@@ -107,18 +110,52 @@ show up on all of them, in the same order.
 
 ## Quick start
 
-> **Status:** pre-release. The server, sync core and TUI are in place and
-> pass end-to-end tests under a simulated bad link; the full acceptance pass
-> against real Claude Code is still in progress.
+> **Status:** early (0.x). The server, sync core, TUI and Android app are in
+> place and pass end-to-end tests under a simulated bad link. The wire
+> protocol may still change between minor versions: an upgrade migrates
+> stored data, but the server and its devices must run the same version.
 
-Requires Rust 1.100+ and, on the server, the [`claude`](https://docs.anthropic.com/en/docs/claude-code)
-CLI on `PATH`.
+The server needs the [`claude`](https://docs.anthropic.com/en/docs/claude-code)
+CLI on `PATH`, logged in as the user that runs `skywaved`. Release binaries
+are for Linux.
+
+### Install from a release
+
+Each [release](https://github.com/lumpsoid/skywave/releases) has:
+
+| File | For |
+|------|-----|
+| `skywave-X.Y.Z-x86_64-linux.tar.gz` | A 64-bit Intel/AMD Linux server or terminal: `skywaved` and `skywave-tui` |
+| `skywave-X.Y.Z-aarch64-linux.tar.gz` | The same for 64-bit ARM (Raspberry Pi 4/5, ARM servers) |
+| `skywave-X.Y.Z.apk` | The Android app |
+| `SHA256SUMS` | Checksums of the above |
+
+The Linux binaries are static and need nothing else installed. Check the
+download, then put the binaries on your `PATH`:
 
 ```sh
-cargo build --release
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf skywave-X.Y.Z-x86_64-linux.tar.gz
+install -m 755 skywave-X.Y.Z-x86_64-linux/skywaved skywave-X.Y.Z-x86_64-linux/skywave-tui ~/.local/bin/
+skywaved --version
 ```
 
-To build for a server reached over ssh and install it there as a service, see
+For the app, open the APK on the phone and allow installing from your
+browser or file manager when Android asks.
+
+### Build from source
+
+Requires Rust (the version in `rust-version` in [`Cargo.toml`](Cargo.toml)).
+
+```sh
+git clone https://github.com/lumpsoid/skywave.git
+cd skywave
+cargo build --release -p skywaved -p skywave-tui
+ls target/release/skywaved target/release/skywave-tui
+```
+
+The app's build steps are in [`gui/README.md`](gui/README.md). To build for a
+server reached over ssh and install it there as a service, see
 [`scripts/deploy/README.md`](scripts/deploy/README.md).
 
 ### 1. Start the server
@@ -405,7 +442,9 @@ restore a backup.
 
 ### Pair a phone
 
-1. **Install the app.** Build the Flutter head for Android as in
+1. **Install the app.** Install the APK from a
+   [release](https://github.com/lumpsoid/skywave/releases), or build the
+   Flutter head for Android as in
    [`gui/README.md`](gui/README.md#android-verified) and install it with the
    phone connected over USB (USB debugging on):
 
@@ -473,6 +512,8 @@ proxy, and adb helpers. `run.sh` without arguments prints how to use it.
 | `skywave-tui` | Terminal head built on ratatui; renders the core's view state and nothing else |
 | `skywave-proto` | Versioned, agent-agnostic wire types |
 | `skywave-present` | Head-side presentation the TUI and the GUI share: timeline sections, wording, draft, read-mark and alert policies |
+| `skywave-safety` | The safety check: proves a shell command read-only and inside a workdir, so the server can approve it unasked |
+| `skywave-version` | The version and commit every binary and the app show |
 | `gui/` | Flutter GUI head (desktop and Android) over rinf; its Rust bridge `hub` is in `gui/native/hub` |
 | `skywave-testkit` | Link harness: a proxy that injects latency, jitter, bandwidth caps and drops |
 | `skywave-claude-compat` | Run after a Claude Code CLI upgrade: checks the new CLI against what the adapter relies on |
@@ -503,7 +544,21 @@ built and run; macOS, iOS and Windows are scaffolded but not yet built; web
 is not supported. Build steps per platform, including `rinf gen` after a
 fresh checkout, are in [`gui/README.md`](gui/README.md).
 
+## Contributing
+
+Bug reports and proposals are welcome. For anything beyond a small fix,
+please open an issue to discuss it before the pull request. Setup, the gates
+and the commit style are in [`CONTRIBUTING.md`](CONTRIBUTING.md); what
+changed per release is in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## License
 
-Licensed under either of [MIT](https://opensource.org/licenses/MIT) or
-[Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0), at your option.
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
+at your option. Unless you state otherwise, any contribution you submit is
+licensed the same way, without additional terms or conditions.
+
+The app bundles [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono)
+under the SIL Open Font License 1.1
+([`gui/fonts/jetbrains_mono/OFL.txt`](gui/fonts/jetbrains_mono/OFL.txt)),
+and a patched copy of [rinf](https://github.com/cunarist/rinf) under the MIT
+license ([`gui/third_party/rinf/LICENSE`](gui/third_party/rinf/LICENSE)).
