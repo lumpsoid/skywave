@@ -16,26 +16,32 @@ env:
   RINF_CLI_VERSION: 8.11.0
 
 jobs:
-  version:
+  verify:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: The tag matches the version
+        with:
+          # origin/main and the earlier tags, for scripts/release.sh verify.
+          fetch-depth: 0
+      # actions/checkout drops the tag's annotation; fetch the tag itself.
+      - name: Fetch the tag
+        run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - name: Release checks
         id: v
         run: |
-          scripts/version.sh check
-          full=$(scripts/version.sh show)
-          version=${full%%+*}
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match version $version"
-            exit 1
-          fi
+          version=$(scripts/release.sh verify "$GITHUB_REF_NAME")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  # Every CI gate, on the tagged commit. The builds run beside it; publish
+  # waits for both.
+  gates:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
   linux:
-    needs: version
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -61,7 +67,7 @@ jobs:
         run: cargo zigbuild --release --locked -p skywaved -p skywave-tui --target "${{ matrix.target }}"
       - name: Package
         run: |
-          name="skywave-${{ needs.version.outputs.version }}-${{ matrix.arch }}-linux"
+          name="skywave-${{ needs.verify.outputs.version }}-${{ matrix.arch }}-linux"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/skywaved" \
              "target/${{ matrix.target }}/release/skywave-tui" \
@@ -76,7 +82,7 @@ jobs:
           if-no-files-found: error
 
   android:
-    needs: version
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -150,7 +156,7 @@ jobs:
             exit 1
           fi
           mkdir -p dist
-          cp "$apk" "dist/skywave-${{ needs.version.outputs.version }}.apk"
+          cp "$apk" "dist/skywave-${{ needs.verify.outputs.version }}.apk"
       - name: Remove the signing key
         if: always()
         run: rm -f "$RUNNER_TEMP/upload.jks" gui/android/key.properties
@@ -161,7 +167,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [version, linux, android]
+    needs: [verify, gates, linux, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -184,7 +190,7 @@ jobs:
           cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          name: skywave ${{ needs.version.outputs.version }}
+          name: skywave ${{ needs.verify.outputs.version }}
           body_path: ${{ runner.temp }}/notes.md
           files: dist/*
           fail_on_unmatched_files: true

@@ -50,23 +50,28 @@ otherwise.
 2. Read the new `## [X.Y.Z]` section of `CHANGELOG.md` as a user would and
    fix it up.
 3. `git commit -m "chore(release): X.Y.Z" Cargo.toml Cargo.lock gui/pubspec.yaml CHANGELOG.md`
-4. `scripts/release.sh`: checks the branch, the tree, the versions and the
-   changelog, runs every gate, and tags `vX.Y.Z` with the changelog section
-   as the message. It never pushes.
+4. `scripts/release.sh`: checks the branch, the tree, the versions, the
+   changelog and that the `versionCode` is above every earlier tag's, runs
+   every gate, and tags `vX.Y.Z` with the changelog section as the message.
+   It never pushes.
 5. `git push origin main vX.Y.Z`
 
-The tag starts `.github/workflows/release.yml`. It checks the tag against
-the version, builds:
+The tag starts `.github/workflows/release.yml`. Its `verify` job runs
+`scripts/release.sh verify vX.Y.Z`: the same release checks, plus that the
+tag is annotated, names the version and is on `main`. Then it runs every CI
+gate on the tagged commit (`ci.yml`, called as a reusable workflow) and,
+beside them, builds:
 
 - `skywave-X.Y.Z-x86_64-linux.tar.gz` and `skywave-X.Y.Z-aarch64-linux.tar.gz`:
   static (musl) `skywaved` and `skywave-tui`, the licenses, the README, the
   changelog and the systemd unit;
 - `skywave-X.Y.Z.apk`, signed with the release key;
 
-and publishes them on a GitHub release with `SHA256SUMS`, using the tag's
-annotation as the notes. If the release fails, fix it on `main`, delete
-the tag locally and on GitHub (`git push origin :vX.Y.Z`), and tag again.
-Never re-use a published `versionCode`.
+Only when the gates and the builds all pass does it publish them on a
+GitHub release with `SHA256SUMS`, using the tag's annotation as the notes.
+If the release fails, fix it on `main`, delete the tag locally and on
+GitHub (`git push origin :vX.Y.Z`), and tag again. Never re-use a
+published `versionCode`.
 
 ## Signing key
 
