@@ -862,6 +862,11 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
                 label: rule_text(rule),
             })
             .collect(),
+        rule_candidates: prompt
+            .shell
+            .as_deref()
+            .map(skywave_safety::simple_commands)
+            .unwrap_or_default(),
         always_picks: can_answer && prompt.suggestions.len() > 1,
         always_label,
         answer_label,
@@ -1817,6 +1822,7 @@ mod tests {
             summary: "a.txt".into(),
             input: Some(input),
             suggestions: Vec::new(),
+            shell: None,
             answer: None,
         };
         let panel = approval_panel(&prompt(FullView::Lost), &session);
@@ -1887,6 +1893,7 @@ mod tests {
                 summary: "src/lib.rs".into(),
                 input: asked,
                 suggestions: Vec::new(),
+                shell: None,
                 answer: None,
             };
             // The gated call is found through the session's pending prompt.
@@ -1954,6 +1961,7 @@ mod tests {
                 summary: "$ make".into(),
                 input: asked,
                 suggestions: Vec::new(),
+                shell: None,
                 answer: None,
             };
             session.pending_approval = Some(prompt.clone());

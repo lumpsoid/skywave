@@ -3292,7 +3292,7 @@ impl Model {
                     summary,
                     input,
                     suggestions,
-                    ..
+                    shell,
                 } if *id == approval => Some(ApprovalPrompt {
                     id: *id,
                     call: *call,
@@ -3304,6 +3304,7 @@ impl Model {
                     summary: summary.clone(),
                     input: input.as_ref().map(|f| self.full_view(f)),
                     suggestions: suggestions.clone(),
+                    shell: shell.clone(),
                     answer: self.local_answer(*id, suggestions, true),
                 }),
                 _ => None,
@@ -6102,6 +6103,7 @@ mod tests {
                 summary: "rm -rf build".into(),
                 input: Some(blob.clone()),
                 suggestions: Vec::new(),
+                shell: None,
                 answer: None,
             })
         );

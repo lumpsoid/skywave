@@ -975,6 +975,9 @@ pub struct ApprovalPanel {
     pub can_answer: bool,
     /// The lasting rules offered with an approval, by index.
     pub suggestions: Vec<RuleOption>,
+    /// The simple commands of a shell approval, each a rule the person can
+    /// trust (D61); empty when it is not a shell call.
+    pub rule_candidates: Vec<Vec<String>>,
     /// `always allow · <rule> (<scope>)`, `always allow · choose one of 3
     /// rules`; `None` when none is offered or it was answered.
     pub always_label: Option<String>,

@@ -5000,6 +5000,57 @@ fn a_background_subagent_opens_from_its_task_and_says_where_its_approval_is() {
 }
 
 #[test]
+fn a_subagents_shell_approval_offers_its_commands_to_trust() {
+    use skywave_proto::{ApprovalId, CallId, ToolKind};
+    let mut rig = Rig::new();
+    let (agent, step) = (CallId::new(), CallId::new());
+    rig.log(vec![
+        a_call(None, agent, "Agent", ToolKind::Subagent, "Explore sync"),
+        a_call(Some(agent), step, "Bash", ToolKind::Shell, "git status"),
+        EventKind::ApprovalRequested {
+            id: ApprovalId::new(),
+            call: Some(step),
+            tool: "Bash".into(),
+            summary: "git status".into(),
+            input: None,
+            suggestions: Vec::new(),
+            shell: Some("git status".into()),
+        },
+    ]);
+    // The foreground subagent's row is not in the main timeline, yet its
+    // approval carries the command to trust.
+    let approval = rig
+        .open_session()
+        .approval
+        .expect("the subagent's approval");
+    assert_eq!(
+        approval.rule_candidates,
+        vec![vec!["git".to_owned(), "status".to_owned()]]
+    );
+    assert!(
+        approval
+            .from
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("from subagent")
+    );
+
+    // Control: an approval that names no shell command offers nothing.
+    let mut rig = Rig::new();
+    rig.log(vec![EventKind::ApprovalRequested {
+        id: ApprovalId::new(),
+        call: None,
+        tool: "Write".into(),
+        summary: "src/lib.rs".into(),
+        input: None,
+        suggestions: Vec::new(),
+        shell: None,
+    }]);
+    let approval = rig.open_session().approval.expect("the approval");
+    assert_eq!(approval.rule_candidates, Vec::<Vec<String>>::new());
+}
+
+#[test]
 fn nothing_is_marked_read_from_a_subagents_view() {
     use skywave_proto::{CallId, ToolKind};
     let mut rig = Rig::new();
