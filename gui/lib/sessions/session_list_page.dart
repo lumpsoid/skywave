@@ -166,6 +166,7 @@ class _KindToggle extends StatelessWidget {
     final (active, archived) = switch (screen.kind) {
       ListKindView.active => (count, screen.otherCount),
       ListKindView.archived => (screen.otherCount, count),
+      ListKindView.all => (count, screen.otherCount),
     };
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
@@ -191,6 +192,7 @@ class _KindToggle extends StatelessWidget {
               route: switch (selected.first) {
                 ListKindView.active => RouteView.sessionList,
                 ListKindView.archived => RouteView.archivedSessions,
+                ListKindView.all => RouteView.allSessions,
               },
             ),
           ),

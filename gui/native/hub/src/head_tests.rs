@@ -2035,6 +2035,53 @@ fn the_list_title_leaves_the_counts_to_the_toggle() {
 }
 
 #[test]
+fn the_all_list_marks_its_archived_rows() {
+    let mut rig = Rig::new();
+    let list = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::SessionList { kind, rows, .. } => (
+            *kind,
+            rows.iter().map(|r| r.archived).collect::<Vec<bool>>(),
+        ),
+        other => panic!("not the list: {other:?}"),
+    };
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 3, 0).unwrap();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(
+                rig.session,
+                at,
+                EventKind::SessionArchived {
+                    archived: true,
+                    by: rig.me,
+                },
+            )],
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::AllSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(list(&rig), (ListKindView::All, vec![true]));
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(list(&rig), (ListKindView::Active, vec![]));
+}
+
+#[test]
 fn the_usage_screen_totals_what_usage_show_picks() {
     use crate::signals::{UsageGroupingView, UsageRowView, UsageSpanView};
 

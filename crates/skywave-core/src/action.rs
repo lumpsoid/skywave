@@ -530,6 +530,9 @@ pub enum Route {
     /// The archived sessions, shown as a
     /// [`ListKind::Archived`](crate::ListKind::Archived) session list.
     ArchivedSessions,
+    /// Every session, shown as a [`ListKind::All`](crate::ListKind::All)
+    /// session list.
+    AllSessions,
     Settings,
     /// The paired server's addresses, to switch between, add and forget;
     /// back returns to the settings.

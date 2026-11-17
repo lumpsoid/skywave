@@ -249,6 +249,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::Navigate { route } => Action::Navigate(match route {
             RouteView::SessionList => Route::SessionList,
             RouteView::ArchivedSessions => Route::ArchivedSessions,
+            RouteView::AllSessions => Route::AllSessions,
             RouteView::Settings => Route::Settings,
             RouteView::ServerAddresses => Route::ServerAddresses,
             RouteView::Pairing => Route::Pairing,

@@ -2152,6 +2152,7 @@ impl App {
                 KeyCode::Char('A') => Some(Action::Navigate(match list.kind {
                     ListKind::Active => Route::ArchivedSessions,
                     ListKind::Archived => Route::SessionList,
+                    ListKind::All => Route::SessionList,
                 })),
                 KeyCode::Esc if self.view.can_go_back => Some(Action::Back),
                 // Deleting from this device asks first; the core says when
