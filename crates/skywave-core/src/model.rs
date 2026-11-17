@@ -2059,15 +2059,21 @@ impl Model {
         pending && !answered
     }
 
-    /// Whether approval `id`, requested in the open session, offers a rule
-    /// at index `rule`.
+    /// Whether approval `id` offers a rule at index `rule`: requested in the
+    /// open session, or cached for the Approvals screen, which has no session
+    /// open.
     fn offers(&self, id: ApprovalId, rule: u8) -> bool {
-        self.shown_events().is_some_and(|(_, open)| {
+        let in_open_session = self.shown_events().is_some_and(|(_, open)| {
             open.events.iter().any(|(_, event)| {
                 matches!(&event.kind, EventKind::ApprovalRequested { id: requested, suggestions, .. }
                     if *requested == id && usize::from(rule) < suggestions.len())
             })
-        })
+        });
+        let cached = matches!(
+            self.waiting_facts.get(&id),
+            Some(Waiting::Approval(facts)) if usize::from(rule) < facts.suggestions.len()
+        );
+        in_open_session || cached
     }
 
     /// The questions of question `id`, asked in the open session; `None`
@@ -2127,14 +2133,19 @@ impl Model {
     }
 
     /// The sessions whose events the Approvals screen must read: those with
-    /// a waiting approval not cached yet, each once, in the order of
-    /// [`Model::waiting_approvals`]. None unless that screen is on show.
+    /// a pending approval not cached yet, each once, in the order of the
+    /// pending approvals' ids, oldest first. Pending rather than waiting, so
+    /// an approval this device answered, then refused for a retry, has its
+    /// facts when it waits again. None unless that screen is on show.
     pub(crate) fn approvals_to_load(&self) -> Vec<SessionId> {
         if self.place != Place::Approvals {
             return Vec::new();
         }
+        let mut pending: Vec<(SessionId, ApprovalId)> =
+            self.pending_approvals().map(|(s, id)| (s.id, id)).collect();
+        pending.sort_by_key(|(_, id)| *id);
         let mut sessions = Vec::new();
-        for (session, id) in self.waiting_approvals() {
+        for (session, id) in pending {
             if !self.waiting_facts.contains_key(&id) && !sessions.contains(&session) {
                 sessions.push(session);
             }
@@ -6294,6 +6305,96 @@ mod tests {
             rule: None,
         });
         assert!(approvals_view(&f).items.is_empty());
+    }
+
+    #[test]
+    fn always_allow_on_the_approvals_screen_queues_its_rule() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let approval = ApprovalId::new();
+        let rule = RuleSuggestion {
+            label: "bash(ls)".into(),
+            scope: RuleScope::Project,
+        };
+        f.log(
+            sid,
+            vec![EventKind::ApprovalRequested {
+                id: approval,
+                call: None,
+                tool: "bash".into(),
+                summary: "ls".into(),
+                input: None,
+                suggestions: vec![rule],
+                shell: None,
+            }],
+        );
+        assert_eq!(
+            f.dispatch(Action::Navigate(Route::Approvals)),
+            [Effect::LoadApprovals(sid)]
+        );
+        f.load_approvals(sid);
+
+        // No session is open here, so the rule is read from the cached facts.
+        // One out of range is still not sent.
+        assert!(
+            f.dispatch(Action::ResolveApproval {
+                id: approval,
+                decision: Decision::Approve,
+                rule: Some(1),
+            })
+            .is_empty()
+        );
+        let command = queued(&f.dispatch(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: Some(0),
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::ResolveApproval {
+                id: approval,
+                decision: Decision::Approve,
+                rule: Some(0),
+            }
+        );
+        assert!(approvals_view(&f).items.is_empty());
+    }
+
+    #[test]
+    fn an_answered_approval_s_facts_load_when_it_waits_again() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let approval = ApprovalId::new();
+        f.log(sid, vec![approval_requested(approval, None)]);
+        // Answered from this device before the screen is shown: the session
+        // has no waiting approval, so only its pending ones can bring it in.
+        let command = queued(&f.dispatch(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: None,
+        }));
+        assert_eq!(
+            f.dispatch(Action::Navigate(Route::Approvals)),
+            [Effect::LoadApprovals(sid)]
+        );
+        f.load_approvals(sid);
+        assert!(f.model.waiting_facts.contains_key(&approval));
+        assert!(approvals_view(&f).items.is_empty());
+
+        // A refused answer that may be retried makes it waiting again, with
+        // no batch in between: its facts are already cached.
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownRule,
+            },
+            Utc::now(),
+        );
+        assert!(matches!(
+            approvals_view(&f).items.as_slice(),
+            [WaitingApproval { id, asks: Asks::Approval(prompt), .. }]
+                if *id == approval && prompt.id == approval
+        ));
     }
 
     #[test]

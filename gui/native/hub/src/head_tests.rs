@@ -2313,6 +2313,57 @@ fn the_approvals_screen_lists_every_session_s_waiting_approvals_oldest_first() {
 }
 
 #[test]
+fn always_allow_from_the_approvals_screen_answers_its_rule() {
+    use crate::signals::DecisionView;
+    use skywave_proto::{ApprovalId, RuleScope, RuleSuggestion};
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    let approval = ApprovalId::new();
+    rig.log(vec![EventKind::ApprovalRequested {
+        id: approval,
+        call: None,
+        tool: "Bash".into(),
+        summary: "ls".into(),
+        input: None,
+        suggestions: vec![RuleSuggestion {
+            label: "bash(ls)".into(),
+            scope: RuleScope::Project,
+        }],
+        shell: Some("ls".into()),
+    }]);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::Approvals,
+        },
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::Approvals { items } = sent_screen(&rig) else {
+        panic!("not the approvals screen");
+    };
+    let [item] = items.as_slice() else {
+        panic!("one approval: {items:?}");
+    };
+    let panel = item.panel.as_ref().expect("a panel for the approval");
+    assert_eq!(panel.suggestions.len(), 1);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::ResolveApproval {
+            approval_id: approval.0.to_string(),
+            decision: DecisionView::Approve,
+            rule: Some(0),
+        },
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::Approvals { items } = sent_screen(&rig) else {
+        panic!("not the approvals screen after the answer");
+    };
+    assert!(items.is_empty(), "always allow left it: {items:?}");
+}
+
+#[test]
 fn the_storage_screen_shows_this_devices_usage_and_what_may_be_reclaimed() {
     use crate::signals::StorageKindView;
 

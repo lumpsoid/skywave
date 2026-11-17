@@ -883,6 +883,11 @@ impl State {
         if let Some((id, Ok(events))) = open.map(|id| (id, self.store.session_events(id))) {
             self.model.session_loaded(id, events);
         }
+        for id in self.model.approvals_to_load() {
+            if let Ok(events) = self.store.session_events(id) {
+                self.model.approvals_loaded(id, events);
+            }
+        }
     }
 }
 
