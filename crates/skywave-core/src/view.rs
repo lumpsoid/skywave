@@ -2121,6 +2121,8 @@ pub struct ApprovalPrompt {
     /// names one by its index
     /// ([`Action::ResolveApproval::rule`](crate::Action::ResolveApproval)).
     pub suggestions: Vec<RuleSuggestion>,
+    /// The shell command the gated call would run, when the agent named one (D59).
+    pub shell: Option<String>,
     /// This device's answer, if it gave one; queued like any command.
     pub answer: Option<Answer>,
 }

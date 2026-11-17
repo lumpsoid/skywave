@@ -1101,6 +1101,7 @@ void main() {
       title: r'$ rm -rf build',
       canAnswer: true,
       suggestions: suggestions,
+      ruleCandidates: const [],
       alwaysPicks: suggestions.length > 1,
       alwaysLabel: suggestions.isEmpty ? null : 'always allow · …',
     );
@@ -1178,6 +1179,7 @@ void main() {
               RuleOption(index: 0, label: 'Bash(rm:*) (project)'),
               RuleOption(index: 1, label: 'Bash(*) (session)'),
             ],
+            ruleCandidates: const [],
             alwaysPicks: true,
           ),
         ),
@@ -1198,6 +1200,7 @@ void main() {
       preview: lines([for (var i = 1; i <= count; i++) 'line $i']),
       canAnswer: true,
       suggestions: const [],
+      ruleCandidates: const [],
       alwaysPicks: false,
     );
 
@@ -1344,6 +1347,7 @@ void main() {
             title: 'ls',
             canAnswer: false,
             suggestions: [],
+            ruleCandidates: [],
             alwaysPicks: false,
             answerLabel: 'you approved · queued 14:02:11',
           ),
@@ -1367,6 +1371,7 @@ void main() {
         lost: said,
         canAnswer: true,
         suggestions: const [],
+        ruleCandidates: const [],
         alwaysPicks: false,
       );
       await pumpSession(
@@ -1401,6 +1406,7 @@ void main() {
         askedLabel: said,
         canAnswer: true,
         suggestions: const [],
+        ruleCandidates: const [],
         alwaysPicks: false,
       );
       await pumpSession(
@@ -3503,6 +3509,7 @@ void main() {
             title: 'src/sync.rs',
             canAnswer: true,
             suggestions: [],
+            ruleCandidates: [],
             alwaysPicks: false,
           ),
         ),
@@ -3527,6 +3534,7 @@ void main() {
             title: 'ls',
             canAnswer: true,
             suggestions: [],
+            ruleCandidates: [],
             alwaysPicks: false,
           ),
         ),
