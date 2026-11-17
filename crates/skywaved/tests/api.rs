@@ -407,6 +407,7 @@ async fn without_a_client_cert_only_pairing_answers() {
     for (method, uri) in [
         (Method::GET, path::HELLO),
         (Method::POST, path::COMMANDS),
+        (Method::POST, path::STORAGE_RECLAIM),
         (Method::GET, "/v1/events?after=0"),
         (Method::GET, path::CONVERSATIONS),
         (Method::GET, blob.as_str()),
@@ -3580,6 +3581,318 @@ async fn deleting_a_shell_output_blob_frees_it_and_logs_it() {
         StatusCode::OK,
         "a refused delete leaves the blob"
     );
+}
+
+/// `DeleteSession` of an idle session is accepted, and the event at its seq
+/// is the `SessionDeleted` tombstone: logged by the command, naming the
+/// device, in the session's context.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_an_idle_session_logs_a_tombstone() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+
+    let delete = delete_command(session);
+    let seq = accepted_seq(&device.command(&delete).await);
+    let batch = device.events(Seq::ZERO, 0).await;
+    let (_, event) = batch
+        .iter()
+        .find(|(s, _)| *s == seq)
+        .expect("the tombstone is in the log");
+    assert_eq!(event.session_id, session);
+    assert_eq!(event.context, context);
+    assert_eq!(event.command_id, Some(delete.id));
+    assert!(matches!(
+        event.kind,
+        EventKind::SessionDeleted { by } if by == creds.id
+    ));
+}
+
+/// `DeleteSession` of a session the server does not know is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_an_unknown_session_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+
+    assert_eq!(
+        device.command(&delete_command(SessionId::new())).await,
+        rejected(RejectReason::UnknownSession)
+    );
+}
+
+/// `DeleteSession` while the session's turn runs is refused `TurnRunning`.
+/// Positive control: once the turn is idle, the same session is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_with_a_running_turn_is_refused() {
+    let mut f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    let working = EventKind::SessionStateChanged(SessionState::AgentWorking);
+    f.log
+        .append(&mut f.storage.db, session, context, working)
+        .unwrap();
+
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    let idle = EventKind::SessionStateChanged(SessionState::Idle);
+    f.log
+        .append(&mut f.storage.db, session, context, idle)
+        .unwrap();
+    accepted_seq(&device.command(&delete_command(session)).await);
+}
+
+/// `DeleteSession` only marks the session requested: its tombstone is at the
+/// seq returned, and its events and output blob are kept, for the supervisor
+/// to erase once its agent is stopped (D62). Positive control: the blob's
+/// file is there before the delete, so its survival is not a setup accident.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_marks_it_and_keeps_its_data_for_the_supervisor() {
+    let mut f = Fixture::start_with_shell(true).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let other = new_session(&f, &mut device).await;
+    let (_, blob, _, _) =
+        finished_run(&mut f, &mut device, creds.id, session, &numbers(1..=3000)).await;
+    assert!(
+        blob_file(&f, blob.id).exists(),
+        "the run's output is stored"
+    );
+
+    let tombstone = accepted_seq(&device.command(&delete_command(session)).await);
+
+    assert!(
+        blob_file(&f, blob.id).exists(),
+        "the command frees nothing: the blob's file is kept"
+    );
+    let batch = device.events(Seq::ZERO, 0).await;
+    let before: Vec<_> = batch
+        .iter()
+        .filter(|(seq, e)| e.session_id == session && seq.0 < tombstone.0)
+        .collect();
+    assert!(
+        !before.is_empty(),
+        "the session had events before its delete"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|(_, e)| !matches!(e.kind, EventKind::Erased)),
+        "no event of the session is erased by the command"
+    );
+    let (_, last) = batch
+        .iter()
+        .find(|(seq, _)| *seq == tombstone)
+        .expect("the tombstone is in the log");
+    assert_eq!(last.session_id, session);
+    assert!(matches!(last.kind, EventKind::SessionDeleted { .. }));
+    assert!(
+        batch
+            .iter()
+            .any(|(_, e)| e.session_id == other && !matches!(e.kind, EventKind::Erased)),
+        "another session's events are not erased"
+    );
+}
+
+/// `DeleteSession` while a message is in the log that the supervisor has not
+/// handed to its agent is refused `TurnRunning`. This fixture runs no
+/// supervisor, so the message stays unhanded. Positive control: once the
+/// supervisor's cursor has caught up, the same delete is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_with_an_unhanded_message_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let context = ContextId::first_of(session);
+    accepted_seq(
+        &device
+            .command(&message_command(session, context, "hi", Vec::new()))
+            .await,
+    );
+
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::TurnRunning)
+    );
+    supervisor_caught_up(&f);
+    accepted_seq(&device.command(&delete_command(session)).await);
+}
+
+/// `DeleteSession` of a session whose worktree is still on disk is refused
+/// `WorktreeNotRemoved`. Positive control: once `RemoveWorktree` has removed
+/// it, the same delete is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_session_whose_worktree_exists_is_refused() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let project = f.root.join("project");
+    make_repo(&project);
+    let created = device.command(&worktree_command(&f, "feat/x")).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    assert!(f.root.join("project.worktrees/feat-x").is_dir());
+
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::WorktreeNotRemoved)
+    );
+    accepted_seq(&device.command(&remove_command(session)).await);
+    accepted_seq(&device.command(&delete_command(session)).await);
+}
+
+/// Once deleted, a session is unknown: a later command on it and a second
+/// delete are refused `UnknownSession`. Positive control: before the delete,
+/// the same archive is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_session_is_unknown() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let archive = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetSessionArchived {
+            session_id: session,
+            archived: true,
+        },
+    };
+    accepted_seq(&device.command(&archive).await);
+
+    accepted_seq(&device.command(&delete_command(session)).await);
+
+    let again = Command {
+        id: CommandId::new(),
+        ..archive
+    };
+    assert_eq!(
+        device.command(&again).await,
+        rejected(RejectReason::UnknownSession)
+    );
+    assert_eq!(
+        device.command(&delete_command(session)).await,
+        rejected(RejectReason::UnknownSession)
+    );
+}
+
+/// The storage report lists a session until it is deleted, and not after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_session_leaves_the_storage_report() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let lists = |report: &StorageReport| report.sessions.iter().any(|s| s.session == session);
+
+    let before: StorageReport = device.get(path::STORAGE).await.json();
+    assert!(
+        lists(&before),
+        "the session is in the report before the delete"
+    );
+
+    accepted_seq(&device.command(&delete_command(session)).await);
+
+    let after: StorageReport = device.get(path::STORAGE).await.json();
+    assert!(!lists(&after), "the deleted session is not in the report");
+}
+
+/// Leaves free pages in the server's database: a table of about 2 MB,
+/// dropped. SQLite keeps the pages on its freelist, so the file does not
+/// shrink until it is compacted.
+fn leave_free_pages(f: &Fixture) {
+    let conn = rusqlite::Connection::open(f.storage.dir.db_path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE filler (body BLOB);
+         INSERT INTO filler WITH RECURSIVE n(i) AS
+           (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+           SELECT randomblob(1000) FROM n;
+         DROP TABLE filler;",
+    )
+    .unwrap();
+}
+
+/// `POST` [`path::STORAGE_RECLAIM`] compacts the database: the free pages
+/// the report counted are given back, and the answer is the new report.
+#[tokio::test(flavor = "multi_thread")]
+async fn reclaiming_space_shrinks_the_database() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    leave_free_pages(&f);
+
+    let before: StorageReport = device.get(path::STORAGE).await.json();
+    assert!(
+        before.reclaimable > 0,
+        "the dropped table left free pages: {before:?}"
+    );
+
+    let reply = device
+        .send(Method::POST, path::STORAGE_RECLAIM, &[], Bytes::new())
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let after: StorageReport = reply.json();
+    assert_eq!(after.reclaimable, 0, "no free pages are left");
+    assert!(
+        after.database < before.database,
+        "the database shrank: {} -> {}",
+        before.database,
+        after.database
+    );
+    let read_again: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(read_again.reclaimable, 0);
+}
+
+/// A reclaim on a disk with less free space than the database plus the
+/// floor is refused with 507 and runs nothing; with room again it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reclaim_on_a_disk_too_full_is_refused() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let f = Fixture::start_cropping(disk, None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    leave_free_pages(&f);
+    let before: StorageReport = device.get(path::STORAGE).await.json();
+
+    let refused = device
+        .send(Method::POST, path::STORAGE_RECLAIM, &[], Bytes::new())
+        .await;
+    assert_eq!(refused.status, StatusCode::INSUFFICIENT_STORAGE);
+    let still: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(
+        still.reclaimable, before.reclaimable,
+        "a refused reclaim ran nothing"
+    );
+
+    free.0
+        .store(u64::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+    let reply = device
+        .send(Method::POST, path::STORAGE_RECLAIM, &[], Bytes::new())
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "with room, the same reclaim runs"
+    );
+    let after: StorageReport = reply.json();
+    assert_eq!(after.reclaimable, 0);
+}
+
+fn delete_command(session: SessionId) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::DeleteSession {
+            session_id: session,
+        },
+    }
 }
 
 /// `seq first last`'s output.

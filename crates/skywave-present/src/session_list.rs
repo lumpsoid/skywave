@@ -71,6 +71,7 @@ mod tests {
             unread: 0,
             cost_usd: None,
             deletable: false,
+            deletable_everywhere: false,
             importing: false,
             worktree: worktree.map(|(repo, branch)| Worktree {
                 repo: repo.into(),

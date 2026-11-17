@@ -716,6 +716,55 @@ async fn archiving_converges_and_a_message_brings_a_session_back() {
     assert_same_view(&a, &b).await;
 }
 
+/// One device deletes an archived session everywhere: the server erases it,
+/// and both devices drop it at its tombstone, with its command settled. The
+/// session beside it stays on both.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_everywhere_drops_the_session_on_every_device() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let (proxy_a, proxy_b) = (proxy(&daemon).await, proxy(&daemon).await);
+    let (a, b) = (Client::open(config()), Client::open(config()));
+    daemon.pair(&a, &proxy_a.address()).await;
+    daemon.pair(&b, &proxy_b.address()).await;
+    let doomed = a.create_session(&daemon).await;
+    let kept = a.create_session(&daemon).await;
+    daemon.settle(&[&a, &b], SOON).await;
+    let ids = |rows: Vec<SessionRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+
+    a.dispatch(Action::SetSessionArchived {
+        session_id: doomed,
+        archived: true,
+    });
+    daemon.settle(&[&a, &b], SOON).await;
+    for client in [&a, &b] {
+        assert_eq!(ids(client.archived_list().await), vec![doomed]);
+    }
+
+    a.dispatch(Action::DeleteSessionEverywhere { session_id: doomed });
+    daemon
+        .wait_log("the tombstone", |events| {
+            events.iter().any(|e| {
+                matches!(e.kind, EventKind::SessionDeleted { .. }) && e.session_id == doomed
+            })
+        })
+        .await;
+    daemon.settle(&[&a, &b], SOON).await;
+
+    for client in [&a, &b] {
+        assert!(client.archived_list().await.is_empty());
+        assert_eq!(ids(client.session_list().await), vec![kept]);
+        assert_eq!(client.sessions(), vec![kept]);
+    }
+    assert!(
+        !a.outbox().iter().any(|e| {
+            matches!(&e.command.kind, CommandKind::DeleteSession { session_id } if *session_id == doomed)
+        }),
+        "the deleting device keeps no command for it"
+    );
+    assert_same_view(&a, &b).await;
+}
+
 /// An answer given while the server was down, to an approval the server
 /// cancelled meanwhile (its agent was shut down with the daemon): the server
 /// refuses it as `ApprovalCancelled`, and the device shows it did not apply,

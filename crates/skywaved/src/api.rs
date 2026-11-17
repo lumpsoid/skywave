@@ -203,6 +203,10 @@ pub const WORKDIR_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest a storage report may take before the reply gives up with a 503.
 /// Longer than [`storage::REPORT_DEADLINE`], which stops the report itself.
 pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a storage reclaim may take before the reply gives up with a 503.
+/// Long, because `VACUUM` rewrites the whole database file. Only the wait
+/// for the connection has a deadline ([`storage::REPORT_DEADLINE`]).
+pub const RECLAIM_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long the agent gets to report its usage limits before the answer is
 /// `Failed`.
 pub const USAGE_LIMITS_DEADLINE: Duration = Duration::from_secs(15);
@@ -395,6 +399,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::DIRS, get(list_dirs))
         .route(path::CONVERSATIONS, get(list_conversations))
         .route(path::STORAGE, get(storage_report))
+        .route(path::STORAGE_RECLAIM, post(storage_reclaim))
         .route(path::USAGE_LIMITS, get(usage_limits))
         .route(path::AGENT_LOGIN_START, post(agent_login_start))
         .route(path::AGENT_LOGIN_FINISH, post(agent_login_finish))
@@ -1203,6 +1208,46 @@ async fn storage_report(State(api): State<Arc<Api>>) -> Response {
         }
         Err(_) => {
             tracing::warn!("storage report timed out");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+/// The reclaim (module `storage`) on a blocking thread: a 200 with the report
+/// after the `VACUUM`; a 507 when the free space is below the database plus
+/// the floor, nothing run; a passed deadline, [`RECLAIM_TIMEOUT`] or no
+/// file-system permit a 503; any other error a 500.
+async fn storage_reclaim(State(api): State<Arc<Api>>) -> Response {
+    let deadline = Instant::now() + storage::REPORT_DEADLINE;
+    let permit = match api.fs_permit().await {
+        Ok(permit) => permit,
+        Err(status) => return status.into_response(),
+    };
+    let api = api.clone();
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        api.storage.reclaim(api.log.disk(), deadline)
+    });
+    match tokio::time::timeout(RECLAIM_TIMEOUT, work).await {
+        Ok(Ok(Ok(Some(report)))) => Json(report).into_response(),
+        Ok(Ok(Ok(None))) => {
+            tracing::warn!("storage reclaim refused: free space below the database's size");
+            StatusCode::INSUFFICIENT_STORAGE.into_response()
+        }
+        Ok(Ok(Err(Error::StorageDeadline))) => {
+            tracing::warn!("storage reclaim passed its deadline");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Ok(Ok(Err(e))) => {
+            tracing::error!(error = %e, "storage reclaim failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "storage reclaim task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => {
+            tracing::warn!("storage reclaim timed out");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }

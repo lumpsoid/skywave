@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
@@ -32,7 +32,9 @@ use crate::address::{ServerAddress, ServerAddresses};
 use crate::attachment::{self, AttachedFile, AttachedImage};
 use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::shell_history::SHELL_HISTORY_MAX;
-use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
+use crate::view::{
+    ComposerMode, DeviceSessionStorage, DeviceStorage, Draft, RunWhen, Snippet, SnippetId,
+};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
 /// File name of the database inside the core's data directory.
@@ -650,7 +652,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
     v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
-    v39_to_v40,
+    v39_to_v40, v40_to_v41,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -799,6 +801,11 @@ fn v38_to_v39(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// a command, an event and a reject reason, all new, so no stored event or
 /// command result changes.
 fn v39_to_v40(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v40 to v41: adds `DeleteSession` and two event kinds; nothing stored changes.
+fn v40_to_v41(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -1222,6 +1229,10 @@ pub struct Applied {
     /// Outbox commands still unanswered that the batch settled as accepted
     /// at the seq of their event, in log order.
     pub settled: Vec<(CommandId, Seq)>,
+    /// Sessions whose server tombstone (`EventKind::SessionDeleted`) arrived
+    /// in this batch, dropped as a local delete drops them, with the blobs
+    /// whose files the caller removes.
+    pub dropped: Vec<(SessionId, Vec<BlobId>)>,
 }
 
 /// A server crop this device makes itself from the bytes it holds: `from`
@@ -1576,6 +1587,12 @@ impl Store {
     /// are not stored, project no summary and register no blob. Contiguity
     /// is the cursor's alone and events are read per session, so the holes
     /// they leave between stored events are harmless.
+    ///
+    /// A `SessionDeleted` tombstone drops its session as
+    /// [`delete_session_locally`](Store::delete_session_locally) does, in
+    /// this transaction and after the batch's own events of it are written.
+    /// The session's later events in the batch are skipped, as those of a
+    /// deleted one are; its blobs are reported in [`Applied::dropped`].
     pub fn apply_batch(
         &mut self,
         batch: &EventBatch,
@@ -1593,7 +1610,8 @@ impl Store {
             });
         }
 
-        let deleted = read_deleted(&tx)?;
+        let mut deleted = read_deleted(&tx)?;
+        let mut tombstoned: Vec<SessionId> = Vec::new();
         let mut touched: BTreeMap<SessionId, SessionSummary> = BTreeMap::new();
         let mut new_cursor = cursor;
         let mut new_events = 0;
@@ -1636,6 +1654,12 @@ impl Store {
             }
             if deleted.contains(&event.session_id) {
                 continue;
+            }
+            // Later events of the session in this batch are skipped, and its
+            // rows go once the batch's own are written.
+            if matches!(event.kind, EventKind::SessionDeleted { .. }) {
+                deleted.insert(event.session_id);
+                tombstoned.push(event.session_id);
             }
             tx.execute(
                 "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
@@ -1704,6 +1728,13 @@ impl Store {
                 ],
             )?;
         }
+        // After the summaries are written: dropping removes the rows just
+        // written for a tombstoned session.
+        let mut dropped = Vec::new();
+        for id in tombstoned {
+            let blobs = drop_session_in(&tx, id, now)?;
+            dropped.push((id, blobs));
+        }
         if new_cursor != cursor {
             tx.execute(
                 "UPDATE cursor SET seq = ?1 WHERE id = 0",
@@ -1712,9 +1743,12 @@ impl Store {
         }
         tx.commit()?;
         // A later event of the batch may have purged a crop's `into`, and
-        // with it the crop's blob.
-        local_crops.retain(|crop| !purged.contains(&crop.into) && !purged.contains(&crop.from));
-        blobs.retain(|id| !local_crops.iter().any(|crop| crop.into == *id));
+        // with it the crop's blob; a dropped session takes its blobs too.
+        let gone = |id: &BlobId| {
+            purged.contains(id) || dropped.iter().any(|(_, blobs)| blobs.contains(id))
+        };
+        local_crops.retain(|crop| !gone(&crop.into) && !gone(&crop.from));
+        blobs.retain(|id| !gone(id) && !local_crops.iter().any(|crop| crop.into == *id));
         Ok(Applied {
             cursor: new_cursor,
             new_events,
@@ -1723,6 +1757,7 @@ impl Store {
             purged,
             local_crops,
             settled,
+            dropped,
         })
     }
 
@@ -1757,77 +1792,7 @@ impl Store {
         now: DateTime<Utc>,
     ) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
-        let session = id.0.to_string();
-        // The blobs table has no session column: the events say which.
-        let mut blobs = Vec::new();
-        {
-            let mut stmt = tx.prepare("SELECT seq, event FROM events WHERE session_id = ?1")?;
-            let mut rows = stmt.query([&session])?;
-            while let Some(row) = rows.next()? {
-                match json_col::<Event>(row, 1) {
-                    Ok(event) => blobs.extend(blob_refs(&event.kind).map(|blob| blob.id)),
-                    Err(error) => {
-                        let seq: i64 = row.get(0)?;
-                        tracing::warn!(seq, %error, "deleting an event that does not decode");
-                    }
-                }
-            }
-        }
-        for blob in &blobs {
-            tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
-            // The fates of its blobs: its events named every one, a crop's
-            // `into` included.
-            tx.execute(
-                "DELETE FROM blob_fates WHERE blob_id = ?1",
-                [blob.0.to_string()],
-            )?;
-        }
-        // Its workdir answers' blobs go only if no other session's names them.
-        let workdir_blobs = {
-            let mut stmt =
-                tx.prepare("SELECT DISTINCT blob_id FROM workdir_blob_refs WHERE session_id = ?1")?;
-            let rows = stmt.query_map([&session], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        tx.execute(
-            "DELETE FROM workdir_blob_refs WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute(
-            "DELETE FROM workdir_snapshots WHERE session_id = ?1",
-            [&session],
-        )?;
-        blobs.extend(purge_workdir_blobs(&tx, &workdir_blobs)?);
-        blobs.sort();
-        blobs.dedup();
-        tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
-        tx.execute("DELETE FROM turns WHERE session_id = ?1", [&session])?;
-        tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
-        tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
-        tx.execute(
-            "DELETE FROM draft_attachments WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute("DELETE FROM draft_files WHERE session_id = ?1", [&session])?;
-        tx.execute(
-            "DELETE FROM composer_modes WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute("DELETE FROM read_marks WHERE session_id = ?1", [&session])?;
-        tx.execute(
-            "DELETE FROM alerted_approvals WHERE session_id = ?1",
-            [&session],
-        )?;
-        tx.execute(
-            "DELETE FROM outbox WHERE result IS NOT NULL
-                AND json_extract(command, '$.kind.session_id') = ?1",
-            [&session],
-        )?;
-        tx.execute(
-            "INSERT INTO deleted_sessions (session_id, at) VALUES (?1, ?2)
-             ON CONFLICT (session_id) DO NOTHING",
-            params![session, now.to_rfc3339()],
-        )?;
+        let blobs = drop_session_in(&tx, id, now)?;
         tx.commit()?;
         Ok(blobs)
     }
@@ -1861,6 +1826,17 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(blobs)
+    }
+
+    /// Give the database's free pages back to the disk: `VACUUM`, then
+    /// truncate the WAL. Holds the database for its whole run.
+    pub fn reclaim_space(&mut self) -> Result<(), StoreError> {
+        self.conn.execute_batch("VACUUM;")?;
+        // The pragma answers a row (busy, log and checkpointed frames); a
+        // reader still in the WAL only leaves it to the next checkpoint.
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
     }
 
     /// Every stored turn's usage, in log order.
@@ -3110,6 +3086,102 @@ fn connect(data_dir: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+/// What this device keeps under `data_dir`, for the storage screen. Read in
+/// one transaction on its own read-only connection: the scan of every event
+/// can take seconds on a big replica, and WAL lets this reader run beside the
+/// engine's writer, so the engine's state lock is never held for it.
+pub fn read_device_storage(data_dir: &Path) -> Result<DeviceStorage, StoreError> {
+    let mut conn = Connection::open_with_flags(
+        data_dir.join(DB_FILE),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let tx = conn.transaction()?;
+    let database = file_len(&data_dir.join(DB_FILE)) + file_len(&data_dir.join("core.db-wal"));
+    let page_size = tx.query_row("PRAGMA page_size", [], |row| u64_col(row, 0))?;
+    let free_pages = tx.query_row("PRAGMA freelist_count", [], |row| u64_col(row, 0))?;
+    // What each blob holds on disk, by id.
+    let blob_disk: HashMap<BlobId, u64> = {
+        let mut stmt = tx.prepare("SELECT id, size, state, got FROM blobs")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((BlobId(uuid_col(row, 0)?), blob_on_disk(row)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let blobs: u64 = blob_disk.values().sum();
+    // The attachment files `kept_file_copies` keeps: an image row's, a draft
+    // file's, and those of an outbox entry not yet accepted. Equal hashes are
+    // one file, and equal hashes have equal sizes, so UNION counts it once.
+    let attachments = tx.query_row(
+        "SELECT COALESCE(SUM(size), 0) FROM (
+            SELECT sha256, size FROM attachments
+            UNION SELECT sha256, size FROM draft_files
+            UNION SELECT f.sha256, f.size FROM outbox_files f JOIN outbox o ON o.command_id = f.command_id
+            WHERE o.result IS NULL
+               OR json_extract(o.result, '$.result') IN ('rejected', 'undeliverable', 'attachment_refused'))",
+        [],
+        |row| u64_col(row, 0),
+    )?;
+    // Per session: the bytes of its events, and the blobs they name.
+    let mut per_session: HashMap<SessionId, (u64, HashSet<BlobId>)> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT session_id, event FROM events")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let session = SessionId(uuid_col(row, 0)?);
+            let text: String = row.get(1)?;
+            let (bytes, named) = per_session.entry(session).or_default();
+            // The column is TEXT: its bytes are its UTF-8 length.
+            *bytes += text.len() as u64;
+            match serde_json::from_str::<Event>(&text) {
+                Ok(event) => named.extend(blob_refs(&event.kind).map(|blob| blob.id)),
+                Err(error) => tracing::warn!(%error, "sizing an event that does not decode"),
+            }
+        }
+    }
+    let mut sessions: Vec<DeviceSessionStorage> = per_session
+        .into_iter()
+        .map(|(session, (event_bytes, named))| DeviceSessionStorage {
+            session,
+            event_bytes,
+            blob_bytes: named.iter().filter_map(|id| blob_disk.get(id)).sum(),
+        })
+        .collect();
+    let size = |s: &DeviceSessionStorage| s.event_bytes + s.blob_bytes;
+    sessions.sort_by(|a, b| size(b).cmp(&size(a)).then(a.session.cmp(&b.session)));
+    Ok(DeviceStorage {
+        database,
+        reclaimable: page_size * free_pages,
+        blobs,
+        attachments,
+        sessions,
+    })
+}
+
+/// The size of the file at `path`; a file not there is 0. One that cannot be
+/// read is 0 too, with a warning: the device report is best effort.
+fn file_len(path: &Path) -> u64 {
+    match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot size a database file");
+            0
+        }
+    }
+}
+
+/// A `blobs` row's bytes on disk, from the columns `size, state, got`: its
+/// whole size once available, else what its download got.
+fn blob_on_disk(row: &Row<'_>) -> rusqlite::Result<u64> {
+    let available = row.get::<_, String>(2)? == "available";
+    let bytes: Option<i64> = if available { row.get(1)? } else { row.get(3)? };
+    match bytes {
+        Some(bytes) => u64::try_from(bytes).map_err(|e| bad_value(3, Type::Integer, e)),
+        None => Ok(0),
+    }
+}
+
 /// Whether [`migrate`] migrates the stored wire JSON from the replica's
 /// protocol stamp, refusing one it cannot migrate.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3599,6 +3671,89 @@ fn opt_time_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<DateTime<U
             .map_err(|e| bad_value(idx, Type::Text, e))
     })
     .transpose()
+}
+
+/// The cleanup of a dropped session, in the caller's transaction: its rows
+/// go and it is recorded as deleted. Returns the blobs whose files the
+/// caller removes. Shared by a local delete and a synced tombstone.
+fn drop_session_in(
+    tx: &Transaction<'_>,
+    id: SessionId,
+    now: DateTime<Utc>,
+) -> Result<Vec<BlobId>, StoreError> {
+    let session = id.0.to_string();
+    // The blobs table has no session column: the events say which.
+    let mut blobs = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT seq, event FROM events WHERE session_id = ?1")?;
+        let mut rows = stmt.query([&session])?;
+        while let Some(row) = rows.next()? {
+            match json_col::<Event>(row, 1) {
+                Ok(event) => blobs.extend(blob_refs(&event.kind).map(|blob| blob.id)),
+                Err(error) => {
+                    let seq: i64 = row.get(0)?;
+                    tracing::warn!(seq, %error, "deleting an event that does not decode");
+                }
+            }
+        }
+    }
+    for blob in &blobs {
+        tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
+        // The fates of its blobs: its events named every one, a crop's
+        // `into` included.
+        tx.execute(
+            "DELETE FROM blob_fates WHERE blob_id = ?1",
+            [blob.0.to_string()],
+        )?;
+    }
+    // Its workdir answers' blobs go only if no other session's names them.
+    let workdir_blobs = {
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT blob_id FROM workdir_blob_refs WHERE session_id = ?1")?;
+        let rows = stmt.query_map([&session], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        "DELETE FROM workdir_blob_refs WHERE session_id = ?1",
+        [&session],
+    )?;
+    tx.execute(
+        "DELETE FROM workdir_snapshots WHERE session_id = ?1",
+        [&session],
+    )?;
+    blobs.extend(purge_workdir_blobs(tx, &workdir_blobs)?);
+    blobs.sort();
+    blobs.dedup();
+    tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
+    tx.execute("DELETE FROM turns WHERE session_id = ?1", [&session])?;
+    tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
+    tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
+    tx.execute(
+        "DELETE FROM draft_attachments WHERE session_id = ?1",
+        [&session],
+    )?;
+    tx.execute("DELETE FROM draft_files WHERE session_id = ?1", [&session])?;
+    tx.execute(
+        "DELETE FROM composer_modes WHERE session_id = ?1",
+        [&session],
+    )?;
+    tx.execute("DELETE FROM read_marks WHERE session_id = ?1", [&session])?;
+    tx.execute(
+        "DELETE FROM alerted_approvals WHERE session_id = ?1",
+        [&session],
+    )?;
+    // Unanswered ones too: a command sent after the tombstone is refused
+    // as an unknown session, and would otherwise stay queued forever.
+    tx.execute(
+        "DELETE FROM outbox WHERE json_extract(command, '$.kind.session_id') = ?1",
+        [&session],
+    )?;
+    tx.execute(
+        "INSERT INTO deleted_sessions (session_id, at) VALUES (?1, ?2)
+         ON CONFLICT (session_id) DO NOTHING",
+        params![session, now.to_rfc3339()],
+    )?;
+    Ok(blobs)
 }
 
 /// Deletes the rows of the `candidates` no workdir answer names any more and

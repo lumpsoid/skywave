@@ -115,6 +115,13 @@ pub trait Transport: Send + Sync {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 
+    /// `POST /v1/storage/reclaim`, which takes no body: compacts the server's
+    /// database and answers its storage report. Defaults to
+    /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
+    fn storage_reclaim(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
     /// `GET /v1/worktrees`: every worktree of the repositories sessions'
     /// worktrees came from, for the worktrees screen. Defaults to
     /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).

@@ -408,7 +408,9 @@ impl SessionSummary {
             | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
-            | EventKind::FileWritten { .. } => {}
+            | EventKind::FileWritten { .. }
+            | EventKind::SessionDeleted { .. }
+            | EventKind::Erased => {}
         }
     }
 
@@ -510,7 +512,9 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::SafetyRuleSet { .. }
         | EventKind::SafetyCheckApproved { .. }
         | EventKind::SafetyCheckFeedback { .. }
-        | EventKind::FileWritten { .. } => false,
+        | EventKind::FileWritten { .. }
+        | EventKind::SessionDeleted { .. }
+        | EventKind::Erased => false,
     }
 }
 

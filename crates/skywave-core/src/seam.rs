@@ -31,8 +31,8 @@ use crate::store::{
 };
 use crate::transport::TransportError;
 use crate::view::{
-    ApprovalId, BlobId, CommandId, DeviceId, PairedLink, Seq, SessionId, UsageLimitsResult,
-    UsageLimitsUnavailable,
+    ApprovalId, BlobId, CommandId, DeviceId, DeviceStorage, PairedLink, Seq, SessionId,
+    UsageLimitsResult, UsageLimitsUnavailable,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk};
 
@@ -92,6 +92,26 @@ pub enum Request {
     /// within [`STORAGE_TIMEOUT`](crate::STORAGE_TIMEOUT). Answer with
     /// [`Seam::storage_reported`], naming `req`.
     Storage {
+        req: u64,
+    },
+    /// Read this device's storage report (what its replica, blobs and
+    /// attachments take on its disk), for the storage screen, off the state
+    /// lock. Needs no server. Answer with [`Seam::device_storage_read`],
+    /// naming `req`.
+    DeviceStorage {
+        req: u64,
+    },
+    /// Ask the server to compact its database and report its storage, for
+    /// the storage screen, within [`RECLAIM_TIMEOUT`](crate::RECLAIM_TIMEOUT).
+    /// Answer with [`Seam::storage_reclaimed`], naming `req`.
+    ReclaimStorage {
+        req: u64,
+    },
+    /// Give this device's database's free pages back to the disk (`VACUUM`
+    /// under the state lock, so dispatch waits for it), then read this
+    /// device's storage again, off the lock. Needs no server. Answer with
+    /// [`Seam::device_storage_read`], naming `req`.
+    ReclaimDeviceStorage {
         req: u64,
     },
     /// Ask the server for its worktree list, for the worktrees screen,
@@ -365,10 +385,26 @@ impl Seam {
         let result = self.update(|state, requests| {
             let mut applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
-            let alerted = state.model.apply_batch(batch);
+            let mut alerted = state.model.apply_batch(batch);
+            // A session the batch dropped keeps no alert: its rows went with it.
+            alerted.retain(|(id, _)| applied.dropped.iter().all(|(dropped, _)| dropped != id));
             for (id, seq) in &applied.settled {
                 let accepted = CommandResult::Accepted { seq: *seq };
                 requests.extend(state.model.command_result(*id, accepted, now));
+            }
+            // After the settled ones: the store has deleted the outbox rows
+            // of a dropped session, so the model must settle them first.
+            // What a local delete does (`Effect::DeleteLocally`), for a
+            // session the server deleted.
+            for (id, blobs) in &applied.dropped {
+                state.model.session_deleted(*id, blobs);
+                state.blobs_purged(blobs);
+                for blob in blobs {
+                    remove_blob_files(&data_dir, *blob);
+                }
+                if !blobs.is_empty() {
+                    requests.push(Request::BlobsPurged(blobs.clone()));
+                }
             }
             // The batch is stored either way; a failed load leaves the
             // session empty until it is opened again.
@@ -671,6 +707,38 @@ impl Seam {
         blocking(|| {
             self.core.shared.update::<(), Infallible>(|state, _| {
                 state.model.storage_reported(req, result);
+                Ok(())
+            })
+        })
+        .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::DeviceStorage`] `req`. Kept in memory only;
+    /// an answer to an older request than the latest is ignored.
+    pub fn device_storage_read(&self, req: u64, result: Result<DeviceStorage, StoreError>) {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
+                state.model.device_storage_read(req, result);
+                Ok(())
+            })
+        })
+        .unwrap_or_else(|never| match never {});
+    }
+
+    /// Runs [`Store::reclaim_space`](crate::Store::reclaim_space) under the
+    /// state lock; call it from a blocking thread.
+    pub fn reclaim_device_space(&self) -> Result<(), StoreError> {
+        self.core
+            .shared
+            .update::<(), StoreError>(|state, _| state.store.reclaim_space())
+    }
+
+    /// The answer to [`Request::ReclaimStorage`] `req`. Kept in memory only;
+    /// an answer to an older request than the latest is ignored.
+    pub fn storage_reclaimed(&self, req: u64, result: Result<StorageReport, TransportError>) {
+        blocking(|| {
+            self.core.shared.update::<(), Infallible>(|state, _| {
+                state.model.storage_reclaimed(req, result);
                 Ok(())
             })
         })

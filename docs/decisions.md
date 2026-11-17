@@ -39,6 +39,8 @@ Not platform-specific.
 - Blob policy knob: `Eager` (download alongside metadata) or `OnDemand`
   (download on explicit user intent).
 - Retention: forever; user can delete sessions locally (they stay on the server).
+  Superseded by D62 for delete: a deleted session is erased on the server.
+  Archive stays a flag.
 **Deferred:** retention policies, storage limits.
 
 ## D7. Reconnect and resend
@@ -1687,3 +1689,49 @@ relative to the wrong directory. Trusting `cd` is trusting where it goes.
 
 **Deferred:**
 - The TUI's way to add and list rules.
+
+## D62. Deleting a session erases it on the server (v41)
+
+D6 kept every session on the server forever, so deleting one left its
+events, blobs and agent transcript there for good. A device that deletes
+a session means it to be gone everywhere, so the server erases it.
+
+**Decided:** `DeleteSession { session_id }` is accepted for a known session
+with no running turn, no message or setting request the supervisor has not
+handed to its agent, no unfinished shell run, no open approval or question,
+and no worktree still on disk (one its `RemoveWorktree` has not removed).
+The first of those that holds refuses it, as `TurnRunning`, `ShellRunning`,
+`ApprovalPending` or `WorktreeNotRemoved`; an unknown session is
+`UnknownSession`. Archived is not checked here: the client deletes only an
+archived session. An accepted delete, in one transaction, frees nothing:
+- marks the session `requested` (`sessions.deletion`). Every later command
+  on it is `UnknownSession`, and it is in no storage report. The supervisor
+  still lists it, so it can finish the erase, and appends for it still
+  succeed.
+- logs `SessionDeleted { by }`: the tombstone, the one event of the session
+  that is not erased.
+
+The supervisor erases the session once it has read the tombstone and nothing of the session runs, starts or stops: queued work is dropped, a running agent is stopped (its exit is logged, then erased), and a restart finishes a deletion it had not.
+The supervisor deletes the agent's own transcript of each of the session's conversations (`AgentAdapter::forget`; for Claude Code `<projects>/<dir>/<id>.jsonl` and `<id>/`, which Claude otherwise keeps forever), except a context moved to another session, which that session still forks (D30). Best effort: a conversation already gone is not an error, and a failure is logged, so the erase always runs. It runs before the erase, so a restart repeats it.
+Erasing, in one transaction:
+- erases the session's events in place. Each keeps its seq, session,
+  time, command and context, and its kind becomes `Erased`. The log stays
+  contiguous (`EventLog::read` rejects a gap), so the rows are not removed.
+  The `session_created` and `worktree_removed` rows stay: the worktree state
+  of other sessions at a path is read from them. So does the tombstone, and
+  so do its `models_offered` events: the newest offered model list is the
+  server's, not the session's.
+- deletes the blob rows its events name, and its `event_blobs`,
+  `workdir_answer_blobs`, `open_calls`, `supervisor_held`, `approvals` and
+  `shell_runs` rows. An event blob is never shared (D44), so its file goes
+  too, once the erase commits. A workdir blob is shared by content, so it
+  stays until the workdir collection finds nothing names it.
+- clears its contexts' `agent_state` resume handles, except a context moved
+  to another session.
+- marks the session `erased`. Its `sessions` and `contexts` rows stay,
+  because other rows reference them. Appends for it are refused from then
+  on, and it is in no session list.
+
+The delete is irreversible.
+
+Compaction is the explicit `POST /v1/storage/reclaim` (`VACUUM`), never automatic: `VACUUM` blocks writers and needs free disk about the size of the database, so it runs only when asked.

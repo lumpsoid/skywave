@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, TryLockError};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode};
@@ -96,7 +96,38 @@ impl StorageReader {
     /// [`Error::StorageDeadline`] when another report still holds the
     /// connection at `deadline`, or this one runs past it.
     pub fn report(&self, disk: &Disk, deadline: Instant) -> Result<StorageReport> {
-        let mut db = loop {
+        let mut db = self.lock(deadline)?;
+        self.answer(db.conn_mut(), disk, Some(deadline))
+    }
+
+    /// Compacts the database (`VACUUM`, then the WAL truncated into it) and
+    /// answers the report after it. `None` when the free space is known and
+    /// below the database's size plus the floor: a `VACUUM` writes a copy of
+    /// the database, so it would not fit. Blocking.
+    ///
+    /// [`Error::StorageDeadline`] only when the connection is still held at
+    /// `deadline`: the `VACUUM` itself is not cut short.
+    pub fn reclaim(&self, disk: &Disk, deadline: Instant) -> Result<Option<StorageReport>> {
+        let mut db = self.lock(deadline)?;
+        let conn = db.conn_mut();
+        let database = database_size(&self.dir);
+        if disk
+            .free()
+            .is_some_and(|free| free < database + disk.floor())
+        {
+            return Ok(None);
+        }
+        conn.execute_batch("VACUUM;")?;
+        // The pragma answers a row (busy, log and checkpointed frames); a
+        // reader still in the WAL only leaves it to the next checkpoint.
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        self.answer(conn, disk, None).map(Some)
+    }
+
+    /// The connection, once no other report holds it: [`Error::StorageDeadline`]
+    /// when that does not happen by `deadline`.
+    fn lock(&self, deadline: Instant) -> Result<MutexGuard<'_, Db>> {
+        let db = loop {
             match self.db.try_lock() {
                 Ok(db) => break db,
                 Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
@@ -111,8 +142,21 @@ impl StorageReader {
         if Instant::now() >= deadline {
             return Err(Error::StorageDeadline);
         }
-        let conn = db.conn_mut();
-        conn.progress_handler(DEADLINE_STEPS, Some(move || Instant::now() >= deadline))?;
+        Ok(db)
+    }
+
+    /// The report read on `conn`, its free space read from `disk`. SQLite
+    /// stops the read at `deadline`, if there is one.
+    fn answer(
+        &self,
+        conn: &mut Connection,
+        disk: &Disk,
+        deadline: Option<Instant>,
+    ) -> Result<StorageReport> {
+        conn.progress_handler(
+            DEADLINE_STEPS,
+            deadline.map(|d| move || Instant::now() >= d),
+        )?;
         let read = read(conn, &self.dir);
         conn.progress_handler(DEADLINE_STEPS, None::<fn() -> bool>)?;
         let mut report = read.map_err(|e| match e {
@@ -130,12 +174,20 @@ impl StorageReader {
     }
 }
 
+/// The database file with its WAL, in bytes.
+fn database_size(dir: &DataDir) -> u64 {
+    let db_path = dir.db_path();
+    file_size(&db_path) + file_size(&with_suffix(&db_path, "-wal"))
+}
+
 /// Everything but the log file and the free space, in one read
 /// transaction.
 fn read(conn: &mut Connection, dir: &DataDir) -> Result<StorageReport> {
     let tx = conn.transaction()?;
-    let db_path = dir.db_path();
-    let database = file_size(&db_path) + file_size(&with_suffix(&db_path, "-wal"));
+    let database = database_size(dir);
+    let page_size: i64 = tx.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let free_pages: i64 = tx.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let reclaimable = count(free_pages) * count(page_size);
     let (event_blobs, workdir_blobs): (i64, i64) = tx.query_row(
         "SELECT COALESCE(SUM(size) FILTER (WHERE w.blob_id IS NULL), 0),
                 COALESCE(SUM(size) FILTER (WHERE w.blob_id IS NOT NULL), 0)
@@ -150,7 +202,8 @@ fn read(conn: &mut Connection, dir: &DataDir) -> Result<StorageReport> {
     let mut sessions: HashMap<String, SessionStorage> = HashMap::new();
     let mut stmt = tx.prepare(
         "SELECT session_id, COUNT(*), SUM(LENGTH(CAST(kind AS BLOB)))
-         FROM events GROUP BY session_id",
+         FROM events WHERE session_id IN (SELECT id FROM sessions WHERE deletion IS NULL)
+         GROUP BY session_id",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -223,6 +276,7 @@ fn read(conn: &mut Connection, dir: &DataDir) -> Result<StorageReport> {
     });
     Ok(StorageReport {
         database,
+        reclaimable,
         event_blobs: count(event_blobs),
         workdir_blobs: count(workdir_blobs),
         shell_running: running.values().sum(),

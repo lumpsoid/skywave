@@ -221,7 +221,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`CommandKind::SetSafetyRule`], [`EventKind::SafetyRuleSet`] and
 /// [`RejectReason::BadSafetyRule`], with [`limits::SAFETY_RULE_WORDS_MAX`] and
 /// [`limits::SAFETY_RULE_MAX_BYTES`].
-pub const PROTOCOL_VERSION: u32 = 40;
+///
+/// v41: `DeleteSession`, `SessionDeleted`, `Erased`, `RejectReason::ApprovalPending`,
+/// `RejectReason::WorktreeNotRemoved`, `StorageReport::reclaimable` and `POST`
+/// [`path::STORAGE_RECLAIM`].
+pub const PROTOCOL_VERSION: u32 = 41;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -617,6 +621,14 @@ pub enum EventKind {
         archived: bool,
         by: DeviceId,
     },
+    /// `by`'s `DeleteSession` deleted the session everywhere. Every earlier
+    /// event of the session is [`EventKind::Erased`]; a device drops its copy.
+    SessionDeleted {
+        by: DeviceId,
+    },
+    /// What an event of a deleted session becomes: its row keeps its seq so
+    /// the log stays contiguous, its content is gone.
+    Erased,
     /// The session's git worktree and its branch were removed by a
     /// `RemoveWorktree` command. The agent is stopped and the session cannot
     /// run again: later work for it is refused `WorkdirNotFound`.
@@ -990,6 +1002,7 @@ impl EventKind {
             | EventKind::QuestionAnswered { by, .. }
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
+            | EventKind::SessionDeleted { by }
             | EventKind::WorktreeRemoved { by }
             | EventKind::FileWritten { by, .. }
             | EventKind::PermissionModeRequested { by, .. }
@@ -1037,7 +1050,8 @@ impl EventKind {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::Imported { .. }
-            | EventKind::ImportFinished { .. } => None,
+            | EventKind::ImportFinished { .. }
+            | EventKind::Erased => None,
         }
     }
 
@@ -1059,6 +1073,7 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
+            | EventKind::SessionDeleted { .. }
             | EventKind::WorktreeRemoved { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
@@ -1076,6 +1091,7 @@ impl EventKind {
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. } => true,
             EventKind::AgentMessage { .. }
+            | EventKind::Erased
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
             | EventKind::ApprovalRequested { .. }
@@ -1160,7 +1176,9 @@ impl EventKind {
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
             | EventKind::BlobCropped { .. }
-            | EventKind::FileWritten { .. } => None,
+            | EventKind::FileWritten { .. }
+            | EventKind::SessionDeleted { .. }
+            | EventKind::Erased => None,
         }
     }
 
@@ -1248,7 +1266,9 @@ impl EventKind {
             | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckApproved { .. }
             | EventKind::SafetyCheckFeedback { .. }
-            | EventKind::FileWritten { .. } => (None, None),
+            | EventKind::FileWritten { .. }
+            | EventKind::SessionDeleted { .. }
+            | EventKind::Erased => (None, None),
         };
         let attachments: &[Attachment] = match self {
             EventKind::UserMessage { attachments, .. } => attachments,
@@ -2178,6 +2198,10 @@ pub enum CommandKind {
         session_id: SessionId,
         archived: bool,
     },
+    /// Delete the session on the server and every device: its events become
+    /// [`EventKind::Erased`], its blobs and agent transcript go. Refused while
+    /// its turn or a shell runs, or an approval is open.
+    DeleteSession { session_id: SessionId },
     /// Remove the git worktree the session runs in and delete its branch, then
     /// stop the session's agent. Refused while a turn runs, when the worktree
     /// has uncommitted changes, or when the branch is not merged into the
@@ -2477,10 +2501,12 @@ pub enum RejectReason {
     /// `RemoveWorktree` while the worktree's branch is not merged into the
     /// repo's HEAD.
     BranchUnmerged,
-    /// `RemoveWorktree` while the session's agent is running a turn.
+    /// `RemoveWorktree` or `DeleteSession` while the session's agent is
+    /// running a turn.
     TurnRunning,
     /// `RemoveWorktree` while a shell command runs, or waits to run, in the
-    /// worktree's directory.
+    /// worktree's directory. `DeleteSession` while a shell command of the
+    /// session runs or waits to run.
     ShellRunning,
     UnknownSession,
     UnknownApproval,
@@ -2490,6 +2516,11 @@ pub enum RejectReason {
     /// ended, its agent was stopped, or the daemon restarted. No answer can
     /// apply any more.
     ApprovalCancelled,
+    /// `DeleteSession` while the session has an open approval or question.
+    ApprovalPending,
+    /// `DeleteSession` of a session whose worktree is still on disk: remove it
+    /// first (`RemoveWorktree`).
+    WorktreeNotRemoved,
     /// The call named no shell command, or not the kind of check the
     /// judgment is about.
     NotAShellCall,
@@ -2815,6 +2846,9 @@ pub struct StorageReport {
     /// The database file with its write-ahead log: the event log, its
     /// projections and everything else the server records.
     pub database: u64,
+    /// Of `database`, the free pages SQLite keeps after rows are deleted: what
+    /// [`path::STORAGE_RECLAIM`] gives back.
+    pub reclaimable: u64,
     /// Blobs events reference ([`EventKind::blobs`]).
     pub event_blobs: u64,
     /// Blobs workdir reads keep for their latest answers.
@@ -3382,6 +3416,9 @@ pub mod path {
     pub const CONVERSATIONS: &str = "/v1/conversations";
     /// What the server's data takes on its disk: [`crate::StorageReport`].
     pub const STORAGE: &str = "/v1/storage";
+    /// `POST`, no body: compact the server's database (`VACUUM`), answering
+    /// the fresh [`crate::StorageReport`].
+    pub const STORAGE_RECLAIM: &str = "/v1/storage/reclaim";
     /// The agent's usage limits: [`crate::UsageLimitsResult`].
     pub const USAGE_LIMITS: &str = "/v1/usage-limits";
     /// Start logging the agent in: [`crate::LoginStartResult`].

@@ -54,7 +54,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::address::ServerAddress;
 use crate::encoding::{self, ZstdBody};
-use crate::engine::WORKTREES_TIMEOUT;
+use crate::engine::{RECLAIM_TIMEOUT, WORKTREES_TIMEOUT};
 use crate::identity::Identity;
 use crate::tls;
 use crate::transport::{
@@ -1040,6 +1040,23 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `POST /v1/storage/reclaim`, which takes no body. Bounded by
+    /// [`RECLAIM_TIMEOUT`] rather than the request timeout: the server's
+    /// `VACUUM` may take minutes.
+    async fn storage_reclaim(&self) -> Result<StorageReport, TransportError> {
+        let reply = self
+            .http
+            .request(
+                Method::POST,
+                path::STORAGE_RECLAIM,
+                &self.run_header(),
+                Bytes::new(),
+                RECLAIM_TIMEOUT,
+            )
+            .await?;
+        ok_json(reply)
+    }
+
     /// `GET /v1/worktrees`, which takes no query. Bounded by
     /// [`WORKTREES_TIMEOUT`] rather than the request timeout: the server
     /// runs git in every worktree.
@@ -1295,6 +1312,10 @@ impl Transport for HttpsTransport {
 
     fn storage_report(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
         Box::pin(HttpsTransport::storage_report(self))
+    }
+
+    fn storage_reclaim(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
+        Box::pin(HttpsTransport::storage_reclaim(self))
     }
 
     fn worktrees(&self) -> BoxFuture<'_, Result<WorktreeList, TransportError>> {
