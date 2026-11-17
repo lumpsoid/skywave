@@ -41,7 +41,7 @@ use crate::prefs::{NotificationPrefs, Prefs};
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
     ComposerFile, ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate,
-    GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, PairForm, PlatformEffect,
+    GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, NotifyKind, PairForm, PlatformEffect,
     RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
     TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range, WorkdirTextUpdate,
 };
@@ -487,6 +487,7 @@ impl Head {
                         body: alert.notice(),
                         title: alert.title.unwrap_or_default(),
                         session_id: Some(session.0.to_string()),
+                        kind: NotifyKind::Approval,
                     }));
                 }
             }
@@ -501,6 +502,7 @@ impl Head {
                 body: notice.notice(),
                 title: notice.title,
                 session_id: Some(last.session_id.0.to_string()),
+                kind: NotifyKind::Shell,
             }));
         }
         let update = self.idle_alerts.observe(&view.attention);
@@ -519,6 +521,7 @@ impl Head {
                 body: notice.notice(),
                 title: notice.title,
                 session_id: Some(notice.session_id.0.to_string()),
+                kind: NotifyKind::Idle,
             }));
         }
         if repair_notice(&view).is_none() {

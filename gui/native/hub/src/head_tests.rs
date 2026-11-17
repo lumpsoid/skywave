@@ -1970,6 +1970,7 @@ fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
         notified,
         [(&"work".to_owned(), &"approval needed · work".to_owned())]
     );
+    assert_eq!(shown_kinds(&outs), [NotifyKind::Approval]);
     // A head that starts at that count does not alert.
     let mut fresh = Head::new(Prefs::default());
     let outs = fresh.on_view(rig.head.view.clone().unwrap(), rig.clock);
@@ -6085,6 +6086,7 @@ fn a_long_shell_run_of_this_devices_notifies() {
             Some(rig.session.0.to_string())
         )]
     );
+    assert_eq!(shown_kinds(&outs), [NotifyKind::Shell]);
     // Once only.
     let outs = rig.head.on_view(view.clone(), rig.clock);
     assert!(
@@ -6101,8 +6103,8 @@ fn a_long_shell_run_of_this_devices_notifies() {
     );
 }
 
-/// The notices `outs` shows, as `(id, title, body, session_id)`.
-fn shown_notices(outs: &[Out]) -> Vec<(i32, String, String, Option<String>)> {
+/// The notices `outs` shows, as `(id, title, body, session_id, kind)`.
+fn shown_notices(outs: &[Out]) -> Vec<(i32, String, String, Option<String>, NotifyKind)> {
     outs.iter()
         .filter_map(|o| match o {
             Out::Effect(PlatformEffect::Notify {
@@ -6110,9 +6112,18 @@ fn shown_notices(outs: &[Out]) -> Vec<(i32, String, String, Option<String>)> {
                 title,
                 body,
                 session_id,
-            }) => Some((*id, title.clone(), body.clone(), session_id.clone())),
+                kind,
+            }) => Some((*id, title.clone(), body.clone(), session_id.clone(), *kind)),
             _ => None,
         })
+        .collect()
+}
+
+/// The kinds of the notices `outs` shows.
+fn shown_kinds(outs: &[Out]) -> Vec<NotifyKind> {
+    shown_notices(outs)
+        .into_iter()
+        .map(|notice| notice.4)
         .collect()
 }
 
@@ -6129,12 +6140,13 @@ fn a_session_that_went_idle_notifies_once() {
     assert_eq!(notifications(&working), (vec![], vec![]));
     let outs = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
     let shown = shown_notices(&outs);
-    let [(id, shown_title, body, session_id)] = shown.as_slice() else {
+    let [(id, shown_title, body, session_id, kind)] = shown.as_slice() else {
         panic!("one idle notice: {shown:?}");
     };
     assert_eq!(shown_title, &title);
     assert_eq!(body, &format!("agent idle · {title}"));
     assert_eq!(session_id, &Some(session.0.to_string()));
+    assert_eq!(kind, &NotifyKind::Idle);
     assert_eq!(*id, rig.head.notifications.id(session, Kind::Idle));
     assert_ne!(*id, rig.head.notifications.id(session, Kind::Approval));
     // Once only.
@@ -6211,7 +6223,7 @@ fn with_idle_off_a_session_going_idle_posts_nothing_but_still_dismisses() {
     });
     let outs = rig.log(vec![EventKind::SessionStateChanged(SessionState::Idle)]);
     let shown = shown_notices(&outs);
-    let [(id, _, _, session_id)] = shown.as_slice() else {
+    let [(id, _, _, session_id, _)] = shown.as_slice() else {
         panic!("one idle notice: {shown:?}");
     };
     assert_eq!(*id, rig.head.notifications.id(session, Kind::Idle));

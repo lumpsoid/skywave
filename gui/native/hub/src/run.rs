@@ -34,7 +34,7 @@ use crate::notify;
 use crate::panics::panic_message;
 use crate::prefs;
 use crate::signals::{
-    Boot, Booted, GuiIntent, HubFailed, PlatformEffect, ScreenUpdate, ScreenView,
+    Boot, Booted, GuiIntent, HubFailed, NotifyKind, PlatformEffect, ScreenUpdate, ScreenView,
 };
 
 /// Waits for `Boot` and opens the core, answering `Booted`, or
@@ -180,6 +180,7 @@ fn give_up() {
         title: "Skywave stopped".to_owned(),
         body: "An internal error stopped it in the background. Open it to restart.".to_owned(),
         session_id: None,
+        kind: NotifyKind::Stopped,
     }
     .send_signal_to_dart();
 }

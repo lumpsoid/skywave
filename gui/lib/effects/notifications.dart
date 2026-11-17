@@ -33,7 +33,7 @@ class SystemNotifications {
     ),
   );
 
-  static const _details = NotificationDetails(
+  static const _approvals = NotificationDetails(
     android: AndroidNotificationDetails(
       'approvals',
       'Approvals',
@@ -42,6 +42,23 @@ class SystemNotifications {
       priority: Priority.high,
     ),
   );
+
+  static const _activity = NotificationDetails(
+    android: AndroidNotificationDetails(
+      'activity',
+      'Agent activity',
+      channelDescription: 'An agent went idle, or a long shell run finished.',
+      importance: Importance.defaultImportance,
+      priority: Priority.defaultPriority,
+    ),
+  );
+
+  /// The channel of [kind]: an approval, or a stop the hub made, is urgent;
+  /// an idle agent or a finished shell run is not.
+  static NotificationDetails _detailsFor(NotifyKind kind) => switch (kind) {
+    NotifyKind.approval || NotifyKind.stopped => _approvals,
+    NotifyKind.shell || NotifyKind.idle => _activity,
+  };
 
   /// Sets the plugin up. A platform without a notification service (no
   /// D-Bus daemon on Linux) leaves notifications off; nothing else breaks.
@@ -61,12 +78,13 @@ class SystemNotifications {
     await openLaunching();
   }
 
-  /// Shows [body] under [title] as notification [id], replacing the one
-  /// up under it; a tap opens [sessionId].
+  /// Shows [body] under [title] as notification [id] on the channel of
+  /// [kind], replacing the one up under it; a tap opens [sessionId].
   Future<void> show({
     required int id,
     required String title,
     required String body,
+    required NotifyKind kind,
     String? sessionId,
   }) async {
     if (!_ready) return;
@@ -74,7 +92,7 @@ class SystemNotifications {
       id: id,
       title: title,
       body: body,
-      notificationDetails: _details,
+      notificationDetails: _detailsFor(kind),
       payload: sessionId,
     );
   }
