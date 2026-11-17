@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 /// The preferences file under the directory Dart sends.
 pub const PREFS_FILE: &str = "skywave-gui.json";
 
-/// What the user chose. Every field defaults to off, so a missing field,
-/// file or a file that cannot be read means off.
+/// What the user chose. A missing field, file or a file that cannot be read
+/// means the defaults: Stay connected off, every notification on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -24,6 +24,40 @@ pub struct Prefs {
     /// Show the session list as one plain list, most recently active first,
     /// instead of grouped by project.
     pub plain_list: bool,
+    /// Which alerts become system notifications (Settings → Notifications).
+    pub notifications: NotificationPrefs,
+}
+
+/// The notification switches. A notice of a kind is shown only when `all`
+/// and that kind are on. Switching off stops new notices alone: a notice
+/// already shown stays, and dismissals still go out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationPrefs {
+    /// Every notification; off stops all of them below.
+    pub all: bool,
+    /// A session needs an approval.
+    pub approvals: bool,
+    /// A session's agent went from working to idle.
+    pub idle: bool,
+    /// A long shell run of this device's finished.
+    pub shell: bool,
+}
+
+impl NotificationPrefs {
+    /// Every switch on: what a fresh install and an older file get.
+    pub const ON: NotificationPrefs = NotificationPrefs {
+        all: true,
+        approvals: true,
+        idle: true,
+        shell: true,
+    };
+}
+
+impl Default for NotificationPrefs {
+    fn default() -> Self {
+        Self::ON
+    }
 }
 
 /// The preferences file for the directory Dart sent.
@@ -74,14 +108,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_missing_file_is_off() {
+    fn a_missing_file_is_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load(&path_in(dir.path())), Prefs::default());
         assert!(!Prefs::default().stay_connected);
+        assert_eq!(Prefs::default().notifications, NotificationPrefs::ON);
     }
 
     #[test]
-    fn a_corrupt_file_is_off_and_not_fatal() {
+    fn a_corrupt_file_is_the_defaults_and_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(dir.path());
         for corrupt in ["not json", "{\"stay_connected\": \"yes\"}", ""] {
@@ -95,12 +130,26 @@ mod tests {
     }
 
     #[test]
+    fn an_older_file_keeps_notifications_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        fs::write(&path, r#"{"stay_connected":true}"#).unwrap();
+        let loaded = load(&path);
+        assert!(loaded.stay_connected);
+        assert_eq!(loaded.notifications, NotificationPrefs::ON);
+    }
+
+    #[test]
     fn it_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(dir.path());
         let on = Prefs {
             stay_connected: true,
             plain_list: true,
+            notifications: NotificationPrefs {
+                idle: false,
+                ..NotificationPrefs::ON
+            },
         };
         save(&path, &on).unwrap();
         assert_eq!(load(&path), on);
@@ -138,6 +187,7 @@ mod tests {
             Prefs {
                 stay_connected: false,
                 plain_list: true,
+                notifications: NotificationPrefs::ON,
             }
         );
     }

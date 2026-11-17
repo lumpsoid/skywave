@@ -38,15 +38,16 @@ use skywave_present::worktrees;
 use skywave_proto::{RepoListing, RepoWorktrees, WorktreeEntry};
 
 use crate::link::count;
+use crate::prefs::NotificationPrefs;
 use crate::signals::{
     AgentLoginView, AgentSettingsView, AgentState, ApprovalPanel, ApprovalsItem, BlobPolicyView,
     CandidateView, CompletionPopup, ComposerModeView, ComposerView, ContextRow,
     ConversationRowView, ConversationsView, CreatePrompt, CreatingView, EffortOption, EffortView,
     InfoFieldView, InfoSectionView, LimitRowView, LimitsView, ListKindView, LoginFlowState,
-    ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView,
-    QuestionPanel, QuestionView, RenamePrompt, RepairNotice, RuleOption, SafetyCheckView,
-    SafetyRuleRow, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    SnippetView, StopHeadings, StorageGroupingView, StorageKindView, StorageRowView,
+    ModeOption, ModelOption, NotificationsView, PairForm, PairingState, PermissionModeView,
+    QuestionOptionView, QuestionPanel, QuestionView, RenamePrompt, RepairNotice, RuleOption,
+    SafetyCheckView, SafetyRuleRow, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView,
+    SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageKindView, StorageRowView,
     StorageSessionView, StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow,
     ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView,
     WorktreeRepoView, WorktreeSessionView, WorktreeView,
@@ -80,6 +81,8 @@ pub struct Ui<'a> {
     pub stay_connected: Option<bool>,
     /// The session list shows as one plain list, not grouped by project.
     pub plain_list: bool,
+    /// The notification switches, the head's own preference.
+    pub notifications: NotificationPrefs,
     /// Only the conversation shows: tool calls are hidden.
     pub conversation_only: bool,
 }
@@ -108,7 +111,13 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Session(session) => ScreenView::Session {
             session: session_view(session, view, ui),
         },
-        Screen::Settings(settings) => settings_view(settings, view, ui.stay_connected, ui.wall_ms),
+        Screen::Settings(settings) => settings_view(
+            settings,
+            view,
+            ui.stay_connected,
+            ui.notifications,
+            ui.wall_ms,
+        ),
         Screen::ServerAddresses(view) => ScreenView::ServerAddresses {
             current: view
                 .current
@@ -933,6 +942,7 @@ fn settings_view(
     settings: &SettingsView,
     view: &ViewState,
     stay_connected: Option<bool>,
+    notifications: NotificationPrefs,
     wall_ms: i64,
 ) -> ScreenView {
     let now = DateTime::from_timestamp_millis(wall_ms).unwrap_or_default();
@@ -967,6 +977,12 @@ fn settings_view(
             .device_id
             .map(|_| agent_login_view(&settings.login, now)),
         stay_connected,
+        notifications: NotificationsView {
+            all: notifications.all,
+            approvals: notifications.approvals,
+            idle: notifications.idle,
+            shell: notifications.shell,
+        },
         safety_rules: settings.safety_rules.iter().map(safety_rule_row).collect(),
     }
 }
@@ -1431,7 +1447,13 @@ mod tests {
                 agent_login_offered: false,
                 agent_logged_out: false,
             };
-            match settings_view(&settings, &view, None, now.timestamp_millis()) {
+            match settings_view(
+                &settings,
+                &view,
+                None,
+                NotificationPrefs::ON,
+                now.timestamp_millis(),
+            ) {
                 ScreenView::Settings { agent_login, .. } => agent_login,
                 other => panic!("not settings: {other:?}"),
             }
@@ -1516,7 +1538,13 @@ mod tests {
                 discard,
             }
         };
-        match settings_view(&settings, &view, None, now.timestamp_millis()) {
+        match settings_view(
+            &settings,
+            &view,
+            None,
+            NotificationPrefs::ON,
+            now.timestamp_millis(),
+        ) {
             ScreenView::Settings { safety_rules, .. } => assert_eq!(
                 safety_rules,
                 vec![
@@ -1559,7 +1587,13 @@ mod tests {
             agent_logged_out: settings.login.logged_out,
         };
         let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
-        match settings_view(&settings, &view, None, now.timestamp_millis()) {
+        match settings_view(
+            &settings,
+            &view,
+            None,
+            NotificationPrefs::ON,
+            now.timestamp_millis(),
+        ) {
             ScreenView::Settings { login, .. } => login,
             other => panic!("not settings: {other:?}"),
         }
@@ -1729,6 +1763,7 @@ mod tests {
             workdir_text: None,
             stay_connected: None,
             plain_list: false,
+            notifications: NotificationPrefs::ON,
             conversation_only: false,
         };
         match update(&view, ui).screen {

@@ -419,6 +419,15 @@ impl SessionSummary {
         self.pending_approvals.first().copied()
     }
 
+    /// Whether the agent is working for the idle alert: a turn, a pending
+    /// approval or a task that is not ambient. Schedules and ambient tasks
+    /// are not work.
+    pub fn busy(&self) -> bool {
+        matches!(self.state, SessionState::AgentWorking)
+            || !self.pending_approvals.is_empty()
+            || self.work.tasks.iter().any(|task| !task.ambient)
+    }
+
     /// What to call the session wherever it is shown: its name, else the
     /// [default title](Self::default_title).
     pub fn title(&self) -> String {

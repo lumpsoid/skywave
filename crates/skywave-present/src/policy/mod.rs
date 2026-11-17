@@ -13,6 +13,8 @@
 //!   sessions no longer wait on one.
 //! - [`ShellAlertWatcher`]: a notice when a long shell run of this
 //!   device's finished.
+//! - [`IdleWatcher`]: a notice when a session's agent goes from working to
+//!   idle, and which sessions no longer are.
 //! - [`PromptHistory`]: recalling earlier prompts, or shell commands, with
 //!   a stash.
 //! - [`WorkdirPicker`]: the workdir candidate list, always shown, with its
@@ -39,7 +41,8 @@ mod shell;
 mod workdir_picker;
 
 pub use alert::{
-    Alert, AlertUpdate, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise,
+    Alert, AlertUpdate, AlertWatcher, IdleNotice, IdleUpdate, IdleWatcher, ShellAlertWatcher,
+    ShellNotice, TITLE_MAX, sanitise,
 };
 pub use conversation::{ConversationOnly, in_conversation};
 pub use draft::{DRAFT_SAVE_AFTER, DraftSaver, message_refusal};

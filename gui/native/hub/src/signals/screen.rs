@@ -105,6 +105,9 @@ pub enum ScreenView {
         /// (the head's own preference, not the core's); `None` where it
         /// is not offered: everywhere but Android.
         stay_connected: Option<bool>,
+        /// This device's notification switches (the head's own preference,
+        /// not the core's).
+        notifications: NotificationsView,
         /// The safety rules: the ones the server's log holds, and the ones
         /// with a change of this device still on its way; in the core's
         /// order.
@@ -885,6 +888,19 @@ pub struct SafetyCheckView {
     pub pending: bool,
     /// `safety check on failed: <why>` until the next switch.
     pub refusal: Option<String>,
+}
+
+/// The notification switches as Settings → Notifications shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct NotificationsView {
+    /// Every notification; off stops all of them.
+    pub all: bool,
+    /// A session needs an approval.
+    pub approvals: bool,
+    /// A session's agent went from working to idle.
+    pub idle: bool,
+    /// A long shell run of this device's finished.
+    pub shell: bool,
 }
 
 /// A safety rule as Settings lists it: a shell command prefix the safety

@@ -19,9 +19,9 @@ use skywave_core::{
 use skywave_present::crop::toggle;
 use skywave_present::format;
 use skywave_present::policy::{
-    AlertWatcher, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
-    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, search_history,
-    shell_stop,
+    AlertWatcher, ConversationOnly, DraftSaver, ExpandFetch, IdleWatcher, PromptHistory,
+    ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
+    search_history, shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::storage::Grouping as StorageGrouping;
@@ -37,11 +37,11 @@ use crate::dispatcher::{Dispatched, Tag};
 use crate::lifecycle::Target;
 use crate::lifecycle::{Awake, Call, Moved};
 use crate::notify::{Kind, NotificationIds};
-use crate::prefs::Prefs;
+use crate::prefs::{NotificationPrefs, Prefs};
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
     ComposerFile, ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate,
-    GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, PairForm, PlatformEffect,
+    GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, NotifyKind, PairForm, PlatformEffect,
     RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
     TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range, WorkdirTextUpdate,
 };
@@ -348,6 +348,8 @@ pub struct Head {
     /// From 0, not from the first snapshot: a run that finished in a
     /// catch-up before it is still news.
     shell_alerts: ShellAlertWatcher,
+    /// From 0, like `shell_alerts`.
+    idle_alerts: IdleWatcher,
     /// Each session's system notification ids.
     notifications: NotificationIds,
     next_tag: Tag,
@@ -385,6 +387,8 @@ pub struct Head {
     /// The session list shows as one plain list, not grouped by project
     /// (`GuiIntent::SetPlainList`).
     plain_list: bool,
+    /// Which alerts become system notifications, from `Prefs`.
+    notify: NotificationPrefs,
 }
 
 impl Head {
@@ -404,6 +408,7 @@ impl Head {
                 ..StayConnected::default()
             },
             plain_list: prefs.plain_list,
+            notify: prefs.notifications,
             awake,
             ..Head::default()
         }
@@ -415,6 +420,7 @@ impl Head {
         Prefs {
             stay_connected: self.stay_connected.on,
             plain_list: self.plain_list,
+            notifications: self.notify,
         }
     }
 
@@ -438,6 +444,7 @@ impl Head {
                 on: prefs.stay_connected,
             },
             plain_list: prefs.plain_list,
+            notify: prefs.notifications,
             ..Head::default()
         }
     }
@@ -472,24 +479,49 @@ impl Head {
                 if let Some((alert, session)) = update
                     .alert
                     .and_then(|alert| alert.session_id.map(|s| (alert, s)))
+                    && self.notify.all
+                    && self.notify.approvals
                 {
                     out.push(Out::Effect(PlatformEffect::Notify {
                         id: self.notifications.id(session, Kind::Approval),
                         body: alert.notice(),
                         title: alert.title.unwrap_or_default(),
                         session_id: Some(session.0.to_string()),
+                        kind: NotifyKind::Approval,
                     }));
                 }
             }
         }
         if let Some(notice) = self.shell_alerts.observe(&view.attention)
             && let Some(last) = &view.attention.last_shell
+            && self.notify.all
+            && self.notify.shell
         {
             out.push(Out::Effect(PlatformEffect::Notify {
                 id: self.notifications.id(last.session_id, Kind::Shell),
                 body: notice.notice(),
                 title: notice.title,
                 session_id: Some(last.session_id.0.to_string()),
+                kind: NotifyKind::Shell,
+            }));
+        }
+        let update = self.idle_alerts.observe(&view.attention);
+        for session in update.cleared {
+            out.push(Out::Effect(PlatformEffect::Dismiss {
+                id: self.notifications.id(session, Kind::Idle),
+            }));
+        }
+        for notice in update
+            .notices
+            .into_iter()
+            .filter(|_| self.notify.all && self.notify.idle)
+        {
+            out.push(Out::Effect(PlatformEffect::Notify {
+                id: self.notifications.id(notice.session_id, Kind::Idle),
+                body: notice.notice(),
+                title: notice.title,
+                session_id: Some(notice.session_id.0.to_string()),
+                kind: NotifyKind::Idle,
             }));
         }
         if repair_notice(&view).is_none() {
@@ -1399,6 +1431,22 @@ impl Head {
                 self.plain_list = on;
                 out.push(Out::SavePrefs(self.prefs()));
             }
+            // Saved whole; the screen is sent again by `publish`, which sees
+            // the switches change.
+            GuiIntent::SetNotifications {
+                all,
+                approvals,
+                idle,
+                shell,
+            } => {
+                self.notify = NotificationPrefs {
+                    all,
+                    approvals,
+                    idle,
+                    shell,
+                };
+                out.push(Out::SavePrefs(self.prefs()));
+            }
             // The hub task's, which keeps it from every head.
             GuiIntent::HubFailedSeen { .. } => {}
         }
@@ -1646,6 +1694,7 @@ impl Head {
             workdir_text,
             stay_connected: self.stay_connected.shown(),
             plain_list: self.plain_list,
+            notifications: self.notify,
             conversation_only: self.conversation_only.on(),
         };
         let shown = screen::update(view, ui);
