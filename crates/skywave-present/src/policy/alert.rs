@@ -193,6 +193,8 @@ mod tests {
             alerts,
             shell_alerts: 0,
             last_shell: None,
+            idle_alerts: 0,
+            idle: Vec::new(),
         }
     }
 
