@@ -114,6 +114,9 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          # Pinned: 3.50 deadlocks on Linux Wayland (flutter/flutter#196529);
+          # see docs/maintaining.md before moving it.
+          flutter-version: 3.47.9
           cache: true
       - name: Write the signing key
         env:

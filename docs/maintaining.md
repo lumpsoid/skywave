@@ -8,7 +8,7 @@ The jobs that keep the project releasable, in the order you meet them.
 git clone git@github.com:lumpsoid/skywave.git && cd skywave
 rustup show                                  # Rust per Cargo.toml's rust-version
 cargo install rinf_cli --version 8.11.0 --locked
-(cd gui && flutter pub get && rinf gen)      # Dart bindings are not committed
+(cd gui && flutter pub get && rinf gen)      # Flutter 3.47.9; bindings are not committed
 scripts/check.sh
 ```
 
@@ -124,8 +124,11 @@ together:
   Dependabot ignores rinf.
 - **Rust**: `rust-version` in `Cargo.toml`. The workflows install that
   version, so CI follows the bump.
-- **Flutter / Dart**: the `sdk` constraint in `gui/pubspec.yaml`. CI uses
-  the latest stable Flutter.
+- **Flutter**: pinned to 3.47.9 (`flutter-version` in both workflows, and
+  CONTRIBUTING.md). Not 3.50: its Linux Wayland renderer can deadlock
+  (flutter/flutter#196529, see `gui/lib/boot/startup_page.dart`). Move the
+  pin only after running the Linux desktop app on the new version; the
+  `sdk` constraint in `gui/pubspec.yaml` must still resolve on it.
 - **Claude Code**: after a `claude` upgrade, run `skywave-claude-compat
   --quick`, then `--full` (see `docs/agents/claude-code.md`).
 
