@@ -1177,8 +1177,6 @@ fn storage_session(facts: storage::SessionFacts) -> StorageSessionView {
     }
 }
 
-/// The worktrees screen: each repository's worktrees, with the sessions
-/// running in each. Repositories with a linked worktree in use come first.
 /// The approvals screen: each waiting approval with its panel, or the note
 /// that says where a question or an unknown request is answered.
 fn approvals_view(view: &ApprovalsView) -> ScreenView {
@@ -1205,6 +1203,8 @@ fn approvals_item(item: &WaitingApproval) -> ApprovalsItem {
     }
 }
 
+/// The worktrees screen: each repository's worktrees, with the sessions
+/// running in each. Repositories with a linked worktree in use come first.
 fn worktrees_view(view: &WorktreesView) -> ScreenView {
     let mut repos: Vec<(u8, WorktreeRepoView)> = view
         .list

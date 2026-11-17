@@ -215,8 +215,8 @@ class LinkProgress extends StatelessWidget {
 }
 
 /// The approvals waiting in other sessions, for an app bar's actions: a
-/// badged bell whose tap (or Ctrl+G) opens the next one. Nothing while
-/// none waits.
+/// badged bell whose tap opens the approvals page, which answers them all;
+/// Ctrl+G opens the next one instead. Nothing while none waits.
 class ApprovalsButton extends StatelessWidget {
   const ApprovalsButton({required this.send, super.key});
 
@@ -235,8 +235,9 @@ class ApprovalsButton extends StatelessWidget {
         final colors = SkyColors.of(context);
         return IconButton(
           key: const Key('approvals-elsewhere'),
-          tooltip: '$label · open the next (Ctrl+G)',
-          onPressed: () => send.act(const ActionIntentOpenNextApproval()),
+          tooltip: '$label · see them all (Ctrl+G opens the next)',
+          onPressed: () =>
+              send.act(const ActionIntentNavigate(route: RouteView.approvals)),
           icon: Badge.count(
             count: link.approvalsElsewhere,
             backgroundColor: colors.warning,
