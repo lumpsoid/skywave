@@ -57,6 +57,7 @@ ScreenViewSessionList list({
   kind: kind,
   title: 'Sessions',
   rows: rows,
+  plain: false,
   otherCount: 2,
   creating: creating,
   dismissable: dismissable,

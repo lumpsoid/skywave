@@ -78,6 +78,8 @@ pub struct Ui<'a> {
     pub workdir_text: Option<&'a Result<workdir::Text, String>>,
     /// The Stay connected preference; `None` where it is not offered.
     pub stay_connected: Option<bool>,
+    /// The session list shows as one plain list, not grouped by project.
+    pub plain_list: bool,
     /// Only the conversation shows: tool calls are hidden.
     pub conversation_only: bool,
 }
@@ -203,10 +205,15 @@ fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
         kind,
         title,
         empty_label,
-        rows: by_repo(&list.sessions)
-            .iter()
-            .flat_map(|group| group.rows.iter().map(move |row| row_view(row, group.key)))
-            .collect(),
+        rows: if ui.plain_list {
+            list.sessions.iter().map(|row| row_view(row, "")).collect()
+        } else {
+            by_repo(&list.sessions)
+                .iter()
+                .flat_map(|group| group.rows.iter().map(move |row| row_view(row, group.key)))
+                .collect()
+        },
+        plain: ui.plain_list,
         other_count: count(list.other_count),
         creating: list.creating.iter().map(creating_view).collect(),
         dismissable: dismissable(list).map(|p| p.command_id.0.to_string()),
@@ -1722,6 +1729,7 @@ mod tests {
             wall_ms: 0,
             workdir_text: None,
             stay_connected: None,
+            plain_list: false,
             conversation_only: false,
         };
         match update(&view, ui).screen {

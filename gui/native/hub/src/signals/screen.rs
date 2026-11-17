@@ -57,6 +57,10 @@ pub enum ScreenView {
         /// What an empty list says; `None` when it has rows.
         empty_label: Option<String>,
         rows: Vec<SessionRowView>,
+        /// Show `rows` as one plain list in recency order: no project headers.
+        /// Otherwise rows come grouped by project, a header wherever `group`
+        /// changes.
+        plain: bool,
         /// How many sessions the other list holds.
         other_count: u32,
         /// Sessions this device asked for that are not in the replica yet,

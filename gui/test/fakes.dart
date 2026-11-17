@@ -116,6 +116,7 @@ ScreenUpdate listScreen() => const ScreenUpdate(
     title: 'Sessions',
     emptyLabel: 'No sessions yet. Start one.',
     rows: [],
+    plain: false,
     otherCount: 0,
     creating: [],
   ),
