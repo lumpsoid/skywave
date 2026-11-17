@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 /// user backed out.
 typedef ScanQr = Future<String?> Function();
 
-const _channel = MethodChannel('dev.skywave.gui/scan');
+const _channel = MethodChannel('io.github.lumpsoid.skywave/scan');
 
 /// The platform's scanner: Android's ZXing activity (D20, MainActivity),
 /// null elsewhere, where pairing is typed or pasted.

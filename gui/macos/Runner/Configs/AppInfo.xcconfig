@@ -8,7 +8,7 @@
 PRODUCT_NAME = Skywave
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = dev.skywave.gui
+PRODUCT_BUNDLE_IDENTIFIER = io.github.lumpsoid.skywave
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 dev.skywave. All rights reserved.
+PRODUCT_COPYRIGHT = Copyright © 2026 lumpsoid. All rights reserved.

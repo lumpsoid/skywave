@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import burst  # noqa: E402
 import ui  # noqa: E402
 
-PKG = "dev.skywave.gui"
+PKG = "io.github.lumpsoid.skywave"
 ACTIVITY = f"{PKG}/.MainActivity"
 SERVICE = f"{PKG}/.StayConnectedService"
 BOOT_LINE = "opening the core"

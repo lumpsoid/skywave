@@ -1,4 +1,4 @@
-package dev.skywave.gui
+package io.github.lumpsoid.skywave
 
 import android.app.Notification
 import android.app.PendingIntent
@@ -123,7 +123,7 @@ class StayConnectedService : Service() {
          * Dart asks `start`/`stop` on it (MainActivity); Kotlin reports
          * `running`/`stopped` back on it. One handler per direction.
          */
-        const val BACKGROUND_CHANNEL = "dev.skywave.gui/background"
+        const val BACKGROUND_CHANNEL = "io.github.lumpsoid.skywave/background"
         private const val RUNNING = "running"
         private const val STOPPED = "stopped"
 

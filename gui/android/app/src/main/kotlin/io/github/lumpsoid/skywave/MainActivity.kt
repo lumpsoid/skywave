@@ -1,4 +1,4 @@
-package dev.skywave.gui
+package io.github.lumpsoid.skywave
 
 import android.Manifest
 import android.content.Context
@@ -169,7 +169,7 @@ class MainActivity : FlutterActivity() {
 
         private const val PERMISSIONS_REQUEST = 1
         private const val SCAN_REQUEST = 2
-        private const val SCAN_CHANNEL = "dev.skywave.gui/scan"
+        private const val SCAN_CHANNEL = "io.github.lumpsoid.skywave/scan"
         private const val PREFS = "permissions"
         private const val NOTIFICATIONS_ASKED = "notifications_asked"
     }
