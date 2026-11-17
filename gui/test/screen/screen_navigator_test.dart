@@ -8,9 +8,30 @@ import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
+import 'package:skywave_gui/settings/notifications_page.dart';
+import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 import '../fakes.dart';
+
+/// Settings with every notification kind on.
+ScreenUpdate settingsScreen({bool canGoBack = true}) => ScreenUpdate(
+  screen: const ScreenViewSettings(
+    blobPolicy: BlobPolicyView.onDemand,
+    blobPolicyLabel: '',
+    server: 'srv:7443',
+    device: 'dev-1',
+    notifications: NotificationsView(
+      all: true,
+      approvals: true,
+      idle: true,
+      shell: true,
+    ),
+    safetyRules: [],
+  ),
+  canGoBack: canGoBack,
+  repair: null,
+);
 
 void main() {
   test('the holder names the page of the screen it holds', () {
@@ -203,5 +224,116 @@ void main() {
     // The page under sent nothing while it was under; shown again, it says
     // whether it follows.
     expect(sent, [const GuiIntentFollowingChanged(following: true)]);
+  });
+
+  testWidgets('notifications open over settings; back closes them, not Back', (
+    tester,
+  ) async {
+    final holders = fakeHolders();
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ScreenNavigator(holders: holders, send: sent.add),
+      ),
+    );
+    holders.screen.apply(settingsScreen());
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsNothing);
+
+    await tester.tap(find.byKey(const Key('notifications')));
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsOneWidget);
+    expect(
+      find.byType(SettingsPage, skipOffstage: false),
+      findsOneWidget,
+      reason: 'settings stays under it',
+    );
+
+    // System back closes the page: Settings stays, and Back is not sent.
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsNothing);
+    expect(find.byType(SettingsPage), findsOneWidget);
+    expect(sent, isEmpty);
+
+    // With the page closed, system back is Back again.
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    expect(sent, [const GuiIntentAct(action: ActionIntentBack())]);
+  });
+
+  testWidgets('the back button of the notifications page closes it', (
+    tester,
+  ) async {
+    final holders = fakeHolders();
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ScreenNavigator(holders: holders, send: sent.add),
+      ),
+    );
+    holders.screen.apply(settingsScreen());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('notifications')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byType(BackButton));
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsNothing);
+    expect(find.byType(SettingsPage), findsOneWidget);
+    expect(sent, isEmpty);
+  });
+
+  testWidgets(
+    'system back closes the notifications page where Settings cannot go back',
+    (tester) async {
+      final holders = fakeHolders();
+      final sent = <GuiIntent>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScreenNavigator(holders: holders, send: sent.add),
+        ),
+      );
+      holders.screen.apply(settingsScreen(canGoBack: false));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('notifications')));
+      await tester.pumpAndSettle();
+      expect(find.byType(NotificationsPage), findsOneWidget);
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.byType(NotificationsPage), findsNothing);
+      expect(find.byType(SettingsPage), findsOneWidget);
+      expect(sent, isEmpty);
+    },
+  );
+
+  testWidgets('leaving settings closes the notifications page', (tester) async {
+    final holders = fakeHolders();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ScreenNavigator(holders: holders, send: (_) {}),
+      ),
+    );
+    holders.screen.apply(settingsScreen());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('notifications')));
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsOneWidget);
+
+    // Settings sent again, as after a switch changes, keeps the page open.
+    holders.screen.apply(settingsScreen());
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsOneWidget);
+
+    holders.screen.apply(listScreen());
+    await tester.pumpAndSettle();
+    expect(find.byType(SessionListPage), findsOneWidget);
+
+    // Reopening Settings shows Settings itself.
+    holders.screen.apply(settingsScreen());
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsNothing);
+    expect(find.byType(SettingsPage), findsOneWidget);
   });
 }

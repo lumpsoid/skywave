@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:skywave_gui/crop/crop_lines_holder.dart';
 import 'package:skywave_gui/effects/effects.dart';
 import 'package:skywave_gui/link/link_holder.dart';
@@ -5,13 +6,16 @@ import 'package:skywave_gui/screen/screen_holder.dart';
 import 'package:skywave_gui/session/search_holder.dart';
 import 'package:skywave_gui/session/shell_holder.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
+import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'package:skywave_gui/workdir/workdir_text_holder.dart';
 
 /// One holder per Rust signal, created once at start and kept for the
 /// app's lifetime. Each subscribes in [connect], before `Boot` goes out,
 /// so nothing Rust sends after boot is missed.
 class Holders {
-  Holders({required EffectSink effects}) : effects = EffectsListener(effects);
+  Holders({required EffectSink effects}) : effects = EffectsListener(effects) {
+    screen.addListener(_leaveNotifications);
+  }
 
   final link = LinkHolder();
   final screen = ScreenHolder();
@@ -21,6 +25,18 @@ class Holders {
   final cropLines = CropLinesHolder();
   final workdirText = WorkdirTextHolder();
   final EffectsListener effects;
+
+  /// Whether Settings' notifications page is open. It is a Flutter-local
+  /// page, so this is the only state it has; see [_leaveNotifications].
+  final notificationsOpen = ValueNotifier<bool>(false);
+
+  /// Leaving Settings closes its notifications page, so that reopening
+  /// Settings shows Settings itself.
+  void _leaveNotifications() {
+    if (screen.screen?.screen is! ScreenViewSettings) {
+      notificationsOpen.value = false;
+    }
+  }
 
   void connect() {
     link.connect();
