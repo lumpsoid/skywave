@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
@@ -5,7 +8,7 @@ import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'package:skywave_gui/usage/limits_page.dart';
 
-/// A session's info page: the session (name, full workdir), the agent
+/// A session's info page: the session (id, name, full workdir), the agent
 /// account's usage limits, what the session's turns took, its agent's
 /// model, effort and mode, its models, and every subagent it ran, each as
 /// its timeline row reads. Rust words it all from the replica; only the
@@ -52,6 +55,7 @@ class InfoPage extends StatelessWidget {
           padding: const EdgeInsets.only(bottom: 16),
           children: [
             _Section(section: session),
+            _SessionIdRow(sessionId: screen.sessionId),
             const _Heading('Usage limits'),
             ...limitsChildren(context, screen.limits),
             for (final section in rest) _Section(section: section),
@@ -155,6 +159,51 @@ class _Section extends StatelessWidget {
                   ),
           ),
       ],
+    );
+  }
+}
+
+/// The session's id, a field of the Session section laid out like the rest,
+/// with a button that copies it (its logs and transcript are found by it on
+/// the server).
+class _SessionIdRow extends StatelessWidget {
+  const _SessionIdRow({required this.sessionId});
+
+  final String sessionId;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final label = theme.textTheme.bodyMedium?.copyWith(
+      color: theme.colorScheme.onSurfaceVariant,
+    );
+    final column = MediaQuery.textScalerOf(context).scale(_Section.labelWidth);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: column,
+            child: Text('Id', style: label),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: SelectableText(sessionId, style: theme.textTheme.bodyMedium),
+          ),
+          IconButton(
+            tooltip: 'Copy session id',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.copy),
+            onPressed: () {
+              unawaited(Clipboard.setData(ClipboardData(text: sessionId)));
+              ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+                const SnackBar(content: Text('Session id copied')),
+              );
+            },
+          ),
+        ],
+      ),
     );
   }
 }
