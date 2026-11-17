@@ -1,0 +1,39 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+    ignore:
+      # rinf moves with its vendored Dart package and the CLI pinned in the
+      # workflows; update all three by hand (docs/maintaining.md).
+      - dependency-name: rinf
+
+  - package-ecosystem: pub
+    directory: /gui
+    schedule:
+      interval: weekly
+    groups:
+      pub-minor:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: rinf
+
+  - package-ecosystem: gradle
+    directory: /gui/android
+    schedule:
+      interval: weekly
+    groups:
+      gradle-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        update-types: [minor, patch]
