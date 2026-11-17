@@ -1,4 +1,5 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:skywave_gui/approvals/approvals_page.dart';
 import 'package:skywave_gui/boot/startup_page.dart';
 import 'package:skywave_gui/crop/crop_page.dart';
 import 'package:skywave_gui/holders.dart';
@@ -138,6 +139,11 @@ class ScreenNavigator extends StatelessWidget {
           send: send,
         ),
         final ScreenViewStorage screen => StoragePage(
+          screen: screen,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        final ScreenViewApprovals screen => ApprovalsPage(
           screen: screen,
           canGoBack: update.canGoBack,
           send: send,

@@ -1093,7 +1093,10 @@ void main() {
   });
 
   group('approval', () {
-    ApprovalPanel panel(List<RuleOption> suggestions) => ApprovalPanel(
+    ApprovalPanel panel(
+      List<RuleOption> suggestions, {
+      List<List<String>> ruleCandidates = const [],
+    }) => ApprovalPanel(
       approvalId: 'a1',
       gatedKey: 's:1',
       kind: ToolKindView.shell,
@@ -1101,6 +1104,7 @@ void main() {
       title: r'$ rm -rf build',
       canAnswer: true,
       suggestions: suggestions,
+      ruleCandidates: ruleCandidates,
       alwaysPicks: suggestions.length > 1,
       alwaysLabel: suggestions.isEmpty ? null : 'always allow · …',
     );
@@ -1157,6 +1161,77 @@ void main() {
       expect(sent, [resolve(DecisionView.approve, 1)]);
     });
 
+    testWidgets('a shell approval trusts its command and approves', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          approval: panel(
+            const [],
+            ruleCandidates: const [
+              ['git', 'status'],
+            ],
+          ),
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      sent.clear();
+      await tester.tap(find.byKey(const Key('approval-trust')));
+      await tester.pumpAndSettle();
+      expect(find.text('Trust and approve'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('trust-confirm')));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentSetSafetyRule(
+            sessionId: 's1',
+            words: ['git', 'status'],
+            on: true,
+          ),
+        ),
+        resolve(DecisionView.approve),
+      ]);
+    });
+
+    testWidgets('cancelling trust sends nothing', (tester) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          approval: panel(
+            const [],
+            ruleCandidates: const [
+              ['git', 'status'],
+            ],
+          ),
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      sent.clear();
+      await tester.tap(find.byKey(const Key('approval-trust')));
+      await tester.pumpAndSettle();
+      expect(find.text('Trust command'), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.text('Trust command'), findsNothing);
+      expect(sent, isEmpty);
+    });
+
+    testWidgets('no trust without a shell command', (tester) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: panel(const [])),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text('Approve'), findsOneWidget);
+      expect(find.byKey(const Key('approval-trust')), findsNothing);
+    });
+
     testWidgets('a phone with the keyboard up: one button row, no overflow', (
       tester,
     ) async {
@@ -1178,6 +1253,7 @@ void main() {
               RuleOption(index: 0, label: 'Bash(rm:*) (project)'),
               RuleOption(index: 1, label: 'Bash(*) (session)'),
             ],
+            ruleCandidates: const [],
             alwaysPicks: true,
           ),
         ),
@@ -1198,6 +1274,7 @@ void main() {
       preview: lines([for (var i = 1; i <= count; i++) 'line $i']),
       canAnswer: true,
       suggestions: const [],
+      ruleCandidates: const [],
       alwaysPicks: false,
     );
 
@@ -1344,6 +1421,7 @@ void main() {
             title: 'ls',
             canAnswer: false,
             suggestions: [],
+            ruleCandidates: [],
             alwaysPicks: false,
             answerLabel: 'you approved · queued 14:02:11',
           ),
@@ -1367,6 +1445,7 @@ void main() {
         lost: said,
         canAnswer: true,
         suggestions: const [],
+        ruleCandidates: const [],
         alwaysPicks: false,
       );
       await pumpSession(
@@ -1401,6 +1480,7 @@ void main() {
         askedLabel: said,
         canAnswer: true,
         suggestions: const [],
+        ruleCandidates: const [],
         alwaysPicks: false,
       );
       await pumpSession(
@@ -3503,6 +3583,7 @@ void main() {
             title: 'src/sync.rs',
             canAnswer: true,
             suggestions: [],
+            ruleCandidates: [],
             alwaysPicks: false,
           ),
         ),
@@ -3527,6 +3608,7 @@ void main() {
             title: 'ls',
             canAnswer: true,
             suggestions: [],
+            ruleCandidates: [],
             alwaysPicks: false,
           ),
         ),

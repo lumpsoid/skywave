@@ -1671,7 +1671,10 @@ approves those too, without Claude Code's auto mode.
   line per simple command, prefilled with its literal words; the person
   taps a word to stop the rule there, and never edits the text, so a
   quoted word like `-m "fix it"` stays exact. Settings lists the rules,
-  each with a remove button.
+  each with a remove button. The approval panel offers the same rules as
+  **Trust…**, and it also approves: a rule does not re-check an approval
+  already pending. That is how a subagent's shell command, which has no row
+  in the timeline, is trusted (D63).
 - The server reads rules per approval through a new `events_type`
   expression index; no cache to keep coherent.
 
@@ -1735,3 +1738,36 @@ Erasing, in one transaction:
 The delete is irreversible.
 
 Compaction is the explicit `POST /v1/storage/reclaim` (`VACUUM`), never automatic: `VACUUM` blocks writers and needs free disk about the size of the database, so it runs only when asked.
+
+## D63. Approvals are answered from one page
+
+An agent can wait on an approval in any session, and a subagent's shell
+approval has no row in the timeline. Answering one meant opening its
+session, so an approval in a long run could wait unseen. The Approvals page
+lists every approval this device can answer, from every session, and
+answers it there, without opening each session.
+
+**Decided:**
+- Oldest first, each with its session's title and an Open button. Its
+  panel is the approval panel (Approve, Deny, Always allow, Trust…), so an
+  answer goes as it does in the session and carries that session's id.
+- A question is listed but not answered there. Its options and draft are
+  the session's, so the item says where it is answered.
+- The facts come from the replica on demand, not from a new store table.
+  The page reads a session's events only while it is shown, and only for a
+  session with a pending approval it holds no facts for. A request missing
+  from those events is cached as unknown, so it is not read again. No
+  store or wire change.
+- Facts are cached raw, and the input's blob state and this device's answer
+  are read when the page is drawn, so they stay live.
+- The app bar's bell opens this page. Ctrl+G still opens the next approval,
+  for the one-key path.
+
+**Rejected:**
+- Persisting approval facts in the store: a schema change to keep a second
+  copy of what the replica already holds.
+- Answering questions on the page: their options and draft belong to the
+  session.
+
+**Deferred:**
+- The TUI's page. Its Approvals screen only counts them.

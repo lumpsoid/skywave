@@ -2230,7 +2230,7 @@ impl App {
                 KeyCode::Esc => Some(Action::Back),
                 _ => None,
             },
-            Screen::Worktrees(_) => match key.code {
+            Screen::Worktrees(_) | Screen::Approvals(_) => match key.code {
                 KeyCode::Char('q') => self.quit(),
                 KeyCode::Esc => Some(Action::Back),
                 _ => None,
