@@ -2138,6 +2138,64 @@ mod tests {
         ));
     }
 
+    /// A v40 database, at schema v26 and before the `deletion` column, opens
+    /// as v41: the v27 migration adds the column, which the old session
+    /// leaves NULL, and the event reads back unchanged. v41 added
+    /// `DeleteSession` and two event kinds, so no stored event changes.
+    #[test]
+    fn v41_reads_what_v40_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let session = "01920000-0000-7000-8000-000000000001";
+        let v40 = r#"{"type":"safety_rule_set","words":["git","status"],"on":true,"by":"01920000-0000-7000-8000-000000000009"}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..26] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 26).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 40)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, workdir) VALUES (?1, 'w')",
+                [session],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, ?1, 't', 'c', ?2)",
+                [session, v40],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let (kind, deletion): (String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT events.kind, sessions.deletion
+                 FROM events JOIN sessions ON sessions.id = events.session_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, v40);
+        assert_eq!(
+            deletion, None,
+            "the v27 column is NULL for a session it did not touch"
+        );
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::SafetyRuleSet { .. }
+        ));
+    }
+
     /// The plan `SAFETY_RULES_SQL` runs, as `EXPLAIN QUERY PLAN` details.
     fn safety_rules_plan(db: &Db) -> Vec<String> {
         let mut stmt = db
