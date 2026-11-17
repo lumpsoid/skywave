@@ -184,7 +184,7 @@ fn pairing_view(pairing: &PairingView, form: &PairForm) -> ScreenView {
 }
 
 fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
-    // The Active/Archived toggle carries the counts and which list shows.
+    // The scope control says which list shows.
     let kind = match list.kind {
         ListKind::Active => ListKindView::Active,
         ListKind::Archived => ListKindView::Archived,
@@ -214,7 +214,6 @@ fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
                 .collect()
         },
         plain: ui.plain_list,
-        other_count: count(list.other_count),
         creating: list.creating.iter().map(creating_view).collect(),
         dismissable: dismissable(list).map(|p| p.command_id.0.to_string()),
         create: ui
