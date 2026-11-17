@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-17T22:40:16.563635+00:00",
+      "status": "2026-11-17T22:40:16.563635+00:00",
+      "title": "2026-11-17T22:40:16.563635+00:00"
+    },
+    "tags": {
+      "followup": [
+        "2026-11-17T22:40:16.563635+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "release.yml's musl zigbuild and APK build first run on a tag; a failure there means deleting and re-tagging. A workflow_dispatch (or weekly) run of linux plus a debug-signed android build, skipping publish, would catch it earlier.",
+  "created": "2026-11-17T22:40:16.563635+00:00",
+  "id": "b55c1c",
+  "status": "open",
+  "tags": [
+    "followup"
+  ],
+  "title": "ci: dry-run the release builds before tagging",
+  "updated": "2026-11-17T22:40:16.563635+00:00"
+}
