@@ -256,6 +256,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             RouteView::Storage => Route::Storage,
             RouteView::Worktrees => Route::Worktrees,
             RouteView::UsageLimits => Route::UsageLimits,
+            RouteView::Approvals => Route::Approvals,
         }),
         ActionIntent::Back => Action::Back,
         ActionIntent::StartAgentLogin => Action::StartAgentLogin,

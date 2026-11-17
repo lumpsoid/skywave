@@ -2213,6 +2213,106 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
 }
 
 #[test]
+fn the_approvals_screen_lists_every_session_s_waiting_approvals_oldest_first() {
+    use crate::signals::DecisionView;
+    use skywave_proto::{ApprovalId, CallId, ToolKind};
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    let (a, b) = (rig.session, SessionId::new());
+    rig.log_in(
+        b,
+        vec![EventKind::SessionCreated {
+            workdir: "/srv/other".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        }],
+    );
+    let mut ids = [ApprovalId::new(), ApprovalId::new()];
+    ids.sort();
+    let [older, newer] = ids;
+    let (agent, step) = (CallId::new(), CallId::new());
+    rig.log(vec![
+        a_call(None, agent, "Agent", ToolKind::Subagent, "Explore sync"),
+        a_call(Some(agent), step, "Bash", ToolKind::Shell, "git status"),
+        EventKind::ApprovalRequested {
+            id: newer,
+            call: Some(step),
+            tool: "Bash".into(),
+            summary: "git status".into(),
+            input: None,
+            suggestions: Vec::new(),
+            shell: Some("git status".into()),
+        },
+    ]);
+    rig.log_in(
+        b,
+        vec![EventKind::ApprovalRequested {
+            id: older,
+            call: None,
+            tool: "Write".into(),
+            summary: "src/lib.rs".into(),
+            input: None,
+            suggestions: Vec::new(),
+            shell: None,
+        }],
+    );
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::Approvals,
+        },
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::Approvals { items } = sent_screen(&rig) else {
+        panic!("not the approvals screen");
+    };
+    let [first, second] = items.as_slice() else {
+        panic!("two approvals: {items:?}");
+    };
+    assert_eq!(first.session_id, b.0.to_string());
+    assert_eq!(first.approval_id, older.0.to_string());
+    assert_eq!(second.session_id, a.0.to_string());
+    assert_eq!(second.approval_id, newer.0.to_string());
+    assert!(first.note.is_none() && second.note.is_none());
+
+    let plain = first.panel.as_ref().expect("a panel for b's approval");
+    assert!(plain.can_answer);
+    assert_eq!(plain.rule_candidates, Vec::<Vec<String>>::new());
+    let subagent = second.panel.as_ref().expect("a panel for a's approval");
+    assert!(subagent.can_answer);
+    assert_eq!(
+        subagent.rule_candidates,
+        vec![vec!["git".to_owned(), "status".to_owned()]]
+    );
+    assert!(
+        subagent
+            .from
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("from subagent")
+    );
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::ResolveApproval {
+            approval_id: newer.0.to_string(),
+            decision: DecisionView::Approve,
+            rule: None,
+        },
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::Approvals { items } = sent_screen(&rig) else {
+        panic!("not the approvals screen after the answer");
+    };
+    let [only] = items.as_slice() else {
+        panic!("one approval left: {items:?}");
+    };
+    assert_eq!(only.approval_id, older.0.to_string());
+}
+
+#[test]
 fn the_storage_screen_shows_this_devices_usage_and_what_may_be_reclaimed() {
     use crate::signals::StorageKindView;
 
