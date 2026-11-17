@@ -1,0 +1,56 @@
+name: Bug report
+description: Something doesn't work as described.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start `skywaved serve` with ...
+        2. In the app, ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Versions
+      description: >-
+        `skywaved --version`, and `skywave-tui --version` or the app's
+        Settings → About, for each side involved.
+      placeholder: skywaved 0.1.0 (2391c1d), app 0.1.0 (2391c1d)
+    validations:
+      required: true
+  - type: dropdown
+    id: head
+    attributes:
+      label: Where
+      multiple: true
+      options:
+        - Server (skywaved)
+        - Terminal (skywave-tui)
+        - Android app
+        - Desktop app (Linux)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent version
+      description: '`claude --version` on the server, if the agent is involved.'
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        The relevant part of the server log or the app's log. Remove anything
+        private (paths, prompts, fingerprints) first.
+      render: text
