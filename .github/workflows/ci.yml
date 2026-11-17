@@ -24,7 +24,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust (Cargo.toml's rust-version)
         run: |
           v=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
@@ -46,7 +46,7 @@ jobs:
       run:
         working-directory: gui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust (Cargo.toml's rust-version)
         working-directory: .
         run: |
