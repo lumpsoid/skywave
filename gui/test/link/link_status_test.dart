@@ -116,39 +116,44 @@ void main() {
     expect(find.text('Retry now'), findsNothing, reason: 'the sheet closed');
   });
 
-  testWidgets('approvals elsewhere: a badged bell, and Ctrl+G', (tester) async {
-    await pump(tester);
-    holder.apply(link(LinkState.online, ''));
-    await tester.pumpAndSettle();
-    expect(find.byKey(const Key('approvals-elsewhere')), findsNothing);
-    final top = bodyTop(tester);
+  testWidgets(
+    'approvals elsewhere: a badged bell opens them all, Ctrl+G the next',
+    (tester) async {
+      await pump(tester);
+      holder.apply(link(LinkState.online, ''));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('approvals-elsewhere')), findsNothing);
+      final top = bodyTop(tester);
 
-    holder.apply(
-      link(
-        LinkState.online,
-        '',
-        elsewhere: 2,
-        elsewhereLabel: '2 approvals elsewhere',
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(bodyTop(tester), top);
-    expect(
-      find.descendant(
-        of: find.byKey(const Key('approvals-elsewhere')),
-        matching: find.text('2'),
-      ),
-      findsOneWidget,
-    );
-    await tester.tap(find.byKey(const Key('approvals-elsewhere')));
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyG);
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
-    expect(sent, [
-      const GuiIntentAct(action: ActionIntentOpenNextApproval()),
-      const GuiIntentAct(action: ActionIntentOpenNextApproval()),
-    ]);
-  });
+      holder.apply(
+        link(
+          LinkState.online,
+          '',
+          elsewhere: 2,
+          elsewhereLabel: '2 approvals elsewhere',
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(bodyTop(tester), top);
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('approvals-elsewhere')),
+          matching: find.text('2'),
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.byKey(const Key('approvals-elsewhere')));
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyG);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentNavigate(route: RouteView.approvals),
+        ),
+        const GuiIntentAct(action: ActionIntentOpenNextApproval()),
+      ]);
+    },
+  );
 
   testWidgets('a phone app bar fits the offline line and the bell', (
     tester,
