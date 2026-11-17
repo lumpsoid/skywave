@@ -84,6 +84,8 @@ flutter:
   # lib/session/look.dart).
   assets:
     - assets/status/
+    # Shipped with the font, as the OFL requires; shown on the licenses page.
+    - fonts/jetbrains_mono/OFL.txt
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

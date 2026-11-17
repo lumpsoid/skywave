@@ -262,6 +262,16 @@ class SettingsPage extends StatelessWidget {
               title: const Text('Version'),
               subtitle: SelectableText(screen.version),
             ),
+            ListTile(
+              key: const Key('licenses'),
+              leading: const Icon(Icons.description_outlined),
+              title: const Text('Licenses'),
+              onTap: () => showLicensePage(
+                context: context,
+                applicationName: 'Skywave',
+                applicationVersion: screen.version,
+              ),
+            ),
           ],
         ),
       ),
