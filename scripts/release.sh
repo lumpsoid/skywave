@@ -122,7 +122,7 @@ $(notes "$version")
 EOF
 
   echo "Tagged $tag ($full). Push with:" >&2
-  echo "  git push origin main $tag" >&2
+  echo "  git push origin $tag" >&2
 }
 
 if [ "${1:-}" = verify ]; then
