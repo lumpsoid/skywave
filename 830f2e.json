@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:55:52.850158+00:00",
+      "status": "2026-11-22T15:55:52.850158+00:00",
+      "title": "2026-11-22T15:55:52.850158+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:55:52.850158+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, after 9e23ea. skywave-core: apply capture events to the replica and expose them in ViewState; the outbox rule from dc27f7 for inputs (no blind resend after a long drop; settle a stale refusal as discardable); captures follow the blob policy, but the latest capture of an open screen downloads eagerly. Link-harness tests: a tap queued offline, a drop mid-capture download, two devices tapping at once.",
+  "created": "2026-11-22T15:55:52.850158+00:00",
+  "id": "830f2e",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 4: core replica and outbox rules for screen inputs",
+  "updated": "2026-11-22T15:55:52.850158+00:00"
+}
