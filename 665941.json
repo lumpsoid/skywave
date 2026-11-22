@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:55:46.450283+00:00",
+      "status": "2026-11-22T15:55:46.450283+00:00",
+      "title": "2026-11-22T15:55:46.450283+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:55:46.450283+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, after 6f8xxx-wire step (see meta). skywaved: a screen runner on its own thread beside the shell runner, following the event log; the backend trait from dc27f7 with an adb implementation: adb devices, exec-out screencap -p (scaled and re-encoded to JPEG on the server), shell input tap/swipe/text/keyevent, install -r, am start / force-stop. Works with an emulator or a real phone over USB or adb over TCP, so it can be tested on the Pi with a physical device even where the emulator does not run (Google ships no linux-aarch64 emulator). Tests: a fake adb script like fake-claude.sh with recorded screencap fixtures; no real device in the test suite.",
+  "created": "2026-11-22T15:55:46.450283+00:00",
+  "id": "665941",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 3: server screen runner with the Android (adb) backend",
+  "updated": "2026-11-22T15:55:46.450283+00:00"
+}
