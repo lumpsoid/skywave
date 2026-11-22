@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:56:03.090963+00:00",
+      "status": "2026-11-22T15:56:03.090963+00:00",
+      "title": "2026-11-22T15:56:03.090963+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:56:03.090963+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, after the macOS port and the Android trial. A second backend behind the same trait: xcrun simctl list/boot/install/launch/terminate and io screenshot; taps, swipes, text and buttons through idb (simctl has no tap). Coordinates in points vs pixels: map through the capture scale. Fake simctl/idb scripts for tests.",
+  "created": "2026-11-22T15:56:03.090963+00:00",
+  "id": "4cc3ff",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 9: iOS simulator backend (simctl + idb)",
+  "updated": "2026-11-22T15:56:03.090963+00:00"
+}
