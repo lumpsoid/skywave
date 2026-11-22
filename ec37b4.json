@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T17:59:08.834442+00:00",
+      "status": "2026-11-22T17:59:08.834442+00:00",
+      "title": "2026-11-22T17:59:08.834442+00:00"
+    },
+    "tags": {
+      "followup": [
+        "2026-11-22T17:59:08.834442+00:00",
+        false
+      ],
+      "screen": [
+        "2026-11-22T17:59:08.834442+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, found by the feat/screen review. The runner captures right after adb returns from an input (crates/skywaved/src/screen/runner.rs, settle -> shoot), so a tap that starts a transition can be shot mid-animation or as Unchanged. Decide from the device trial (49daac): a short settle delay, a second shot, or leave it to a follow-up Capture.",
+  "created": "2026-11-22T17:59:08.834442+00:00",
+  "id": "ec37b4",
+  "status": "open",
+  "tags": [
+    "followup",
+    "screen"
+  ],
+  "title": "screen: settle before the after-input shot",
+  "updated": "2026-11-22T17:59:08.834442+00:00"
+}
