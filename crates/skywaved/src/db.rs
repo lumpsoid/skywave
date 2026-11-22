@@ -2249,7 +2249,7 @@ mod tests {
         ));
     }
 
-    /// A v41 database, at schema v27 (the current one), opens as v42: v42
+    /// A v41 database, at schema v27 (what v41 wrote), opens as v42: v42
     /// added the `Screen` command, two event kinds and a blob use, which
     /// store nothing this event held, so the event reads back unchanged.
     #[test]
@@ -2304,6 +2304,53 @@ mod tests {
             serde_json::from_str(&kind).unwrap(),
             EventKind::SafetyRuleSet { .. }
         ));
+    }
+
+    /// v28 remakes `event_blobs` with the `screen_capture` use and keeps the
+    /// rows a v27 build wrote in it, then takes the screen tables.
+    #[test]
+    fn v28_keeps_event_blobs_and_takes_screen_captures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let session = "01920000-0000-7000-8000-000000000001";
+        let attachment = "01920000-0000-7000-8000-000000000011";
+        let capture = "01920000-0000-7000-8000-000000000012";
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..27] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 27).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 41)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES (?1, ?2, 1, 'attachment')",
+                [attachment, session],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let (count, holds): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT count(*), holds FROM event_blobs WHERE blob_id = ?1",
+                [attachment],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, holds.as_str()), (1, "attachment"));
+        db.conn()
+            .execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES (?1, ?2, 2, 'screen_capture')",
+                [capture, session],
+            )
+            .unwrap();
     }
 
     /// The plan `SAFETY_RULES_SQL` runs, as `EXPLAIN QUERY PLAN` details.

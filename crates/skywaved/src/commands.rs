@@ -201,7 +201,8 @@
 //! `ShellFinished` is `RunFinished`. A second stop of a running run is
 //! accepted and logged; the first is the one the runner acts on.
 //!
-//! **Screen.** `ScreenDisabled` while `[screen]` is off
+//! **Screen.** `DiskLow` and `ServerStopping` come first, as for any command
+//! that starts work (see above). Then `ScreenDisabled` while `[screen]` is off
 //! ([`EventLog::with_screen`]), then `UnknownSession`, then `BadScreenInput`
 //! for an action [`screen::valid_action`] refuses. An input is aimed at a
 //! capture: `ScreenStale` unless its `aim` is the device's latest capture in

@@ -775,8 +775,9 @@ the daemon's appends, which would otherwise stop `serve` (below).
   latest's id. Two server tables back it: `screen_requests` holds the open
   requests, for recovery, and `screen_captures` the latest capture per
   session and device, for the stale check and the coordinate scaling. After
-  each `ScreenDone` only the newest 20 capture blobs of its session remain;
-  the older ones are deleted in that transaction and listed in its `pruned`.
+  each `ScreenDone` only the newest 20 capture blobs of its session remain,
+  and never a device's latest; the older ones are deleted in that transaction
+  and listed in its `pruned`.
   On start every request without a `ScreenDone` is settled `Lost`, never run
   again, or `NotStarted` while the runner is disabled. Config:
   `[screen] enabled` (off by default) and `adb` (the adb binary). See D65.

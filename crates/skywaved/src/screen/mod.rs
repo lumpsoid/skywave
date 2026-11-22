@@ -76,13 +76,14 @@ fn valid_text(text: &str) -> bool {
 }
 
 /// An app's package id: non-empty, within the name limit, and only ASCII
-/// letters, digits and `._/$`.
+/// letters, digits and `._/`. `$` is refused: adb joins the launch arguments
+/// and the device's `sh -c` expands them.
 fn valid_app(app: &str) -> bool {
     !app.is_empty()
         && app.len() <= limits::SCREEN_NAME_MAX_BYTES
         && app
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '$'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/'))
 }
 
 /// An APK path under the server's allowed names: non-empty, within the name
@@ -207,9 +208,18 @@ mod tests {
     fn accepts_a_package_id() {
         let launch = ScreenAction::Launch {
             device: "d".to_owned(),
-            app: "com.example.app_1$x/.Main".to_owned(),
+            app: "com.example.app_1x/.Main".to_owned(),
         };
         assert!(valid_action(&launch));
+    }
+
+    #[test]
+    fn refuses_a_dollar_in_an_app() {
+        let launch = ScreenAction::Launch {
+            device: "d".to_owned(),
+            app: "com.x$Inner/.Main".to_owned(),
+        };
+        assert!(!valid_action(&launch));
     }
 
     #[test]

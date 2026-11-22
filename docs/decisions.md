@@ -1871,8 +1871,9 @@ is a field of each action (its serial). **Rejected:** a server-wide screen
 (a new non-session event stream through every layer).
 
 **Captures pile up.** The server keeps the newest 20 capture blobs per
-session; a `ScreenDone` deletes the older ones in its transaction and lists
-them in `pruned`, so devices drop them with no deletion event per blob. A low
+session, and never a device's latest (inputs may still aim at it); a
+`ScreenDone` deletes the older ones in its transaction and lists them in
+`pruned`, so devices drop them with no deletion event per blob. A low
 disk refuses new requests (`DiskLow`, D40) and fails one the runner reaches
 (`Failed`): an input is cheap to redo.
 
