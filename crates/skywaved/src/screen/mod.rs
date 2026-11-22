@@ -6,6 +6,9 @@
 pub mod android;
 pub mod backend;
 pub mod capture;
+mod runner;
+
+pub use runner::{ScreenHandle, ScreenRunner};
 
 use std::path::{Component, Path, PathBuf};
 
