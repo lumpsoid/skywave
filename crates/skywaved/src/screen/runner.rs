@@ -306,7 +306,11 @@ impl<B: ScreenBackend> ScreenRunner<B> {
             .log
             .latest_capture(&self.storage.db, request.session_id, device)?;
         let latest_id = latest.as_ref().map(|l| l.capture);
-        if request.action.aim().is_some_and(|aim| Some(aim) != latest_id) {
+        if request
+            .action
+            .aim()
+            .is_some_and(|aim| Some(aim) != latest_id)
+        {
             let outcome = ScreenOutcome::Stale { latest: latest_id };
             return Ok((outcome, Blobs::default()));
         }
@@ -347,7 +351,10 @@ impl<B: ScreenBackend> ScreenRunner<B> {
                 to_y,
                 duration_ms,
                 ..
-            } => match (on_screen(latest, *from_x, *from_y), on_screen(latest, *to_x, *to_y)) {
+            } => match (
+                on_screen(latest, *from_x, *from_y),
+                on_screen(latest, *to_x, *to_y),
+            ) {
                 (Some(from), Some(to)) => self.backend.swipe(device, from, to, *duration_ms).await,
                 _ => Err(unaimed()),
             },
@@ -406,9 +413,9 @@ impl<B: ScreenBackend> ScreenRunner<B> {
                     }
                 };
                 self.storage.blobs.record(self.storage.db.conn(), &meta)?;
-                let pruned = self
-                    .log
-                    .prunable_captures(&self.storage.db, session, KEEP_CAPTURES - 1)?;
+                let pruned =
+                    self.log
+                        .prunable_captures(&self.storage.db, session, KEEP_CAPTURES - 1)?;
                 let image = ScreenImage {
                     image: meta.blob_ref(),
                     format: encoded.format,

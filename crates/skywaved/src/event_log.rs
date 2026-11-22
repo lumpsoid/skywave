@@ -2162,8 +2162,14 @@ pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<B
     )?;
     conn.execute("DELETE FROM approvals WHERE session_id = ?1", [&session])?;
     conn.execute("DELETE FROM shell_runs WHERE session_id = ?1", [&session])?;
-    conn.execute("DELETE FROM screen_requests WHERE session_id = ?1", [&session])?;
-    conn.execute("DELETE FROM screen_captures WHERE session_id = ?1", [&session])?;
+    conn.execute(
+        "DELETE FROM screen_requests WHERE session_id = ?1",
+        [&session],
+    )?;
+    conn.execute(
+        "DELETE FROM screen_captures WHERE session_id = ?1",
+        [&session],
+    )?;
     let erased = serde_json::to_string(&EventKind::Erased)?;
     conn.execute(
         "UPDATE events SET kind = ?2 WHERE session_id = ?1

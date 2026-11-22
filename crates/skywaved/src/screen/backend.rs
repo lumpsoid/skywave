@@ -64,7 +64,8 @@ pub trait ScreenBackend {
     ) -> impl Future<Output = Result<(), BackendError>>;
 
     /// Starts `app`: a package id, or a `package/activity` component.
-    fn launch(&mut self, device: &str, app: &str) -> impl Future<Output = Result<(), BackendError>>;
+    fn launch(&mut self, device: &str, app: &str)
+    -> impl Future<Output = Result<(), BackendError>>;
 
     /// Stops `app`.
     fn stop(&mut self, device: &str, app: &str) -> impl Future<Output = Result<(), BackendError>>;

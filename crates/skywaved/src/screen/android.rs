@@ -64,7 +64,9 @@ impl ScreenBackend for Android {
     }
 
     async fn capture(&mut self, device: &str) -> Result<Vec<u8>, BackendError> {
-        let png = self.adb(&["-s", device, "exec-out", "screencap", "-p"], TIMEOUT).await?;
+        let png = self
+            .adb(&["-s", device, "exec-out", "screencap", "-p"], TIMEOUT)
+            .await?;
         if png.starts_with(PNG_SIGNATURE) {
             Ok(png)
         } else {
@@ -74,7 +76,8 @@ impl ScreenBackend for Android {
 
     async fn tap(&mut self, device: &str, x: u32, y: u32) -> Result<(), BackendError> {
         let (x, y) = (x.to_string(), y.to_string());
-        self.adb(&["-s", device, "shell", "input", "tap", &x, &y], TIMEOUT).await?;
+        self.adb(&["-s", device, "shell", "input", "tap", &x, &y], TIMEOUT)
+            .await?;
         Ok(())
     }
 
@@ -87,20 +90,27 @@ impl ScreenBackend for Android {
     ) -> Result<(), BackendError> {
         let [x1, y1, x2, y2] = [from.0, from.1, to.0, to.1].map(|n| n.to_string());
         let duration = duration_ms.to_string();
-        let args = ["-s", device, "shell", "input", "swipe", &x1, &y1, &x2, &y2, &duration];
+        let args = [
+            "-s", device, "shell", "input", "swipe", &x1, &y1, &x2, &y2, &duration,
+        ];
         self.adb(&args, TIMEOUT).await?;
         Ok(())
     }
 
     async fn text(&mut self, device: &str, text: &str) -> Result<(), BackendError> {
         let escaped = escape_text(text);
-        self.adb(&["-s", device, "shell", "input", "text", &escaped], TIMEOUT).await?;
+        self.adb(&["-s", device, "shell", "input", "text", &escaped], TIMEOUT)
+            .await?;
         Ok(())
     }
 
     async fn key(&mut self, device: &str, key: ScreenKey) -> Result<(), BackendError> {
         let code = keycode(key).to_string();
-        self.adb(&["-s", device, "shell", "input", "keyevent", &code], TIMEOUT).await?;
+        self.adb(
+            &["-s", device, "shell", "input", "keyevent", &code],
+            TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
@@ -116,7 +126,8 @@ impl ScreenBackend for Android {
     async fn launch(&mut self, device: &str, app: &str) -> Result<(), BackendError> {
         // `am` and `monkey` can exit 0 on failure, so the output is checked.
         let out = if app.contains('/') {
-            self.adb(&["-s", device, "shell", "am", "start", "-n", app], TIMEOUT).await?
+            self.adb(&["-s", device, "shell", "am", "start", "-n", app], TIMEOUT)
+                .await?
         } else {
             let args = [
                 "-s",

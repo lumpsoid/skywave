@@ -481,7 +481,9 @@ async fn a_disabled_runner_settles_requests_not_started() {
             action: ScreenAction::Devices,
         },
     };
-    let result = plain.handle(&mut f.storage.db, DeviceId::new(), &command).unwrap();
+    let result = plain
+        .handle(&mut f.storage.db, DeviceId::new(), &command)
+        .unwrap();
     assert_eq!(rejected(result), RejectReason::ScreenDisabled);
 }
 
@@ -628,10 +630,7 @@ async fn install_resolves_the_apk_in_the_workdir() {
         apk: "app.apk".into(),
     });
     let outcome = f.done(request).await;
-    assert!(
-        matches!(outcome, ScreenOutcome::Done { .. }),
-        "{outcome:?}"
-    );
+    assert!(matches!(outcome, ScreenOutcome::Done { .. }), "{outcome:?}");
     let apk = std::fs::canonicalize(workdir.join("app.apk")).unwrap();
     let line = format!("-s {SERIAL} install -r {}", apk.display());
     assert!(f.calls().contains(&line), "{:?}", f.calls());

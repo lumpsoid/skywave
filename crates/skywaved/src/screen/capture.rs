@@ -3,9 +3,9 @@
 //! capture whose pixels equal the latest one is `Unchanged`, so aims at the
 //! latest capture stay valid.
 
+use image::DynamicImage;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::{self, FilterType};
-use image::DynamicImage;
 use skywave_proto::{CaptureFormat, ContentHash};
 
 use super::backend::BackendError;
