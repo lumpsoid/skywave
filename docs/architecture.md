@@ -328,8 +328,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
 - **Commands** are deduplicated, validated and appended in one transaction;
   rejected ones are stored too, so their answer stays stable. Validation
   reads projections of the log (`sessions`, `contexts`, `approvals`,
-  `shell_runs`, `event_blobs`) updated in the transaction that appends the
-  event.
+  `shell_runs`, `event_blobs`, `screen_captures`) updated in the transaction
+  that appends the event.
 - **Deleting an event blob** (D42): `DeleteBlob { blob }` is `UnknownBlob`
   when no event referenced the blob (no `event_blobs` row: a workdir blob,
   an id never minted) and `BlobGone` when one did but its `blobs` row is

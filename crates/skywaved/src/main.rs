@@ -291,6 +291,7 @@ async fn serve(
     // are set before any clone: each clone keeps its own.
     let log = EventLog::open(&storage.db, config.roots.clone())?
         .with_shell(config.shell.enabled)
+        .with_screen(config.screen.enabled)
         .with_bypass(config.agent.allow_bypass)
         .with_disk(disk);
     // The agent's own conversations, read from the environment the CLI the

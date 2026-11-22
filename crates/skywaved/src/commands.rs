@@ -27,6 +27,7 @@
 //!   source;
 //! - `RunShell` → `ShellRequested` with the command verbatim;
 //! - `StopShell` → `ShellStopRequested`;
+//! - `Screen` → `ScreenRequested` with the action verbatim;
 //! - `DeleteBlob` → `BlobDeleted` with what the blob held;
 //! - `CropBlob` → `BlobCropped` with what the blob held and the new blob.
 //!
@@ -47,7 +48,7 @@
 //! up to 5 s old is reused) and, while the disk is low, is `DiskLow` before
 //! anything else is checked:
 //! `CreateSession`, `SendMessage`, `SetPermissionMode`, `SetModel`,
-//! `SetEffort`, `ClearContext`, `MoveContext` and `RunShell`. The rest is
+//! `SetEffort`, `ClearContext`, `MoveContext`, `RunShell` and `Screen`. The rest is
 //! control the user needs while the agents are paused, or one small event
 //! that starts nothing, and is handled as usual: `ResolveApproval`,
 //! `Interrupt`, `StopSession`, `StopTask`, `StopShell`, `RenameSession`,
@@ -200,6 +201,12 @@
 //! `ShellFinished` is `RunFinished`. A second stop of a running run is
 //! accepted and logged; the first is the one the runner acts on.
 //!
+//! **Screen.** `ScreenDisabled` while `[screen]` is off
+//! ([`EventLog::with_screen`]), then `UnknownSession`, then `BadScreenInput`
+//! for an action [`screen::valid_action`] refuses. An input is aimed at a
+//! capture: `ScreenStale` unless its `aim` is the device's latest capture in
+//! the session, and `BadScreenInput` for a point past that capture's image.
+//!
 //! **SafetyCheckFeedback.** `UnknownSession`, then `MessageTooLong` for a note
 //! over [`limits::SAFETY_FEEDBACK_NOTE_MAX_BYTES`] (checked untrimmed). Then
 //! `NotAShellCall` unless the call's newest `ApprovalRequested` names a shell
@@ -256,6 +263,7 @@ use crate::db::Db;
 use crate::dirs;
 use crate::error::{Error, Result};
 use crate::event_log::{self, Closed, EventLog};
+use crate::screen;
 use crate::worktree;
 
 /// What a command needs done before its transaction, off the database
@@ -968,8 +976,35 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
-            // The screen runner's rules come with its config (D65).
-            CommandKind::Screen { .. } => return Ok(Err(RejectReason::ScreenDisabled)),
+            CommandKind::Screen { session_id, action } => {
+                if !self.screen_enabled() {
+                    return Ok(Err(RejectReason::ScreenDisabled));
+                }
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                if !screen::valid_action(action) {
+                    return Ok(Err(RejectReason::BadScreenInput));
+                }
+                // An aimed input is valid only while its capture is the
+                // device's latest one (D65), as the log says now.
+                if let Some(aim) = action.aim()
+                    && let Some(name) = action.device()
+                {
+                    let latest = event_log::latest_capture_in(tx, *session_id, name)?;
+                    let Some(latest) = latest.filter(|latest| latest.capture == aim) else {
+                        return Ok(Err(RejectReason::ScreenStale));
+                    };
+                    if !on_image(action, latest.width, latest.height) {
+                        return Ok(Err(RejectReason::BadScreenInput));
+                    }
+                }
+                let kind = EventKind::ScreenRequested {
+                    action: action.clone(),
+                    by: device,
+                };
+                (*session_id, session.context, kind)
+            }
             CommandKind::DeleteBlob { blob } => {
                 let Some(row) = event_log::event_blob_in(tx, *blob)? else {
                     return Ok(Err(RejectReason::UnknownBlob));
@@ -1126,6 +1161,23 @@ fn work_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::DeleteBlob { .. }
         | CommandKind::CropBlob { .. }
         | CommandKind::Screen { .. } => None,
+    }
+}
+
+/// Whether the points `action` names lie on a capture's image of `width` by
+/// `height` pixels: the coordinates of a tap or swipe are the image's (D65).
+fn on_image(action: &ScreenAction, width: u32, height: u32) -> bool {
+    let within = |x: u32, y: u32| x < width && y < height;
+    match action {
+        ScreenAction::Tap { x, y, .. } => within(*x, *y),
+        ScreenAction::Swipe {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            ..
+        } => within(*from_x, *from_y) && within(*to_x, *to_y),
+        _ => true,
     }
 }
 

@@ -81,6 +81,9 @@ pub struct EventLog {
     /// Whether `RunShell` and `StopShell` are accepted ([`EventLog::with_shell`]).
     /// Beside `inner`, not in it, so the builder needs no unique `Arc`.
     shell_enabled: bool,
+    /// Whether `Screen` commands are accepted ([`EventLog::with_screen`]).
+    /// Beside `inner` like `shell_enabled`.
+    screen_enabled: bool,
     /// Whether a `SetPermissionMode` may ask for bypass
     /// ([`EventLog::with_bypass`]). Beside `inner` like `shell_enabled`.
     bypass_allowed: bool,
@@ -265,6 +268,7 @@ impl EventLog {
                 stopping: AtomicBool::new(false),
             }),
             shell_enabled: false,
+            screen_enabled: false,
             bypass_allowed: false,
             disk: Disk::default(),
             blobs: None,
@@ -314,6 +318,21 @@ impl EventLog {
     /// Whether this log accepts shell commands.
     pub fn shell_enabled(&self) -> bool {
         self.shell_enabled
+    }
+
+    /// This log with screen commands on or off (`[screen] enabled`);
+    /// [`EventLog::open`] has them off, and `Screen` is then refused
+    /// `ScreenDisabled`. Set it before cloning, like [`EventLog::with_shell`].
+    pub fn with_screen(self, enabled: bool) -> EventLog {
+        EventLog {
+            screen_enabled: enabled,
+            ..self
+        }
+    }
+
+    /// Whether this log accepts screen commands.
+    pub fn screen_enabled(&self) -> bool {
+        self.screen_enabled
     }
 
     /// This log with bypass mode allowed or not (`agent.allow_bypass`);
@@ -664,9 +683,13 @@ impl EventLog {
     /// request's session and that session's current context, which stamps the
     /// event, and appends, as [`EventLog::shell_event`] does for a run.
     ///
-    /// Refused with [`Error::InvalidAppend`]: any other kind, and a request no
-    /// `ScreenRequested` logged.
-    pub fn screen_event(&self, db: &mut Db, kind: EventKind) -> Result<Seq> {
+    /// `None`, appending nothing, when the request's row is gone or its
+    /// session is unknown or has a deletion requested: a deleted session's
+    /// request is not settled, its log is going away (D62).
+    ///
+    /// Refused with [`Error::InvalidAppend`]: any other kind, and a request
+    /// that is already done.
+    pub fn screen_event(&self, db: &mut Db, kind: EventKind) -> Result<Option<Seq>> {
         let EventKind::ScreenDone { request, .. } = &kind else {
             return Err(Error::InvalidAppend(format!(
                 "{} is not a daemon screen event",
@@ -680,22 +703,16 @@ impl EventLog {
             .query_row([request.0.to_string()], |r| r.get(0))
             .optional()?;
         let Some(session) = session else {
-            return Err(Error::InvalidAppend(format!(
-                "unknown screen request {}",
-                request.0
-            )));
+            return Ok(None);
         };
         let session_id = parse_id::<SessionId>(&session)?;
         let Some(info) = session_in(&tx, session_id)? else {
-            return Err(Error::Corrupt(format!(
-                "screen request {} of unknown session {session}",
-                request.0
-            )));
+            return Ok(None);
         };
         let seq = append_in(&tx, session_id, info.context, None, &kind)?;
         tx.commit()?;
         self.published(seq);
-        Ok(seq)
+        Ok(Some(seq))
     }
 
     /// Appends `kind`, the `FileWritten` a workdir write made (`POST`
@@ -2145,6 +2162,8 @@ pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<B
     )?;
     conn.execute("DELETE FROM approvals WHERE session_id = ?1", [&session])?;
     conn.execute("DELETE FROM shell_runs WHERE session_id = ?1", [&session])?;
+    conn.execute("DELETE FROM screen_requests WHERE session_id = ?1", [&session])?;
+    conn.execute("DELETE FROM screen_captures WHERE session_id = ?1", [&session])?;
     let erased = serde_json::to_string(&EventKind::Erased)?;
     conn.execute(
         "UPDATE events SET kind = ?2 WHERE session_id = ?1
