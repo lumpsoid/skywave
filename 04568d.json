@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:56:01.330182+00:00",
+      "status": "2026-11-22T15:56:01.330182+00:00",
+      "title": "2026-11-22T15:56:01.330182+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:56:01.330182+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, needed for the iOS backend. skywaved ships Linux only; Linux-specific code sits in process.rs, shell/host.rs, disk.rs, server/limits.rs, identity.rs, main.rs (reaping, the shell sandbox, disk check, socket options). Port each, add a darwin release artefact, and document running it as a per-user launchd agent (a booted simulator wants a logged-in session).",
+  "created": "2026-11-22T15:56:01.330182+00:00",
+  "id": "04568d",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 8: run skywaved on macOS",
+  "updated": "2026-11-22T15:56:01.330182+00:00"
+}
