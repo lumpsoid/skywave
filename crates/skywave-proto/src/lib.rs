@@ -225,7 +225,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v41: `DeleteSession`, `SessionDeleted`, `Erased`, `RejectReason::ApprovalPending`,
 /// `RejectReason::WorktreeNotRemoved`, `StorageReport::reclaimable` and `POST`
 /// [`path::STORAGE_RECLAIM`].
-pub const PROTOCOL_VERSION: u32 = 41;
+///
+/// v42: the screen runner (D65): [`CommandKind::Screen`],
+/// [`EventKind::ScreenRequested`], [`EventKind::ScreenDone`],
+/// [`BlobUse::ScreenCapture`] and the refusals [`RejectReason::ScreenDisabled`],
+/// [`RejectReason::ScreenStale`] and [`RejectReason::BadScreenInput`].
+pub const PROTOCOL_VERSION: u32 = 42;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has

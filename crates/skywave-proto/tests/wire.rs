@@ -589,9 +589,27 @@ fn all_event_kinds() -> Vec<EventKind> {
             lines: 40,
             bytes: 2_048,
         },
+        EventKind::ScreenRequested {
+            action: ScreenAction::Tap {
+                device: "emulator-5554".into(),
+                aim: command(),
+                x: 540,
+                y: 1200,
+            },
+            by: device(),
+        },
+        EventKind::ScreenDone {
+            request: command(),
+            by: device(),
+            outcome: ScreenOutcome::Done {
+                shot: ScreenShot::Unchanged { capture: command() },
+            },
+            pruned: vec![blob_id()],
+        },
     ]
     .into_iter()
     .chain(all_shell_ends().into_iter().map(shell_finished))
+    .chain(all_screen_outcomes().into_iter().map(screen_done))
     .chain(
         all_imported_items()
             .into_iter()
@@ -952,6 +970,65 @@ fn shell_finished(end: ShellEnd) -> EventKind {
     }
 }
 
+fn all_screen_outcomes() -> Vec<ScreenOutcome> {
+    vec![
+        ScreenOutcome::Devices {
+            devices: vec![
+                ScreenDevice {
+                    serial: "emulator-5554".into(),
+                    state: "device".into(),
+                    model: Some("sdk_gphone64_arm64".into()),
+                },
+                ScreenDevice {
+                    serial: "R58M1234ABC".into(),
+                    state: "unauthorized".into(),
+                    model: None,
+                },
+            ],
+        },
+        ScreenOutcome::Done {
+            shot: ScreenShot::Image(ScreenImage {
+                image: blob(),
+                format: CaptureFormat::Jpeg,
+                width: 720,
+                height: 1280,
+                screen_width: 1080,
+                screen_height: 2400,
+                pixels: ContentHash::of(b"scaled pixels"),
+            }),
+        },
+        ScreenOutcome::Done {
+            shot: ScreenShot::Unchanged { capture: command() },
+        },
+        ScreenOutcome::Done {
+            shot: ScreenShot::Failed {
+                reason: "screencap exited 1".into(),
+            },
+        },
+        ScreenOutcome::Stale {
+            latest: Some(command()),
+        },
+        ScreenOutcome::Stale { latest: None },
+        ScreenOutcome::Failed {
+            reason: "disk low".into(),
+        },
+        ScreenOutcome::Lost,
+        ScreenOutcome::NotStarted {
+            reason: "screen disabled".into(),
+        },
+    ]
+}
+
+/// A `ScreenDone` ending in `outcome`, with nothing pruned.
+fn screen_done(outcome: ScreenOutcome) -> EventKind {
+    EventKind::ScreenDone {
+        request: command(),
+        by: device(),
+        outcome,
+        pruned: Vec::new(),
+    }
+}
+
 fn all_command_kinds() -> Vec<CommandKind> {
     vec![
         CommandKind::CreateSession {
@@ -1098,6 +1175,106 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             run: command(),
         },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Devices,
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Capture {
+                device: "emulator-5554".into(),
+                full: false,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Capture {
+                device: "emulator-5554".into(),
+                full: true,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Tap {
+                device: "emulator-5554".into(),
+                aim: command(),
+                x: 540,
+                y: 1200,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Swipe {
+                device: "emulator-5554".into(),
+                aim: command(),
+                from_x: 540,
+                from_y: 1800,
+                to_x: 540,
+                to_y: 600,
+                duration_ms: 300,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Text {
+                device: "emulator-5554".into(),
+                aim: command(),
+                text: "hello world".into(),
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Key {
+                device: "emulator-5554".into(),
+                aim: command(),
+                key: ScreenKey::Back,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Key {
+                device: "emulator-5554".into(),
+                aim: command(),
+                key: ScreenKey::Enter,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Key {
+                device: "emulator-5554".into(),
+                aim: command(),
+                key: ScreenKey::Delete,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Key {
+                device: "emulator-5554".into(),
+                aim: command(),
+                key: ScreenKey::VolumeUp,
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Install {
+                device: "emulator-5554".into(),
+                apk: "/srv/apks/app-debug.apk".into(),
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Launch {
+                device: "emulator-5554".into(),
+                app: "com.example.app".into(),
+            },
+        },
+        CommandKind::Screen {
+            session_id: session(),
+            action: ScreenAction::Stop {
+                device: "emulator-5554".into(),
+                app: "com.example.app".into(),
+            },
+        },
         CommandKind::DeleteBlob { blob: blob_id() },
         CommandKind::CropBlob {
             blob: blob_id(),
@@ -1155,6 +1332,9 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::TooManyAttachments,
             RejectReason::AttachmentsTooLarge,
             RejectReason::BadSafetyRule,
+            RejectReason::ScreenDisabled,
+            RejectReason::ScreenStale,
+            RejectReason::BadScreenInput,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -1770,6 +1950,31 @@ fn run_shell_decodes_without_when_as_always() {
 }
 
 #[test]
+fn screen_capture_decodes_without_full_as_scaled() {
+    let action: ScreenAction =
+        serde_json::from_str(r#"{"type":"capture","device":"emulator-5554"}"#).unwrap();
+    assert_eq!(
+        action,
+        ScreenAction::Capture {
+            device: "emulator-5554".into(),
+            full: false,
+        }
+    );
+}
+
+#[test]
+fn screen_done_without_pruned_has_no_pruned_key() {
+    let done = EventKind::ScreenDone {
+        request: command(),
+        by: device(),
+        outcome: ScreenOutcome::Lost,
+        pruned: Vec::new(),
+    };
+    let json = serde_json::to_string(&done).unwrap();
+    assert!(!json.contains("pruned"), "{json}");
+}
+
+#[test]
 fn every_shell_end_round_trips() {
     for end in all_shell_ends() {
         round_trip(&end);
@@ -2055,8 +2260,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v41() {
-    assert_eq!(PROTOCOL_VERSION, 41);
+fn protocol_is_v42() {
+    assert_eq!(PROTOCOL_VERSION, 42);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
