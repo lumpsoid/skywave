@@ -9,11 +9,13 @@ use std::thread;
 use chrono::{TimeZone, Utc};
 use skywave_core::attachment::{AttachedFile, AttachedImage};
 use skywave_core::{
-    Action, Attention, BlobState, BlobStatus, ComposerMode, ContentHash, Core, CoreError, Delivery,
-    DeviceRef, Draft, Entry, FailReason, Fingerprint, FullView, ImageType, Link, OutboxStatus,
-    Outgoing, PairedCredentials, PairedLink, PairingStatus, Pause, Request, Route, RunWhen, Screen,
-    Seam, ServerAddress, SessionView, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
-    ShellView, Store, StoreError, TimelineItem, ViewState,
+    Action, AppScreenView, Attention, BlobState, BlobStatus, CaptureFormat, ComposerMode,
+    ContentHash, Core, CoreError, Delivery, DeviceRef, Draft, Entry, FailReason, Fingerprint,
+    FullView, ImageType, Link, OutboxStatus, Outgoing, PairedCredentials, PairedLink,
+    PairingStatus, Pause, Request, Route, RunWhen, Screen, ScreenAction, ScreenDevice, ScreenImage,
+    ScreenOutcome, ScreenRequestState, ScreenShot, Seam, ServerAddress, SessionView, SettingsView,
+    ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem,
+    ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
@@ -2351,6 +2353,395 @@ fn a_long_run_of_this_device_alerts_once_wherever_it_finished() {
         2,
         "open in agent mode, exactly 10 s"
     );
+}
+
+/// A [`ShellLog`]'s core, open session and log, fed with app screen events.
+struct ScreenLog {
+    log: ShellLog,
+}
+
+impl ScreenLog {
+    fn new() -> ScreenLog {
+        ScreenLog {
+            log: ShellLog::new(),
+        }
+    }
+
+    /// Queues `action` for the session from this device and returns its id.
+    fn send(&self, action: ScreenAction) -> CommandId {
+        self.log
+            .core
+            .dispatch(Action::Screen {
+                session_id: self.log.sid,
+                action,
+            })
+            .unwrap();
+        self.log
+            .seam
+            .pending_outbox()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e.command.kind, CommandKind::Screen { .. }))
+            .map(|e| e.command.id)
+            .last()
+            .unwrap()
+    }
+
+    fn batch(&mut self, events: Vec<(i64, Option<CommandId>, EventKind)>) {
+        self.log.batch(events);
+    }
+
+    fn screen(&self) -> AppScreenView {
+        session_view(&self.log.core.view()).app_screen.clone()
+    }
+}
+
+/// A capture of `device`, as the request names it.
+fn capture_of(device: &str) -> ScreenAction {
+    ScreenAction::Capture {
+        device: device.into(),
+        full: false,
+    }
+}
+
+fn fresh_blob(size: u64) -> BlobRef {
+    BlobRef {
+        id: BlobId::new(),
+        size,
+        sha256: skywave_proto::ContentHash::of(b""),
+    }
+}
+
+/// A capture's image, kept as `blob`, of `width` by `height` pixels on a
+/// screen of the same size.
+fn screen_image(blob: BlobRef, width: u32, height: u32) -> ScreenImage {
+    ScreenImage {
+        image: blob,
+        format: CaptureFormat::Jpeg,
+        width,
+        height,
+        screen_width: width,
+        screen_height: height,
+        pixels: skywave_proto::ContentHash::of(b""),
+    }
+}
+
+fn screen_requested(action: ScreenAction, by: DeviceId) -> EventKind {
+    EventKind::ScreenRequested { action, by }
+}
+
+fn screen_done(
+    request: CommandId,
+    by: DeviceId,
+    outcome: ScreenOutcome,
+    pruned: Vec<BlobId>,
+) -> EventKind {
+    EventKind::ScreenDone {
+        request,
+        by,
+        outcome,
+        pruned,
+    }
+}
+
+#[test]
+fn screen_requests_fold_from_the_log_and_this_devices_outbox() {
+    let mut log = ScreenLog::new();
+    let other = DeviceId::new();
+    assert_eq!(log.screen(), AppScreenView::default(), "nothing yet");
+
+    // This device's request is only in its outbox, queued.
+    let mine = log.send(capture_of("emulator-5554"));
+    let shown = log.screen();
+    let request = shown.requests.iter().find(|r| r.request == mine).unwrap();
+    assert_eq!(request.state, ScreenRequestState::Pending);
+    assert_eq!(request.outgoing, Some(Outgoing::Queued));
+    assert!(request.discardable);
+    assert!(request.by.me);
+
+    // Another device lists the attached devices; the listing answers it.
+    let listed = CommandId::new();
+    log.batch(vec![
+        (
+            1,
+            Some(listed),
+            screen_requested(ScreenAction::Devices, other),
+        ),
+        (
+            2,
+            None,
+            screen_done(
+                listed,
+                other,
+                ScreenOutcome::Devices {
+                    devices: vec![ScreenDevice {
+                        serial: "emulator-5554".into(),
+                        state: "device".into(),
+                        model: Some("Pixel_7".into()),
+                    }],
+                },
+                vec![],
+            ),
+        ),
+    ]);
+    let shown = log.screen();
+    assert_eq!(
+        shown
+            .devices
+            .iter()
+            .map(|d| d.serial.as_str())
+            .collect::<Vec<_>>(),
+        ["emulator-5554"]
+    );
+    let request = shown.requests.iter().find(|r| r.request == listed).unwrap();
+    assert!(matches!(
+        request.state,
+        ScreenRequestState::Done(ScreenOutcome::Devices { .. })
+    ));
+    assert!(request.finished_at.is_some());
+    assert!(!request.by.me);
+}
+
+#[test]
+fn the_latest_capture_is_each_devices_last_image() {
+    let mut log = ScreenLog::new();
+    let other = DeviceId::new();
+    let (c1, c2, c3, c4) = (
+        CommandId::new(),
+        CommandId::new(),
+        CommandId::new(),
+        CommandId::new(),
+    );
+    log.batch(vec![
+        (1, Some(c1), screen_requested(capture_of("a"), other)),
+        (
+            2,
+            None,
+            screen_done(
+                c1,
+                other,
+                ScreenOutcome::Done {
+                    shot: ScreenShot::Image(screen_image(fresh_blob(9000), 1080, 2400)),
+                },
+                vec![],
+            ),
+        ),
+        (3, Some(c2), screen_requested(capture_of("b"), other)),
+        (
+            4,
+            None,
+            screen_done(
+                c2,
+                other,
+                ScreenOutcome::Done {
+                    shot: ScreenShot::Image(screen_image(fresh_blob(9000), 1080, 2400)),
+                },
+                vec![],
+            ),
+        ),
+        // A capture of "a" that came out unchanged keeps its latest.
+        (5, Some(c3), screen_requested(capture_of("a"), other)),
+        (
+            6,
+            None,
+            screen_done(
+                c3,
+                other,
+                ScreenOutcome::Done {
+                    shot: ScreenShot::Unchanged { capture: c1 },
+                },
+                vec![],
+            ),
+        ),
+    ]);
+    let shown = log.screen();
+    assert_eq!(shown.latest("a").map(|c| c.capture), Some(c1));
+
+    // A new image of "a" replaces its latest and keeps "b" where it was.
+    log.batch(vec![
+        (7, Some(c4), screen_requested(capture_of("a"), other)),
+        (
+            8,
+            None,
+            screen_done(
+                c4,
+                other,
+                ScreenOutcome::Done {
+                    shot: ScreenShot::Image(screen_image(fresh_blob(9000), 720, 1280)),
+                },
+                vec![],
+            ),
+        ),
+    ]);
+    let shown = log.screen();
+    let a = shown.latest("a").unwrap();
+    assert_eq!(a.capture, c4);
+    assert_eq!((a.width, a.height), (720, 1280));
+    assert_eq!(shown.latest("b").map(|c| c.capture), Some(c2));
+    assert_eq!(shown.captures.len(), 2);
+    assert_eq!(
+        shown
+            .captures
+            .iter()
+            .map(|c| c.device.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    // The image's download was asked for at once, in an open session: it
+    // shows as requested, not as not downloaded.
+    assert_eq!(
+        a.content.blob().map(|b| b.state.clone()),
+        Some(BlobState::Requested { size: 9000 })
+    );
+}
+
+#[test]
+fn a_stale_refusal_leaves_the_input_discardable() {
+    let log = ScreenLog::new();
+    let tapped = log.send(ScreenAction::Tap {
+        device: "a".into(),
+        aim: CommandId::new(),
+        x: 1,
+        y: 2,
+    });
+    log.log.seam.command_sending(tapped).unwrap();
+    log.log
+        .seam
+        .command_result(
+            tapped,
+            &CommandResult::Rejected {
+                reason: RejectReason::ScreenStale,
+            },
+        )
+        .unwrap();
+
+    let shown = log.screen();
+    let request = shown.requests.iter().find(|r| r.request == tapped).unwrap();
+    assert_eq!(
+        request.outgoing,
+        Some(Outgoing::Failed(FailReason::Rejected(
+            RejectReason::ScreenStale
+        )))
+    );
+    assert!(request.refused());
+    assert!(request.discardable);
+
+    // Taking it back removes it from the requests.
+    log.log.core.dispatch(Action::Discard(tapped)).unwrap();
+    assert!(log.screen().requests.iter().all(|r| r.request != tapped));
+}
+
+#[test]
+fn pruned_captures_are_deleted() {
+    let mut log = ScreenLog::new();
+    let other = DeviceId::new();
+    let (c1, c2, c3) = (CommandId::new(), CommandId::new(), CommandId::new());
+    let first = fresh_blob(9000);
+    let second = fresh_blob(9000);
+    log.batch(vec![
+        (1, Some(c1), screen_requested(capture_of("a"), other)),
+        (
+            2,
+            None,
+            screen_done(
+                c1,
+                other,
+                ScreenOutcome::Done {
+                    shot: ScreenShot::Image(screen_image(first.clone(), 1080, 2400)),
+                },
+                vec![],
+            ),
+        ),
+        // The newer capture prunes the first one's blob.
+        (3, Some(c2), screen_requested(capture_of("a"), other)),
+        (
+            4,
+            None,
+            screen_done(
+                c2,
+                other,
+                ScreenOutcome::Done {
+                    shot: ScreenShot::Image(screen_image(second, 1080, 2400)),
+                },
+                vec![first.id],
+            ),
+        ),
+    ]);
+    assert_eq!(log.screen().latest("a").map(|c| c.capture), Some(c2));
+
+    // The pruned blob is gone for good: a later capture naming it shows it
+    // deleted, not as a blob to fetch.
+    log.batch(vec![
+        (5, Some(c3), screen_requested(capture_of("b"), other)),
+        (
+            6,
+            None,
+            screen_done(
+                c3,
+                other,
+                ScreenOutcome::Done {
+                    shot: ScreenShot::Image(screen_image(first.clone(), 1080, 2400)),
+                },
+                vec![],
+            ),
+        ),
+    ]);
+    let content = log.screen().latest("b").unwrap().content.clone();
+    assert!(
+        matches!(content, FullView::Deleted { .. }),
+        "got {content:?}"
+    );
+}
+
+#[test]
+fn the_open_sessions_latest_capture_is_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, requests, sid) = core_with_session(dir.path());
+    drain(&requests);
+    let other = DeviceId::new();
+    let image = fresh_blob(9000);
+    let request = CommandId::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
+    let event = |command_id: Option<CommandId>, kind: EventKind| Event {
+        session_id: sid,
+        at,
+        command_id,
+        context: ContextId::first_of(sid),
+        kind,
+    };
+    seam.apply_events(&EventBatch {
+        from: Seq(2),
+        events: vec![
+            event(Some(request), screen_requested(capture_of("a"), other)),
+            event(
+                None,
+                screen_done(
+                    request,
+                    other,
+                    ScreenOutcome::Done {
+                        shot: ScreenShot::Image(screen_image(image.clone(), 1080, 2400)),
+                    },
+                    vec![],
+                ),
+            ),
+        ],
+    })
+    .unwrap();
+    let asked = |requests: &Receiver<Request>| {
+        drain(requests)
+            .iter()
+            .filter(|r| matches!(r, Request::DownloadBlob(id) if *id == image.id))
+            .count()
+    };
+    assert_eq!(asked(&requests), 1, "the open session's latest capture");
+
+    // Another change asks for it no more.
+    core.dispatch(Action::SendMessage {
+        session_id: sid,
+        text: "look".into(),
+    })
+    .unwrap();
+    assert_eq!(asked(&requests), 0, "asked once");
 }
 
 /// What [`replica_to_reset`] stored: the log it applied, its session and
