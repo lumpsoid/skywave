@@ -159,13 +159,15 @@ impl ScreenBackend for Android {
     }
 }
 
-/// The devices in `adb devices -l` output. The first line is a header; lines
-/// starting with `*` are daemon notices. A line without a serial and a state
-/// is skipped, which also drops blank lines.
+/// The devices in `adb devices -l` output. Lines starting with `*` are daemon
+/// notices, which adb may print before the `List of devices attached` header,
+/// so the header is skipped by its text, not by its position. A line without
+/// a serial and a state is skipped, which also drops blank lines.
 fn parse_devices(out: &str) -> Vec<ScreenDevice> {
     out.lines()
-        .skip(1)
+        .filter(|line| !line.trim().is_empty())
         .filter(|line| !line.starts_with('*'))
+        .filter(|line| !line.starts_with("List of devices"))
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let serial = fields.next()?;
