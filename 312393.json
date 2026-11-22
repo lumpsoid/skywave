@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:56:04.554891+00:00",
+      "status": "2026-11-22T15:56:04.554891+00:00",
+      "title": "2026-11-22T15:56:04.554891+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:56:04.554891+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, last and optional. An opt-in stream of captures while a screen is open, for good links only; off by default (D35: the UI never waits on the network per input). Decide only after the trial numbers from the Android step.",
+  "created": "2026-11-22T15:56:04.554891+00:00",
+  "id": "312393",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 10: optional low-fps live mode for good links",
+  "updated": "2026-11-22T15:56:04.554891+00:00"
+}
