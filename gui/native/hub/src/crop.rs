@@ -61,6 +61,7 @@ fn blob_use_view(holds: BlobUse) -> BlobUseView {
         BlobUse::ShellOutput => BlobUseView::ShellOutput,
         BlobUse::Message => BlobUseView::Message,
         BlobUse::Attachment => BlobUseView::Attachment,
+        BlobUse::ScreenCapture => BlobUseView::ScreenCapture,
     }
 }
 

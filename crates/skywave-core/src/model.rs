@@ -4589,7 +4589,9 @@ impl Model {
                 | EventKind::ShellStopRequested { .. }
                 | EventKind::ShellStarted { .. }
                 | EventKind::ShellOutput { .. }
-                | EventKind::ShellFinished { .. } => None,
+                | EventKind::ShellFinished { .. }
+                | EventKind::ScreenRequested { .. }
+                | EventKind::ScreenDone { .. } => None,
                 // Nothing in the timeline: what it changes is the content of
                 // the event that referenced the blob.
                 EventKind::BlobDeleted { .. } | EventKind::BlobCropped { .. } => None,
@@ -5517,7 +5519,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::MoveContext { session_id, .. }
         | CommandKind::StopTask { session_id, .. }
         | CommandKind::RunShell { session_id, .. }
-        | CommandKind::StopShell { session_id, .. } => Some(*session_id),
+        | CommandKind::StopShell { session_id, .. }
+        | CommandKind::Screen { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. }
         | CommandKind::ResolveApproval { .. }
         | CommandKind::AnswerQuestion { .. }

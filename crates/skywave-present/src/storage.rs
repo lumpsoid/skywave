@@ -475,6 +475,7 @@ pub fn holds_label(holds: BlobUse) -> &'static str {
         BlobUse::ShellOutput => "shell output",
         BlobUse::Message => "message",
         BlobUse::Attachment => "image",
+        BlobUse::ScreenCapture => "screen capture",
     }
 }
 

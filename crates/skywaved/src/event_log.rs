@@ -488,7 +488,9 @@ impl EventLog {
             | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::BlobDeleted { .. }
-            | EventKind::BlobCropped { .. } => {
+            | EventKind::BlobCropped { .. }
+            | EventKind::ScreenRequested { .. }
+            | EventKind::ScreenDone { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -1067,7 +1069,9 @@ pub(crate) fn append_in(
         | EventKind::SafetyRuleSet { .. }
         | EventKind::SafetyCheckApproved { .. }
         | EventKind::SafetyCheckFeedback { .. }
-        | EventKind::ShellOutput { .. } => {}
+        | EventKind::ShellOutput { .. }
+        | EventKind::ScreenRequested { .. }
+        | EventKind::ScreenDone { .. } => {}
         // Imported history is a record: an imported call opens nothing.
         EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
         // `DeleteBlob` removed the `blobs` row before appending it. The
@@ -1964,6 +1968,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ImportFinished { .. } => "ImportFinished",
         EventKind::BlobDeleted { .. } => "BlobDeleted",
         EventKind::BlobCropped { .. } => "BlobCropped",
+        EventKind::ScreenRequested { .. } => "ScreenRequested",
+        EventKind::ScreenDone { .. } => "ScreenDone",
         EventKind::FileWritten { .. } => "FileWritten",
     }
 }

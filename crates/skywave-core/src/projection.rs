@@ -400,6 +400,8 @@ impl SessionSummary {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
+            | EventKind::ScreenRequested { .. }
+            | EventKind::ScreenDone { .. }
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
@@ -513,6 +515,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ShellStarted { .. }
         | EventKind::ShellOutput { .. }
         | EventKind::ShellFinished { .. }
+        | EventKind::ScreenRequested { .. }
+        | EventKind::ScreenDone { .. }
         | EventKind::Imported { .. }
         | EventKind::ImportFinished { .. }
         | EventKind::BlobDeleted { .. }

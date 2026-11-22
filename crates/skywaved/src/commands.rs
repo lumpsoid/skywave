@@ -244,8 +244,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef,
     Decision, DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, SafetyJudgment,
-    Seq, SessionId, SessionOrigin, Worktree, answers_fit, check_conversation_id, context_name,
-    limits, normalise_context_name,
+    ScreenAction, Seq, SessionId, SessionOrigin, Worktree, answers_fit, check_conversation_id,
+    context_name, limits, normalise_context_name,
 };
 use skywave_safety::Verdict;
 
@@ -968,6 +968,8 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
+            // The screen runner's rules come with its config (D65).
+            CommandKind::Screen { .. } => return Ok(Err(RejectReason::ScreenDisabled)),
             CommandKind::DeleteBlob { blob } => {
                 let Some(row) = event_log::event_blob_in(tx, *blob)? else {
                     return Ok(Err(RejectReason::UnknownBlob));
@@ -1065,7 +1067,8 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::SetEffort { .. }
         | CommandKind::ClearContext { .. }
         | CommandKind::MoveContext { .. }
-        | CommandKind::RunShell { .. } => true,
+        | CommandKind::RunShell { .. }
+        | CommandKind::Screen { .. } => true,
         CommandKind::ResolveApproval { .. }
         | CommandKind::AnswerQuestion { .. }
         | CommandKind::Interrupt { .. }
@@ -1101,6 +1104,10 @@ fn work_session(kind: &CommandKind) -> Option<SessionId> {
         // The moved context would run in this session's workdir.
         | CommandKind::MoveContext { session_id, .. }
         | CommandKind::RunShell { session_id, .. } => Some(*session_id),
+        CommandKind::Screen {
+            session_id,
+            action: ScreenAction::Install { .. },
+        } => Some(*session_id),
         CommandKind::CreateSession { .. }
         | CommandKind::ResolveApproval { .. }
         | CommandKind::AnswerQuestion { .. }
@@ -1117,7 +1124,8 @@ fn work_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetSafetyRule { .. }
         | CommandKind::SafetyCheckFeedback { .. }
         | CommandKind::DeleteBlob { .. }
-        | CommandKind::CropBlob { .. } => None,
+        | CommandKind::CropBlob { .. }
+        | CommandKind::Screen { .. } => None,
     }
 }
 

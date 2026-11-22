@@ -21,6 +21,7 @@ pub enum BlobUseView {
     ShellOutput,
     Message,
     Attachment,
+    ScreenCapture,
 }
 
 /// The blob a timeline item's output, a shell run's output or a storage
