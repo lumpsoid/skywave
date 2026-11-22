@@ -10,6 +10,7 @@
 #![allow(dead_code)] // each test crate uses a different part
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -25,11 +26,12 @@ use skywave_proto::{
     CommandId, CommandKind, CommandResult, ContextRef, Event, EventKind, Seq, SessionId,
     SessionOrigin,
 };
-use skywave_testkit::LinkProxy;
+use skywave_testkit::{LinkProxy, Rng};
 use skywaved::agent::fake::{FakeAgent, FakeOutside};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, ResultDisplay};
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing;
+use skywaved::screen::{ScreenConfig, ScreenHandle, ScreenRunner};
 use skywaved::server::{Server, ServerOptions};
 use skywaved::workdir::Git;
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
@@ -40,6 +42,12 @@ use tokio::task::JoinHandle;
 /// Upper bound for any wait in the fast tests; a passing test never gets
 /// near it.
 pub const SOON: Duration = Duration::from_secs(20);
+
+/// The fake adb skywaved's screen tests use.
+const FAKE_ADB: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../skywaved/tests/support/fake-adb.sh"
+);
 
 // ---- server -----------------------------------------------------------------
 
@@ -53,6 +61,9 @@ pub struct Daemon {
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<skywaved::Result<()>>,
     _supervisor: SupervisorHandle,
+    /// The screen runner and the fake adb's directory, when started with
+    /// [`Daemon::start_with_screen`].
+    screen: Option<(ScreenHandle, TempDir)>,
 }
 
 impl Daemon {
@@ -62,17 +73,39 @@ impl Daemon {
 
     /// As [`Daemon::start`], running shell commands from devices if `shell`.
     pub async fn start_with_shell(agent: FakeAgent, shell: bool) -> Daemon {
-        Daemon::start_with(agent, shell, FakeOutside::new()).await
+        Daemon::start_with(agent, shell, FakeOutside::new(), false).await
     }
 
     /// As [`Daemon::start`], an adopting `CreateSession` reading its
     /// conversation from `outside` (keyed by [`Daemon::canonical_workdir`]).
     pub async fn start_with_outside(agent: FakeAgent, outside: FakeOutside) -> Daemon {
-        Daemon::start_with(agent, false, outside).await
+        Daemon::start_with(agent, false, outside, false).await
     }
 
-    async fn start_with(agent: FakeAgent, shell: bool, outside: FakeOutside) -> Daemon {
-        Daemon::start_in(tempfile::tempdir().unwrap(), agent, shell, outside).await
+    /// As [`Daemon::start`], with the screen runner on over a fake adb. The
+    /// screen is [`noise_png`] at first; [`Daemon::next_screen`] sets the
+    /// one the next input leaves.
+    pub async fn start_with_screen(agent: FakeAgent) -> Daemon {
+        Daemon::start_with(agent, false, FakeOutside::new(), true).await
+    }
+
+    async fn start_with(
+        agent: FakeAgent,
+        shell: bool,
+        outside: FakeOutside,
+        screen: bool,
+    ) -> Daemon {
+        Daemon::start_in(tempfile::tempdir().unwrap(), agent, shell, outside, screen).await
+    }
+
+    /// Makes the fake adb's next input leave `png` on the screen: the
+    /// capture after that input shows it.
+    pub fn next_screen(&self, png: &[u8]) {
+        let (_, adb) = self
+            .screen
+            .as_ref()
+            .expect("a daemon started with the screen");
+        std::fs::write(adb.path().join("next.png"), png).unwrap();
     }
 
     /// A copy of the data dir as a backup would take it: the identity
@@ -116,10 +149,16 @@ impl Daemon {
     /// the one it came from still runs: beside it, a rollback the device
     /// has not noticed, its open connections still reaching the old one.
     pub async fn start_from(backup: TempDir, agent: FakeAgent) -> Daemon {
-        Daemon::start_in(backup, agent, false, FakeOutside::new()).await
+        Daemon::start_in(backup, agent, false, FakeOutside::new(), false).await
     }
 
-    async fn start_in(tmp: TempDir, agent: FakeAgent, shell: bool, outside: FakeOutside) -> Daemon {
+    async fn start_in(
+        tmp: TempDir,
+        agent: FakeAgent,
+        shell: bool,
+        outside: FakeOutside,
+        screen: bool,
+    ) -> Daemon {
         std::fs::create_dir_all(tmp.path().join("root/project")).unwrap();
         let data = tmp.path().join("server");
         let storage = Storage::open(&data).unwrap();
@@ -127,9 +166,11 @@ impl Daemon {
             ServerIdentity::bootstrap(&storage.dir, &["localhost".into(), "127.0.0.1".into()])
                 .unwrap(),
         );
+        let adb = screen.then(fake_adb);
         let log = EventLog::open(&storage.db, vec![tmp.path().join("root")])
             .unwrap()
-            .with_shell(shell);
+            .with_shell(shell)
+            .with_screen(adb.is_some());
         // The daemon's git (workdir changes), immune to the user's config.
         let git = Git::default()
             .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -156,6 +197,19 @@ impl Daemon {
         let supervisor = Supervisor::start(agent, &data, log.clone(), SupervisorConfig::default())
             .await
             .unwrap();
+        let screen = match adb {
+            Some(adb) => {
+                let config = ScreenConfig {
+                    enabled: true,
+                    adb: adb.path().join("adb"),
+                };
+                let handle = ScreenRunner::start(data.clone(), log.clone(), config)
+                    .await
+                    .unwrap();
+                Some((handle, adb))
+            }
+            None => None,
+        };
         Daemon {
             tmp,
             storage,
@@ -165,6 +219,7 @@ impl Daemon {
             stop: Some(stop),
             task,
             _supervisor: supervisor,
+            screen,
         }
     }
 
@@ -298,6 +353,40 @@ impl Drop for Daemon {
         }
         self.task.abort();
     }
+}
+
+/// A directory for the fake adb: the script as `adb` (a symlink, so its
+/// state stays here) and the screen at first, [`noise_png`].
+fn fake_adb() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(FAKE_ADB, dir.path().join("adb")).unwrap();
+    std::fs::write(dir.path().join("screen.png"), noise_png(0)).unwrap();
+    dir
+}
+
+/// A solid 1080x2400 screen of `colour`, as a PNG.
+pub fn screen_png(colour: [u8; 3]) -> Vec<u8> {
+    let [r, g, b] = colour;
+    let screen = image::RgbaImage::from_pixel(1080, 2400, image::Rgba([r, g, b, 255]));
+    encode_png(&screen)
+}
+
+/// A 540x1200 screen of random grey, seeded by `seed`. Its JPEG capture is
+/// large next to a solid screen's few kilobytes, so a download of one spans
+/// several dropped connections.
+pub fn noise_png(seed: u64) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let screen = image::RgbaImage::from_fn(540, 1200, |_, _| {
+        let grey = (rng.below(16) * 4) as u8;
+        image::Rgba([grey, grey, grey, 255])
+    });
+    encode_png(&screen)
+}
+
+fn encode_png(screen: &image::RgbaImage) -> Vec<u8> {
+    let mut png = Cursor::new(Vec::new());
+    screen.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    png.into_inner()
 }
 
 // ---- client -----------------------------------------------------------------
@@ -828,6 +917,14 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                     *accepted.entry("MovedSessionCreated").or_default() += 1;
                     "ContextMoved"
                 }
+                (
+                    CommandKind::Screen { session_id, action },
+                    EventKind::ScreenRequested { action: logged, by },
+                ) => {
+                    assert_eq!((logged, by), (action, &device));
+                    assert_eq!(events[(seq.0 - 1) as usize].session_id, *session_id);
+                    "ScreenRequested"
+                }
                 (command, event) => panic!("seq {seq:?} holds {event:?}, not {command:?}"),
             };
             *accepted.entry(name).or_default() += 1;
@@ -855,6 +952,7 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                 EventKind::ContextStarted { .. } => "ContextStarted",
                 EventKind::ContextSwitched { .. } => "ContextSwitched",
                 EventKind::ContextMoved { .. } => "ContextMoved",
+                EventKind::ScreenRequested { .. } => "ScreenRequested",
                 _ => "",
             }
         })
@@ -870,6 +968,7 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
         "MovedSessionCreated",
         "ImportFinished",
         "AdoptedSessionCreated",
+        "ScreenRequested",
     ] {
         assert_eq!(
             logged(name),
