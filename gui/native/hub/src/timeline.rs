@@ -1160,6 +1160,7 @@ mod tests {
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
+            app_screen: Default::default(),
             last_seq: Seq(0),
             unread_from: None,
         }

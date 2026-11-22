@@ -183,6 +183,7 @@ pub(crate) mod tests {
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
+            app_screen: Default::default(),
             last_seq,
             unread_from: None,
         }
