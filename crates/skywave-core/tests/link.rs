@@ -952,6 +952,14 @@ async fn a_capture_download_survives_a_dropped_link() {
             _ => None,
         })
         .expect("the capture's image in the log");
+    // The premise of the drops: the download outlasts the drop window, so
+    // the link cuts it part way through.
+    assert!(
+        image.image.size > 48 * KIB,
+        "the capture must be bigger than the drop window's 48 KiB bound for a \
+         drop mid-download, got {} bytes",
+        image.image.size
+    );
     assert_eq!(blob.id, image.image.id);
     assert_eq!(ContentHash::of(&bytes), image.image.sha256);
     assert!(

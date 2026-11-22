@@ -2744,6 +2744,64 @@ fn the_open_sessions_latest_capture_is_asked_for() {
     assert_eq!(asked(&requests), 0, "asked once");
 }
 
+#[test]
+fn a_closed_sessions_capture_is_not_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_core, seam, requests, _) = core_with_session(dir.path());
+    drain(&requests);
+    let closed = SessionId::new();
+    let other = DeviceId::new();
+    let image = fresh_blob(9000);
+    let request = CommandId::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
+    let event = |session_id: SessionId, command_id: Option<CommandId>, kind: EventKind| Event {
+        session_id,
+        at,
+        command_id,
+        context: ContextId::first_of(session_id),
+        kind,
+    };
+    // A second session is created and left closed; its capture lands there.
+    seam.apply_events(&EventBatch {
+        from: Seq(2),
+        events: vec![
+            event(
+                closed,
+                None,
+                EventKind::SessionCreated {
+                    workdir: "/srv/b".into(),
+                    context_name: "start".into(),
+                    from: None,
+                    worktree: None,
+                },
+            ),
+            event(
+                closed,
+                Some(request),
+                screen_requested(capture_of("a"), other),
+            ),
+            event(
+                closed,
+                None,
+                screen_done(
+                    request,
+                    other,
+                    ScreenOutcome::Done {
+                        shot: ScreenShot::Image(screen_image(image.clone(), 1080, 2400)),
+                    },
+                    vec![],
+                ),
+            ),
+        ],
+    })
+    .unwrap();
+    let asked = drain(&requests)
+        .iter()
+        .filter(|r| matches!(r, Request::DownloadBlob(id) if *id == image.id))
+        .count();
+    assert_eq!(asked, 0, "only the open session's captures are asked for");
+}
+
 /// What [`replica_to_reset`] stored: the log it applied, its session and
 /// blob, and the device it paired as.
 struct ToReset {

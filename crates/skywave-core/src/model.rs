@@ -3226,6 +3226,22 @@ impl Model {
             return Vec::new();
         };
         let events = open.as_ref().map_or(&[][..], |open| open.events.as_slice());
+        // Only a `Done` image names a capture: without one, skip the fold
+        // of the whole log.
+        let some_capture = events.iter().any(|(_, event)| {
+            matches!(
+                event.kind,
+                EventKind::ScreenDone {
+                    outcome: ScreenOutcome::Done {
+                        shot: ScreenShot::Image(_),
+                    },
+                    ..
+                }
+            )
+        });
+        if !some_capture {
+            return Vec::new();
+        }
         let ids: Vec<BlobId> = self
             .app_screen_view(*id, events)
             .captures
