@@ -1880,5 +1880,13 @@ disk refuses new requests (`DiskLow`, D40) and fails one the runner reaches
 **Backends.** A backend trait hides the platform; Android (adb) is the
 first. adb calls time out (30 s, 300 s for an install) and fail the action.
 
+**Devices.** Three rules for the replica. A queued screen action has no
+expiry: the server's `ScreenStale` at accept is the stale signal. A
+`ScreenDone` lists the captures it pruned, and they become `Deleted` fates,
+purged as `BlobDeleted` is. The open session's latest capture of each device
+downloads eagerly, whatever the blob policy. Hello does not advertise
+`[screen] enabled` yet, so a disabled server is found only when it refuses
+with `ScreenDisabled`.
+
 **Deferred:** an iOS simulator backend (needs `skywaved` on macOS) and a
 low-fps live mode for good links.
