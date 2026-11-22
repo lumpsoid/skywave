@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:55:57.494812+00:00",
+      "status": "2026-11-22T15:55:57.494812+00:00",
+      "title": "2026-11-22T15:55:57.494812+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:55:57.494812+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, after the GUI step. The test of the system: on the Pi server, an app under development on a phone (adb over USB or TCP) or an emulator on an x86 host, clicked through from the Android GUI over a bad link (the link harness or a real mobile link). Record round-trip time per tap and bytes per capture, and decide from that whether the design holds before porting to iOS. Update README with how to enable [screen].",
+  "created": "2026-11-22T15:55:57.494812+00:00",
+  "id": "49daac",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 6: end-to-end trial on a real Android device",
+  "updated": "2026-11-22T15:55:57.494812+00:00"
+}
