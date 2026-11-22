@@ -3219,6 +3219,27 @@ impl Model {
         Some(Request::CountLines { req, path })
     }
 
+    /// Each device's latest capture in the open session, asked for once
+    /// whatever the blob policy: the app screen shows it (D65).
+    pub(crate) fn want_captures(&mut self) -> Vec<Request> {
+        let Place::Session { id, open, .. } = &self.place else {
+            return Vec::new();
+        };
+        let events = open.as_ref().map_or(&[][..], |open| open.events.as_slice());
+        let ids: Vec<BlobId> = self
+            .app_screen_view(*id, events)
+            .captures
+            .iter()
+            .filter_map(|capture| match &capture.content {
+                FullView::Blob(blob) => Some(blob.id),
+                FullView::Inline(_) | FullView::Lost | FullView::Deleted { .. } => None,
+            })
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.want_blob(id))
+            .collect()
+    }
+
     /// The answer to [`Request::CountLines`] `req`; any but the one the
     /// page waits on is ignored.
     pub(crate) fn lines_counted(&mut self, req: u64, result: std::io::Result<u64>) {

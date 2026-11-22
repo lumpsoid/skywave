@@ -574,6 +574,7 @@ impl Shared {
             // Whatever made the crop page's blob available (a download, a
             // local crop, opening the page), its count is asked here, once.
             requests.extend(state.model.count_wanted());
+            requests.extend(state.model.want_captures());
             for request in requests {
                 self.requests.send(request);
             }
