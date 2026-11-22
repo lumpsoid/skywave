@@ -549,6 +549,17 @@ mod tests {
     }
 
     #[test]
+    fn screen_is_off_by_default_and_takes_an_adb_path() {
+        let e = env(&[("HOME", "/home/u")]);
+        let c = Config::parse("", Path::new("/etc/skywaved.toml"), &e).unwrap();
+        assert!(!c.screen.enabled, "screen is opt-in");
+        let text = "[screen]\nenabled = true\nadb = \"/opt/android/adb\"";
+        let c = Config::parse(text, Path::new("/etc/skywaved.toml"), &e).unwrap();
+        assert!(c.screen.enabled);
+        assert_eq!(c.screen.adb, Path::new("/opt/android/adb"));
+    }
+
+    #[test]
     fn bypass_is_allowed_only_by_a_true_flag() {
         let parse = |text: &str| Config::parse(text, Path::new("/c.toml"), &env(&[("HOME", "/h")]));
         assert!(
