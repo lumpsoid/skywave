@@ -947,6 +947,12 @@ impl Model {
                 }
                 effects
             }
+            Action::Screen { session_id, action } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::Screen { session_id, action }, Vec::new())
+            }
             Action::StopShell { session_id, run } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();

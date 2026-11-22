@@ -78,7 +78,10 @@ pub use projection::{BlobFate, ContextFill, SessionSummary, SessionUsage, TurnRe
 pub use seam::{Request, Seam};
 pub use search::Query;
 pub use skywave_proto::PROTOCOL_VERSION;
-pub use skywave_proto::{ContentHash, Fingerprint, ImageType};
+pub use skywave_proto::{
+    CaptureFormat, ContentHash, Fingerprint, ImageType, ScreenAction, ScreenDevice, ScreenImage,
+    ScreenKey, ScreenOutcome, ScreenShot,
+};
 pub use store::{
     Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
     OutboxStatus, PendingCrop, ReadMark, SafetyRule, ServerFacts, Settings, Snapshot, Store,

@@ -1129,8 +1129,9 @@ pub struct OutboxFile {
 
 impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
-    /// message, shell run, session creation, context move, blob delete or
-    /// crop, or safety rule change the server has not answered, or refused.
+    /// message, shell run, screen action, session creation, context move,
+    /// blob delete or crop, or safety rule change the server has not
+    /// answered, or refused.
     /// One already sent may have reached the server, and withdrawing cannot
     /// stop it there; it only stops the resends, so a command whose request
     /// keeps failing no longer holds back every later one. If the server took
@@ -1141,6 +1142,7 @@ impl OutboxEntry {
             self.command.kind,
             CommandKind::SendMessage { .. }
                 | CommandKind::RunShell { .. }
+                | CommandKind::Screen { .. }
                 | CommandKind::CreateSession { .. }
                 | CommandKind::MoveContext { .. }
                 | CommandKind::DeleteBlob { .. }
