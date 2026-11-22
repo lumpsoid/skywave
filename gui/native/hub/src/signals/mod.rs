@@ -4,6 +4,7 @@
 //! `rinf gen` reads every signal type in the crate into one flat namespace,
 //! so names are unique across files and avoid Flutter's own.
 //!
+//! - [`app_screen`]: the open session's app screen, whole (`AppScreenUpdate`).
 //! - [`boot`]: `Boot` in, `Booted`/`BootFailed` out, `HubFailed` on a
 //!   panic.
 //! - [`intents`]: every GUI intent after boot, as one ordered `GuiIntent`.
@@ -19,6 +20,7 @@
 //!   (`BlobTargetView`).
 //! - [`effects`]: one-shot platform effects (`PlatformEffect`).
 
+mod app_screen;
 mod boot;
 mod crop;
 mod effects;
@@ -30,6 +32,9 @@ mod shell;
 mod timeline;
 mod workdir;
 
+pub use app_screen::{
+    AppScreenCapture, AppScreenDevice, AppScreenKeyView, AppScreenRow, AppScreenUpdate,
+};
 pub use boot::{Boot, BootFailed, Booted, HubFailed};
 pub use crop::{
     BlobTargetView, BlobUseView, CropContentKind, CropLine, CropLinesUpdate, CropPresetView,

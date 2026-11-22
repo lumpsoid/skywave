@@ -13,9 +13,10 @@ use skywave_core::attachment::{self, AttachedFile, AttachedImage};
 use skywave_core::search::BlobText;
 use skywave_core::{
     Action, BlobState, BlobView, CallId, CommandId, ComposerMode, ContentHash, Entry, PairUri,
-    PairingView, RunWhen, Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState,
-    parse_pair_uri,
+    PairingView, RunWhen, Screen, ScreenAction, Seq, SessionId, SessionView, SnippetId,
+    TimelineItem, ViewState, parse_pair_uri,
 };
+use skywave_present::app_screen::{self as present, Input};
 use skywave_present::crop::toggle;
 use skywave_present::format;
 use skywave_present::policy::{
@@ -40,14 +41,15 @@ use crate::notify::{Kind, NotificationIds};
 use crate::prefs::{NotificationPrefs, Prefs};
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
-    ComposerFile, ComposerImage, ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate,
-    GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, NotifyKind, PairForm, PlatformEffect,
-    RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
-    TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range, WorkdirTextUpdate,
+    AppScreenUpdate, ComposerFile, ComposerImage, ComposerModeView, ComposerView, CopyWhat,
+    CropLinesUpdate, GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, NotifyKind,
+    PairForm, PlatformEffect, RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate,
+    StorageGroupingView, TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range,
+    WorkdirTextUpdate,
 };
 use crate::timeline::{BlobHeads, Rows, RuleCandidates, parse_key};
 use crate::workdir::{WorkdirText, shown_blob, shown_text};
-use crate::{intents, link, screen, search, shell, timeline};
+use crate::{app_screen, intents, link, screen, search, shell, timeline};
 
 /// How often running clocks on screen (a tool's elapsed time, how long a
 /// message has waited) are brought up to date.
@@ -100,6 +102,8 @@ pub enum Out {
     Screen(ScreenUpdate),
     Timeline(TimelineUpdate),
     Shell(ShellUpdate),
+    /// The open session's app screen, whole, when it changed (D65).
+    AppScreen(AppScreenUpdate),
     Search(SearchUpdate),
     /// The crop page's line window.
     CropLines(CropLinesUpdate),
@@ -223,6 +227,12 @@ struct SessionHead {
     /// The shell runs whose rows carry their whole output.
     shell_expanded: HashSet<CommandId>,
     outputs: shell::Outputs,
+    /// The app screen is shown in place of the timeline (D65). Kept here,
+    /// not in the core: a session's head only.
+    app_screen: bool,
+    /// The device the app screen shows, as the user picked it; `None` for
+    /// the default device.
+    app_screen_device: Option<String>,
     /// The composer's message waiting for its result.
     sending: Option<Tag>,
 }
@@ -248,6 +258,8 @@ impl SessionHead {
             candidates: RuleCandidates::default(),
             shell_expanded: HashSet::new(),
             outputs: shell::Outputs::default(),
+            app_screen: false,
+            app_screen_device: None,
             sending: None,
         }
     }
@@ -294,6 +306,8 @@ struct Sent {
     timeline: Option<(Option<SessionId>, Option<CallId>, Vec<TimelineRow>)>,
     /// The session the shell runs are of, and the runs.
     shell: Option<(Option<SessionId>, Vec<ShellRunRow>)>,
+    /// The app screen last sent, whole.
+    app_screen: Option<AppScreenUpdate>,
     search: Option<SearchUpdate>,
     crop_lines: Option<CropLinesUpdate>,
     /// The blob id of the workdir text last sent, so it goes out once per
@@ -913,6 +927,103 @@ impl Head {
                 if let Some(copied) = copied {
                     self.copied(copied, clock, out)?;
                 }
+            }
+            GuiIntent::AppScreenToggle { session_id } => {
+                let Some(session) = self.open_head(&session_id) else {
+                    return Ok(());
+                };
+                session.app_screen = !session.app_screen;
+                let open = session.app_screen;
+                let Some(view) = open_session(&self.view) else {
+                    return Ok(());
+                };
+                // The devices are asked for once: not while listed, nor
+                // while a listing waits.
+                let listing =
+                    view.app_screen.devices.is_empty()
+                        && !view.app_screen.requests.iter().any(|r| {
+                            matches!(r.action, ScreenAction::Devices) && present::waiting(r)
+                        });
+                if open && listing {
+                    let action = present::devices(view);
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
+                }
+            }
+            GuiIntent::AppScreenDevices { session_id } => {
+                if self.open_head(&session_id).is_none() {
+                    return Ok(());
+                }
+                let Some(view) = open_session(&self.view) else {
+                    return Ok(());
+                };
+                let action = present::devices(view);
+                self.dispatch_user(action, Purpose::Plain, clock, out);
+            }
+            GuiIntent::AppScreenSelect { session_id, serial } => {
+                let Some(session) = self.open_head(&session_id) else {
+                    return Ok(());
+                };
+                session.app_screen_device = Some(serial.clone());
+                let Some(view) = open_session(&self.view) else {
+                    return Ok(());
+                };
+                let action = present::capture(view, &serial);
+                self.dispatch_user(action, Purpose::Plain, clock, out);
+            }
+            GuiIntent::AppScreenCapture { session_id } => {
+                let Some(session) = self.open_head(&session_id) else {
+                    return Ok(());
+                };
+                let selected = session.app_screen_device.clone();
+                let Some(view) = open_session(&self.view) else {
+                    return Ok(());
+                };
+                let Some(device) = app_screen::shown_device(view, selected.as_deref()) else {
+                    return Ok(());
+                };
+                let action = present::capture(view, &device);
+                self.dispatch_user(action, Purpose::Plain, clock, out);
+            }
+            GuiIntent::AppScreenTap {
+                session_id,
+                capture_id,
+                x,
+                y,
+            } => {
+                let input = Input::Tap { x, y };
+                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
+            }
+            GuiIntent::AppScreenSwipe {
+                session_id,
+                capture_id,
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => {
+                let input = Input::Swipe {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                };
+                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
+            }
+            GuiIntent::AppScreenText {
+                session_id,
+                capture_id,
+                text,
+            } => {
+                let input = Input::Text(text);
+                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
+            }
+            GuiIntent::AppScreenKey {
+                session_id,
+                capture_id,
+                key,
+            } => {
+                let input = Input::Key(app_screen::key(key));
+                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
             }
             GuiIntent::RunSnippet {
                 session_id,
@@ -1797,6 +1908,21 @@ impl Head {
             })),
         }
         self.sent.shell = Some((id, runs));
+
+        // The app screen goes out whole, when it changed; a head with no
+        // session open sends the empty screen.
+        let app = match (open, &self.session) {
+            (Some(view), Some(session)) => app_screen::update(
+                Some(view),
+                session.app_screen,
+                session.app_screen_device.as_deref(),
+            ),
+            _ => app_screen::update(None, false, None),
+        };
+        if self.sent.app_screen.as_ref() != Some(&app) {
+            self.sent.app_screen = Some(app.clone());
+            out.push(Out::AppScreen(app));
+        }
     }
 
     /// A fresh session head when another session opens; none off a session.
@@ -1827,6 +1953,41 @@ impl Head {
         self.session
             .as_mut()
             .filter(|s| s.id.0.to_string() == session_id)
+    }
+
+    /// An input to the app screen's device of the open session, aimed at
+    /// `capture_id`. An aim that is no longer the device's latest capture
+    /// is said so; blank text types nothing.
+    fn app_screen_input(
+        &mut self,
+        session_id: &str,
+        capture_id: &str,
+        input: Input,
+        clock: Clock,
+        out: &mut Vec<Out>,
+    ) -> Result<(), String> {
+        let aim: CommandId = intents::id("capture", capture_id)?;
+        let Some(session) = self.open_head(session_id) else {
+            return Ok(());
+        };
+        let selected = session.app_screen_device.clone();
+        let blank = matches!(&input, Input::Text(text) if text.trim().is_empty());
+        let Some(view) = open_session(&self.view) else {
+            return Ok(());
+        };
+        let Some(device) = app_screen::shown_device(view, selected.as_deref()) else {
+            return Ok(());
+        };
+        match present::input(view, &device, aim, input) {
+            Some(action) => {
+                self.dispatch_user(action, Purpose::Plain, clock, out);
+            }
+            None if !blank => out.push(Out::Effect(PlatformEffect::Notice {
+                text: "the screen changed; aim again on the new capture".to_owned(),
+            })),
+            None => {}
+        }
+        Ok(())
     }
 
     /// The open session's view, when it is `id`'s.
