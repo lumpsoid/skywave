@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T17:59:09.029704+00:00",
+      "status": "2026-11-22T17:59:09.029704+00:00",
+      "title": "2026-11-22T17:59:09.029704+00:00"
+    },
+    "tags": {
+      "followup": [
+        "2026-11-22T17:59:09.029704+00:00",
+        false
+      ],
+      "screen": [
+        "2026-11-22T17:59:09.029704+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce. crates/skywaved/tests/screen.rs does not cover: accept DiskLow and the runner's Failed{\"disk low\"}, screen_event Ok(None) for a deleted session with its blob cleanup, erase removing screen_requests/screen_captures rows, Devices failing, install symlink escape.",
+  "created": "2026-11-22T17:59:09.029704+00:00",
+  "id": "5c7794",
+  "status": "open",
+  "tags": [
+    "followup",
+    "screen"
+  ],
+  "title": "screen: test the low-disk and deleted-session paths of the runner",
+  "updated": "2026-11-22T17:59:09.029704+00:00"
+}
