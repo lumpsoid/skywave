@@ -3,6 +3,10 @@
 //! runner's parts share: the `[screen]` config and the rules an action must
 //! meet before the log accepts it. Only the Android backend names adb (D3).
 
+pub mod android;
+pub mod backend;
+pub mod capture;
+
 use std::path::{Component, Path, PathBuf};
 
 use skywave_proto::{ScreenAction, limits};
