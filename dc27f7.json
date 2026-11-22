@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:55:40.333416+00:00",
+      "status": "2026-11-22T15:55:40.333416+00:00",
+      "title": "2026-11-22T15:55:40.333416+00:00"
+    },
+    "tags": {
+      "design": [
+        "2026-11-22T15:55:40.333416+00:00",
+        false
+      ],
+      "screen": [
+        "2026-11-22T15:55:40.333416+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce. Write the decision in docs/decisions.md and the shape in architecture.md before code. Settle: (1) a generic name and backend trait (D3: no adb/simctl outside the backend); (2) commands: list devices, capture, tap, swipe, type text, hardware key, install, launch, stop; (3) every input names the capture it was aimed at (capture id, coordinates relative to that image) - what the server does when that capture is no longer the latest: refuse as stale or apply and flag; (4) outbox: a queued input must not be resent blindly after a long drop - expiry or stale refusal, unlike messages; (5) one input at a time per screen, a fresh capture after each input, logged as events; (6) capture format: scaled JPEG (~100-200 KB), skipped when the hash is unchanged, full resolution on request (D54 pattern); (7) [screen] enabled config toggle, off by default (same power as [shell]); (8) low disk (D40) and blob GC for captures, which pile up fast.",
+  "created": "2026-11-22T15:55:40.333416+00:00",
+  "id": "dc27f7",
+  "status": "open",
+  "tags": [
+    "design",
+    "screen"
+  ],
+  "title": "screen 1: decide the screen runner design (new D entry)",
+  "updated": "2026-11-22T15:55:40.333416+00:00"
+}
