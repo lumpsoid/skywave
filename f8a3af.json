@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T17:59:08.931473+00:00",
+      "status": "2026-11-22T17:59:08.931473+00:00",
+      "title": "2026-11-22T17:59:08.931473+00:00"
+    },
+    "tags": {
+      "followup": [
+        "2026-11-22T17:59:08.931473+00:00",
+        false
+      ],
+      "screen": [
+        "2026-11-22T17:59:08.931473+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce. A request queued in a session that is then deleted still sends its input to the device; only its ScreenDone is skipped (screen_event returns Ok(None)). The runner could check the session's deletion before executing. Accepted for now (the user did ask for the input).",
+  "created": "2026-11-22T17:59:08.931473+00:00",
+  "id": "f8a3af",
+  "status": "open",
+  "tags": [
+    "followup",
+    "screen"
+  ],
+  "title": "screen: drop a deleted session's queued requests before they reach the device",
+  "updated": "2026-11-22T17:59:08.931473+00:00"
+}
