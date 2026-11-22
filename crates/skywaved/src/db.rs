@@ -506,6 +506,53 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN
         deletion TEXT CHECK (deletion IN ('requested', 'erased'));
     "#,
+    // v28: the screen runner (protocol v42, D65): open requests, each session's
+    // latest capture per device, and `BlobUse::ScreenCapture`.
+    // Made again as in v23: SQLite cannot change a CHECK in place.
+    r#"
+    CREATE TABLE event_blobs_v28 (
+        blob_id    TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        holds      TEXT NOT NULL CHECK (holds IN
+            ('tool_input', 'tool_body', 'tool_output', 'approval_input', 'shell_output',
+             'message', 'attachment', 'screen_capture'))
+    ) STRICT;
+    INSERT INTO event_blobs_v28 (blob_id, session_id, seq, holds)
+        SELECT blob_id, session_id, seq, holds FROM event_blobs;
+    DROP TABLE event_blobs;
+    ALTER TABLE event_blobs_v28 RENAME TO event_blobs;
+    CREATE INDEX event_blobs_seq ON event_blobs (seq);
+
+    -- One row per accepted Screen command, keyed by its command id (the request
+    -- id), folded from the ScreenRequested and ScreenDone events.
+    CREATE TABLE screen_requests (
+        command_id   TEXT PRIMARY KEY,
+        session_id   TEXT NOT NULL REFERENCES sessions (id),
+        -- Seq of the request's ScreenRequested.
+        seq          INTEGER NOT NULL,
+        -- The device the action names; NULL for a device listing.
+        device       TEXT,
+        requested_by TEXT NOT NULL,
+        -- Seq of the request's ScreenDone; NULL while the request is open.
+        done_seq     INTEGER
+    ) STRICT;
+    CREATE INDEX screen_requests_open ON screen_requests (done_seq);
+
+    -- The latest capture of each device in each session: one row, replaced by
+    -- each new image shot.
+    CREATE TABLE screen_captures (
+        session_id    TEXT NOT NULL REFERENCES sessions (id),
+        device        TEXT NOT NULL,
+        capture       TEXT NOT NULL,
+        pixels        TEXT NOT NULL,
+        width         INTEGER NOT NULL,
+        height        INTEGER NOT NULL,
+        screen_width  INTEGER NOT NULL,
+        screen_height INTEGER NOT NULL,
+        PRIMARY KEY (session_id, device)
+    ) STRICT;
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
