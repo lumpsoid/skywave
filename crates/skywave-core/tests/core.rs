@@ -2383,7 +2383,7 @@ impl ScreenLog {
             .into_iter()
             .filter(|e| matches!(e.command.kind, CommandKind::Screen { .. }))
             .map(|e| e.command.id)
-            .last()
+            .next_back()
             .unwrap()
     }
 

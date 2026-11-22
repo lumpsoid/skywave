@@ -427,12 +427,6 @@ class _SessionPageState extends State<SessionPage> {
         ),
       ),
       _MenuItem(
-        icon: Icons.phone_android,
-        title: 'App screen',
-        onTap: () =>
-            widget.send(GuiIntentAppScreenToggle(sessionId: screen.sessionId)),
-      ),
-      _MenuItem(
         icon: Icons.pending_actions,
         title: 'Background work',
         subtitle: screen.workLabel ?? 'nothing running',
@@ -466,6 +460,12 @@ class _SessionPageState extends State<SessionPage> {
             ActionIntentStopSession(sessionId: screen.sessionId),
           ),
         ),
+      ),
+      _MenuItem(
+        icon: Icons.phone_android,
+        title: 'App screen',
+        onTap: () =>
+            widget.send(GuiIntentAppScreenToggle(sessionId: screen.sessionId)),
       ),
     ];
 
