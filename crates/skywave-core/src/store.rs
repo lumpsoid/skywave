@@ -1691,7 +1691,7 @@ impl Store {
                 }
             }
             // Decided before a crop's `into` registers below.
-            if let Some((blob, fate)) = BlobFate::of(&event.kind) {
+            for (blob, fate) in BlobFate::all(&event.kind) {
                 let into = match &fate {
                     BlobFate::Cropped { into, .. } => Some(into.id),
                     BlobFate::Deleted { .. } => None,

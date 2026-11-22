@@ -2288,7 +2288,7 @@ impl Model {
             // As the store decides it (`Store::apply_batch`): before a
             // crop's `into` registers, the old blob goes unless a crop
             // finds it held; a blob with a fate never registers again.
-            if let Some((blob, fate)) = BlobFate::of(&event.kind) {
+            for (blob, fate) in BlobFate::all(&event.kind) {
                 let held = matches!(fate, BlobFate::Cropped { .. }) && self.blob_held(blob);
                 self.fates.entry(blob).or_insert(fate);
                 if !held {
