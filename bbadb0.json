@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:55:59.483163+00:00",
+      "status": "2026-11-22T15:55:59.483163+00:00",
+      "title": "2026-11-22T15:55:59.483163+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:55:59.483163+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce; independent of the runner, can go any time. The agent driving the emulator itself (adb screencap, or a simulator MCP server) returns screenshots in tool results. Check what the claude-code adapter does with image content in tool_result today (D50 covers only device-to-agent images); keep it as an image blob and render it in the GUI timeline. Record a fixture with the real CLI and note its version.",
+  "created": "2026-11-22T15:55:59.483163+00:00",
+  "id": "bbadb0",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 7: show images in agent tool outputs",
+  "updated": "2026-11-22T15:55:59.483163+00:00"
+}
