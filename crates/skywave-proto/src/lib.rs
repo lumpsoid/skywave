@@ -993,6 +993,186 @@ impl ShellEnd {
     }
 }
 
+/// A key a screen input presses (`ScreenAction::Key`, D65).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenKey {
+    /// The Back key.
+    Back,
+    /// The Home key.
+    Home,
+    /// The Recents (app switcher) key.
+    Recents,
+    /// The Enter key.
+    Enter,
+    /// The Delete (backspace) key.
+    Delete,
+    /// The Power key.
+    Power,
+    /// The volume-up key.
+    VolumeUp,
+    /// The volume-down key.
+    VolumeDown,
+}
+
+/// One action a device asks the screen runner to take on an Android device
+/// attached to the server (`CommandKind::Screen`, D65). Every action but
+/// `Devices` is followed by a shot. An input names the capture it was aimed
+/// at (`aim`) and gives coordinates in that capture's pixels; the server
+/// refuses it as stale unless that is still the device's latest capture.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScreenAction {
+    /// List the attached devices.
+    Devices,
+    /// Take a shot of `device`; `full` keeps the full-resolution PNG.
+    Capture {
+        device: String,
+        #[serde(default)]
+        full: bool,
+    },
+    /// Tap at (`x`, `y`) on `device`.
+    Tap {
+        device: String,
+        aim: CommandId,
+        x: u32,
+        y: u32,
+    },
+    /// Swipe on `device` from (`from_x`, `from_y`) to (`to_x`, `to_y`) over
+    /// `duration_ms`.
+    Swipe {
+        device: String,
+        aim: CommandId,
+        from_x: u32,
+        from_y: u32,
+        to_x: u32,
+        to_y: u32,
+        duration_ms: u32,
+    },
+    /// Type `text` into `device`.
+    Text {
+        device: String,
+        aim: CommandId,
+        text: String,
+    },
+    /// Press `key` on `device`.
+    Key {
+        device: String,
+        aim: CommandId,
+        key: ScreenKey,
+    },
+    /// Install the APK at `apk` on `device`.
+    Install { device: String, apk: String },
+    /// Launch the app `app` (its package id) on `device`.
+    Launch { device: String, app: String },
+    /// Stop the app `app` (its package id) on `device`.
+    Stop { device: String, app: String },
+}
+
+impl ScreenAction {
+    /// The device the action names; `None` only for `Devices`.
+    pub fn device(&self) -> Option<&str> {
+        match self {
+            ScreenAction::Devices => None,
+            ScreenAction::Capture { device, .. }
+            | ScreenAction::Tap { device, .. }
+            | ScreenAction::Swipe { device, .. }
+            | ScreenAction::Text { device, .. }
+            | ScreenAction::Key { device, .. }
+            | ScreenAction::Install { device, .. }
+            | ScreenAction::Launch { device, .. }
+            | ScreenAction::Stop { device, .. } => Some(device.as_str()),
+        }
+    }
+
+    /// The capture an input was aimed at; `None` for the actions that do not
+    /// depend on what is on screen.
+    pub fn aim(&self) -> Option<CommandId> {
+        match self {
+            ScreenAction::Tap { aim, .. }
+            | ScreenAction::Swipe { aim, .. }
+            | ScreenAction::Text { aim, .. }
+            | ScreenAction::Key { aim, .. } => Some(*aim),
+            _ => None,
+        }
+    }
+}
+
+/// An Android device the server can see (`ScreenOutcome::Devices`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScreenDevice {
+    /// The device's adb serial.
+    pub serial: String,
+    /// The device's adb state, such as `device`, `offline` or `unauthorized`.
+    pub state: String,
+    /// The device's model name, if adb reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// The encoding of a stored capture: JPEG for a scaled one, PNG for a `full`
+/// one.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureFormat {
+    /// JPEG, scaled so the longest side is at most 1280 px.
+    Jpeg,
+    /// PNG at the device's full resolution.
+    Png,
+}
+
+/// A capture the runner stored as a blob. It carries no Eq or Hash because
+/// [`BlobRef`] has neither.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ScreenImage {
+    /// The stored image.
+    pub image: BlobRef,
+    /// The image's encoding.
+    pub format: CaptureFormat,
+    /// The image's width in pixels; aim coordinates are in these pixels.
+    pub width: u32,
+    /// The image's height in pixels.
+    pub height: u32,
+    /// The device screen's width in pixels.
+    pub screen_width: u32,
+    /// The device screen's height in pixels.
+    pub screen_height: u32,
+    /// sha256 of the decoded RGBA8 pixels; equal pixels mean `Unchanged`.
+    pub pixels: ContentHash,
+}
+
+/// The result of a shot after an action (`ScreenOutcome::Done`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScreenShot {
+    /// A new image.
+    Image(ScreenImage),
+    /// The screen is the same as `capture`, the device's latest; the id stays
+    /// valid for aims.
+    Unchanged { capture: CommandId },
+    /// The shot could not be taken, for `reason`.
+    Failed { reason: String },
+}
+
+/// How a screen request ended (`EventKind::ScreenDone::outcome`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScreenOutcome {
+    /// The attached devices.
+    Devices { devices: Vec<ScreenDevice> },
+    /// The action ran, and this is the shot after it.
+    Done { shot: ScreenShot },
+    /// An input was not applied: its `aim` is not the device's latest
+    /// capture, which is `latest` (none if the device has none).
+    Stale { latest: Option<CommandId> },
+    /// The action failed, for `reason`.
+    Failed { reason: String },
+    /// The daemon lost track of the request (e.g. it restarted mid-run).
+    Lost,
+    /// It could not be started, for `reason`.
+    NotStarted { reason: String },
+}
+
 impl EventKind {
     /// The device whose command logged the event, for events that name one.
     pub fn device(&self) -> Option<DeviceId> {
@@ -1418,6 +1598,13 @@ pub mod limits {
     /// longer one as `BadShellCommand` rather than cut it, as a cut command
     /// would run something else.
     pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
+    /// Longest `ScreenAction::Text::text`, in UTF-8 bytes; the server refuses a
+    /// longer one as `BadScreenInput` rather than cut it, as a cut text would
+    /// type something else.
+    pub const SCREEN_TEXT_MAX_BYTES: usize = 1024;
+    /// Longest device serial, app id or APK path in a `ScreenAction`, in UTF-8
+    /// bytes.
+    pub const SCREEN_NAME_MAX_BYTES: usize = 256;
     /// Longest note a safety check feedback carries.
     pub const SAFETY_FEEDBACK_NOTE_MAX_BYTES: usize = 2000;
     /// Most words in a safety rule (`SetSafetyRule::words`).
