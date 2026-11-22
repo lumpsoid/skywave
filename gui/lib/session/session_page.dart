@@ -3,6 +3,8 @@ import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/session/agent_pickers.dart';
+import 'package:skywave_gui/session/app_screen_holder.dart';
+import 'package:skywave_gui/session/app_screen_view.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
 import 'package:skywave_gui/session/question_panel.dart';
 import 'package:skywave_gui/session/background_sheet.dart';
@@ -22,7 +24,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// The open session: its header and status line, a bar under them while
 /// the agent works, the search bar while a search is open, the timeline,
 /// the approval it waits on, and the composer; the rename prompt over it
-/// while open. In shell mode the shell runs take the timeline's place.
+/// while open. In shell mode the shell runs take the timeline's place, and
+/// with the app screen open its view does.
 ///
 /// Desktop keys, as in the TUI: Ctrl+X interrupts (unless text is
 /// selected: then it cuts; in shell mode it stops the shell), Ctrl+F
@@ -34,6 +37,7 @@ class SessionPage extends StatefulWidget {
     required this.timeline,
     required this.send,
     this.shell,
+    this.appScreen,
     this.search,
     super.key,
   });
@@ -44,6 +48,9 @@ class SessionPage extends StatefulWidget {
 
   /// The app's shell holder; without one the page keeps its own.
   final ShellHolder? shell;
+
+  /// The app's app-screen holder; without one the page keeps its own.
+  final AppScreenHolder? appScreen;
 
   /// The app's search holder; without one the page has no search.
   final SearchHolder? search;
@@ -58,14 +65,24 @@ class _SessionPageState extends State<SessionPage> {
   final _searchFocus = FocusNode(debugLabel: 'search');
   SearchHolder? _ownSearch;
   ShellHolder? _ownShell;
+  AppScreenHolder? _ownAppScreen;
 
   SearchHolder get _search => widget.search ?? (_ownSearch ??= SearchHolder());
 
   ShellHolder get _shellRuns => widget.shell ?? (_ownShell ??= ShellHolder());
 
+  AppScreenHolder get _appScreenHolder =>
+      widget.appScreen ?? (_ownAppScreen ??= AppScreenHolder());
+
   SessionScreen get _screen => widget.screen;
 
   bool get _shell => _screen.composer.mode == ComposerModeView.shell;
+
+  /// Whether the app screen is shown: Rust has it open, of this session.
+  bool get _appScreenOpen {
+    final update = _appScreenHolder.update;
+    return update?.open == true && update?.sessionId == _screen.sessionId;
+  }
 
   /// The screen for the background work sheet, which stays open across
   /// updates.
@@ -126,6 +143,7 @@ class _SessionPageState extends State<SessionPage> {
     _searchFocus.dispose();
     _ownSearch?.dispose();
     _ownShell?.dispose();
+    _ownAppScreen?.dispose();
     _work.dispose();
     super.dispose();
   }
@@ -409,6 +427,12 @@ class _SessionPageState extends State<SessionPage> {
         ),
       ),
       _MenuItem(
+        icon: Icons.phone_android,
+        title: 'App screen',
+        onTap: () =>
+            widget.send(GuiIntentAppScreenToggle(sessionId: screen.sessionId)),
+      ),
+      _MenuItem(
         icon: Icons.pending_actions,
         title: 'Background work',
         subtitle: screen.workLabel ?? 'nothing running',
@@ -661,19 +685,29 @@ class _SessionPageState extends State<SessionPage> {
                 ),
                 Expanded(
                   child: _TimelineAndPanels(
-                    timeline: _shell
-                        ? ShellView(
-                            sessionId: screen.sessionId,
-                            shell: _shellRuns,
-                            send: widget.send,
-                          )
-                        : TimelineView(
-                            key: _timelineView,
-                            sessionId: screen.sessionId,
-                            timeline: widget.timeline,
-                            search: _search,
-                            send: widget.send,
-                          ),
+                    // Rebuilt as the app screen opens and closes.
+                    timeline: ListenableBuilder(
+                      listenable: _appScreenHolder,
+                      builder: (context, _) => _appScreenOpen
+                          ? AppScreenView(
+                              sessionId: screen.sessionId,
+                              holder: _appScreenHolder,
+                              send: widget.send,
+                            )
+                          : _shell
+                          ? ShellView(
+                              sessionId: screen.sessionId,
+                              shell: _shellRuns,
+                              send: widget.send,
+                            )
+                          : TimelineView(
+                              key: _timelineView,
+                              sessionId: screen.sessionId,
+                              timeline: widget.timeline,
+                              search: _search,
+                              send: widget.send,
+                            ),
+                    ),
                     panels: [
                       if (screen.question case final question?)
                         QuestionPanelView(
