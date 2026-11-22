@@ -804,12 +804,11 @@ impl EventLog {
     }
 
     /// The capture blobs of session `session` still stored, beyond its newest
-    /// `keep`, newest first, never a device's latest capture: inputs may still
-    /// aim at that one. The runner calls it with `keep` one less than it
-    /// wants kept, before appending the new capture, so the new one and the
-    /// kept ones make the newest `keep + 1`. It still protects the device's
-    /// previous latest then, which is fine: at most one extra blob is kept per
-    /// device.
+    /// `keep` by position, newest first. A device's latest capture is never
+    /// among them: inputs may still aim at that one, so it is spared even when
+    /// it is older than `keep`. The runner calls it with `keep` one less than
+    /// it wants kept, before appending the new capture, so the new one and the
+    /// kept ones make the newest `keep + 1`.
     pub fn prunable_captures(
         &self,
         db: &Db,
@@ -820,13 +819,16 @@ impl EventLog {
         let blobs = db
             .conn()
             .prepare_cached(
-                "SELECT eb.blob_id FROM event_blobs eb JOIN blobs b ON b.id = eb.blob_id
-                 WHERE eb.session_id = ?1 AND eb.holds = 'screen_capture'
-                 AND eb.seq NOT IN (
+                "SELECT blob_id FROM (
+                     SELECT eb.blob_id, eb.seq FROM event_blobs eb
+                     JOIN blobs b ON b.id = eb.blob_id
+                     WHERE eb.session_id = ?1 AND eb.holds = 'screen_capture'
+                     ORDER BY eb.seq DESC LIMIT -1 OFFSET ?2)
+                 WHERE seq NOT IN (
                      SELECT r.done_seq FROM screen_requests r
                      JOIN screen_captures c ON c.capture = r.command_id
                      WHERE c.session_id = ?1 AND r.done_seq IS NOT NULL)
-                 ORDER BY eb.seq DESC LIMIT -1 OFFSET ?2",
+                 ORDER BY seq DESC",
             )?
             .query_map(params![session.0.to_string(), offset], |r| {
                 r.get::<_, String>(0)
