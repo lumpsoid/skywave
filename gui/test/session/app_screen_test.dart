@@ -34,6 +34,7 @@ AppScreenRow screenRow(
   bool waiting = false,
   bool stale = false,
   bool refused = false,
+  bool discardable = false,
 }) => AppScreenRow(
   key: key,
   label: label,
@@ -41,6 +42,7 @@ AppScreenRow screenRow(
   waiting: waiting,
   stale: stale,
   refused: refused,
+  discardable: discardable,
 );
 
 /// Pumps the view over [holder] in a 540x1200 box, sending into [sent].
@@ -98,16 +100,50 @@ void main() {
     final sent = <GuiIntent>[];
     await pumpScreen(tester, holder, sent);
 
-    await tester.drag(
-      find.byKey(const Key('app-screen-image')),
-      const Offset(0, -200),
-    );
+    final image = find.byKey(const Key('app-screen-image'));
+    final down = tester.getCenter(image);
+    await tester.drag(image, const Offset(0, -200));
     await tester.pump();
 
     expect(sent, hasLength(1));
     final swipe = sent.single as GuiIntentAppScreenSwipe;
     expect(swipe.captureId, 'c1');
     expect(swipe.fromY, greaterThan(swipe.toY));
+    // It starts where the finger went down, within 2 capture pixels.
+    final box = tester.getRect(image);
+    final downY = ((down.dy - box.top) / box.height * 2400).floor();
+    expect((swipe.fromY - downY).abs(), lessThanOrEqualTo(2));
+  });
+
+  testWidgets('a refused request can be dismissed', (tester) async {
+    final holder = AppScreenHolder()
+      ..apply(
+        screenUpdate(
+          capture: phoneCapture,
+          requests: [
+            screenRow(
+              'r1',
+              'tap 10,20',
+              'failed',
+              refused: true,
+              discardable: true,
+            ),
+            // Refused but not discardable: no dismiss button.
+            screenRow('r2', 'tap 5,5', 'failed', refused: true),
+          ],
+        ),
+      );
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    expect(find.byKey(const Key('app-screen-dismiss-r2')), findsNothing);
+    await tester.tap(find.byKey(const Key('app-screen-dismiss-r1')));
+    await tester.pump();
+
+    expect(sent, hasLength(1));
+    final dismiss = sent.single as GuiIntentAppScreenDismiss;
+    expect(dismiss.sessionId, 's1');
+    expect(dismiss.requestId, 'r1');
   });
 
   testWidgets('keys are off without a capture', (tester) async {

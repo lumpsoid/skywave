@@ -101,5 +101,6 @@ fn request_row(request: &ScreenRequest) -> AppScreenRow {
         waiting: present::waiting(request),
         stale: present::stale(request),
         refused: request.refused(),
+        discardable: request.discardable,
     }
 }

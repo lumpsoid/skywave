@@ -147,6 +147,12 @@ pub enum GuiIntent {
         capture_id: String,
         key: AppScreenKeyView,
     },
+    /// Dismiss the open session's app screen request `request_id`, when it
+    /// is refused or stale and the core can take it back.
+    AppScreenDismiss {
+        session_id: String,
+        request_id: String,
+    },
     /// Run a shell snippet's text as a command at once, on no condition;
     /// the composer keeps what it holds.
     RunSnippet {

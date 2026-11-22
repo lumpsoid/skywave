@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/app_screen_holder.dart';
@@ -104,7 +105,13 @@ class AppScreenView extends StatelessWidget {
               ),
             ),
             Expanded(
-              child: capture != null && path != null
+              // A capture with no size has no aspect to draw at: it shows
+              // its note instead.
+              child:
+                  capture != null &&
+                      path != null &&
+                      capture.width > 0 &&
+                      capture.height > 0
                   ? _ScreenImage(
                       sessionId: sessionId,
                       capture: capture,
@@ -161,7 +168,10 @@ class AppScreenView extends StatelessWidget {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
-                children: [for (final row in recent) _RequestLine(row: row)],
+                children: [
+                  for (final row in recent)
+                    _RequestLine(sessionId: sessionId, row: row, send: send),
+                ],
               ),
             ),
           ],
@@ -215,6 +225,9 @@ class _ScreenImageState extends State<_ScreenImage> {
               },
               onPanUpdate: (details) => _dragEnd = details.localPosition,
               onPanEnd: (_) => _drag(shown),
+              // The swipe starts where the finger went down, not where the
+              // drag was recognised a little later.
+              dragStartBehavior: DragStartBehavior.down,
               child: Image.file(
                 File(widget.path),
                 fit: BoxFit.fill,
@@ -341,15 +354,23 @@ class _TextEntryState extends State<_TextEntry> {
 
 /// One request: its label and how it stands, in the error colour when the
 /// screen moved on or the server refused it, with a spinner while it waits.
+/// A stale or refused request the core can take back has a dismiss button.
 class _RequestLine extends StatelessWidget {
-  const _RequestLine({required this.row});
+  const _RequestLine({
+    required this.sessionId,
+    required this.row,
+    required this.send,
+  });
 
+  final String sessionId;
   final AppScreenRow row;
+  final SendIntent send;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final style = row.stale || row.refused
+    final failed = row.stale || row.refused;
+    final style = failed
         ? theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error)
         : theme.textTheme.bodySmall;
     return Row(
@@ -370,6 +391,19 @@ class _RequestLine extends StatelessWidget {
             style: style,
           ),
         ),
+        if (failed && row.discardable)
+          IconButton(
+            key: Key('app-screen-dismiss-${row.key}'),
+            tooltip: 'Dismiss',
+            iconSize: 16,
+            onPressed: () => send(
+              GuiIntentAppScreenDismiss(
+                sessionId: sessionId,
+                requestId: row.key,
+              ),
+            ),
+            icon: const Icon(Icons.close),
+          ),
       ],
     );
   }

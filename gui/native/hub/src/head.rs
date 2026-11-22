@@ -1025,6 +1025,24 @@ impl Head {
                 let input = Input::Key(app_screen::key(key));
                 self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
             }
+            GuiIntent::AppScreenDismiss {
+                session_id,
+                request_id,
+            } => {
+                let request: CommandId = intents::id("request", &request_id)?;
+                if self.open_head(&session_id).is_none() {
+                    return Ok(());
+                }
+                let discardable = open_session(&self.view).is_some_and(|view| {
+                    view.app_screen
+                        .requests
+                        .iter()
+                        .any(|r| r.request == request && r.discardable)
+                });
+                if discardable {
+                    self.dispatch_user(Action::Discard(request), Purpose::Plain, clock, out);
+                }
+            }
             GuiIntent::RunSnippet {
                 session_id,
                 snippet_id,
@@ -1982,10 +2000,21 @@ impl Head {
             Some(action) => {
                 self.dispatch_user(action, Purpose::Plain, clock, out);
             }
-            None if !blank => out.push(Out::Effect(PlatformEffect::Notice {
-                text: "the screen changed; aim again on the new capture".to_owned(),
-            })),
-            None => {}
+            None if blank => {}
+            None => {
+                let text = match view.app_screen.latest(&device) {
+                    None => Some("capture the screen first"),
+                    Some(latest) if latest.capture != aim => {
+                        Some("the screen changed; aim again on the new capture")
+                    }
+                    Some(_) => None,
+                };
+                if let Some(text) = text {
+                    out.push(Out::Effect(PlatformEffect::Notice {
+                        text: text.to_owned(),
+                    }));
+                }
+            }
         }
         Ok(())
     }

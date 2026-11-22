@@ -59,6 +59,8 @@ pub struct AppScreenRow {
     pub stale: bool,
     /// The server refused it for good.
     pub refused: bool,
+    /// Taking it back dismisses it (`AppScreenDismiss`).
+    pub discardable: bool,
 }
 
 /// A hardware key the screen view offers.

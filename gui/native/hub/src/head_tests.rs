@@ -4,10 +4,12 @@ use chrono::{TimeZone, Utc};
 use skywave_core::attachment;
 use skywave_core::{
     CaptureFormat, ContentHash, Core, CoreError, DeviceId, PairedCredentials, ScreenAction,
-    ScreenImage, ScreenOutcome, ScreenShot, Seam,
+    ScreenDevice, ScreenImage, ScreenOutcome, ScreenShot, Seam,
 };
 use skywave_present::policy::DRAFT_SAVE_AFTER;
-use skywave_proto::{CommandId, CommandKind, DirsResult, Event, EventBatch, EventKind};
+use skywave_proto::{
+    CommandId, CommandKind, CommandResult, DirsResult, Event, EventBatch, EventKind, RejectReason,
+};
 
 use super::*;
 use crate::lifecycle::{Holder, Target};
@@ -6661,10 +6663,9 @@ fn opening_the_app_screen_lists_the_devices_once() {
     assert_eq!(screen_actions(&rig).len(), 1, "{:?}", rig.actions);
 }
 
-#[test]
-fn a_tap_aims_at_the_latest_capture() {
-    let mut rig = Rig::new();
-    let session = rig.session.0.to_string();
+/// Logs a 1080x2400 capture of `emulator-5554`, asked for and done, and
+/// returns its request's id with the outs of its result.
+fn log_capture(rig: &mut Rig) -> (CommandId, Vec<Out>) {
     let me = rig.me;
     let capture = CommandId::new();
     let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 2, 0).unwrap();
@@ -6703,6 +6704,14 @@ fn a_tap_aims_at_the_latest_capture() {
             pruned: Vec::new(),
         },
     );
+    (capture, outs)
+}
+
+#[test]
+fn a_tap_aims_at_the_latest_capture() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, outs) = log_capture(&mut rig);
     let update = app_screens(&outs).pop().unwrap();
     let shown = update.capture.as_ref().unwrap();
     assert_eq!(shown.capture_id, capture.0.to_string());
@@ -6738,6 +6747,113 @@ fn a_tap_aims_at_the_latest_capture() {
         ["the screen changed; aim again on the new capture".to_owned()]
     );
     assert_eq!(screen_actions(&rig).len(), 1);
+}
+
+#[test]
+fn a_refused_screen_request_is_dismissed() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, _) = log_capture(&mut rig);
+    rig.intent(GuiIntent::AppScreenTap {
+        session_id: session.clone(),
+        capture_id: capture.0.to_string(),
+        x: 540,
+        y: 1200,
+    });
+    rig.results();
+    let tap = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(
+                entry.command.kind,
+                CommandKind::Screen {
+                    action: ScreenAction::Tap { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap()
+        .command
+        .id;
+
+    // The screen moved on before the tap reached the server: refused.
+    rig.seam.command_sending(tap).unwrap();
+    rig.seam
+        .command_result(
+            tap,
+            &CommandResult::Rejected {
+                reason: RejectReason::ScreenStale,
+            },
+        )
+        .unwrap();
+    let outs = rig.view();
+    let row = app_screens(&outs)
+        .pop()
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|r| r.key == tap.0.to_string())
+        .unwrap();
+    assert!(row.refused && row.discardable, "{row:?}");
+
+    rig.intent(GuiIntent::AppScreenDismiss {
+        session_id: session,
+        request_id: tap.0.to_string(),
+    });
+    rig.results();
+    let outs = rig.view();
+    let rows = app_screens(&outs).pop().unwrap().requests;
+    assert!(rows.iter().all(|r| r.key != tap.0.to_string()), "{rows:?}");
+}
+
+#[test]
+fn an_input_before_any_capture_asks_for_one() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let me = rig.me;
+    let listing = CommandId::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    rig.log_screen(
+        Some(listing),
+        at,
+        EventKind::ScreenRequested {
+            action: ScreenAction::Devices,
+            by: me,
+        },
+    );
+    rig.log_screen(
+        None,
+        at + chrono::Duration::seconds(1),
+        EventKind::ScreenDone {
+            request: listing,
+            by: me,
+            outcome: ScreenOutcome::Devices {
+                devices: vec![ScreenDevice {
+                    serial: "emulator-5554".into(),
+                    state: "device".into(),
+                    model: None,
+                }],
+            },
+            pruned: Vec::new(),
+        },
+    );
+
+    // The device is shown, with nothing captured yet.
+    let outs = rig.intent(GuiIntent::AppScreenTap {
+        session_id: session,
+        capture_id: CommandId::new().0.to_string(),
+        x: 1,
+        y: 1,
+    });
+    assert_eq!(
+        notices(&outs),
+        ["capture the screen first".to_owned()],
+        "{outs:?}"
+    );
+    assert!(screen_actions(&rig).is_empty(), "{:?}", rig.actions);
 }
 
 #[test]
