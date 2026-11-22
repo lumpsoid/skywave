@@ -6,14 +6,14 @@
 #![cfg(unix)]
 
 use std::io::{Cursor, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use skywave_proto::{
     BlobId, BlobRef, CaptureFormat, Command, CommandId, CommandKind, CommandResult, DeviceId,
-    Event, EventKind, RejectReason, ScreenAction, ScreenImage, ScreenOutcome, ScreenShot, Seq,
-    SessionId,
+    Event, EventKind, RejectReason, ScreenAction, ScreenImage, ScreenKey, ScreenOutcome,
+    ScreenShot, Seq, SessionId,
 };
 use skywaved::screen::{DISABLED_REASON, KEEP_CAPTURES, ScreenConfig, ScreenHandle, ScreenRunner};
 use skywaved::{EventLog, Storage};
@@ -57,9 +57,10 @@ impl Fixture {
         let data = tmp.path().join("data");
         let adb_dir = tmp.path().join("adb");
         std::fs::create_dir_all(&adb_dir).unwrap();
-        let adb = adb_dir.join("adb");
-        std::fs::copy(FAKE_ADB, &adb).unwrap();
-        std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A symlink, not a copy: writing the script and exec'ing it while a
+        // sibling test forks can fail with ETXTBSY. The script's state dir is
+        // `dirname "$0"`, which is this directory, so state stays per test.
+        symlink(FAKE_ADB, adb_dir.join("adb")).unwrap();
         std::fs::write(adb_dir.join("screen.png"), screen_png(SCREEN)).unwrap();
         let storage = Storage::open(&data).unwrap();
         let log = EventLog::open(&storage.db, vec![root.clone()])
@@ -504,7 +505,7 @@ async fn captures_beyond_the_keep_limit_are_pruned() {
     }
     assert_eq!(pruned, vec![blobs[0]], "the last capture prunes the first");
     assert!(
-        matches!(f.storage.open_blob(blobs[0]), Ok(None) | Err(_)),
+        matches!(f.storage.open_blob(blobs[0]), Ok(None)),
         "the first capture is gone"
     );
     assert!(
@@ -634,5 +635,107 @@ async fn install_resolves_the_apk_in_the_workdir() {
     let apk = std::fs::canonicalize(workdir.join("app.apk")).unwrap();
     let line = format!("-s {SERIAL} install -r {}", apk.display());
     assert!(f.calls().contains(&line), "{:?}", f.calls());
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inputs_reach_the_backend_as_adb_args() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    // No `next.png`: every shot after an input is the same screen, so the
+    // capture stays the latest and later inputs can aim at it.
+    let capture = f.request(ScreenAction::Capture {
+        device: SERIAL.into(),
+        full: false,
+    });
+    new_image(f.done(capture).await);
+    let requests = [
+        f.request(ScreenAction::Swipe {
+            device: SERIAL.into(),
+            aim: capture,
+            from_x: 0,
+            from_y: 0,
+            to_x: 288,
+            to_y: 640,
+            duration_ms: 300,
+        }),
+        f.request(ScreenAction::Text {
+            device: SERIAL.into(),
+            aim: capture,
+            text: "a b".into(),
+        }),
+        f.request(ScreenAction::Key {
+            device: SERIAL.into(),
+            aim: capture,
+            key: ScreenKey::Back,
+        }),
+        f.request(ScreenAction::Launch {
+            device: SERIAL.into(),
+            app: "com.example/.Main".into(),
+        }),
+        f.request(ScreenAction::Launch {
+            device: SERIAL.into(),
+            app: "com.example".into(),
+        }),
+        f.request(ScreenAction::Stop {
+            device: SERIAL.into(),
+            app: "com.example".into(),
+        }),
+    ];
+    for request in requests {
+        assert!(
+            matches!(f.done(request).await, ScreenOutcome::Done { .. }),
+            "{request:?} is done"
+        );
+    }
+    let calls = f.calls();
+    for expected in [
+        "shell input swipe 0 0 540 1200 300",
+        "shell input text a%sb",
+        "shell input keyevent 4",
+        "shell am start -n com.example/.Main",
+        "shell monkey -p com.example -c android.intent.category.LAUNCHER 1",
+        "shell am force-stop com.example",
+    ] {
+        assert!(
+            calls.iter().any(|line| line.ends_with(expected)),
+            "{expected} was called: {calls:?}"
+        );
+    }
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_devices_latest_capture_is_never_pruned() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let own = f.request(ScreenAction::Capture {
+        device: SERIAL.into(),
+        full: true,
+    });
+    let own_image = new_image(f.done(own).await);
+    // Another device takes more captures than the session keeps; device A's
+    // latest is the oldest blob in the session, and still must survive.
+    for _ in 0..=KEEP_CAPTURES {
+        let request = f.request(ScreenAction::Capture {
+            device: "other-1".into(),
+            full: true,
+        });
+        new_image(f.done(request).await);
+    }
+    assert!(
+        matches!(f.storage.open_blob(own_image.image.id), Ok(Some(_))),
+        "device A's latest capture is kept"
+    );
+    let tap = f.request(ScreenAction::Tap {
+        device: SERIAL.into(),
+        aim: own,
+        x: 288,
+        y: 640,
+    });
+    assert!(
+        matches!(f.done(tap).await, ScreenOutcome::Done { .. }),
+        "a tap aimed at device A's latest capture runs"
+    );
     runner.shutdown().await.unwrap();
 }
