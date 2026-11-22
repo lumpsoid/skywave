@@ -2,7 +2,7 @@
   "_meta": {
     "deleted": null,
     "fields": {
-      "body": "2026-11-22T15:55:35.054535+00:00",
+      "body": "2026-11-22T15:56:09.553152+00:00",
       "status": "2026-11-22T15:55:35.054535+00:00",
       "title": "2026-11-22T15:55:35.054535+00:00"
     },
@@ -18,7 +18,7 @@
     },
     "v": 2
   },
-  "body": "Feature request: a user building an app clicks through it in a simulator; they want that from Skywave on the server. Plan: a screen runner beside the shell runner (D35 shape): screenshot as blob, tap/swipe/text as deduped commands anchored to the capture they were aimed at, no live stream by default. Android (adb) is the first backend and the test of the system, since it runs on the current Linux server; iOS needs skywaved on macOS. Steps are filled in below.",
+  "body": "Feature request: a user building an app clicks through it in a simulator; they want that from Skywave on the server. Plan: a screen runner beside the shell runner (D35 shape): screenshot as blob, tap/swipe/text as deduped commands anchored to the capture they were aimed at, no live stream by default. Android (adb) is the first backend and the test of the system, since it runs on the current Linux server; iOS needs skywaved on macOS.\n\nSteps, in order:\nPhase A - Android, the test of the system\n 1. dc27f7  decide the screen runner design (new D entry)\n 2. 9e23ea  wire types for screen commands and capture events\n 3. 665941  server screen runner with the Android (adb) backend\n 4. 830f2e  core replica and outbox rules for screen inputs\n 5. 5b7cc3  GUI screen view (tap, swipe, type, keys)\n 6. 49daac  end-to-end trial on a real Android device (go/no-go for phase B)\nAny time\n 7. bbadb0  show images in agent tool outputs\nPhase B - iOS\n 8. 04568d  run skywaved on macOS\n 9. 4cc3ff  iOS simulator backend (simctl + idb)\nLater, optional\n10. 312393  low-fps live mode for good links\n\nDone when step 6 passes; phase B is tracked here but decided after it.",
   "created": "2026-11-22T15:55:35.054535+00:00",
   "id": "e553ce",
   "status": "open",
@@ -27,5 +27,5 @@
     "screen"
   ],
   "title": "Meta: drive an app emulator/simulator on the server from a device",
-  "updated": "2026-11-22T15:55:35.054535+00:00"
+  "updated": "2026-11-22T15:56:09.553152+00:00"
 }
