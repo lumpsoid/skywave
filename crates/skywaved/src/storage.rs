@@ -55,6 +55,7 @@ pub(crate) fn holds_to_sql(holds: BlobUse) -> &'static str {
         BlobUse::ShellOutput => "shell_output",
         BlobUse::Message => "message",
         BlobUse::Attachment => "attachment",
+        BlobUse::ScreenCapture => "screen_capture",
     }
 }
 
@@ -68,6 +69,7 @@ pub(crate) fn holds_from_sql(text: &str) -> Result<BlobUse> {
         "shell_output" => BlobUse::ShellOutput,
         "message" => BlobUse::Message,
         "attachment" => BlobUse::Attachment,
+        "screen_capture" => BlobUse::ScreenCapture,
         other => return Err(Error::Corrupt(format!("event_blobs.holds {other:?}"))),
     })
 }

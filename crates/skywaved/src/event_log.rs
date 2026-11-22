@@ -44,10 +44,10 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, BlobId, BlobUse, CallId, CommandId, ContextId, DeviceId,
-    Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, Question, RejectReason, RunId,
-    RunWhen, RunsSince, Seq, SessionId, SessionState, ShellEnd, ToolCall, ToolResult, Worktree,
-    limits,
+    AgentSettings, AgentWork, ApprovalId, BlobId, BlobUse, CallId, CommandId, ContentHash,
+    ContextId, DeviceId, Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, Question,
+    RejectReason, RunId, RunWhen, RunsSince, ScreenOutcome, ScreenShot, Seq, SessionId,
+    SessionState, ShellEnd, ToolCall, ToolResult, Worktree, limits,
 };
 use skywave_safety::Rule;
 use tokio::sync::watch;
@@ -81,6 +81,9 @@ pub struct EventLog {
     /// Whether `RunShell` and `StopShell` are accepted ([`EventLog::with_shell`]).
     /// Beside `inner`, not in it, so the builder needs no unique `Arc`.
     shell_enabled: bool,
+    /// Whether `Screen` commands are accepted ([`EventLog::with_screen`]).
+    /// Beside `inner` like `shell_enabled`.
+    screen_enabled: bool,
     /// Whether a `SetPermissionMode` may ask for bypass
     /// ([`EventLog::with_bypass`]). Beside `inner` like `shell_enabled`.
     bypass_allowed: bool,
@@ -182,6 +185,38 @@ pub struct ShellRecovery {
     pub runs: Vec<ShellRun>,
 }
 
+/// A screen request with no `ScreenDone` yet, as
+/// [`EventLog::unfinished_screen_requests`] has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenScreenRequest {
+    /// The `Screen` command's id, which is the request id.
+    pub request: CommandId,
+    pub session_id: SessionId,
+    /// The device that asked for it.
+    pub by: DeviceId,
+}
+
+/// The screen runner's starting point ([`EventLog::unfinished_screen_requests`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenRecovery {
+    /// The head the requests were read at.
+    pub head: Seq,
+    /// Every request with no `ScreenDone`, in seq order.
+    pub requests: Vec<OpenScreenRequest>,
+}
+
+/// A device's latest capture in a session ([`EventLog::latest_capture`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestCapture {
+    /// The request that took the image: the capture id aims name.
+    pub capture: CommandId,
+    pub pixels: ContentHash,
+    pub width: u32,
+    pub height: u32,
+    pub screen_width: u32,
+    pub screen_height: u32,
+}
+
 /// A session's shell history as a new run needs it ([`EventLog::shell_status`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShellStatus {
@@ -233,6 +268,7 @@ impl EventLog {
                 stopping: AtomicBool::new(false),
             }),
             shell_enabled: false,
+            screen_enabled: false,
             bypass_allowed: false,
             disk: Disk::default(),
             blobs: None,
@@ -282,6 +318,21 @@ impl EventLog {
     /// Whether this log accepts shell commands.
     pub fn shell_enabled(&self) -> bool {
         self.shell_enabled
+    }
+
+    /// This log with screen commands on or off (`[screen] enabled`);
+    /// [`EventLog::open`] has them off, and `Screen` is then refused
+    /// `ScreenDisabled`. Set it before cloning, like [`EventLog::with_shell`].
+    pub fn with_screen(self, enabled: bool) -> EventLog {
+        EventLog {
+            screen_enabled: enabled,
+            ..self
+        }
+    }
+
+    /// Whether this log accepts screen commands.
+    pub fn screen_enabled(&self) -> bool {
+        self.screen_enabled
     }
 
     /// This log with bypass mode allowed or not (`agent.allow_bypass`);
@@ -488,7 +539,9 @@ impl EventLog {
             | EventKind::SafetyRuleSet { .. }
             | EventKind::SafetyCheckFeedback { .. }
             | EventKind::BlobDeleted { .. }
-            | EventKind::BlobCropped { .. } => {
+            | EventKind::BlobCropped { .. }
+            | EventKind::ScreenRequested { .. }
+            | EventKind::ScreenDone { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -625,6 +678,43 @@ impl EventLog {
         })
     }
 
+    /// Appends a daemon screen event, the `ScreenDone` the screen runner logs
+    /// for a request, and returns its seq. One transaction reads the
+    /// request's session and that session's current context, which stamps the
+    /// event, and appends, as [`EventLog::shell_event`] does for a run.
+    ///
+    /// `None`, appending nothing, when the request's row is gone or its
+    /// session is unknown or has a deletion requested: a deleted session's
+    /// request is not settled, its log is going away (D62).
+    ///
+    /// Refused with [`Error::InvalidAppend`]: any other kind, and a request
+    /// that is already done.
+    pub fn screen_event(&self, db: &mut Db, kind: EventKind) -> Result<Option<Seq>> {
+        let EventKind::ScreenDone { request, .. } = &kind else {
+            return Err(Error::InvalidAppend(format!(
+                "{} is not a daemon screen event",
+                kind_name(&kind)
+            )));
+        };
+        let request = *request;
+        let tx = begin(db)?;
+        let session: Option<String> = tx
+            .prepare_cached("SELECT session_id FROM screen_requests WHERE command_id = ?1")?
+            .query_row([request.0.to_string()], |r| r.get(0))
+            .optional()?;
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        let session_id = parse_id::<SessionId>(&session)?;
+        let Some(info) = session_in(&tx, session_id)? else {
+            return Ok(None);
+        };
+        let seq = append_in(&tx, session_id, info.context, None, &kind)?;
+        tx.commit()?;
+        self.published(seq);
+        Ok(Some(seq))
+    }
+
     /// Appends `kind`, the `FileWritten` a workdir write made (`POST`
     /// [`skywave_proto::path::WORKDIR_WRITE`]), to `session_id` in its
     /// current context, and returns its seq. `None` for an unknown session,
@@ -667,6 +757,85 @@ impl EventLog {
         drop(stmt);
         tx.finish()?;
         Ok(ShellRecovery { head, runs })
+    }
+
+    /// Every screen request not yet answered by a `ScreenDone`, oldest first,
+    /// and the head, read in one transaction: the screen runner's starting
+    /// point after a daemon start. It follows the log from `head` on.
+    pub fn unfinished_screen_requests(&self, db: &Db) -> Result<ScreenRecovery> {
+        let tx = db.conn().unchecked_transaction()?;
+        let head = head_in(&tx)?;
+        let rows = tx
+            .prepare_cached(
+                "SELECT command_id, session_id, requested_by FROM screen_requests
+                 WHERE done_seq IS NULL ORDER BY seq",
+            )?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.finish()?;
+        let requests = rows
+            .iter()
+            .map(|(request, session, by)| {
+                Ok(OpenScreenRequest {
+                    request: parse_id(request)?,
+                    session_id: parse_id(session)?,
+                    by: parse_id(by)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ScreenRecovery { head, requests })
+    }
+
+    /// The latest capture of `device` in session `session`, if the session
+    /// has one. Its `capture` is the id aims at the screen name.
+    pub fn latest_capture(
+        &self,
+        db: &Db,
+        session: SessionId,
+        device: &str,
+    ) -> Result<Option<LatestCapture>> {
+        latest_capture_in(db.conn(), session, device)
+    }
+
+    /// The capture blobs of session `session` still stored, beyond its newest
+    /// `keep` by position, newest first. A device's latest capture is never
+    /// among them: inputs may still aim at that one, so it is spared even when
+    /// it is older than `keep`. The runner calls it with `keep` one less than
+    /// it wants kept, before appending the new capture, so the new one and the
+    /// kept ones make the newest `keep + 1`.
+    pub fn prunable_captures(
+        &self,
+        db: &Db,
+        session: SessionId,
+        keep: usize,
+    ) -> Result<Vec<BlobId>> {
+        let offset = i64::try_from(keep).unwrap_or(i64::MAX);
+        let blobs = db
+            .conn()
+            .prepare_cached(
+                "SELECT blob_id FROM (
+                     SELECT eb.blob_id, eb.seq FROM event_blobs eb
+                     JOIN blobs b ON b.id = eb.blob_id
+                     WHERE eb.session_id = ?1 AND eb.holds = 'screen_capture'
+                     ORDER BY eb.seq DESC LIMIT -1 OFFSET ?2)
+                 WHERE seq NOT IN (
+                     SELECT r.done_seq FROM screen_requests r
+                     JOIN screen_captures c ON c.capture = r.command_id
+                     WHERE c.session_id = ?1 AND r.done_seq IS NOT NULL)
+                 ORDER BY seq DESC",
+            )?
+            .query_map(params![session.0.to_string(), offset], |r| {
+                r.get::<_, String>(0)
+            })?
+            .map(|text| parse_id::<BlobId>(&text?))
+            .collect::<Result<Vec<BlobId>>>()?;
+        Ok(blobs)
     }
 
     /// Session `id`'s last shell status and last known cwd as its finished
@@ -1134,6 +1303,80 @@ pub(crate) fn append_in(
                 serde_json::to_string(end)?,
                 cwd
             ])?;
+        }
+        // The request's id is the command's: a `ScreenRequested` naming none
+        // has no request to track.
+        EventKind::ScreenRequested { action, by } => {
+            let Some(request) = command else {
+                return Err(Error::InvalidAppend(
+                    "ScreenRequested names no command".to_owned(),
+                ));
+            };
+            conn.prepare_cached(
+                "INSERT INTO screen_requests (command_id, session_id, seq, device, requested_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![
+                request.0.to_string(),
+                session,
+                sql_seq,
+                action.device(),
+                by.0.to_string()
+            ])?;
+        }
+        // The runner settles each request once: a `ScreenDone` for a request
+        // that is not open is refused. A new image is the device's latest
+        // capture; the blobs the runner pruned leave their `blobs` rows.
+        EventKind::ScreenDone {
+            request,
+            outcome,
+            pruned,
+            ..
+        } => {
+            let closed = conn
+                .prepare_cached(
+                    "UPDATE screen_requests SET done_seq = ?2
+                     WHERE command_id = ?1 AND done_seq IS NULL",
+                )?
+                .execute(params![request.0.to_string(), sql_seq])?;
+            if closed != 1 {
+                return Err(Error::InvalidAppend(
+                    "ScreenDone names no open request".to_owned(),
+                ));
+            }
+            if let ScreenOutcome::Done {
+                shot: ScreenShot::Image(image),
+            } = outcome
+            {
+                let device: Option<String> = conn
+                    .prepare_cached("SELECT device FROM screen_requests WHERE command_id = ?1")?
+                    .query_row([request.0.to_string()], |r| r.get(0))?;
+                if let Some(device) = device {
+                    conn.prepare_cached(
+                        "INSERT INTO screen_captures (session_id, device, capture, pixels,
+                             width, height, screen_width, screen_height)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT (session_id, device) DO UPDATE SET
+                             capture = excluded.capture, pixels = excluded.pixels,
+                             width = excluded.width, height = excluded.height,
+                             screen_width = excluded.screen_width,
+                             screen_height = excluded.screen_height",
+                    )?
+                    .execute(params![
+                        session,
+                        device,
+                        request.0.to_string(),
+                        image.pixels.to_hex(),
+                        image.width,
+                        image.height,
+                        image.screen_width,
+                        image.screen_height
+                    ])?;
+                }
+            }
+            for id in pruned {
+                delete_blob_row_in(conn, *id)?;
+            }
         }
     }
     Ok(seq)
@@ -1837,6 +2080,43 @@ pub(crate) fn event_blob_in(conn: &Connection, id: BlobId) -> Result<Option<Even
     .transpose()
 }
 
+/// [`EventLog::latest_capture`]: the device's one `screen_captures` row.
+pub(crate) fn latest_capture_in(
+    conn: &Connection,
+    session: SessionId,
+    device: &str,
+) -> Result<Option<LatestCapture>> {
+    let row = conn
+        .prepare_cached(
+            "SELECT capture, pixels, width, height, screen_width, screen_height
+             FROM screen_captures WHERE session_id = ?1 AND device = ?2",
+        )?
+        .query_row(params![session.0.to_string(), device], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u32>(2)?,
+                r.get::<_, u32>(3)?,
+                r.get::<_, u32>(4)?,
+                r.get::<_, u32>(5)?,
+            ))
+        })
+        .optional()?;
+    let Some((capture, pixels, width, height, screen_width, screen_height)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(LatestCapture {
+        capture: parse_id(&capture)?,
+        pixels: pixels
+            .parse()
+            .map_err(|_| Error::Corrupt(format!("screen_captures.pixels {pixels:?}")))?,
+        width,
+        height,
+        screen_width,
+        screen_height,
+    }))
+}
+
 /// Deletes event blob `id`'s `blobs` row, keeping its `event_blobs` row.
 /// The file is the caller's to remove, after commit.
 pub(crate) fn delete_blob_row_in(conn: &Connection, id: BlobId) -> Result<()> {
@@ -1891,6 +2171,14 @@ pub(crate) fn erase_session_in(conn: &Connection, id: SessionId) -> Result<Vec<B
     )?;
     conn.execute("DELETE FROM approvals WHERE session_id = ?1", [&session])?;
     conn.execute("DELETE FROM shell_runs WHERE session_id = ?1", [&session])?;
+    conn.execute(
+        "DELETE FROM screen_requests WHERE session_id = ?1",
+        [&session],
+    )?;
+    conn.execute(
+        "DELETE FROM screen_captures WHERE session_id = ?1",
+        [&session],
+    )?;
     let erased = serde_json::to_string(&EventKind::Erased)?;
     conn.execute(
         "UPDATE events SET kind = ?2 WHERE session_id = ?1
@@ -1964,6 +2252,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ImportFinished { .. } => "ImportFinished",
         EventKind::BlobDeleted { .. } => "BlobDeleted",
         EventKind::BlobCropped { .. } => "BlobCropped",
+        EventKind::ScreenRequested { .. } => "ScreenRequested",
+        EventKind::ScreenDone { .. } => "ScreenDone",
         EventKind::FileWritten { .. } => "FileWritten",
     }
 }

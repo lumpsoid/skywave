@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer};
 use crate::attachments::STAGING_MAX_BYTES;
 use crate::disk::DEFAULT_MIN_FREE;
 use crate::error::{Error, IoContext, Result};
+use crate::screen::{DEFAULT_ADB, ScreenConfig};
 use crate::shell::{DEFAULT_OUTPUT_MAX, DEFAULT_PROGRAM, ShellConfig};
 use crate::workdir::DEFAULT_DOWNLOAD_MAX;
 
@@ -40,6 +41,8 @@ pub struct Config {
     pub server_names: Vec<String>,
     /// Shell commands from devices (`[shell]`); off by default.
     pub shell: ShellConfig,
+    /// `[screen]`: the screen runner (D65).
+    pub screen: ScreenConfig,
     /// The data dir's disk (`[disk]`).
     pub disk: DiskConfig,
     /// Files moving between devices and the server (`[files]`).
@@ -109,6 +112,8 @@ struct RawConfig {
     #[serde(default)]
     shell: RawShell,
     #[serde(default)]
+    screen: RawScreen,
+    #[serde(default)]
     disk: RawDisk,
     #[serde(default)]
     files: RawFiles,
@@ -149,6 +154,14 @@ struct RawShell {
     rc: Option<PathBuf>,
     #[serde(default, deserialize_with = "size")]
     output_max: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawScreen {
+    #[serde(default)]
+    enabled: bool,
+    adb: Option<PathBuf>,
 }
 
 /// A size as `parse_size` reads it, or a bare integer of bytes.
@@ -325,6 +338,14 @@ impl Config {
                 rc: raw.shell.rc.map(abs),
                 output_max: raw.shell.output_max.unwrap_or(DEFAULT_OUTPUT_MAX),
                 ..ShellConfig::default()
+            },
+            screen: ScreenConfig {
+                enabled: raw.screen.enabled,
+                adb: raw
+                    .screen
+                    .adb
+                    .map(program)
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_ADB)),
             },
             disk: DiskConfig {
                 min_free: raw.disk.min_free.unwrap_or(DEFAULT_MIN_FREE),
@@ -525,6 +546,17 @@ mod tests {
             let err = Config::parse(bad, Path::new("/c.toml"), &env(&[])).unwrap_err();
             assert!(matches!(err, Error::ConfigParse { .. }), "{bad}");
         }
+    }
+
+    #[test]
+    fn screen_is_off_by_default_and_takes_an_adb_path() {
+        let e = env(&[("HOME", "/home/u")]);
+        let c = Config::parse("", Path::new("/etc/skywaved.toml"), &e).unwrap();
+        assert!(!c.screen.enabled, "screen is opt-in");
+        let text = "[screen]\nenabled = true\nadb = \"/opt/android/adb\"";
+        let c = Config::parse(text, Path::new("/etc/skywaved.toml"), &e).unwrap();
+        assert!(c.screen.enabled);
+        assert_eq!(c.screen.adb, Path::new("/opt/android/adb"));
     }
 
     #[test]

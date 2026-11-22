@@ -225,7 +225,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v41: `DeleteSession`, `SessionDeleted`, `Erased`, `RejectReason::ApprovalPending`,
 /// `RejectReason::WorktreeNotRemoved`, `StorageReport::reclaimable` and `POST`
 /// [`path::STORAGE_RECLAIM`].
-pub const PROTOCOL_VERSION: u32 = 41;
+///
+/// v42: the screen runner (D65): [`CommandKind::Screen`],
+/// [`EventKind::ScreenRequested`], [`EventKind::ScreenDone`],
+/// [`BlobUse::ScreenCapture`] and the refusals [`RejectReason::ScreenDisabled`],
+/// [`RejectReason::ScreenStale`] and [`RejectReason::BadScreenInput`].
+pub const PROTOCOL_VERSION: u32 = 42;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -856,6 +861,21 @@ pub enum EventKind {
         output: Option<BlobRef>,
         truncated: bool,
     },
+    /// `by` asked the screen runner for `action` (D65); the event's command
+    /// id is the request's.
+    ScreenRequested {
+        action: ScreenAction,
+        by: DeviceId,
+    },
+    /// The screen runner finished `request`; `pruned` lists capture blobs it
+    /// deleted to keep the newest 20 of the session.
+    ScreenDone {
+        request: CommandId,
+        by: DeviceId,
+        outcome: ScreenOutcome,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pruned: Vec<BlobId>,
+    },
     /// One item of the history of the conversation an adopting
     /// `CreateSession` took over ([`SessionOrigin::Agent`]), as the agent
     /// kept it outside Skywave; logged by the daemon, in the conversation's
@@ -993,6 +1013,186 @@ impl ShellEnd {
     }
 }
 
+/// A key a screen input presses (`ScreenAction::Key`, D65).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenKey {
+    /// The Back key.
+    Back,
+    /// The Home key.
+    Home,
+    /// The Recents (app switcher) key.
+    Recents,
+    /// The Enter key.
+    Enter,
+    /// The Delete (backspace) key.
+    Delete,
+    /// The Power key.
+    Power,
+    /// The volume-up key.
+    VolumeUp,
+    /// The volume-down key.
+    VolumeDown,
+}
+
+/// One action a device asks the screen runner to take on an Android device
+/// attached to the server (`CommandKind::Screen`, D65). Every action but
+/// `Devices` is followed by a shot. An input names the capture it was aimed
+/// at (`aim`) and gives coordinates in that capture's pixels; the server
+/// refuses it as stale unless that is still the device's latest capture.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScreenAction {
+    /// List the attached devices.
+    Devices,
+    /// Take a shot of `device`; `full` keeps the full-resolution PNG.
+    Capture {
+        device: String,
+        #[serde(default)]
+        full: bool,
+    },
+    /// Tap at (`x`, `y`) on `device`.
+    Tap {
+        device: String,
+        aim: CommandId,
+        x: u32,
+        y: u32,
+    },
+    /// Swipe on `device` from (`from_x`, `from_y`) to (`to_x`, `to_y`) over
+    /// `duration_ms`.
+    Swipe {
+        device: String,
+        aim: CommandId,
+        from_x: u32,
+        from_y: u32,
+        to_x: u32,
+        to_y: u32,
+        duration_ms: u32,
+    },
+    /// Type `text` into `device`.
+    Text {
+        device: String,
+        aim: CommandId,
+        text: String,
+    },
+    /// Press `key` on `device`.
+    Key {
+        device: String,
+        aim: CommandId,
+        key: ScreenKey,
+    },
+    /// Install the APK at `apk` on `device`.
+    Install { device: String, apk: String },
+    /// Launch the app `app` (its package id) on `device`.
+    Launch { device: String, app: String },
+    /// Stop the app `app` (its package id) on `device`.
+    Stop { device: String, app: String },
+}
+
+impl ScreenAction {
+    /// The device the action names; `None` only for `Devices`.
+    pub fn device(&self) -> Option<&str> {
+        match self {
+            ScreenAction::Devices => None,
+            ScreenAction::Capture { device, .. }
+            | ScreenAction::Tap { device, .. }
+            | ScreenAction::Swipe { device, .. }
+            | ScreenAction::Text { device, .. }
+            | ScreenAction::Key { device, .. }
+            | ScreenAction::Install { device, .. }
+            | ScreenAction::Launch { device, .. }
+            | ScreenAction::Stop { device, .. } => Some(device.as_str()),
+        }
+    }
+
+    /// The capture an input was aimed at; `None` for the actions that do not
+    /// depend on what is on screen.
+    pub fn aim(&self) -> Option<CommandId> {
+        match self {
+            ScreenAction::Tap { aim, .. }
+            | ScreenAction::Swipe { aim, .. }
+            | ScreenAction::Text { aim, .. }
+            | ScreenAction::Key { aim, .. } => Some(*aim),
+            _ => None,
+        }
+    }
+}
+
+/// An Android device the server can see (`ScreenOutcome::Devices`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScreenDevice {
+    /// The device's adb serial.
+    pub serial: String,
+    /// The device's adb state, such as `device`, `offline` or `unauthorized`.
+    pub state: String,
+    /// The device's model name, if adb reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// The encoding of a stored capture: JPEG for a scaled one, PNG for a `full`
+/// one.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureFormat {
+    /// JPEG, scaled so the longest side is at most 1280 px.
+    Jpeg,
+    /// PNG at the device's full resolution.
+    Png,
+}
+
+/// A capture the runner stored as a blob. It carries no Eq or Hash because
+/// [`BlobRef`] has neither.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ScreenImage {
+    /// The stored image.
+    pub image: BlobRef,
+    /// The image's encoding.
+    pub format: CaptureFormat,
+    /// The image's width in pixels; aim coordinates are in these pixels.
+    pub width: u32,
+    /// The image's height in pixels.
+    pub height: u32,
+    /// The device screen's width in pixels.
+    pub screen_width: u32,
+    /// The device screen's height in pixels.
+    pub screen_height: u32,
+    /// sha256 of the decoded RGBA8 pixels; equal pixels mean `Unchanged`.
+    pub pixels: ContentHash,
+}
+
+/// The result of a shot after an action (`ScreenOutcome::Done`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScreenShot {
+    /// A new image.
+    Image(ScreenImage),
+    /// The screen is the same as `capture`, the device's latest; the id stays
+    /// valid for aims.
+    Unchanged { capture: CommandId },
+    /// The shot could not be taken, for `reason`.
+    Failed { reason: String },
+}
+
+/// How a screen request ended (`EventKind::ScreenDone::outcome`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScreenOutcome {
+    /// The attached devices.
+    Devices { devices: Vec<ScreenDevice> },
+    /// The action ran, and this is the shot after it.
+    Done { shot: ScreenShot },
+    /// An input was not applied: its `aim` is not the device's latest
+    /// capture, which is `latest` (none if the device has none).
+    Stale { latest: Option<CommandId> },
+    /// The action failed, for `reason`.
+    Failed { reason: String },
+    /// The daemon lost track of the request (e.g. it restarted mid-run).
+    Lost,
+    /// It could not be started, for `reason`.
+    NotStarted { reason: String },
+}
+
 impl EventKind {
     /// The device whose command logged the event, for events that name one.
     pub fn device(&self) -> Option<DeviceId> {
@@ -1018,7 +1218,9 @@ impl EventKind {
             | EventKind::ShellRequested { by, .. }
             | EventKind::ShellStopRequested { by, .. }
             | EventKind::BlobDeleted { by, .. }
-            | EventKind::BlobCropped { by, .. } => Some(*by),
+            | EventKind::BlobCropped { by, .. }
+            | EventKind::ScreenRequested { by, .. }
+            | EventKind::ScreenDone { by, .. } => Some(*by),
             // The daemon logs it, but copies the requester's device so a
             // device can tell its own runs apart from this one event.
             EventKind::ShellFinished { by, .. } => Some(*by),
@@ -1089,7 +1291,8 @@ impl EventKind {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
-            | EventKind::BlobCropped { .. } => true,
+            | EventKind::BlobCropped { .. }
+            | EventKind::ScreenRequested { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::Erased
             | EventKind::ToolCall(_)
@@ -1116,6 +1319,7 @@ impl EventKind {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
+            | EventKind::ScreenDone { .. }
             | EventKind::FileWritten { .. }
             | EventKind::Imported { .. } => false,
         }
@@ -1123,12 +1327,14 @@ impl EventKind {
 
     /// What the event does to its session's archived flag, the one rule the
     /// server and every client fold: `SessionArchived` sets it, a
-    /// `UserMessage` or `ShellRequested` from any device brings the session
-    /// back, anything else leaves it alone (`None`).
+    /// `UserMessage`, `ShellRequested` or `ScreenRequested` from any device
+    /// brings the session back, anything else leaves it alone (`None`).
     pub fn archived_effect(&self) -> Option<bool> {
         match self {
             EventKind::SessionArchived { archived, .. } => Some(*archived),
-            EventKind::UserMessage { .. } | EventKind::ShellRequested { .. } => Some(false),
+            EventKind::UserMessage { .. }
+            | EventKind::ShellRequested { .. }
+            | EventKind::ScreenRequested { .. } => Some(false),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -1172,6 +1378,7 @@ impl EventKind {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
+            | EventKind::ScreenDone { .. }
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
             | EventKind::BlobDeleted { .. }
@@ -1214,6 +1421,13 @@ impl EventKind {
             EventKind::ShellFinished { output, .. } => {
                 (output.as_ref().map(|b| (BlobUse::ShellOutput, b)), None)
             }
+            EventKind::ScreenDone {
+                outcome:
+                    ScreenOutcome::Done {
+                        shot: ScreenShot::Image(image),
+                    },
+                ..
+            } => (Some((BlobUse::ScreenCapture, &image.image)), None),
             EventKind::BlobCropped { holds, into, .. } => (Some((*holds, into)), None),
             EventKind::AgentMessage { full: whole, .. }
             | EventKind::Imported {
@@ -1259,6 +1473,8 @@ impl EventKind {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
+            | EventKind::ScreenRequested { .. }
+            | EventKind::ScreenDone { .. }
             | EventKind::ImportFinished { .. }
             // It names a blob it deleted; it references none.
             | EventKind::BlobDeleted { .. }
@@ -1301,6 +1517,8 @@ pub enum BlobUse {
     Message,
     /// An image attached to a user message; deletable, not croppable.
     Attachment,
+    /// A screen capture (D65); deletable, not croppable.
+    ScreenCapture,
 }
 
 /// Size caps on the bounded text in tool events. Producers (the server)
@@ -1418,6 +1636,13 @@ pub mod limits {
     /// longer one as `BadShellCommand` rather than cut it, as a cut command
     /// would run something else.
     pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
+    /// Longest `ScreenAction::Text::text`, in UTF-8 bytes; the server refuses a
+    /// longer one as `BadScreenInput` rather than cut it, as a cut text would
+    /// type something else.
+    pub const SCREEN_TEXT_MAX_BYTES: usize = 1024;
+    /// Longest device serial, app id or APK path in a `ScreenAction`, in UTF-8
+    /// bytes.
+    pub const SCREEN_NAME_MAX_BYTES: usize = 256;
     /// Longest note a safety check feedback carries.
     pub const SAFETY_FEEDBACK_NOTE_MAX_BYTES: usize = 2000;
     /// Most words in a safety rule (`SetSafetyRule::words`).
@@ -2320,6 +2545,14 @@ pub enum CommandKind {
         session_id: SessionId,
         run: CommandId,
     },
+    /// Asks the screen runner for `action` (D65); logged as
+    /// `ScreenRequested`, answered by `ScreenDone`. This command's id is the
+    /// request's, and the capture id of the image it produces. Refused
+    /// `ScreenDisabled`, `ScreenStale` or `BadScreenInput`.
+    Screen {
+        session_id: SessionId,
+        action: ScreenAction,
+    },
     /// Delete the event blob `blob` from the server. The preview in its
     /// event stays. Logged as `BlobDeleted`. `UnknownBlob` when no event
     /// references it, `BlobGone` when it was already deleted or cropped.
@@ -2613,6 +2846,12 @@ pub enum RejectReason {
     /// [`limits::SAFETY_RULE_WORDS_MAX`] words, or more than
     /// [`limits::SAFETY_RULE_MAX_BYTES`] bytes in all.
     BadSafetyRule,
+    /// `[screen] enabled` is off.
+    ScreenDisabled,
+    /// The input's `aim` is not the device's latest capture in the session.
+    ScreenStale,
+    /// A screen action failed validation.
+    BadScreenInput,
 }
 
 impl RejectReason {

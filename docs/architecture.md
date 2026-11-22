@@ -328,8 +328,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
 - **Commands** are deduplicated, validated and appended in one transaction;
   rejected ones are stored too, so their answer stays stable. Validation
   reads projections of the log (`sessions`, `contexts`, `approvals`,
-  `shell_runs`, `event_blobs`) updated in the transaction that appends the
-  event.
+  `shell_runs`, `event_blobs`, `screen_captures`) updated in the transaction
+  that appends the event.
 - **Deleting an event blob** (D42): `DeleteBlob { blob }` is `UnknownBlob`
   when no event referenced the blob (no `event_blobs` row: a workdir blob,
   an id never minted) and `BlobGone` when one did but its `blobs` row is
@@ -761,6 +761,26 @@ the daemon's appends, which would otherwise stop `serve` (below).
   On start, runs left running are finished `Lost` and queued ones run; if
   the runner fails, `serve` stops rather than accept runs nothing would
   start.
+- **Screen runner** (D65): a sibling of the shell runner in
+  `crates/skywaved/src/screen/`: `mod.rs` the config and its validation,
+  `backend.rs` the `ScreenBackend` trait, `android.rs` the adb backend (the
+  only file that names adb), `capture.rs` the decoding, scaling and encoding,
+  `runner.rs` the runner thread. A `Screen` command is validated in
+  `commands.rs` and logged as `ScreenRequested`, its `command_id` the
+  request. The runner follows the log on its own thread, runs one request at
+  a time from one FIFO for the whole server, and logs `ScreenDone` through
+  `EventLog::screen_event`. Every action but `Devices` ends with a capture,
+  scaled to a longest side of 1280 px and JPEG-encoded (or a full PNG when
+  asked); a capture equal to the latest is logged `Unchanged` and keeps the
+  latest's id. Two server tables back it: `screen_requests` holds the open
+  requests, for recovery, and `screen_captures` the latest capture per
+  session and device, for the stale check and the coordinate scaling. After
+  each `ScreenDone` only the newest 20 capture blobs of its session remain,
+  and never a device's latest; the older ones are deleted in that transaction
+  and listed in its `pruned`.
+  On start every request without a `ScreenDone` is settled `Lost`, never run
+  again, or `NotStarted` while the runner is disabled. Config:
+  `[screen] enabled` (off by default) and `adb` (the adb binary). See D65.
 - **Workdir reads** (D36): list and file resolve the session's stored
   workdir, which must still canonicalise to itself under the roots, then the
   requested path, which must be relative, must not climb out with `..`, and

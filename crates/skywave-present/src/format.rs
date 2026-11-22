@@ -385,6 +385,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::TooManyAttachments => "too many images in one message",
         RejectReason::AttachmentsTooLarge => "the message's images are too large together",
         RejectReason::BadSafetyRule => "a rule needs 1 to 16 words, none empty, 512 bytes at most",
+        RejectReason::ScreenDisabled => "screen control is off on the server",
+        RejectReason::ScreenStale => "the screen changed since that capture; aim again",
+        RejectReason::BadScreenInput => "the server refused that screen input",
     }
 }
 

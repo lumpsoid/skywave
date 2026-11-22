@@ -506,6 +506,53 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN
         deletion TEXT CHECK (deletion IN ('requested', 'erased'));
     "#,
+    // v28: the screen runner (protocol v42, D65): open requests, each session's
+    // latest capture per device, and `BlobUse::ScreenCapture`.
+    // Made again as in v23: SQLite cannot change a CHECK in place.
+    r#"
+    CREATE TABLE event_blobs_v28 (
+        blob_id    TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        holds      TEXT NOT NULL CHECK (holds IN
+            ('tool_input', 'tool_body', 'tool_output', 'approval_input', 'shell_output',
+             'message', 'attachment', 'screen_capture'))
+    ) STRICT;
+    INSERT INTO event_blobs_v28 (blob_id, session_id, seq, holds)
+        SELECT blob_id, session_id, seq, holds FROM event_blobs;
+    DROP TABLE event_blobs;
+    ALTER TABLE event_blobs_v28 RENAME TO event_blobs;
+    CREATE INDEX event_blobs_seq ON event_blobs (seq);
+
+    -- One row per accepted Screen command, keyed by its command id (the request
+    -- id), folded from the ScreenRequested and ScreenDone events.
+    CREATE TABLE screen_requests (
+        command_id   TEXT PRIMARY KEY,
+        session_id   TEXT NOT NULL REFERENCES sessions (id),
+        -- Seq of the request's ScreenRequested.
+        seq          INTEGER NOT NULL,
+        -- The device the action names; NULL for a device listing.
+        device       TEXT,
+        requested_by TEXT NOT NULL,
+        -- Seq of the request's ScreenDone; NULL while the request is open.
+        done_seq     INTEGER
+    ) STRICT;
+    CREATE INDEX screen_requests_open ON screen_requests (done_seq);
+
+    -- The latest capture of each device in each session: one row, replaced by
+    -- each new image shot.
+    CREATE TABLE screen_captures (
+        session_id    TEXT NOT NULL REFERENCES sessions (id),
+        device        TEXT NOT NULL,
+        capture       TEXT NOT NULL,
+        pixels        TEXT NOT NULL,
+        width         INTEGER NOT NULL,
+        height        INTEGER NOT NULL,
+        screen_width  INTEGER NOT NULL,
+        screen_height INTEGER NOT NULL,
+        PRIMARY KEY (session_id, device)
+    ) STRICT;
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -526,7 +573,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
     v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
-    v39_to_v40, v40_to_v41,
+    v39_to_v40, v40_to_v41, v41_to_v42,
 ];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
@@ -663,6 +710,12 @@ fn v39_to_v40(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// v40 to v41: adds `DeleteSession`, two event kinds and the
 /// `WorktreeNotRemoved` refusal; nothing stored changes.
 fn v40_to_v41(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v41 to v42: adds the `Screen` command, two event kinds,
+/// `BlobUse::ScreenCapture` and three refusals (D65); nothing stored changes.
+fn v41_to_v42(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -2194,6 +2247,110 @@ mod tests {
             serde_json::from_str(&kind).unwrap(),
             EventKind::SafetyRuleSet { .. }
         ));
+    }
+
+    /// A v41 database, at schema v27 (what v41 wrote), opens as v42: v42
+    /// added the `Screen` command, two event kinds and a blob use, which
+    /// store nothing this event held, so the event reads back unchanged.
+    #[test]
+    fn v42_reads_what_v41_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let session = "01920000-0000-7000-8000-000000000001";
+        let v41 = r#"{"type":"safety_rule_set","words":["git","status"],"on":true,"by":"01920000-0000-7000-8000-000000000009"}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..27] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 27).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 41)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, workdir) VALUES (?1, 'w')",
+                [session],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, ?1, 't', 'c', ?2)",
+                [session, v41],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let (kind, deletion): (String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT events.kind, sessions.deletion
+                 FROM events JOIN sessions ON sessions.id = events.session_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, v41);
+        assert_eq!(
+            deletion, None,
+            "the v27 column is NULL for a session it did not touch"
+        );
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::SafetyRuleSet { .. }
+        ));
+    }
+
+    /// v28 remakes `event_blobs` with the `screen_capture` use and keeps the
+    /// rows a v27 build wrote in it, then takes the screen tables.
+    #[test]
+    fn v28_keeps_event_blobs_and_takes_screen_captures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let session = "01920000-0000-7000-8000-000000000001";
+        let attachment = "01920000-0000-7000-8000-000000000011";
+        let capture = "01920000-0000-7000-8000-000000000012";
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..27] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 27).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 41)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES (?1, ?2, 1, 'attachment')",
+                [attachment, session],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let (count, holds): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT count(*), holds FROM event_blobs WHERE blob_id = ?1",
+                [attachment],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, holds.as_str()), (1, "attachment"));
+        db.conn()
+            .execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES (?1, ?2, 2, 'screen_capture')",
+                [capture, session],
+            )
+            .unwrap();
     }
 
     /// The plan `SAFETY_RULES_SQL` runs, as `EXPLAIN QUERY PLAN` details.

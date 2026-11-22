@@ -23,6 +23,7 @@ use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 use skywaved::logging::LogFile;
 use skywaved::pairing;
 use skywaved::safety_feedback;
+use skywaved::screen::ScreenRunner;
 use skywaved::server::{Server, ServerOptions};
 use skywaved::shell::ShellRunner;
 use skywaved::workdir::Git;
@@ -291,6 +292,7 @@ async fn serve(
     // are set before any clone: each clone keeps its own.
     let log = EventLog::open(&storage.db, config.roots.clone())?
         .with_shell(config.shell.enabled)
+        .with_screen(config.screen.enabled)
         .with_bypass(config.agent.allow_bypass)
         .with_disk(disk);
     // The agent's own conversations, read from the environment the CLI the
@@ -371,8 +373,11 @@ async fn serve(
         supervisor.activity(),
     )?;
     // Always started: disabled, it still settles runs an enabled daemon
-    // left, then ends.
-    let mut shell = ShellRunner::start(config.data_dir.clone(), log, config.shell.clone()).await?;
+    // left, then ends. The screen runner is the same.
+    let mut shell =
+        ShellRunner::start(config.data_dir.clone(), log.clone(), config.shell.clone()).await?;
+    let mut screen =
+        ScreenRunner::start(config.data_dir.clone(), log, config.screen.clone()).await?;
     // Made before "listening", so a signal sent once that line is logged is never lost.
     let term = sigterm_listener();
     let presses = ctrl_c_listener();
@@ -405,6 +410,7 @@ async fn serve(
             () = stop_signal(&db_path, term, presses) => {}
             () = requested => {}
             () = shell.failed() => tracing::error!("shell runner failed; stopping the daemon"),
+            () = screen.failed() => tracing::error!("screen runner failed; stopping the daemon"),
             () = supervisor.failed() => {
                 tracing::error!("agent supervisor failed; stopping the daemon");
             }
@@ -412,8 +418,10 @@ async fn serve(
     };
     let served = server.serve(stop).await;
     let shell_stopped = shell.shutdown().await;
+    let screen_stopped = screen.shutdown().await;
     supervisor.shutdown().await?;
     shell_stopped?;
+    screen_stopped?;
     served?;
     tracing::info!("stopped");
     Ok(exit.get())

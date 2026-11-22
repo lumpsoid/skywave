@@ -19,6 +19,7 @@ hex.workspace = true
 http-body.workspace = true
 hyper = { workspace = true, features = ["server"] }
 hyper-util.workspace = true
+image.workspace = true
 qrcode.workspace = true
 rcgen.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }

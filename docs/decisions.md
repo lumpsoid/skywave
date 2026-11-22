@@ -1827,3 +1827,58 @@ which still shows a session with only schedules or ambient tasks as working.
 - error notifications: an errored session does not ring (task b75f0a);
 - TUI parity: the TUI has approval and shell alerts only, no idle notice
   (task d04c64).
+
+## D65. Driving an app's screen from a device (v42)
+
+A device clicks through an app under development on an Android device or
+emulator attached to the server: list devices, capture the screen, tap,
+swipe, type text, press keys, install an APK, launch and stop an app. The
+daemon's screen runner (`crates/skywaved/src/screen/`) does it beside the
+shell runner (D35); `[screen] enabled` turns it on.
+
+**Security.** Off by default, with the same power as `[shell]`: any paired
+device can install and run code on the attached device.
+
+**Captures, not a stream.** A screenshot is a blob, and an input is a
+command. A live video stream would make the UI wait on the network, the
+thing this product avoids. After every action but a device listing the
+runner takes a fresh capture: scaled so its longest side is at most 1280 px
+and JPEG-encoded (quality 70, about 100-200 KB), or the full-resolution PNG
+when asked (`full`). A capture whose pixels equal the latest is not stored:
+the outcome says `Unchanged` and names the latest capture.
+
+**Aimed at a capture.** Every input that depends on what is on screen (tap,
+swipe, text, key) names the capture it was aimed at (`aim`, the id of the
+request that produced it) and gives coordinates in that image's pixels; the
+server scales them to the screen. An input aimed at anything but the
+device's latest capture in that session is refused as stale: at accept
+(`ScreenStale`) and again when the runner reaches it (`Stale`). The user
+re-aims on the new image. This is a definitive signal, not a timeout, and it
+is also the outbox rule: a tap queued during a long drop is refused, never
+applied blindly to a screen that moved on. **Rejected:** applying a stale
+input and flagging it (a tap lands on whatever is there now); an outbox
+expiry (a guess).
+
+**One at a time, at most once.** One FIFO for the whole server, one action
+at a time. `ScreenRequested` is logged by the command and `ScreenDone` by
+the runner; there is no "started" event, so at start every request without
+a `ScreenDone` is settled `Lost` and never run again, and disabled, the
+runner settles them `NotStarted`.
+
+**Per session.** Screen events live in a session's log like shell runs, so
+replication, sync and blob GC are the session machinery. The attached device
+is a field of each action (its serial). **Rejected:** a server-wide screen
+(a new non-session event stream through every layer).
+
+**Captures pile up.** The server keeps the newest 20 capture blobs per
+session, and never a device's latest (inputs may still aim at it); a
+`ScreenDone` deletes the older ones in its transaction and lists them in
+`pruned`, so devices drop them with no deletion event per blob. A low
+disk refuses new requests (`DiskLow`, D40) and fails one the runner reaches
+(`Failed`): an input is cheap to redo.
+
+**Backends.** A backend trait hides the platform; Android (adb) is the
+first. adb calls time out (30 s, 300 s for an install) and fail the action.
+
+**Deferred:** an iOS simulator backend (needs `skywaved` on macOS) and a
+low-fps live mode for good links.

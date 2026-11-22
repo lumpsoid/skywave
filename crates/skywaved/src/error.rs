@@ -110,6 +110,8 @@ pub enum Error {
     Supervisor(String),
     #[error("shell runner: {0}")]
     Shell(String),
+    #[error("screen runner: {0}")]
+    Screen(String),
     /// No `serve` listens on the data dir's control socket.
     #[error("no skywaved serve is running on {}", path.display())]
     NotServing { path: PathBuf },
