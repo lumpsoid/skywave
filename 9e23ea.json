@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:55:43.337165+00:00",
+      "status": "2026-11-22T15:55:43.337165+00:00",
+      "title": "2026-11-22T15:55:43.337165+00:00"
+    },
+    "tags": {
+      "screen": [
+        "2026-11-22T15:55:43.337165+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce, after dc27f7. skywave-proto: the commands and events from the design, capture events carry a BlobRef. One PROTOCOL_VERSION bump for the batch, a no-op step in PROTOCOL_STEPS in both skywaved/src/db.rs and skywave-core/src/store.rs (tested on data the previous version wrote), and UPDATE_SNAPSHOTS=1 for the wire snapshots.",
+  "created": "2026-11-22T15:55:43.337165+00:00",
+  "id": "9e23ea",
+  "status": "open",
+  "tags": [
+    "screen"
+  ],
+  "title": "screen 2: wire types for screen commands and capture events",
+  "updated": "2026-11-22T15:55:43.337165+00:00"
+}
