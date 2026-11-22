@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-22T15:55:35.054535+00:00",
+      "status": "2026-11-22T15:55:35.054535+00:00",
+      "title": "2026-11-22T15:55:35.054535+00:00"
+    },
+    "tags": {
+      "meta": [
+        "2026-11-22T15:55:35.054535+00:00",
+        false
+      ],
+      "screen": [
+        "2026-11-22T15:55:35.054535+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Feature request: a user building an app clicks through it in a simulator; they want that from Skywave on the server. Plan: a screen runner beside the shell runner (D35 shape): screenshot as blob, tap/swipe/text as deduped commands anchored to the capture they were aimed at, no live stream by default. Android (adb) is the first backend and the test of the system, since it runs on the current Linux server; iOS needs skywaved on macOS. Steps are filled in below.",
+  "created": "2026-11-22T15:55:35.054535+00:00",
+  "id": "e553ce",
+  "status": "open",
+  "tags": [
+    "meta",
+    "screen"
+  ],
+  "title": "Meta: drive an app emulator/simulator on the server from a device",
+  "updated": "2026-11-22T15:55:35.054535+00:00"
+}
