@@ -1090,7 +1090,7 @@ logs) an event that no longer decodes rather than failing.
   `ListKind::Active`, `Archived` and `All`; the all list marks its archived
   rows, and back from a session returns to the list last shown, so
   archiving or unarchiving the open session doesn't move the user to another
-  list.
+  list; that list also shows when the open session is deleted.
 - **Worktrees** (D52): the replica's `sessions` table has a `worktree`
   column (the JSON `{repo, branch}` of the session's `SessionCreated`, NULL
   when it has none) and a `worktree_removed` column (set by
@@ -1473,8 +1473,8 @@ logs) an event that no longer decodes rather than failing.
   replaces a stored answer; any other answer is stored, and the model learns the blobs it
   registered and purged in the same update. Back walks file → its
   directory, diff → changes, directory → its parent, and the changes, the
-  commits or the workdir root → the session; a session deleted here falls back to the
-  archived list, or to the all list when that was the list last shown.
+  commits or the workdir root → the session; a session deleted here falls back
+  to the list last shown, the one back from the session returns to.
 - **Workdir downloads and pushes** (D54, D56). `Action::DownloadWorkdirFile`
   asks for one file as a `WorkdirAsk::Download`, stored under its own kind so
   it never replaces a file view's answer; the stored `WorkdirAnswer::File`

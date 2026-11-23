@@ -2588,7 +2588,8 @@ impl Model {
 
     /// Mirrors [`Store::delete_session_locally`](crate::Store::delete_session_locally),
     /// which returned `blobs`: the session goes for good, with what this
-    /// device kept for it. If it was on screen, its list shows instead.
+    /// device kept for it. If it was on screen, the list last shown shows
+    /// instead, as back would return to.
     pub(crate) fn session_deleted(&mut self, id: SessionId, blobs: &[BlobId]) {
         self.deleted.insert(id);
         self.sessions.retain(|s| s.id != id);
@@ -2612,10 +2613,10 @@ impl Model {
             | Place::SessionInfo { id: shown, .. }
             | Place::Workdir { id: shown, .. } if *shown == id)
         {
-            self.place = if self.last_list == ListKind::All {
-                Place::All
-            } else {
-                Place::Archived
+            self.place = match self.last_list {
+                ListKind::Active => Place::session_list(),
+                ListKind::Archived => Place::Archived,
+                ListKind::All => Place::All,
             };
         }
     }
@@ -8513,6 +8514,32 @@ mod tests {
         f.open(id);
         f.dispatch(Action::Back);
         assert_eq!(f.list_view().kind, ListKind::Active);
+    }
+
+    #[test]
+    fn deleting_the_open_session_shows_the_list_last_shown() {
+        let mut f = Fixture::paired();
+        let a = f.session("/srv/a");
+        let b = f.session("/srv/b");
+        let c = f.session("/srv/c");
+
+        // Opened from the active list, deleted from another device.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        f.open(a);
+        f.model.session_deleted(a, &[]);
+        assert_eq!(f.list_view().kind, ListKind::Active);
+
+        queued(&f.dispatch(archive(b, true)));
+        f.dispatch(Action::Navigate(Route::AllSessions));
+        f.open(b);
+        f.model.session_deleted(b, &[]);
+        assert_eq!(f.list_view().kind, ListKind::All);
+
+        queued(&f.dispatch(archive(c, true)));
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        f.open(c);
+        f.model.session_deleted(c, &[]);
+        assert_eq!(f.list_view().kind, ListKind::Archived);
     }
 
     #[test]
@@ -16462,7 +16489,7 @@ mod tests {
             answer(&mut f, req, ask.clone(), changes(Vec::new()));
             let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
             f.model.session_deleted(id, &[]);
-            assert_eq!(shown(&f.model.view()), "archived list");
+            assert_eq!(shown(&f.model.view()), "active list");
             assert!(!f.model.workdir_awaited(req, &ask), "its read is forgotten");
             // Another session's reads stay.
             assert!(
