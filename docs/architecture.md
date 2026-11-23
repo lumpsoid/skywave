@@ -2001,6 +2001,10 @@ skywave-core                 all logic, sync, replica
   notifications page) wherever a page can go back; it never leaves the app,
   and the session page's own Esc (closing search, leaving the composer)
   comes first.
+- **Approve and deny** (GUI): on the session page Ctrl+Shift+A approves and
+  Ctrl+Shift+D denies the approval on screen (with none, Ctrl+Shift+D
+  declines the question); the buttons' tooltips name them. A held key
+  answers once; the Approvals page binds no key, as it shows several.
 - **Platforms:** Linux and Android verified; macOS, iOS and Windows
   scaffolded only; no web (D26).
 - **Shell history picker** (D53). The hub owns its state. In shell mode

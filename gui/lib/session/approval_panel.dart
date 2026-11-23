@@ -25,6 +25,7 @@ class ApprovalPanelView extends StatefulWidget {
     required this.sessionId,
     required this.send,
     this.onShowCall,
+    this.shortcuts = false,
     super.key,
   });
 
@@ -34,6 +35,10 @@ class ApprovalPanelView extends StatefulWidget {
 
   /// Reveals the gated call in the timeline; null when it is not there.
   final VoidCallback? onShowCall;
+
+  /// The session page binds Ctrl+Shift+A / Ctrl+Shift+D to this panel: its
+  /// buttons say so.
+  final bool shortcuts;
 
   @override
   State<ApprovalPanelView> createState() => _ApprovalPanelViewState();
@@ -58,6 +63,10 @@ class _ApprovalPanelViewState extends State<ApprovalPanelView> {
       rule: rule,
     ),
   );
+
+  /// The button, with the key that answers it named when the page binds one.
+  Widget _tipped(String tip, Widget button) =>
+      widget.shortcuts ? Tooltip(message: tip, child: button) : button;
 
   Future<void> _always(BuildContext context) async {
     final suggestions = widget.approval.suggestions;
@@ -293,17 +302,23 @@ class _ApprovalPanelViewState extends State<ApprovalPanelView> {
                     ),
                   ),
                 Expanded(
-                  child: OutlinedButton(
-                    style: _compact,
-                    onPressed: () => _resolve(DecisionView.deny),
-                    child: const _Label('Deny'),
+                  child: _tipped(
+                    'Deny (Ctrl+Shift+D)',
+                    OutlinedButton(
+                      style: _compact,
+                      onPressed: () => _resolve(DecisionView.deny),
+                      child: const _Label('Deny'),
+                    ),
                   ),
                 ),
                 Expanded(
-                  child: FilledButton(
-                    style: _compact,
-                    onPressed: () => _resolve(DecisionView.approve),
-                    child: const _Label('Approve'),
+                  child: _tipped(
+                    'Approve (Ctrl+Shift+A)',
+                    FilledButton(
+                      style: _compact,
+                      onPressed: () => _resolve(DecisionView.approve),
+                      child: const _Label('Approve'),
+                    ),
                   ),
                 ),
               ],

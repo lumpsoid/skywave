@@ -322,6 +322,15 @@ class _SessionPageState extends State<SessionPage> {
     final keyboard = HardwareKeyboard.instance;
     final ctrl = keyboard.isControlPressed;
     final key = event.logicalKey;
+    if (ctrl &&
+        keyboard.isShiftPressed &&
+        (key == LogicalKeyboardKey.keyA || key == LogicalKeyboardKey.keyD)) {
+      // The key down only: a held key's repeats would answer again.
+      if (event is KeyDownEvent) {
+        _answer(approve: key == LogicalKeyboardKey.keyA);
+      }
+      return KeyEventResult.handled;
+    }
     final timeline = _timelineView.currentState;
     if (ctrl && key == LogicalKeyboardKey.keyX) {
       if (_textSelected) return KeyEventResult.ignored;
@@ -360,6 +369,31 @@ class _SessionPageState extends State<SessionPage> {
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// Ctrl+Shift+A approves and Ctrl+Shift+D denies the approval on
+  /// screen; with none, Ctrl+Shift+D declines the question. Core drops a
+  /// second answer to the same approval.
+  void _answer({required bool approve}) {
+    final screen = _screen;
+    if (screen.approval case final approval? when approval.canAnswer) {
+      widget.send.act(
+        ActionIntentResolveApproval(
+          approvalId: approval.approvalId,
+          decision: approve ? DecisionView.approve : DecisionView.deny,
+        ),
+      );
+      return;
+    }
+    if (approve) return;
+    if (screen.question case final question? when question.canAnswer) {
+      widget.send.act(
+        ActionIntentResolveApproval(
+          approvalId: question.approvalId,
+          decision: DecisionView.deny,
+        ),
+      );
+    }
   }
 
   @override
@@ -719,6 +753,8 @@ class _SessionPageState extends State<SessionPage> {
                           onShowCall: question.callKey == null
                               ? null
                               : () => _showCall(question.callKey!),
+                          // Ctrl+Shift+D goes to the approval when both show.
+                          shortcuts: screen.approval == null,
                         ),
                       if (screen.approval case final approval?)
                         ApprovalPanelView(
@@ -728,6 +764,7 @@ class _SessionPageState extends State<SessionPage> {
                           onShowCall: approval.gatedKey == null
                               ? null
                               : () => _showCall(approval.gatedKey!),
+                          shortcuts: true,
                         ),
                     ],
                   ),

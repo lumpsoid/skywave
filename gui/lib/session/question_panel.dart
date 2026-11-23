@@ -18,6 +18,7 @@ class QuestionPanelView extends StatefulWidget {
     required this.question,
     required this.send,
     this.onShowCall,
+    this.shortcuts = false,
     super.key,
   });
 
@@ -26,6 +27,10 @@ class QuestionPanelView extends StatefulWidget {
 
   /// Reveals the call that asks in the timeline; null when it is not there.
   final VoidCallback? onShowCall;
+
+  /// The session page binds Ctrl+Shift+A / Ctrl+Shift+D to this panel: its
+  /// buttons say so.
+  final bool shortcuts;
 
   @override
   State<QuestionPanelView> createState() => _QuestionPanelViewState();
@@ -126,6 +131,10 @@ class _QuestionPanelViewState extends State<QuestionPanelView> {
     ),
   );
 
+  /// The button, with the key that answers it named when the page binds one.
+  Widget _tipped(String tip, Widget button) =>
+      widget.shortcuts ? Tooltip(message: tip, child: button) : button;
+
   @override
   Widget build(BuildContext context) {
     final question = widget.question;
@@ -213,9 +222,12 @@ class _QuestionPanelViewState extends State<QuestionPanelView> {
               spacing: 8,
               children: [
                 Expanded(
-                  child: OutlinedButton(
-                    onPressed: _decline,
-                    child: const Text('Decline', maxLines: 1),
+                  child: _tipped(
+                    'Decline (Ctrl+Shift+D)',
+                    OutlinedButton(
+                      onPressed: _decline,
+                      child: const Text('Decline', maxLines: 1),
+                    ),
                   ),
                 ),
                 Expanded(
