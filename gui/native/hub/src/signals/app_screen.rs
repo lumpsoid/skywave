@@ -19,9 +19,17 @@ pub struct AppScreenUpdate {
     /// The device's newest requests and device listings, oldest first, at
     /// most 20.
     pub requests: Vec<AppScreenRow>,
-    /// Bumped each time typed text was queued in this session; the field
-    /// clears on a change.
-    pub typed: u32,
+    /// The answer to the latest typed text, by the number the GUI gave it.
+    pub text_result: Option<AppScreenTextResult>,
+}
+
+/// Whether the typed text the GUI numbered `seq` was queued.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, SignalPiece)]
+pub struct AppScreenTextResult {
+    pub seq: u32,
+    /// True once the core took it; false when it was not queued (the
+    /// dispatch failed, the aim was refused, or the text was blank).
+    pub queued: bool,
 }
 
 /// One attached device, as the device list shows it.

@@ -33,7 +33,8 @@ mod timeline;
 mod workdir;
 
 pub use app_screen::{
-    AppScreenCapture, AppScreenDevice, AppScreenKeyView, AppScreenRow, AppScreenUpdate,
+    AppScreenCapture, AppScreenDevice, AppScreenKeyView, AppScreenRow, AppScreenTextResult,
+    AppScreenUpdate,
 };
 pub use boot::{Boot, BootFailed, Booted, HubFailed};
 pub use crop::{

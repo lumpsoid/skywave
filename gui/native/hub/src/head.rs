@@ -41,11 +41,11 @@ use crate::notify::{Kind, NotificationIds};
 use crate::prefs::{NotificationPrefs, Prefs};
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
-    AppScreenUpdate, ComposerFile, ComposerImage, ComposerModeView, ComposerView, CopyWhat,
-    CropLinesUpdate, GuiIntent, HistoryRowView, HistorySearchView, LinkUpdate, NotifyKind,
-    PairForm, PlatformEffect, RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate,
-    StorageGroupingView, TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView, Utf16Range,
-    WorkdirTextUpdate,
+    AppScreenTextResult, AppScreenUpdate, ComposerFile, ComposerImage, ComposerModeView,
+    ComposerView, CopyWhat, CropLinesUpdate, GuiIntent, HistoryRowView, HistorySearchView,
+    LinkUpdate, NotifyKind, PairForm, PlatformEffect, RenamePrompt, ScreenUpdate, SearchUpdate,
+    ShellRunRow, ShellUpdate, StorageGroupingView, TimelineRow, TimelineUpdate, UsageGroupingView,
+    UsageSpanView, Utf16Range, WorkdirTextUpdate,
 };
 use crate::timeline::{BlobHeads, Rows, RuleCandidates, parse_key};
 use crate::workdir::{WorkdirText, shown_blob, shown_text};
@@ -131,9 +131,8 @@ pub enum Out {
 enum Purpose {
     /// A message from the composer of this session.
     Send(SessionId),
-    /// Text typed into this session's app screen; counted once the core
-    /// took it.
-    ScreenText(SessionId),
+    /// Typed text of the app screen, by the GUI's number for it.
+    ScreenText(u32),
     /// A draft save of the open session.
     Draft,
     /// The new-session prompt's workdir.
@@ -373,11 +372,10 @@ pub struct Head {
     pending: HashMap<Tag, Purpose>,
     /// Bumped for every value the hub writes into a Dart field.
     revs: u32,
-    /// Bumped each time typed text of the app screen was queued; the GUI
-    /// clears its field on a change. Kept here, not in a session's head: a
-    /// count that restarted on each session open would look like a change
-    /// to a field that outlives the switch, and clear text never queued.
-    app_screen_typed: u32,
+    /// The answer to the latest typed text of the app screen. Kept here, not
+    /// in a session's head: the GUI's number for a send is unique while the
+    /// app runs, so an answer is never mistaken for another send's.
+    app_screen_text: Option<AppScreenTextResult>,
     form: PairForm,
     create: Option<CreateUi>,
     create_tag: Option<Tag>,
@@ -660,10 +658,11 @@ impl Head {
                     }
                 }
             }
-            Purpose::ScreenText(id) => {
-                if done.result.is_ok() && self.session.as_ref().is_some_and(|s| s.id == id) {
-                    self.app_screen_typed += 1;
-                }
+            Purpose::ScreenText(seq) => {
+                self.app_screen_text = Some(AppScreenTextResult {
+                    seq,
+                    queued: done.result.is_ok(),
+                });
             }
             Purpose::Draft => {
                 if done.result.is_err()
@@ -1004,7 +1003,7 @@ impl Head {
                 y,
             } => {
                 let input = Input::Tap { x, y };
-                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
+                self.app_screen_input(&session_id, &capture_id, input, Purpose::Plain, clock, out)?;
             }
             GuiIntent::AppScreenSwipe {
                 session_id,
@@ -1020,15 +1019,23 @@ impl Head {
                     to_x,
                     to_y,
                 };
-                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
+                self.app_screen_input(&session_id, &capture_id, input, Purpose::Plain, clock, out)?;
             }
             GuiIntent::AppScreenText {
                 session_id,
                 capture_id,
                 text,
+                seq,
             } => {
                 let input = Input::Text(text);
-                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
+                let purpose = Purpose::ScreenText(seq);
+                let dispatched =
+                    self.app_screen_input(&session_id, &capture_id, input, purpose, clock, out);
+                // Not queued: the GUI may send the same text again.
+                if !matches!(dispatched, Ok(true)) {
+                    self.app_screen_text = Some(AppScreenTextResult { seq, queued: false });
+                }
+                dispatched?;
             }
             GuiIntent::AppScreenKey {
                 session_id,
@@ -1036,7 +1043,7 @@ impl Head {
                 key,
             } => {
                 let input = Input::Key(app_screen::key(key));
-                self.app_screen_input(&session_id, &capture_id, input, clock, out)?;
+                self.app_screen_input(&session_id, &capture_id, input, Purpose::Plain, clock, out)?;
             }
             GuiIntent::AppScreenDismiss {
                 session_id,
@@ -1950,7 +1957,7 @@ impl Head {
             ),
             _ => app_screen::update(None, false, None),
         };
-        app.typed = self.app_screen_typed;
+        app.text_result = self.app_screen_text;
         if self.sent.app_screen.as_ref() != Some(&app) {
             self.sent.app_screen = Some(app.clone());
             out.push(Out::AppScreen(app));
@@ -1988,39 +1995,36 @@ impl Head {
     }
 
     /// An input to the app screen's device of the open session, aimed at
-    /// `capture_id`. An aim that is no longer the device's latest capture
-    /// is said so; blank text types nothing.
+    /// `capture_id`, with `purpose` for its result. An aim that is no longer
+    /// the device's latest capture is said so; blank text types nothing.
+    /// Returns whether it dispatched.
     fn app_screen_input(
         &mut self,
         session_id: &str,
         capture_id: &str,
         input: Input,
+        purpose: Purpose,
         clock: Clock,
         out: &mut Vec<Out>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let aim: CommandId = intents::id("capture", capture_id)?;
         let Some(session) = self.open_head(session_id) else {
-            return Ok(());
+            return Ok(false);
         };
-        let id = session.id;
         let selected = session.app_screen_device.clone();
         let blank = matches!(&input, Input::Text(text) if text.trim().is_empty());
-        let purpose = if matches!(&input, Input::Text(_)) {
-            Purpose::ScreenText(id)
-        } else {
-            Purpose::Plain
-        };
         let Some(view) = open_session(&self.view) else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(device) = app_screen::shown_device(view, selected.as_deref()) else {
-            return Ok(());
+            return Ok(false);
         };
         match present::input(view, &device, aim, input) {
             Some(action) => {
                 self.dispatch_user(action, purpose, clock, out);
+                Ok(true)
             }
-            None if blank => {}
+            None if blank => Ok(false),
             None => {
                 let text = match view.app_screen.latest(&device) {
                     None => Some("capture the screen first"),
@@ -2034,9 +2038,9 @@ impl Head {
                         text: text.to_owned(),
                     }));
                 }
+                Ok(false)
             }
         }
-        Ok(())
     }
 
     /// The open session's view, when it is `id`'s.

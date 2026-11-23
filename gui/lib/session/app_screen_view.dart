@@ -161,7 +161,7 @@ class AppScreenView extends StatelessWidget {
             _TextEntry(
               sessionId: sessionId,
               captureId: capture?.captureId,
-              typed: update?.typed ?? 0,
+              textResult: update?.textResult,
               send: send,
             ),
             Padding(
@@ -287,14 +287,18 @@ class _ScreenImageState extends State<_ScreenImage> {
       (at / shown * size).floor().clamp(0, size - 1).toInt();
 }
 
-/// The text field and its send: the text goes to the capture's screen, then
-/// the field clears once the hub says the core queued it (a stale aim keeps
-/// the text, so it can be aimed again).
+/// The number of the last text sent; unique while the app runs, so the
+/// hub's answer to one send is never taken for another's.
+int _textSeq = 0;
+
+/// The text field and its send: the text goes to the capture's screen. The
+/// field clears once the hub says the core queued this send; a send that was
+/// not queued keeps the text and can be sent again.
 class _TextEntry extends StatefulWidget {
   const _TextEntry({
     required this.sessionId,
     required this.captureId,
-    required this.typed,
+    required this.textResult,
     required this.send,
   });
 
@@ -304,9 +308,8 @@ class _TextEntry extends StatefulWidget {
   /// the send is off.
   final String? captureId;
 
-  /// The hub's count of typed text queued in this session; the field clears
-  /// when it changes.
-  final int typed;
+  /// The hub's answer to the latest typed text, by its number.
+  final AppScreenTextResult? textResult;
   final SendIntent send;
 
   @override
@@ -322,6 +325,9 @@ class _TextEntryState extends State<_TextEntry> {
   /// The capture the waiting text was sent to, or null with [_sent].
   String? _sentAim;
 
+  /// The number of the waiting send, or null with [_sent].
+  int? _sentSeq;
+
   @override
   void dispose() {
     _controller.dispose();
@@ -331,12 +337,14 @@ class _TextEntryState extends State<_TextEntry> {
   @override
   void didUpdateWidget(_TextEntry oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // Only the answer to the waiting send counts; an older send's is stale.
+    final result = widget.textResult;
+    if (result == null || result.seq != _sentSeq) return;
     // Text edited after the send is the user's and stays.
-    if (widget.typed != oldWidget.typed && _controller.text == _sent) {
-      _controller.clear();
-      _sent = null;
-      _sentAim = null;
-    }
+    if (result.queued && _controller.text == _sent) _controller.clear();
+    _sent = null;
+    _sentAim = null;
+    _sentSeq = null;
   }
 
   void _type(String captureId) {
@@ -345,13 +353,16 @@ class _TextEntryState extends State<_TextEntry> {
     if (_sent != null && _controller.text == _sent && captureId == _sentAim) {
       return;
     }
+    final seq = ++_textSeq;
     _sent = _controller.text;
     _sentAim = captureId;
+    _sentSeq = seq;
     widget.send(
       GuiIntentAppScreenText(
         sessionId: widget.sessionId,
         captureId: captureId,
         text: _controller.text,
+        seq: seq,
       ),
     );
   }
