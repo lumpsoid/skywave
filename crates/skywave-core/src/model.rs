@@ -131,6 +131,14 @@ struct Title {
     rename: Option<Outgoing>,
 }
 
+/// A session a search looks through.
+pub(crate) struct SearchTarget {
+    pub id: SessionId,
+    pub title: String,
+    pub workdir: Option<String>,
+    pub last_activity: DateTime<Utc>,
+}
+
 /// The screen shown, with what only that screen keeps: leaving it drops
 /// that.
 #[derive(Debug, Clone, PartialEq)]
@@ -4567,6 +4575,35 @@ impl Model {
                 .map(|e| e.command.id);
         }
         contexts
+    }
+
+    /// The sessions a search looks through, in the session list's order:
+    /// only `scope`'s when it is given.
+    pub(crate) fn search_targets(&self, scope: Option<SessionId>) -> Vec<SearchTarget> {
+        self.sessions
+            .iter()
+            .filter(|summary| scope.is_none_or(|id| summary.id == id))
+            .map(|summary| SearchTarget {
+                id: summary.id,
+                title: self.title(summary).text,
+                workdir: summary.workdir.clone(),
+                last_activity: summary.last_activity,
+            })
+            .collect()
+    }
+
+    /// The session's items a search looks through: its logged items outside
+    /// any subagent, in log order.
+    pub(crate) fn search_timeline(
+        &self,
+        id: SessionId,
+        events: &[(Seq, Event)],
+    ) -> Vec<TimelineItem> {
+        self.timeline(id, events)
+            .0
+            .into_iter()
+            .filter(|item| matches!(item, TimelineItem::Logged { parent: None, .. }))
+            .collect()
     }
 
     /// The session's timeline and the rules granted in it, in log order.
