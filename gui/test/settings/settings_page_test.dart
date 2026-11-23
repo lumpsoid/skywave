@@ -68,6 +68,13 @@ void main() {
     await tester.drag(find.byType(ListView), const Offset(0, -300));
     await tester.pump();
     await tester.tap(find.text('Re-pair'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('confirm-cancel')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Re-pair'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('confirm-ok')));
+    await tester.pumpAndSettle();
     await tester.tap(find.byType(BackButton));
     expect(sent, [
       const GuiIntentAct(

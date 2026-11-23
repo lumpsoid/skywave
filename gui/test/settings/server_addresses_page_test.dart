@@ -28,6 +28,13 @@ void main() {
     expect(find.textContaining('kept here'), findsNothing);
     await tester.tap(find.text('vpn:7443'));
     await tester.tap(find.byKey(const Key('forget-address-10.0.0.7:7443')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('confirm-cancel')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('forget-address-10.0.0.7:7443')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('confirm-ok')));
+    await tester.pumpAndSettle();
     await tester.tap(find.byType(BackButton));
     expect(sent, [
       const GuiIntentAct(

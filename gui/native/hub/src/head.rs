@@ -55,6 +55,9 @@ use crate::{app_screen, intents, link, screen, search, shell, timeline};
 /// message has waited) are brought up to date.
 pub const TICK: Duration = Duration::from_secs(1);
 
+/// How often the session list's "N min ago" labels are brought up to date.
+const LIST_TICK: Duration = Duration::from_secs(60);
+
 /// The most rows the shell history picker sends, newest first.
 const HISTORY_SEARCH_ROWS: usize = 100;
 
@@ -741,7 +744,8 @@ impl Head {
     }
 
     /// When something is due without input: a draft save, a read mark, the
-    /// retry countdown, a running clock on screen. `None`: nothing is.
+    /// retry countdown, a running clock on screen, the list's ages. `None`:
+    /// nothing is.
     pub fn next_wake(&self, clock: Clock) -> Option<Instant> {
         let view = self.view.as_ref()?;
         let open = open_session(&self.view);
@@ -754,6 +758,7 @@ impl Head {
             link::next_change(&view.link, clock.wall_ms).map(|d| clock.now + d),
             open.filter(|v| timeline::live(v) || shell::live(v))
                 .map(|_| clock.now + TICK),
+            matches!(view.screen, Screen::SessionList(_)).then(|| clock.now + LIST_TICK),
         ]
         .into_iter()
         .flatten()

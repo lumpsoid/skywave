@@ -2131,6 +2131,23 @@ fn the_list_says_which_kind_it_shows() {
 }
 
 #[test]
+fn the_session_list_wakes_each_minute_for_its_ages() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    assert!(matches!(rig.list(), ScreenView::SessionList { .. }));
+    let within_a_minute = rig.clock.now + Duration::from_secs(60);
+    assert!(
+        rig.head
+            .next_wake(rig.clock)
+            .is_some_and(|at| at <= within_a_minute)
+    );
+}
+
+#[test]
 fn the_all_list_marks_its_archived_rows() {
     let mut rig = Rig::new();
     let list = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {

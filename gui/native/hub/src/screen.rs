@@ -14,14 +14,14 @@ use skywave_core::{
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
-    StopAction, TRAIL_SEPARATOR, adopting_note, agent_effort_label, agent_mode_label,
-    agent_model_label, answer_words, approval_origin, background_rows, blob_size, bytes,
-    context_moved_label, context_row, conversation_detail, conversation_link, conversation_title,
-    conversations_empty, conversations_status, delivery_label, dir_name, dollars, effort_label,
-    effort_refusal, fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal,
-    model_refusal, move_refusal, offered_modes, on_off, outgoing_label, repeat_word,
-    safety_check_label, scope_label, session_usage_fields, stop_heading, stop_warning,
-    subagent_status, task_kind_word, trail, viewing_hint, work_summary,
+    StopAction, TRAIL_SEPARATOR, activity_label, adopting_note, agent_effort_label,
+    agent_mode_label, agent_model_label, answer_words, approval_origin, background_rows, blob_size,
+    bytes, context_moved_label, context_row, conversation_detail, conversation_link,
+    conversation_title, conversations_empty, conversations_status, delivery_label, dir_name,
+    dollars, effort_label, effort_refusal, fail_reason, mode_detail, mode_label,
+    mode_needs_confirmation, mode_refusal, model_refusal, move_refusal, offered_modes, on_off,
+    outgoing_label, repeat_word, safety_check_label, scope_label, session_usage_fields,
+    stop_heading, stop_warning, subagent_status, task_kind_word, trail, viewing_hint, work_summary,
 };
 use skywave_present::limits;
 use skywave_present::login;
@@ -210,16 +210,25 @@ fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
         }
         .to_owned()
     });
+    let now = DateTime::<Utc>::from_timestamp_millis(ui.wall_ms).unwrap_or_default();
     ScreenView::SessionList {
         kind,
         title,
         empty_label,
         rows: if ui.plain_list {
-            list.sessions.iter().map(|row| row_view(row, "")).collect()
+            list.sessions
+                .iter()
+                .map(|row| row_view(row, "", now))
+                .collect()
         } else {
             by_repo(&list.sessions)
                 .iter()
-                .flat_map(|group| group.rows.iter().map(move |row| row_view(row, group.key)))
+                .flat_map(|group| {
+                    group
+                        .rows
+                        .iter()
+                        .map(move |row| row_view(row, group.key, now))
+                })
                 .collect()
         },
         plain: ui.plain_list,
@@ -268,7 +277,7 @@ fn conversations_view(
 }
 
 /// `group` is the key [`by_repo`] put the row under.
-fn row_view(row: &SessionRow, group: &str) -> SessionRowView {
+fn row_view(row: &SessionRow, group: &str, now: DateTime<Utc>) -> SessionRowView {
     let title = clean_line(&row.title);
     SessionRowView {
         session_id: row.id.0.to_string(),
@@ -296,7 +305,7 @@ fn row_view(row: &SessionRow, group: &str) -> SessionRowView {
         },
         has_draft: row.has_draft,
         cost_label: row.cost_usd.map(dollars),
-        last_activity_label: row.last_activity.format("%Y-%m-%d %H:%M UTC").to_string(),
+        last_activity_label: activity_label(row.last_activity, now, &Local),
         last_activity_ms: row.last_activity.timestamp_millis(),
         rename: row.rename.as_ref().map(outgoing_view),
         rename_label: rename_label(row.rename.as_ref()),

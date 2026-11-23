@@ -535,7 +535,7 @@ pub struct SessionRowView {
     pub has_draft: bool,
     /// What it has cost: `$1.27`.
     pub cost_label: Option<String>,
-    /// `2026-10-31 14:02 UTC`.
+    /// `5 min ago` for the last day, then local `2026-10-31 16:02`.
     pub last_activity_label: String,
     pub last_activity_ms: i64,
     /// This device's rename on its way, until settled.

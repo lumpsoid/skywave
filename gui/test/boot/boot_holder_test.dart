@@ -49,23 +49,33 @@ void main() {
     );
   });
 
-  testWidgets('Reset local data and Retry call their own callbacks', (
-    tester,
-  ) async {
-    final taps = <String>[];
-    await tester.pumpWidget(
-      MaterialApp(
-        home: BootFailurePage(
-          message: 'unreadable',
-          onRetry: () => taps.add('retry'),
-          onReset: () => taps.add('reset'),
+  testWidgets(
+    'Reset local data asks first; Reset and Retry call their own callbacks',
+    (tester) async {
+      final taps = <String>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: BootFailurePage(
+            message: 'unreadable',
+            onRetry: () => taps.add('retry'),
+            onReset: () => taps.add('reset'),
+          ),
         ),
-      ),
-    );
-    await tester.tap(find.text('Reset local data'));
-    await tester.tap(find.text('Retry'));
-    expect(taps, ['reset', 'retry']);
-  });
+      );
+      await tester.tap(find.text('Reset local data'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('confirm-cancel')));
+      await tester.pumpAndSettle();
+      expect(taps, isEmpty);
+
+      await tester.tap(find.text('Reset local data'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('confirm-ok')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Retry'));
+      expect(taps, ['reset', 'retry']);
+    },
+  );
 
   test('Booted after a failure clears it', () {
     final holder = BootHolder()

@@ -1,4 +1,5 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_holder.dart';
@@ -203,9 +204,21 @@ class SettingsPage extends StatelessWidget {
                 alignment: Alignment.centerLeft,
                 child: OutlinedButton.icon(
                   icon: const Icon(Icons.qr_code),
-                  onPressed: () => send.act(
-                    const ActionIntentNavigate(route: RouteView.pairing),
-                  ),
+                  onPressed: () async {
+                    final yes = await confirmIrreversible(
+                      context,
+                      question:
+                          'Re-pair this device? Pairing with another server '
+                          "drops this device's sessions, drafts and messages "
+                          'not sent yet.',
+                      action: 'Re-pair',
+                    );
+                    if (yes) {
+                      send.act(
+                        const ActionIntentNavigate(route: RouteView.pairing),
+                      );
+                    }
+                  },
                   label: const Text('Re-pair'),
                 ),
               ),
