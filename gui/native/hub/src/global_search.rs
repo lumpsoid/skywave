@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
 use skywave_core::search::{Query, SessionHit, SessionsFound};
-use skywave_core::{Screen, SearchView, SessionId};
+use skywave_core::{Screen, SearchView, Seq, SessionId, SessionView};
 use skywave_present::format::activity_label;
 use skywave_present::search_hits;
 use skywave_present::text::clean_line;
@@ -16,6 +16,15 @@ use crate::signals::{ScreenView, SearchRowView};
 
 /// How long typing must pause before the query is searched.
 pub const SEARCH_AFTER: Duration = Duration::from_millis(250);
+
+/// An item a search hit opened: the session's head jumps to it, with the
+/// query's matches marked, once the session's events are loaded.
+#[derive(Debug)]
+pub struct Reveal {
+    pub session: SessionId,
+    pub seq: Seq,
+    pub query: String,
+}
 
 /// The search page's query, scope and hits, as the head holds them.
 #[derive(Debug, Default)]
@@ -30,6 +39,8 @@ pub struct GlobalSearch {
     asked: u64,
     /// The newest answer for the current query and scope.
     found: Option<SessionsFound>,
+    /// The item of the hit opened last, until its session shows it.
+    reveal: Option<Reveal>,
 }
 
 impl GlobalSearch {
@@ -53,6 +64,18 @@ impl GlobalSearch {
     /// changed, and a scope change clears the old hits. Any other screen ends
     /// the search page.
     pub fn follow(&mut self, screen: &Screen, now: Instant) {
+        // A reveal lives while its session, or the search page, is the screen.
+        let kept = match screen {
+            Screen::Search(_) => true,
+            Screen::Session(session) => self
+                .reveal
+                .as_ref()
+                .is_some_and(|reveal| reveal.session == session.id),
+            _ => false,
+        };
+        if !kept {
+            self.reveal = None;
+        }
         let Screen::Search(view) = screen else {
             self.shown = false;
             self.due = None;
@@ -92,6 +115,41 @@ impl GlobalSearch {
         if asked == self.asked {
             self.found = Some(found);
         }
+    }
+
+    /// The hit `key` names, from the answer held.
+    fn hit(&self, key: &str) -> Option<&SessionHit> {
+        self.found
+            .as_ref()?
+            .hits
+            .iter()
+            .find(|hit| row_key(hit) == key)
+    }
+
+    /// Opens the hit `key` names: its session is returned. An item hit keeps
+    /// a reveal of the item with the query; a session hit clears any reveal.
+    /// `None` when no hit has `key`, the results having changed since the row
+    /// was shown.
+    pub fn open(&mut self, key: &str) -> Option<SessionId> {
+        let hit = self.hit(key)?;
+        let session = hit.session;
+        self.reveal = hit.item.as_ref().map(|item| Reveal {
+            session,
+            seq: item.seq,
+            query: self.query.clone(),
+        });
+        Some(session)
+    }
+
+    /// The reveal, taken once `view`, the open session, has its events loaded
+    /// (its timeline is not empty). `None` while the reveal is for another
+    /// session, or there is none.
+    pub fn take_reveal(&mut self, view: &SessionView) -> Option<Reveal> {
+        let reveal = self.reveal.as_ref()?;
+        if reveal.session != view.id || view.timeline.is_empty() {
+            return None;
+        }
+        self.reveal.take()
     }
 }
 

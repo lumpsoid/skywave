@@ -255,6 +255,11 @@ pub enum GuiIntent {
     GlobalSearchTyped {
         query: String,
     },
+    /// Open the search page's hit `key`: its session, at the item, the matches
+    /// marked.
+    GlobalSearchOpen {
+        key: String,
+    },
     /// Open the new-session prompt.
     CreateOpen,
     /// The workdir input changed.

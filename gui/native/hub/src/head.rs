@@ -631,6 +631,19 @@ impl Head {
             if let Some(search) = &mut session.search {
                 search.refresh(view, old_match, BlobText::read);
             }
+            // A search hit opened this session: its query, marked, with the
+            // item jumped to once the events are loaded.
+            if let Some(reveal) = self.global_search.take_reveal(view) {
+                let mut search = TimelineSearch::new();
+                search.edit(view, |text| *text = reveal.query, BlobText::read);
+                if let Some(index) = find(view, ItemKey::Logged(reveal.seq))
+                    && let Some(jump) = search.jump(view, None, index)
+                    && let Some(seq) = jump.expand
+                {
+                    session.expanded.insert(seq);
+                }
+                session.search = Some(search);
+            }
         }
         self.fetch_expanded(clock, &mut out);
         self.after(clock, &mut out);
@@ -1345,6 +1358,11 @@ impl Head {
             }
             GuiIntent::GlobalSearchTyped { query } => {
                 self.global_search.typed(clean_query(&query), clock.now);
+            }
+            GuiIntent::GlobalSearchOpen { key } => {
+                if let Some(id) = self.global_search.open(&key) {
+                    self.dispatch_user(Action::OpenSession(id), Purpose::Plain, clock, out);
+                }
             }
             GuiIntent::CreateOpen => {
                 if let Some(Screen::SessionList(list)) = self.view.as_ref().map(|v| &v.screen)
