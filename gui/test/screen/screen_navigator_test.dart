@@ -362,6 +362,29 @@ void main() {
     expect(sent, [const GuiIntentAct(action: ActionIntentBack())]);
   });
 
+  testWidgets('a held Escape sends one Back', (tester) async {
+    final holders = fakeHolders();
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LinkShortcuts(
+          send: sent.add,
+          child: ScreenNavigator(holders: holders, send: sent.add),
+        ),
+      ),
+    );
+    holders.screen.apply(settingsScreen(canGoBack: true));
+    await tester.pumpAndSettle();
+
+    sent.clear();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.escape);
+    await tester.sendKeyRepeatEvent(LogicalKeyboardKey.escape);
+    await tester.sendKeyRepeatEvent(LogicalKeyboardKey.escape);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.escape);
+    await tester.pump();
+    expect(sent, [const GuiIntentAct(action: ActionIntentBack())]);
+  });
+
   testWidgets('Escape does nothing where back would leave the app', (
     tester,
   ) async {

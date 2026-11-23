@@ -201,7 +201,10 @@ class LinkShortcuts extends StatelessWidget {
             send.act(const ActionIntentRetryNow()),
         const SingleActivator(LogicalKeyboardKey.keyG, control: true): () =>
             send.act(const ActionIntentOpenNextApproval()),
-        const SingleActivator(LogicalKeyboardKey.escape): () =>
+        const SingleActivator(
+          LogicalKeyboardKey.escape,
+          includeRepeats: false,
+        ): () =>
             unawaited(Navigator.maybePop(context)),
       },
       child: Focus(autofocus: true, child: child),
