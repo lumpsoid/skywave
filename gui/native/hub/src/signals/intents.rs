@@ -558,6 +558,18 @@ pub enum ActionIntent {
         path: String,
         replace: Option<String>,
     },
+    /// Stop asking for or downloading the workdir file at `path`: its row's
+    /// `can_cancel` says when this applies.
+    CancelWorkdirDownload {
+        session_id: String,
+        path: String,
+    },
+    /// Stop the push of the device file to the workdir at `path`: its row's
+    /// `can_cancel` says when this applies.
+    CancelWorkdirPush {
+        session_id: String,
+        path: String,
+    },
     /// Delete a blob (a target's `blob_id`) from the server and every
     /// device. Sent only once its `delete_question` was confirmed.
     DeleteBlob {

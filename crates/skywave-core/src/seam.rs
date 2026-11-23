@@ -67,6 +67,8 @@ pub enum Request {
     DraftImagesChanged,
     /// The user wants this blob's content.
     DownloadBlob(BlobId),
+    /// Stop blob `id`'s download, keeping what it got (the user stopped it).
+    StopBlob(BlobId),
     BlobPolicyChanged(BlobPolicy),
     /// These blobs left the replica (with a locally deleted session, or no
     /// longer named by a refreshed workdir answer), their files already
@@ -136,6 +138,10 @@ pub enum Request {
         source: PathBuf,
         path: String,
         replace: Option<ContentHash>,
+    },
+    /// Cancel push `req` unless its write is sent already.
+    CancelPush {
+        req: u64,
     },
     /// Ask the server for its agent's usage limits, for the usage limits
     /// page, within [`USAGE_LIMITS_TIMEOUT`](crate::USAGE_LIMITS_TIMEOUT).

@@ -38,9 +38,11 @@ pub enum PairError {
     InvalidCode,
     #[error("the fingerprint must be 64 hex digits (32 colon-separated pairs)")]
     InvalidFingerprint,
-    #[error("not a pairing link: {0}")]
+    #[error("not a pairing link: {0}; copy the whole link `skywaved pair` printed")]
     InvalidUri(String),
-    #[error("could not reach the server: {0}")]
+    #[error(
+        "could not reach the server: {0}; check the address and port, and that skywaved is running"
+    )]
     Unreachable(String),
     /// The server's CA is not the one the user was shown: wrong address,
     /// mistyped fingerprint, or someone in between. The code was not sent.
@@ -50,20 +52,32 @@ pub enum PairError {
     FingerprintMismatch,
     /// The CA matched, but the server certificate is not valid for the
     /// address (or not signed by it, or expired).
-    #[error("the server's certificate is not valid for this address: {0}")]
+    #[error(
+        "the server's certificate is not valid for this address: {0}; check the address, or use the link `skywaved pair` printed"
+    )]
     BadServerCertificate(String),
-    #[error("the pairing code was not accepted: it is wrong, already used or expired")]
+    #[error(
+        "the pairing code was not accepted: it is wrong, already used or expired; run `skywaved pair` on the server for a new code"
+    )]
     CodeRejected,
-    #[error("too many failed pairing attempts; try again in {}", retry_text(.retry_after_secs))]
+    #[error("too many failed pairing attempts; wait {}, then try again", retry_text(.retry_after_secs))]
     RateLimited { retry_after_secs: Option<u64> },
-    #[error("the server refused the pairing request as malformed (400)")]
+    #[error(
+        "the server refused the pairing request as malformed (400); update this app and skywaved to the same version"
+    )]
     BadRequest,
-    #[error("the server answered with HTTP {0}")]
+    #[error(
+        "the server answered with HTTP {0}; check that the address is skywaved's, and the server's log"
+    )]
     BadStatus(u16),
-    #[error("the server's answer could not be understood: {0}")]
+    #[error(
+        "the server's answer could not be understood: {0}; check that the address is skywaved's, and that this app and skywaved are the same version"
+    )]
     Decode(String),
     /// The CA in the response is not the one the handshake was pinned to.
-    #[error("the server returned a CA certificate that does not match the fingerprint")]
+    #[error(
+        "the server returned a CA certificate that does not match the fingerprint; check the fingerprint, or get a new link with `skywaved pair`"
+    )]
     CaMismatch,
     #[error("could not create the device key: {0}")]
     Key(String),
@@ -347,5 +361,44 @@ mod tests {
             retry_after_secs: Some(42),
         };
         assert!(e.to_string().contains("42s"), "{e}");
+    }
+
+    #[test]
+    fn each_failure_says_what_to_do_next() {
+        let says = |e: PairError, want: &[&str]| {
+            let text = e.to_string();
+            for w in want {
+                assert!(text.contains(w), "{text:?} lacks {w:?}");
+            }
+        };
+        says(PairError::CodeRejected, &["skywaved pair", "not accepted"]);
+        says(
+            PairError::Unreachable("timed out".into()),
+            &["timed out", "check the address and port"],
+        );
+        says(
+            PairError::RateLimited {
+                retry_after_secs: Some(42),
+            },
+            &["wait 42s"],
+        );
+        says(
+            PairError::RateLimited {
+                retry_after_secs: None,
+            },
+            &["wait a minute"],
+        );
+        says(PairError::BadStatus(500), &["HTTP 500", "server's log"]);
+        says(PairError::BadRequest, &["same version"]);
+        says(PairError::Decode("x".into()), &["same version"]);
+        says(PairError::CaMismatch, &["skywaved pair"]);
+        says(
+            PairError::InvalidUri("missing fp".into()),
+            &["skywaved pair"],
+        );
+        says(
+            PairError::BadServerCertificate("x".into()),
+            &["check the address"],
+        );
     }
 }

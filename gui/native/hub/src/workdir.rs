@@ -383,12 +383,18 @@ fn download_row(download: &WorkdirDownload) -> WorkdirDownloadRow {
             ),
             (WorkdirFetch::Idle, None, _) => ("Not asked yet.".to_owned(), false, None, None),
         };
+    let can_cancel = matches!(download.fetch, WorkdirFetch::Loading)
+        || matches!(
+            download.blob.as_ref().map(|blob| &blob.state),
+            Some(BlobState::Requested { .. } | BlobState::Downloading { .. })
+        );
     WorkdirDownloadRow {
         path: download.path.clone(),
         label: clean_line(&label),
         failed,
         blob,
         local_path,
+        can_cancel,
     }
 }
 
@@ -429,6 +435,13 @@ fn push_row(push: &WorkdirPush) -> WorkdirPushRow {
         PushState::Done(PushOutcome::UploadRefused(
             UploadResult::Stored { .. } | UploadResult::OffsetMismatch { .. },
         )) => ("Push failed".to_owned(), false, false, None, true),
+        PushState::Done(PushOutcome::Cancelled) => (
+            "Cancelled before writing: nothing written. Retry resumes the upload.".to_owned(),
+            false,
+            false,
+            None,
+            true,
+        ),
         PushState::Done(PushOutcome::Written(WriteFileResult::Written { size, .. })) => (
             format!("Written \u{b7} {}", bytes(*size)),
             false,
@@ -484,6 +497,7 @@ fn push_row(push: &WorkdirPush) -> WorkdirPushRow {
         done,
         existing_sha256,
         failed,
+        can_cancel: matches!(push.state, PushState::Pushing),
     }
 }
 

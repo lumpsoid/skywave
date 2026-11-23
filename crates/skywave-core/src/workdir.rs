@@ -166,6 +166,9 @@ pub enum PushOutcome {
     UploadRefused(UploadResult),
     /// The server's answer to the write.
     Written(WriteFileResult),
+    /// Cancelled by the user before its write was sent: nothing was
+    /// written. The server keeps what was uploaded: pushing again resumes.
+    Cancelled,
 }
 
 /// The model's workdir reads: the latest stored answer per ask, as the
@@ -244,6 +247,17 @@ impl Workdirs {
     /// The awaited answer was dropped (its session left the replica).
     pub(crate) fn dropped(&mut self, ask: &WorkdirAsk) {
         self.pending.remove(ask);
+    }
+
+    /// The user cancelled `ask` while it was in flight: an answer to it
+    /// is stale now, and it shows as failed, `cancelled`; a stored answer
+    /// stays. False if it was not in flight.
+    pub(crate) fn cancel(&mut self, ask: &WorkdirAsk) -> bool {
+        if self.pending.remove(ask).is_none() {
+            return false;
+        }
+        self.failed.insert(ask.clone(), "cancelled".to_owned());
+        true
     }
 
     /// The session left the replica: everything read of it goes.
@@ -363,6 +377,14 @@ impl Workdirs {
             Ok(outcome) => PushState::Done(outcome),
             Err(error) => PushState::Failed(error.to_string()),
         };
+    }
+
+    /// The request of the push into `path` of `session`, while it is pushing.
+    pub(crate) fn pushing_req(&self, session: SessionId, path: &str) -> Option<u64> {
+        self.pushes
+            .get(&(session, path.to_owned()))
+            .filter(|push| push.state == PushState::Pushing)
+            .map(|push| push.req)
     }
 
     /// `session`'s pushes, sorted by path.

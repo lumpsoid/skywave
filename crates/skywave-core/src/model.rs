@@ -355,6 +355,9 @@ pub(crate) struct Model {
     /// the blob queue forgets un-started requests on a restart too. A
     /// `Failed` blob asked for again shows as requested.
     wanted: HashSet<BlobId>,
+    /// Blobs whose download the user stopped ([`Action::StopBlobDownload`]):
+    /// nothing asks for them on its own, only a new ask by hand. In memory only.
+    stopped: HashSet<BlobId>,
     /// The blob queue paused every download on a full device disk; the
     /// queue decides and reports it ([`Model::set_blobs_disk_full`]).
     blobs_disk_full: bool,
@@ -488,6 +491,7 @@ impl Model {
             blobs: BTreeMap::new(),
             fates: HashMap::new(),
             wanted: HashSet::new(),
+            stopped: HashSet::new(),
             blobs_disk_full: false,
             drafts: HashMap::new(),
             draft_images: HashMap::new(),
@@ -719,14 +723,21 @@ impl Model {
                     .map(str::trim)
                     .filter(|w| !w.is_empty())
                     .map(str::to_owned);
-                self.enqueue(
+                let at = self.opening_from();
+                let effects = self.enqueue(
                     CommandKind::CreateSession {
                         workdir: workdir.to_owned(),
                         conversation,
                         worktree,
                     },
                     Vec::new(),
-                )
+                );
+                // Like `CreateSessionLike`: open it once it is logged, unless the
+                // user went elsewhere meanwhile.
+                if let (Some(at), Some(Effect::Enqueue(command, _))) = (at, effects.first()) {
+                    self.opening = Some((command.id, at));
+                }
+                effects
             }
             Action::CreateSessionLike(from) => {
                 let Some(at) = self.opening_from().filter(|at| match at {
@@ -1345,6 +1356,25 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::CancelWorkdirDownload { session_id, path } => {
+                let ask = WorkdirAsk::Download {
+                    session: session_id,
+                    path,
+                };
+                if self.workdirs.cancel(&ask) {
+                    return Vec::new();
+                }
+                match self.workdirs.stored.get(&ask) {
+                    Some(WorkdirAnswer::File(FileResult::File {
+                        content: FileBody::Blob(blob),
+                        ..
+                    })) => {
+                        let id = blob.id;
+                        self.stop_blob(id)
+                    }
+                    _ => Vec::new(),
+                }
+            }
             Action::PushWorkdirFile {
                 session_id,
                 source,
@@ -1361,9 +1391,15 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::CancelWorkdirPush { session_id, path } => self
+                .workdirs
+                .pushing_req(session_id, &path)
+                .map(|req| vec![Effect::Request(Request::CancelPush { req })])
+                .unwrap_or_default(),
             Action::DownloadBlob(id) => match self.blobs.get(&id).map(|b| &b.status) {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
+                    self.stopped.remove(&id);
                     // A download already running shows its progress instead.
                     if matches!(
                         status,
@@ -1376,6 +1412,7 @@ impl Model {
                     vec![Effect::Request(Request::DownloadBlob(id))]
                 }
             },
+            Action::StopBlobDownload(id) => self.stop_blob(id),
             // The server decides whether the blob may go (its refusals
             // show as the view's `pending`): this replica may not know of
             // a delete or crop another device sent.
@@ -1693,11 +1730,25 @@ impl Model {
             record.status,
             BlobStatus::NotDownloaded | BlobStatus::Stopped { .. }
         );
-        if !not_here || self.wanted.contains(&id) {
+        if !not_here || self.wanted.contains(&id) || self.stopped.contains(&id) {
             return None;
         }
         self.wanted.insert(id);
         Some(Request::DownloadBlob(id))
+    }
+
+    /// Stops `id`'s download if it is asked for or under way
+    /// ([`Action::StopBlobDownload`]).
+    fn stop_blob(&mut self, id: BlobId) -> Vec<Effect> {
+        let Some(record) = self.blobs.get(&id) else {
+            return Vec::new();
+        };
+        let under_way = matches!(record.status, BlobStatus::Downloading { .. });
+        if !self.wanted.remove(&id) && !under_way {
+            return Vec::new();
+        }
+        self.stopped.insert(id);
+        vec![Effect::Request(Request::StopBlob(id))]
     }
 
     fn pair(&mut self, address: String, code: String, fingerprint: String) -> Vec<Effect> {
@@ -2880,6 +2931,10 @@ impl Model {
             _ => None,
         };
         self.workdirs.answered(ask, answer);
+        // Asked for by hand afresh: a download stopped before may go again.
+        if let Some(id) = download {
+            self.stopped.remove(&id);
+        }
         let downloaded = download.and_then(|id| self.want_blob(id));
         downloaded
             .into_iter()
@@ -2896,6 +2951,7 @@ impl Model {
         let had_drafts = !self.drafts.is_empty();
         self.reload(snapshot);
         self.wanted.clear();
+        self.stopped.clear();
         self.alerted.clear();
         self.alerted_at.clear();
         self.seen_working.clear();
@@ -2948,6 +3004,7 @@ impl Model {
     fn forget_blob(&mut self, id: BlobId) {
         self.blobs.remove(&id);
         self.wanted.remove(&id);
+        self.stopped.remove(&id);
     }
 
     /// The `from` of each crop pending to produce `into`: a `Cropped` fate
@@ -9552,6 +9609,42 @@ mod tests {
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));
     }
 
+    #[test]
+    fn a_session_created_from_the_dialog_opens_once_it_is_logged() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let command = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/new".into(),
+            conversation: None,
+            worktree: None,
+        }));
+
+        // Another device's session in the same place is not it.
+        f.session("/srv/new");
+        assert_eq!(f.model.open_session(), None);
+
+        let new = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/new".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        };
+        f.log_commands(new, vec![(Some(command.id), created.clone())]);
+        assert_eq!(f.model.open_session(), Some(new));
+
+        // Gone elsewhere meanwhile: stays there.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let command = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/new".into(),
+            conversation: None,
+            worktree: None,
+        }));
+        f.dispatch(Action::Navigate(Route::Settings));
+        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        assert!(matches!(f.model.view().screen, Screen::Settings(_)));
+    }
+
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {
         queued(&f.dispatch(Action::SendMessage {
             session_id,
@@ -11121,6 +11214,9 @@ mod tests {
         ));
         f.log_stamped(adopted, rest);
         assert_eq!(f.events.len() as u64, finished.0);
+        // Its import is in: the creation opens it, as the dialog asked.
+        assert_eq!(f.model.open_session(), Some(adopted));
+        f.dispatch(Action::Navigate(Route::SessionList));
         let list = f.list_view();
         assert_eq!(list.creating, Vec::new());
         assert!(!list.sessions[0].importing);
@@ -16296,6 +16392,49 @@ mod tests {
         }
 
         #[test]
+        fn workdir_a_push_cancels_only_while_pushing() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let push = |session: SessionId, path: &str| Action::PushWorkdirFile {
+                session_id: session,
+                source: PathBuf::from("/home/me/notes.md"),
+                path: path.into(),
+                replace: None,
+            };
+            let cancel = |session: SessionId, path: &str| Action::CancelWorkdirPush {
+                session_id: session,
+                path: path.into(),
+            };
+
+            // Nothing to cancel before a push.
+            assert!(f.dispatch(cancel(id, "docs/notes.md")).is_empty());
+
+            // Cancelling asks the engine to stop the push; it still shows as
+            // pushing until the engine answers.
+            let (req, _) = push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_eq!(
+                requests(f.dispatch(cancel(id, "docs/notes.md"))),
+                [Request::CancelPush { req }]
+            );
+            assert_eq!(view(&f).pushes[0].state, PushState::Pushing);
+
+            // The engine's answer ends the push; cancelling it again is a no-op.
+            f.model
+                .workdir_pushed(req, id, "docs/notes.md".into(), Ok(PushOutcome::Cancelled));
+            assert_eq!(
+                view(&f).pushes[0].state,
+                PushState::Done(PushOutcome::Cancelled)
+            );
+            assert!(f.dispatch(cancel(id, "docs/notes.md")).is_empty());
+
+            // A cancelled push does not block its path: pushing again asks.
+            push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_eq!(view(&f).pushes[0].state, PushState::Pushing);
+        }
+
+        #[test]
         fn workdir_a_failure_keeps_the_stored_snapshot() {
             let mut f = Fixture::paired();
             let id = f.session("/srv/a");
@@ -16391,6 +16530,107 @@ mod tests {
                 .is_empty()
             );
             assert!(!f.model.wanted.contains(&other.id));
+        }
+
+        #[test]
+        fn workdir_a_stopped_blob_is_asked_for_again_only_by_hand() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let diff = blob(10);
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            let set = changes(vec![changed(
+                "a.rs",
+                FileChange::Modified,
+                DiffBody::Blob(diff.clone()),
+            )]);
+            assert!(answer(&mut f, req, ask, set).is_empty());
+
+            let pane = WorkdirPane::Diff {
+                path: "a.rs".into(),
+                untracked: false,
+            };
+            assert_eq!(
+                requests(f.dispatch(Action::ShowWorkdir(pane.clone()))),
+                [Request::DownloadBlob(diff.id)]
+            );
+            // Stopped by hand: the request goes out, the blob shows as not
+            // downloaded, and nothing asks for it again on its own.
+            assert_eq!(
+                requests(f.dispatch(Action::StopBlobDownload(diff.id))),
+                [Request::StopBlob(diff.id)]
+            );
+            let WorkdirBody::Diff {
+                blob: Some(shown), ..
+            } = view(&f).body
+            else {
+                panic!("expected the diff");
+            };
+            assert_eq!(shown.state, BlobState::NotDownloaded { size: 10 });
+            assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes));
+            assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
+            // Stopping again, with nothing asked for or under way, does nothing.
+            assert!(f.dispatch(Action::StopBlobDownload(diff.id)).is_empty());
+            // Asked for by hand: it goes again and shows as requested.
+            assert_eq!(
+                requests(f.dispatch(Action::DownloadBlob(diff.id))),
+                [Request::DownloadBlob(diff.id)]
+            );
+            let WorkdirBody::Diff {
+                blob: Some(shown), ..
+            } = view(&f).body
+            else {
+                panic!("expected the diff");
+            };
+            assert_eq!(shown.state, BlobState::Requested { size: 10 });
+        }
+
+        #[test]
+        fn workdir_a_download_cancelled_while_asked_or_downloading_stops() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let download = || Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "big.bin".into(),
+            };
+            let cancel = || Action::CancelWorkdirDownload {
+                session_id: id,
+                path: "big.bin".into(),
+            };
+
+            // Asked, and in flight: the cancel drops the ask, which shows as
+            // failed, and the late answer is stale.
+            let (req, ask) = asked(f.dispatch(download()));
+            assert!(f.dispatch(cancel()).is_empty());
+            assert_eq!(
+                view(&f).downloads[0].fetch,
+                WorkdirFetch::Failed("cancelled".into())
+            );
+            assert!(!f.model.workdir_awaited(req, &ask));
+            // Nothing in flight any more: a second cancel does nothing.
+            assert!(f.dispatch(cancel()).is_empty());
+
+            // Asked afresh and answered with a blob: the content downloads.
+            let (req, ask) = asked(f.dispatch(download()));
+            let big = blob(4);
+            assert_eq!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("big.bin", FileBody::Blob(big.clone()))
+                ),
+                vec![Request::DownloadBlob(big.id)]
+            );
+            // Downloading: the cancel stops it, and the blob shows as not
+            // downloaded.
+            assert_eq!(requests(f.dispatch(cancel())), [Request::StopBlob(big.id)]);
+            assert_eq!(
+                view(&f).downloads[0].blob.as_ref().map(|b| &b.state),
+                Some(&BlobState::NotDownloaded { size: 4 })
+            );
         }
 
         #[test]

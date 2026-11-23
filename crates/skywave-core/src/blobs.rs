@@ -341,6 +341,9 @@ struct Queue {
     /// Blobs asked for while a worker held them: queued again, as asked
     /// for, once it lets go.
     again: HashSet<BlobId>,
+    /// Blobs the user stopped while a worker held them: it lets them go,
+    /// `Stopped` with what they got, whatever the policy.
+    cancelled: HashSet<BlobId>,
     /// The [`Slot::Wanted`] worker waits for a blob.
     wanted_idle: bool,
     /// A write failed on a full device disk: no worker takes a blob until
@@ -353,12 +356,14 @@ impl Queue {
         self.active.contains(&id) || self.waiting.contains(id)
     }
 
-    /// Whether a worker holding `item` lets it go now: the policy is
-    /// `OnDemand`, and nobody asked for it (nor is it a local crop).
+    /// Whether a worker holding `item` lets it go now: the user stopped it
+    /// ([`BlobQueue::cancel`]), or the policy is `OnDemand`, and nobody
+    /// asked for it (nor is it a local crop).
     fn drops(&self, item: &Queued) -> bool {
-        self.policy == BlobPolicy::OnDemand
-            && !item.kept_on_demand()
-            && !self.again.contains(&item.id)
+        self.cancelled.contains(&item.id)
+            || (self.policy == BlobPolicy::OnDemand
+                && !item.kept_on_demand()
+                && !self.again.contains(&item.id))
     }
 
     fn push_back(&mut self, id: BlobId) {
@@ -477,6 +482,7 @@ impl BlobQueue {
     pub(crate) fn want(&self, id: BlobId) {
         let mut queue = lock(&self.queue);
         self.set_disk_full(&mut queue, false);
+        queue.cancelled.remove(&id);
         if queue.active.contains(&id) {
             queue.again.insert(id);
         } else {
@@ -616,6 +622,25 @@ impl BlobQueue {
         }
     }
 
+    /// The user stopped `id`'s download, asked for or not: a waiting one
+    /// leaves the queue, and one a worker holds is let go at its next
+    /// chunk; either is `Stopped` with what it got, its `.part` kept.
+    /// Asking for it again ([`BlobQueue::want`]) resumes it.
+    pub(crate) fn cancel(&self, id: BlobId) {
+        let mut queue = lock(&self.queue);
+        queue.again.remove(&id);
+        if queue.active.contains(&id) {
+            queue.cancelled.insert(id);
+        } else {
+            queue.waiting.remove(id);
+            if queue.started.remove(&id) {
+                self.stop(id);
+            }
+        }
+        drop(queue);
+        self.wake.notify_waiters();
+    }
+
     /// A worker's write failed on a full device disk: it lets go of the
     /// blob, which waits at the front, and every download pauses until one
     /// is asked for. What the blob got stays, `.part` and recorded progress.
@@ -648,6 +673,7 @@ impl BlobQueue {
         let mut queue = lock(&self.queue);
         queue.waiting.retain(|q| !ids.contains(&q.id));
         queue.again.retain(|id| !ids.contains(id));
+        queue.cancelled.retain(|id| !ids.contains(id));
         // One a worker holds may record progress (on a row registered
         // again) until it lets go: it stays started.
         let Queue {
@@ -832,6 +858,7 @@ impl Claim<'_> {
         let id = self.item.id;
         queue.active.remove(&id);
         let again = queue.again.remove(&id);
+        let cancelled = queue.cancelled.remove(&id);
         match how {
             LetGo::HandedOver => queue.waiting.push_front(Queued {
                 reserved: true,
@@ -853,6 +880,11 @@ impl Claim<'_> {
                 );
             }
             LetGo::Yielded => {
+                queue.started.remove(&id);
+                self.queue.stop(id);
+            }
+            // Stopped by the user: what it got stays, `Stopped`, whatever the policy.
+            LetGo::Unfinished if cancelled => {
                 queue.started.remove(&id);
                 self.queue.stop(id);
             }
@@ -1008,7 +1040,18 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
                         break;
                     }
                 },
-                Slot::Wanted => tokio::time::sleep(next_in).await,
+                // Stopped meanwhile (the user, `BlobQueue::cancel`): no more tries.
+                Slot::Wanted => {
+                    let stopped = tokio::select! {
+                        biased;
+                        () = ctx.queue.dropped(&claim.item) => true,
+                        () = tokio::time::sleep(next_in) => false,
+                    };
+                    if stopped {
+                        tracing::debug!(?id, "blob download stopped while waiting to retry");
+                        break claim.stopped();
+                    }
+                }
             }
         }
     }
@@ -3649,6 +3692,14 @@ mod tests {
                 queue.set_policy(BlobPolicy::OnDemand, &[])
             }));
         }
+
+        /// Cancels the download before the first response's second chunk,
+        /// as the user does by hand.
+        fn cancel_mid_body(&self) {
+            let queue = self.queue.clone();
+            let id = self.blob.id;
+            *self.server.mid_body.lock().unwrap() = Some(Box::new(move || queue.cancel(id)));
+        }
     }
 
     /// An eager download in flight when the policy turns `OnDemand` stops
@@ -3704,6 +3755,93 @@ mod tests {
         f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
             .await;
         assert_eq!(*f.server.froms.lock().unwrap(), [0], "one try, whole");
+    }
+
+    /// The user stops a download asked for: it is `Stopped` with what it got,
+    /// its `.part` kept, and not queued again. Asking for it resumes it.
+    #[tokio::test]
+    async fn a_download_asked_for_stops_when_cancelled_keeping_its_part() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        f.queue.want(f.blob.id);
+        f.cancel_mid_body();
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("stopped", || f.stopped_idle()).await;
+        let BlobStatus::Stopped { got, path } = f.status() else {
+            panic!("expected Stopped, got {:?}", f.status())
+        };
+        assert!(got > 0 && got < 5000, "some chunks, not all: {got}");
+        assert_eq!(path, f.part());
+        assert_eq!(std::fs::metadata(f.part()).unwrap().len(), got);
+        assert!(waiting(&f.queue).is_empty(), "not queued again");
+        assert!(f.takes_nothing().await);
+        assert_eq!(f.shown(), BlobState::NotDownloaded { size: 5000 });
+        downloader.abort();
+        let _ = downloader.await;
+
+        f.queue.want(f.blob.id);
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, got], "resumed");
+    }
+
+    /// Under `Eager`, a download the user stopped stays stopped: the policy
+    /// would otherwise queue it again.
+    #[tokio::test]
+    async fn a_cancelled_download_stays_stopped_under_eager() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        f.cancel_mid_body();
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("stopped", || f.stopped_idle()).await;
+        assert!(waiting(&f.queue).is_empty(), "not queued again");
+        assert!(f.takes_nothing().await);
+        downloader.abort();
+        let _ = downloader.await;
+    }
+
+    /// A download waiting in the queue that the user stops leaves it.
+    #[tokio::test]
+    async fn a_waiting_download_cancelled_leaves_the_queue() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        f.queue.want(f.blob.id);
+        assert!(!waiting(&f.queue).is_empty());
+        f.queue.cancel(f.blob.id);
+        assert!(waiting(&f.queue).is_empty());
+        assert!(f.takes_nothing().await);
+    }
+
+    /// A download the user asked for, retrying on the Wanted worker while
+    /// the link is down, stops at once when cancelled: it does not sit out
+    /// its minute-long backoff first.
+    #[tokio::test]
+    async fn a_download_waiting_to_retry_stops_when_cancelled() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        // The first try gets two chunks, then the link goes down.
+        *f.server.break_after.lock().unwrap() = Some(2);
+        let server = f.server.clone();
+        let id = f.blob.id;
+        *f.server.mid_body.lock().unwrap() = Some(Box::new(move || {
+            server.held.lock().unwrap().insert(id, Hold::Offline);
+        }));
+        f.queue.want(id);
+        let downloader = tokio::spawn(run_downloader(
+            f.ctx_backing_off(Duration::from_secs(60), Duration::from_secs(60)),
+        ));
+        // The second try, on the Wanted worker, fails too: it is then in
+        // its wait.
+        until("retrying offline", || {
+            f.server.calls.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+
+        f.queue.cancel(id);
+        until("stopped", || f.stopped_idle()).await;
+        assert!(matches!(f.status(), BlobStatus::Stopped { .. }));
+        assert!(waiting(&f.queue).is_empty());
+        assert!(f.takes_nothing().await);
+        downloader.abort();
+        let _ = downloader.await;
     }
 
     /// An eager worker retrying a blob while the link is down lets it go

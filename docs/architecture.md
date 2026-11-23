@@ -1306,7 +1306,12 @@ no longer decodes rather than failing.
   at once. Bytes over a bad network are dear, so a dropped blob keeps its
   `.part` and recorded progress as `BlobStatus::Stopped` (stored as
   `not_downloaded` with `got` and `path` set), which the views show as
-  `NotDownloaded`; asking for it, or `Eager` again, resumes from there. A
+  `NotDownloaded`; asking for it, or `Eager` again, resumes from there. The
+  user stops one by hand with `Action::StopBlobDownload`, asked for or not and
+  whatever the policy: it ends the same way, `Stopped` with its `.part`, and
+  the device asks for it again on its own only when the policy is set to
+  `Eager` (a restart under `Eager`, or switching back to it); captures and
+  the shown workdir blob do not, until the user does (`DownloadBlob`, or a new workdir download of it). A
   restart queues `Downloading` rows, and `Stopped` ones only under
   `Eager`, so it never resumes under `OnDemand` what nobody asked for;
   only a kill between the
@@ -1486,6 +1491,7 @@ no longer decodes rather than failing.
   screen (`Model::want_blob`). An action while that download is in flight
   asks nothing. `WorkdirView.downloads` lists the session's downloads that are
   stored, in flight or failed, each with its `fetch`, `result` and `blob`.
+  `Action::CancelWorkdirDownload` drops a download still asking the server (it shows as failed, `cancelled`; its late answer is stale) or stops its blob as `StopBlobDownload` does, keeping what it got.
   `Action::PushWorkdirFile { session_id, source, path, replace }` makes a
   `Request::PushWorkdirFile`, which the engine's `push_workdir_file` carries
   out: it hashes the device file where it is (not copied into the data dir)
@@ -1499,7 +1505,11 @@ no longer decodes rather than failing.
   `Done(PushOutcome)`); a push the server answers `Exists` is
   `Done(Written(Exists { sha256, size }))`, the hash the GUI's Replace… resends
   with. A download's answer is stored like a read's; a push is held in
-  memory only.
+  memory only. `Action::CancelWorkdirPush` stops a push until its write is
+  sent: the engine then answers `Done(Cancelled)`, nothing written, and the
+  server keeps what was uploaded, so pushing again resumes. Once the write is
+  sent the push ends as the server answers; the model marks nothing cancelled
+  before the engine says so.
 - **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
   the sessions they ran in; heads total them with `skywave_present::usage`
   by local day, session, workdir or model. A turn with no cost is unpriced,
@@ -1919,14 +1929,16 @@ skywave-core                 all logic, sync, replica
 - **Workdir download and push** (D54, D56). A file row in a directory listing
   and the file pane's app bar carry Download
   (`ActionIntentDownloadWorkdirFile`).
-  The downloads panel shows each download: its progress, Retry when it failed,
-  and Save… once the file is on the device. Save… is the system save sheet on
+  The downloads panel shows each download: its progress, Cancel while it is
+  under way, Download to resume a stopped one, Retry when it failed, and Save…
+  once the file is on the device. Save… is the system save sheet on
   Android and iOS (`flutter_file_dialog`), and `file_selector`'s
   `getSaveLocation` on desktop, which copies the file
   (`gui/lib/workdir/saving.dart`). The directory pane's push action picks a
   device file (`pickPushFile`), proposes `<shown dir>/<file name>` in a target
   dialog, and sends `ActionIntentPushWorkdirFile`. The pushes panel shows each
-  push's one line of progress or outcome, Retry when it failed, and Replace…
+  push's one line of progress or outcome, Cancel while it pushes, Retry when it
+  failed or was cancelled, and Replace…
   when the path holds another file: asked first, then pushed again with the
   hash found. A written file's timeline row reads `<path> written by <who>`,
   or `replaced` when it replaced one.
@@ -2001,6 +2013,10 @@ skywave-core                 all logic, sync, replica
   notifications page) wherever a page can go back; it never leaves the app,
   and the session page's own Esc (closing search, leaving the composer)
   comes first.
+- **Approve and deny** (GUI): on the session page Ctrl+Shift+A approves and
+  Ctrl+Shift+D denies the approval on screen (with none, Ctrl+Shift+D
+  declines the question); the buttons' tooltips name them. A held key
+  answers once; the Approvals page binds no key, as it shows several.
 - **Platforms:** Linux and Android verified; macOS, iOS and Windows
   scaffolded only; no web (D26).
 - **Shell history picker** (D53). The hub owns its state. In shell mode

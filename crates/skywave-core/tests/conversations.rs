@@ -9,7 +9,7 @@
 mod support;
 
 use chrono::{TimeZone, Utc};
-use skywave_core::{Action, ConversationPicker, ConversationsStatus, Screen, ViewState};
+use skywave_core::{Action, ConversationPicker, ConversationsStatus, Route, Screen, ViewState};
 use skywaved::agent::fake::{FakeAgent, FakeOutside, FakeScript};
 use skywaved::agent::{HistoryRead, Listed, OutsideConversation};
 use support::{Client, Daemon, adopted_history, config};
@@ -80,6 +80,19 @@ async fn a_conversation_picked_and_continued_shows_as_continued() {
         .await;
     assert_eq!(picker(&view), None, "continuing ends the picker");
     let session = client.sessions()[0];
+    client
+        .wait(
+            "the adopted session opened",
+            |_, view| matches!(&view.screen, Screen::Session(s) if s.id == session),
+        )
+        .await;
+
+    client.dispatch(Action::Navigate(Route::SessionList));
+    client
+        .wait("the session list again", |_, view| {
+            matches!(&view.screen, Screen::SessionList(_))
+        })
+        .await;
 
     client.dispatch(Action::ListConversations);
     let view = client

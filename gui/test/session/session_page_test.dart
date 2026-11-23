@@ -1090,6 +1090,44 @@ void main() {
         expect(find.text('Decline'), findsNothing);
       },
     );
+
+    testWidgets(
+      'Ctrl+Shift+D declines the question; Ctrl+Shift+A sends nothing',
+      (tester) async {
+        final sent = <GuiIntent>[];
+        await pumpSession(
+          tester,
+          screen: screenWith(question: panel([question('Which bread?')])),
+          timeline: holding([]),
+          sent: sent,
+        );
+        // The composer has focus: the keys come from there, as in use.
+        await tester.tap(
+          find.descendant(
+            of: find.byType(Composer),
+            matching: find.byType(TextField),
+          ),
+        );
+        await tester.pump();
+        expect(find.byTooltip('Decline (Ctrl+Shift+D)'), findsOneWidget);
+        sent.clear();
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+        expect(sent, isEmpty);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyD);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        expect(sent, [
+          const GuiIntentAct(
+            action: ActionIntentResolveApproval(
+              approvalId: 'q1',
+              decision: DecisionView.deny,
+            ),
+          ),
+        ]);
+      },
+    );
   });
 
   group('approval', () {
@@ -1137,6 +1175,41 @@ void main() {
       expect(find.byType(SimpleDialog), findsNothing);
       expect(sent.last, resolve(DecisionView.approve, 0));
     });
+
+    testWidgets(
+      'Ctrl+Shift+A approves and Ctrl+Shift+D denies, once per press',
+      (tester) async {
+        final sent = <GuiIntent>[];
+        await pumpSession(
+          tester,
+          screen: screenWith(approval: panel([])),
+          timeline: holding([]),
+          sent: sent,
+        );
+        // The composer has focus: the keys come from there, as in use.
+        await tester.tap(
+          find.descendant(
+            of: find.byType(Composer),
+            matching: find.byType(TextField),
+          ),
+        );
+        await tester.pump();
+        expect(find.byTooltip('Approve (Ctrl+Shift+A)'), findsOneWidget);
+        expect(find.byTooltip('Deny (Ctrl+Shift+D)'), findsOneWidget);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+        expect(sent.last, resolve(DecisionView.approve));
+        final before = sent.length;
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.keyD);
+        await tester.sendKeyRepeatEvent(LogicalKeyboardKey.keyD);
+        await tester.sendKeyRepeatEvent(LogicalKeyboardKey.keyD);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.keyD);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        expect(sent.sublist(before), [resolve(DecisionView.deny)]);
+      },
+    );
 
     testWidgets('several rules: a picker chooses which', (tester) async {
       final sent = <GuiIntent>[];

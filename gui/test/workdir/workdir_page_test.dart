@@ -570,16 +570,19 @@ void main() {
             path: 'a.bin',
             label: 'Asking the server…',
             failed: false,
+            canCancel: false,
           ),
           WorkdirDownloadRow(
             path: 'b.bin',
             label: 'Download failed: timed out',
             failed: true,
+            canCancel: false,
           ),
           WorkdirDownloadRow(
             path: 'out/c.zip',
             label: 'downloaded',
             failed: false,
+            canCancel: false,
             localPath: '/data/blobs/c',
           ),
         ],
@@ -626,6 +629,7 @@ void main() {
             path: 'out/c.zip',
             label: 'downloaded',
             failed: false,
+            canCancel: false,
             localPath: '/data/blobs/c',
           ),
         ],
@@ -730,6 +734,7 @@ void main() {
             pushing: true,
             done: false,
             failed: false,
+            canCancel: false,
           ),
           WorkdirPushRow(
             path: 'out/c.zip',
@@ -739,6 +744,7 @@ void main() {
             done: false,
             existingSha256: sha,
             failed: false,
+            canCancel: false,
           ),
           WorkdirPushRow(
             path: 'b.bin',
@@ -747,6 +753,7 @@ void main() {
             pushing: false,
             done: false,
             failed: true,
+            canCancel: false,
           ),
         ],
       ),
@@ -801,6 +808,78 @@ void main() {
       ),
     );
   });
+
+  testWidgets(
+    'a download or push under way cancels; a stopped download resumes',
+    (tester) async {
+      final sent = await pump(
+        tester,
+        screen(
+          downloads: const [
+            WorkdirDownloadRow(
+              path: 'a.bin',
+              label: 'Asking the server…',
+              failed: false,
+              canCancel: true,
+            ),
+            WorkdirDownloadRow(
+              path: 'b.bin',
+              label: 'not downloaded',
+              failed: false,
+              canCancel: false,
+              blob: BlobFacts(
+                blobId: 'b-1',
+                state: BlobStateKind.notDownloaded,
+                label: 'not downloaded',
+                canDownload: true,
+              ),
+            ),
+          ],
+          pushes: const [
+            WorkdirPushRow(
+              path: 'c.bin',
+              source: '/home/u/c.bin',
+              label: 'Sending…',
+              pushing: true,
+              done: false,
+              failed: false,
+              canCancel: true,
+            ),
+          ],
+        ),
+      );
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('download-cancel-a.bin')),
+      );
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('download-cancel-a.bin')));
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('download-resume-b.bin')),
+      );
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('download-resume-b.bin')));
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('push-cancel-c.bin')),
+      );
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('push-cancel-c.bin')));
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentCancelWorkdirDownload(
+            sessionId: 's-1',
+            path: 'a.bin',
+          ),
+        ),
+        const GuiIntentAct(action: ActionIntentDownloadBlob(blobId: 'b-1')),
+        const GuiIntentAct(
+          action: ActionIntentCancelWorkdirPush(
+            sessionId: 's-1',
+            path: 'c.bin',
+          ),
+        ),
+      ]);
+    },
+  );
 
   testWidgets('a file listing opens entries and goes up', (tester) async {
     final sent = await pump(

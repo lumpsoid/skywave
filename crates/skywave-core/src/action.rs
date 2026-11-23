@@ -47,6 +47,9 @@ pub enum Action {
     ///
     /// `worktree` is a new branch to create a git worktree on; the session
     /// runs in that worktree. `None` or blank: run in `workdir`.
+    ///
+    /// Opens the session once its `SessionCreated` reaches the replica,
+    /// unless the user went elsewhere meanwhile.
     CreateSession {
         workdir: String,
         conversation: Option<String>,
@@ -463,6 +466,15 @@ pub enum Action {
         session_id: SessionId,
         path: String,
     },
+    /// Cancel a download of the session's workdir file
+    /// ([`Action::DownloadWorkdirFile`]): while the server is asked, the ask
+    /// is dropped and shows as failed, `cancelled`; while its content
+    /// downloads, that stops as [`Action::StopBlobDownload`] does, keeping
+    /// what it got. A no-op otherwise.
+    CancelWorkdirDownload {
+        session_id: SessionId,
+        path: String,
+    },
     /// Push a device file into the session's workdir at `path`: it is read,
     /// uploaded unless the server holds it, and written there. `replace` is the
     /// sha256 of the file now at `path` (from a `WriteFileResult::Exists`), when
@@ -475,8 +487,21 @@ pub enum Action {
         path: String,
         replace: Option<ContentHash>,
     },
+    /// Cancel the push into the session's workdir `path` while it uploads.
+    /// Stopped before its write is sent, it ends `PushOutcome::Cancelled`
+    /// (nothing written; pushing again resumes the upload); once the write is
+    /// sent it ends as it ends. A no-op unless it is pushing.
+    CancelWorkdirPush {
+        session_id: SessionId,
+        path: String,
+    },
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
+    /// Stop blob's download, asked for or under way, keeping what it got: it
+    /// shows as not downloaded, only the `Eager` policy, set again or
+    /// restored at start, asks for it again on its own, and
+    /// [`Action::DownloadBlob`] resumes it. A no-op otherwise.
+    StopBlobDownload(BlobId),
     /// Delete a blob from the server and from every device. Queued in the
     /// outbox like any command, offline too, and discardable until the
     /// server takes it. `BlobId` is the blob a view shows

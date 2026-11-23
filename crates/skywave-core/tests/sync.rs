@@ -18,7 +18,8 @@ use chrono::Utc;
 use skywave_core::{
     Action, ApprovalStatus, BlobDownload, BlobStatus, BoxFuture, Connector, Core, Decision,
     EngineConfig, Entry, FailReason, HttpsTransport, Link, LinkRejection, MAX_SERVER_ERRORS,
-    OutboxStatus, Outgoing, Screen, SessionRow, TimelineItem, Transport, TransportError, ViewState,
+    OutboxStatus, Outgoing, Route, Screen, SessionRow, TimelineItem, Transport, TransportError,
+    ViewState,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, Event, EventBatch,
@@ -592,7 +593,14 @@ async fn suspend_pauses_and_resume_syncs() {
 
     client.core.resume();
     client
-        .wait("the session after resume", |_, view| {
+        .wait("the session opened after resume", |client, view| {
+            view.queued == 0
+                && matches!(&view.screen, Screen::Session(s) if client.sessions().contains(&s.id))
+        })
+        .await;
+    client.dispatch(Action::Navigate(Route::SessionList));
+    client
+        .wait("the session list after resume", |_, view| {
             view.queued == 0
                 && matches!(&view.screen, Screen::SessionList(list) if list.sessions.len() == 1)
         })
@@ -2212,6 +2220,8 @@ async fn blobs_and_listings_follow_the_run_the_link_expects() {
         unreachable!()
     };
     assert_eq!(std::fs::read(path).unwrap(), output.as_bytes());
+    // The created session opened; go back to the list for the listing.
+    client.session_list().await;
     client.dispatch(Action::ListConversations);
     wait_answer(&answers, "conversations", Result::is_ok).await;
     let all = answers.borrow().clone();

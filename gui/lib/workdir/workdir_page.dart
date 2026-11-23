@@ -280,8 +280,9 @@ class _ListPane extends StatelessWidget {
 }
 
 /// The downloads this session started, one row each in the core's order: the
-/// path, its one line of progress or outcome, then Save… once the file is on
-/// this device, or Retry when the download failed.
+/// path, its one line of progress or outcome, then Cancel while it is under
+/// way, Save… once the file is on this device, Retry when the download failed,
+/// or Download to resume one that was stopped.
 class _DownloadsPanel extends StatelessWidget {
   const _DownloadsPanel({
     required this.sessionId,
@@ -316,6 +317,18 @@ class _DownloadsPanel extends StatelessWidget {
   }
 
   Widget? _action(BuildContext context, WorkdirDownloadRow row) {
+    if (row.canCancel) {
+      return TextButton(
+        key: ValueKey('download-cancel-${row.path}'),
+        onPressed: () => send.act(
+          ActionIntentCancelWorkdirDownload(
+            sessionId: sessionId,
+            path: row.path,
+          ),
+        ),
+        child: const Text('Cancel'),
+      );
+    }
     final localPath = row.localPath;
     if (localPath != null) {
       return TextButton(
@@ -329,6 +342,14 @@ class _DownloadsPanel extends StatelessWidget {
           ActionIntentDownloadWorkdirFile(sessionId: sessionId, path: row.path),
         ),
         child: const Text('Retry'),
+      );
+    }
+    if (row.blob case final blob? when blob.canDownload) {
+      return TextButton(
+        key: ValueKey('download-resume-${row.path}'),
+        onPressed: () =>
+            send.act(ActionIntentDownloadBlob(blobId: blob.blobId)),
+        child: const Text('Download'),
       );
     }
     return null;
@@ -441,8 +462,9 @@ class _TargetDialogState extends State<_TargetDialog> {
 }
 
 /// The pushes this session started, one row each: the path, its one line of
-/// progress or outcome, then Replace… when a different file is already at the
-/// path (asked first), or Retry when the push failed.
+/// progress or outcome, then Cancel while it pushes, Replace… when a different
+/// file is already at the path (asked first), or Retry when the push failed or
+/// was cancelled.
 class _PushesPanel extends StatelessWidget {
   const _PushesPanel({
     required this.sessionId,
@@ -477,6 +499,15 @@ class _PushesPanel extends StatelessWidget {
   }
 
   Widget? _action(BuildContext context, WorkdirPushRow row) {
+    if (row.canCancel) {
+      return TextButton(
+        key: ValueKey('push-cancel-${row.path}'),
+        onPressed: () => send.act(
+          ActionIntentCancelWorkdirPush(sessionId: sessionId, path: row.path),
+        ),
+        child: const Text('Cancel'),
+      );
+    }
     if (row.existingSha256 != null) {
       return TextButton(
         onPressed: () => _replace(context, row),
