@@ -897,7 +897,6 @@ async fn a_tap_queued_offline_is_refused_once_the_screen_moved_on() {
 /// A capture's download that the link drops part way through resumes and
 /// lands whole: the file holds exactly the image the log names.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: a blob download makes no progress when the link drops under ~128 KiB per connection (task e82db6)"]
 async fn a_capture_download_survives_a_dropped_link() {
     let seed = seed();
     let daemon = Daemon::start_with_screen(FakeAgent::new(FakeScript::new())).await;
