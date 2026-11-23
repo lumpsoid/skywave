@@ -3,7 +3,7 @@
     "deleted": null,
     "fields": {
       "body": "2026-11-22T15:55:54.778449+00:00",
-      "status": "2026-11-22T15:55:54.778449+00:00",
+      "status": "2026-11-23T03:17:12.844605+00:00",
       "title": "2026-11-22T15:55:54.778449+00:00"
     },
     "tags": {
@@ -21,11 +21,11 @@
   "body": "Part of e553ce, after 665941 and the core step. Flutter head: pick a device, show the latest capture, map a tap or swipe on the image to capture coordinates and dispatch it, a text field for type text, buttons for back/home/recents. Show pending and stale inputs plainly. Shared wording and policy go in skywave-present. rinf gen after signal changes.",
   "created": "2026-11-22T15:55:54.778449+00:00",
   "id": "5b7cc3",
-  "status": "open",
+  "status": "done",
   "tags": [
     "gui",
     "screen"
   ],
   "title": "screen 5: GUI screen view (tap, swipe, type, keys)",
-  "updated": "2026-11-22T15:55:54.778449+00:00"
+  "updated": "2026-11-23T03:17:12.844605+00:00"
 }
