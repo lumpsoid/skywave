@@ -236,9 +236,6 @@ struct SessionHead {
     /// The device the app screen shows, as the user picked it; `None` for
     /// the default device.
     app_screen_device: Option<String>,
-    /// Bumped each time typed text of the app screen was queued; the GUI
-    /// clears its field on a change.
-    app_screen_typed: u32,
     /// The composer's message waiting for its result.
     sending: Option<Tag>,
 }
@@ -266,7 +263,6 @@ impl SessionHead {
             outputs: shell::Outputs::default(),
             app_screen: false,
             app_screen_device: None,
-            app_screen_typed: 0,
             sending: None,
         }
     }
@@ -377,6 +373,11 @@ pub struct Head {
     pending: HashMap<Tag, Purpose>,
     /// Bumped for every value the hub writes into a Dart field.
     revs: u32,
+    /// Bumped each time typed text of the app screen was queued; the GUI
+    /// clears its field on a change. Kept here, not in a session's head: a
+    /// count that restarted on each session open would look like a change
+    /// to a field that outlives the switch, and clear text never queued.
+    app_screen_typed: u32,
     form: PairForm,
     create: Option<CreateUi>,
     create_tag: Option<Tag>,
@@ -660,10 +661,8 @@ impl Head {
                 }
             }
             Purpose::ScreenText(id) => {
-                if done.result.is_ok()
-                    && let Some(session) = self.session.as_mut().filter(|s| s.id == id)
-                {
-                    session.app_screen_typed += 1;
+                if done.result.is_ok() && self.session.as_ref().is_some_and(|s| s.id == id) {
+                    self.app_screen_typed += 1;
                 }
             }
             Purpose::Draft => {
@@ -1943,18 +1942,15 @@ impl Head {
 
         // The app screen goes out whole, when it changed; a head with no
         // session open sends the empty screen.
-        let app = match (open, &self.session) {
-            (Some(view), Some(session)) => {
-                let mut app = app_screen::update(
-                    Some(view),
-                    session.app_screen,
-                    session.app_screen_device.as_deref(),
-                );
-                app.typed = session.app_screen_typed;
-                app
-            }
+        let mut app = match (open, &self.session) {
+            (Some(view), Some(session)) => app_screen::update(
+                Some(view),
+                session.app_screen,
+                session.app_screen_device.as_deref(),
+            ),
             _ => app_screen::update(None, false, None),
         };
+        app.typed = self.app_screen_typed;
         if self.sent.app_screen.as_ref() != Some(&app) {
             self.sent.app_screen = Some(app.clone());
             out.push(Out::AppScreen(app));

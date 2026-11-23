@@ -2551,6 +2551,32 @@ fn a_capture_waiting_in_the_outbox_takes_the_next_ones() {
 }
 
 #[test]
+fn a_settled_capture_lets_the_next_one_queue() {
+    let log = ScreenLog::new();
+    let pending = || {
+        log.log
+            .seam
+            .pending_outbox()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e.command.kind, CommandKind::Screen { .. }))
+            .count()
+    };
+
+    let first = log.send(capture_of("emulator-5554"));
+    log.log.seam.command_sending(first).unwrap();
+    log.log
+        .seam
+        .command_result(first, &CommandResult::Accepted { seq: Seq(2) })
+        .unwrap();
+    assert_eq!(pending(), 0, "a settled capture leaves the outbox");
+
+    let next = log.send(capture_of("emulator-5554"));
+    assert_ne!(next, first, "a settled capture does not cover the next one");
+    assert_eq!(pending(), 1, "the next capture is queued again");
+}
+
+#[test]
 fn the_latest_capture_is_each_devices_last_image() {
     let mut log = ScreenLog::new();
     let other = DeviceId::new();
