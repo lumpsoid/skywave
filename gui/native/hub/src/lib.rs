@@ -20,6 +20,7 @@ mod boot;
 mod clip;
 mod crop;
 pub mod dispatcher;
+mod global_search;
 mod head;
 mod intents;
 mod lifecycle;

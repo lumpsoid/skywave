@@ -21,6 +21,7 @@ use std::task::Poll;
 
 use rinf::{DartSignal, DartSignalPack, RustSignal, SignalReceiver};
 use skywave_core::SessionId;
+use skywave_core::search::SessionsFound;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::{Instant as TokioInstant, sleep_until};
@@ -351,6 +352,8 @@ async fn run(
     let mut shown = None;
     // Attachments prepared off this task answer here, in the order they finish.
     let (prepared_tx, mut prepared) = unbounded_channel();
+    // Searches run off this task answer here.
+    let (searched_tx, mut searched) = unbounded_channel();
     loop {
         // Read afresh each turn: what is due changes with every step.
         let wake = head.next_wake(Clock::read()).map(TokioInstant::from_std);
@@ -394,18 +397,27 @@ async fn run(
             Some((session_id, result)) = prepared.recv() => {
                 head.on_prepared(session_id, result, Clock::read())
             }
+            Some((asked, found)) = searched.recv() => {
+                head.on_searched(asked, found, Clock::read())
+            }
             () = sleep_until(wake.unwrap_or_else(TokioInstant::now)), if wake.is_some() => {
                 head.on_wake(Clock::read())
             }
         };
         #[cfg(test)]
         tests::panic_if_asked();
-        perform(outs, hub, &mut shown, &prepared_tx);
+        perform(outs, hub, &mut shown, &prepared_tx, &searched_tx);
         recovery.stepped(*head.awake());
     }
     // The one way out of the loop: the unsaved draft and read mark are
     // queued now, and closing applies everything queued before shutdown.
-    perform(head.on_stop(Clock::read()), hub, &mut shown, &prepared_tx);
+    perform(
+        head.on_stop(Clock::read()),
+        hub,
+        &mut shown,
+        &prepared_tx,
+        &searched_tx,
+    );
     Ok(())
 }
 
@@ -428,12 +440,14 @@ async fn catching<T>(work: impl Future<Output = T>) -> Result<T, String> {
 /// dispatcher, suspend and resume to the core (neither blocks: each only
 /// flips the engine's flag), preferences to their file (a failed write is
 /// logged: the head keeps the choice until the hub stops), images to prepare
-/// (on a blocking thread, the result sent to `prepared`).
+/// (on a blocking thread, the result sent to `prepared`), searches (off the
+/// task too, the answer sent to `searched`).
 fn perform(
     outs: Vec<Out>,
     hub: &Running,
     shown: &mut Option<&'static str>,
     prepared: &UnboundedSender<(SessionId, Result<Prepared, String>)>,
+    searched: &UnboundedSender<(u64, SessionsFound)>,
 ) {
     for out in outs {
         match out {
@@ -468,6 +482,21 @@ fn perform(
                             });
                     // Nothing waits for the answer once the loop has ended.
                     let _ = done.send((session_id, result));
+                });
+            }
+            Out::SearchSessions {
+                asked,
+                query,
+                scope,
+            } => {
+                let (core, done) = (hub.core.clone(), searched.clone());
+                tokio::spawn(async move {
+                    if let Ok(found) =
+                        tokio::task::spawn_blocking(move || core.search(&query, scope)).await
+                    {
+                        // Nothing waits for the answer once the loop has ended.
+                        let _ = done.send((asked, found));
+                    }
                 });
             }
             Out::Suspend => {
@@ -826,7 +855,14 @@ mod tests {
             ..prefs::Prefs::default()
         };
         let (prepared, _) = unbounded_channel();
-        perform(vec![Out::SavePrefs(on)], &hub, &mut None, &prepared);
+        let (searched, _) = unbounded_channel();
+        perform(
+            vec![Out::SavePrefs(on)],
+            &hub,
+            &mut None,
+            &prepared,
+            &searched,
+        );
         let file = dir.path().join("skywave-gui.json");
         assert!(file.is_file());
         assert!(
@@ -842,7 +878,13 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
         std::fs::write(file.join("x"), b"").unwrap();
-        perform(vec![Out::SavePrefs(on)], &hub, &mut None, &prepared);
+        perform(
+            vec![Out::SavePrefs(on)],
+            &hub,
+            &mut None,
+            &prepared,
+            &searched,
+        );
         hub.close();
     }
 

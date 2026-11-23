@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skywave_core::attachment::{self, AttachedFile, AttachedImage};
-use skywave_core::search::BlobText;
+use skywave_core::search::{BlobText, SessionsFound};
 use skywave_core::{
     Action, BlobState, BlobView, CallId, CommandId, ComposerMode, ContentHash, Entry, PairUri,
     PairingView, RunWhen, Screen, ScreenAction, Seq, SessionId, SessionView, SnippetId,
@@ -34,6 +34,7 @@ use crate::attach::{AttachSource, Prepared};
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
 use crate::crop::CropLines;
 use crate::dispatcher::{Dispatched, Tag};
+use crate::global_search::GlobalSearch;
 #[cfg(test)]
 use crate::lifecycle::Target;
 use crate::lifecycle::{Awake, Call, Moved};
@@ -120,6 +121,13 @@ pub enum Out {
     Prepare {
         session_id: SessionId,
         source: AttachSource,
+    },
+    /// Run `Core::search` off the hub task; the answer comes back to
+    /// [`Head::on_searched`] with `asked`.
+    SearchSessions {
+        asked: u64,
+        query: String,
+        scope: Option<SessionId>,
     },
     /// Pause the engine's network loops (`Core::suspend`).
     Suspend,
@@ -396,6 +404,8 @@ pub struct Head {
     workdir_text: WorkdirText,
     /// The crop page's line window (`CropLines`).
     crop_lines: CropLines,
+    /// The search page's query and hits (`GuiIntent::GlobalSearchTyped`).
+    global_search: GlobalSearch,
     session: Option<SessionHead>,
     /// The core's data dir, where the attachments are stored; set by `run`
     /// once the core is open.
@@ -595,6 +605,9 @@ impl Head {
             create.picker.settle(&create.input, Some(completion));
         }
         self.follow_session();
+        if let Some(view) = &self.view {
+            self.global_search.follow(&view.screen, clock.now);
+        }
         let switched = open_session(&self.view)
             .zip(self.session.as_ref())
             .is_some_and(|(view, session)| view.mode != session.mode);
@@ -727,6 +740,15 @@ impl Head {
         out
     }
 
+    /// The answer [`Out::SearchSessions`] asked for, numbered `asked`: kept
+    /// when it answers the newest search asked.
+    pub fn on_searched(&mut self, asked: u64, found: SessionsFound, clock: Clock) -> Vec<Out> {
+        let mut out = Vec::new();
+        self.global_search.answered(asked, found);
+        self.after(clock, &mut out);
+        out
+    }
+
     /// The wake-up [`Head::next_wake`] asked for (or any other).
     pub fn on_wake(&mut self, clock: Clock) -> Vec<Out> {
         let mut out = Vec::new();
@@ -759,6 +781,7 @@ impl Head {
             open.filter(|v| timeline::live(v) || shell::live(v))
                 .map(|_| clock.now + TICK),
             matches!(view.screen, Screen::SessionList(_)).then(|| clock.now + LIST_TICK),
+            self.global_search.next_wake(),
         ]
         .into_iter()
         .flatten()
@@ -1291,11 +1314,7 @@ impl Head {
                 else {
                     return Ok(());
                 };
-                let query: String = query
-                    .chars()
-                    .map(|c| if c == '\n' { ' ' } else { c })
-                    .filter(|c| !c.is_control())
-                    .collect();
+                let query = clean_query(&query);
                 let search = session.search.get_or_insert_with(TimelineSearch::new);
                 search.wrapped = false;
                 search.edit(view, |text| *text = query, BlobText::read);
@@ -1323,6 +1342,9 @@ impl Head {
                 if let Some(session) = &mut self.session {
                     session.search = None;
                 }
+            }
+            GuiIntent::GlobalSearchTyped { query } => {
+                self.global_search.typed(clean_query(&query), clock.now);
             }
             GuiIntent::CreateOpen => {
                 if let Some(Screen::SessionList(list)) = self.view.as_ref().map(|v| &v.screen)
@@ -1768,6 +1790,13 @@ impl Head {
     fn after(&mut self, clock: Clock, out: &mut Vec<Out>) {
         self.save_draft(clock, false, out);
         self.mark_read(clock, false, out);
+        if let Some((asked, query, scope)) = self.global_search.take_due(clock.now) {
+            out.push(Out::SearchSessions {
+                asked,
+                query,
+                scope,
+            });
+        }
         self.publish(clock, true, out);
     }
 
@@ -1861,6 +1890,7 @@ impl Head {
             plain_list: self.plain_list,
             notifications: self.notify,
             conversation_only: self.conversation_only.on(),
+            search: &self.global_search,
         };
         let shown = screen::update(view, ui);
         if self.sent.screen.as_ref() != Some(&shown) {
@@ -2310,6 +2340,16 @@ fn message_image_blobs(entry: &Entry) -> Vec<&BlobView> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// A typed query as the search takes it: newlines become spaces, other
+/// control characters go.
+fn clean_query(query: &str) -> String {
+    query
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// The open session in `view`, if a session is the screen.

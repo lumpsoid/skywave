@@ -37,6 +37,7 @@ use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 use skywave_present::worktrees;
 use skywave_proto::{RepoListing, RepoWorktrees, WorktreeEntry};
 
+use crate::global_search::{self, GlobalSearch};
 use crate::link::count;
 use crate::prefs::NotificationPrefs;
 use crate::signals::{
@@ -85,6 +86,8 @@ pub struct Ui<'a> {
     pub notifications: NotificationPrefs,
     /// Only the conversation shows: tool calls are hidden.
     pub conversation_only: bool,
+    /// The search page's query and hits.
+    pub search: &'a GlobalSearch,
 }
 
 /// The new-session prompt: its input as the hub knows it and the highlight
@@ -129,14 +132,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
         Screen::Worktrees(view) => worktrees_view(view),
-        Screen::Search(view) => ScreenView::Search {
-            scope_id: view.scope.as_ref().map(|s| s.id.0.to_string()),
-            scope_title: view.scope.as_ref().map(|s| clean_line(&s.title)),
-            query: String::new(),
-            count_label: None,
-            partial_label: None,
-            rows: Vec::new(),
-        },
+        Screen::Search(view) => global_search::screen(view, ui.search, ui.wall_ms),
         Screen::Approvals(view) => approvals_view(view),
         Screen::UsageLimits(view) => ScreenView::UsageLimits {
             limits: limits_view(view, ui.wall_ms),
@@ -1770,6 +1766,7 @@ mod tests {
             agent_logged_out: false,
         };
         let form = PairForm::default();
+        let search = GlobalSearch::default();
         let ui = Ui {
             form: &form,
             create: None,
@@ -1784,6 +1781,7 @@ mod tests {
             plain_list: false,
             notifications: NotificationPrefs::ON,
             conversation_only: false,
+            search: &search,
         };
         match update(&view, ui).screen {
             ScreenView::Session { session } => session,

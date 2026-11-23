@@ -251,6 +251,10 @@ pub enum GuiIntent {
         from_key: Option<String>,
     },
     SearchClose,
+    /// The search page's query; searched once typing pauses.
+    GlobalSearchTyped {
+        query: String,
+    },
     /// Open the new-session prompt.
     CreateOpen,
     /// The workdir input changed.
