@@ -414,7 +414,7 @@ pub struct ItemHit {
     pub output: bool,
 }
 
-/// A hit in one session: an item, or (`item: None`) the session's title or workdir.
+/// A hit in one session: an item, or (`item: None`) the session's name or workdir.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionHit {
     pub session: SessionId,

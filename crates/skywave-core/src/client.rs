@@ -427,7 +427,7 @@ impl Core {
     }
 
     /// Every session's items `text` matches, or only `scope`'s, and the
-    /// sessions whose title or workdir it matches (see `search::SessionsFound`).
+    /// sessions whose name or workdir it matches (see `search::SessionsFound`).
     /// The state is locked once per session, to build its timeline; matching
     /// and reading downloaded outputs happen outside the lock. Blocking: call
     /// it off the UI thread.
@@ -444,7 +444,8 @@ impl Core {
                 .workdir
                 .as_deref()
                 .is_some_and(|workdir| query.matches(workdir));
-            if query.matches(&target.title) || workdir_matches {
+            // An unnamed session's title is its first prompt, already an item hit.
+            if (target.named && query.matches(&target.title)) || workdir_matches {
                 found.hits.push(SessionHit {
                     session: target.id,
                     title: target.title.clone(),

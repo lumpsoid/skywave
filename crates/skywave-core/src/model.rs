@@ -135,6 +135,8 @@ struct Title {
 pub(crate) struct SearchTarget {
     pub id: SessionId,
     pub title: String,
+    /// `title` is a name the user gave, not the session's first prompt.
+    pub named: bool,
     pub workdir: Option<String>,
     pub last_activity: DateTime<Utc>,
 }
@@ -4609,11 +4611,15 @@ impl Model {
         self.sessions
             .iter()
             .filter(|summary| scope.is_none_or(|id| summary.id == id))
-            .map(|summary| SearchTarget {
-                id: summary.id,
-                title: self.title(summary).text,
-                workdir: summary.workdir.clone(),
-                last_activity: summary.last_activity,
+            .map(|summary| {
+                let title = self.title(summary);
+                SearchTarget {
+                    id: summary.id,
+                    title: title.text,
+                    named: title.named,
+                    workdir: summary.workdir.clone(),
+                    last_activity: summary.last_activity,
+                }
             })
             .collect()
     }

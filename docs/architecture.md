@@ -1651,7 +1651,7 @@ no longer decodes rather than failing.
   session at a time; matching and reading downloaded outputs happen outside
   it, so sync is not stalled by a long search. One hit per item, from the main
   timeline's `Logged` items only (no subagent items, no pending ones); a
-  session hit when its title or workdir matches. At most
+  session hit when its name (one the user gave) or workdir matches. At most
   `search::SEARCH_HITS_MAX` (200) item hits, and `more` says the search stopped
   there. The cap keeps each session's newest hits, walking the sessions most
   recently written first. A long matching line is cut to a window of

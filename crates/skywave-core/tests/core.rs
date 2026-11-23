@@ -3301,6 +3301,36 @@ fn search_finds_a_session_by_its_name() {
 }
 
 #[test]
+fn an_unnamed_session_is_not_a_session_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(sid, 0, created("/srv/a")),
+            event(
+                sid,
+                1,
+                EventKind::UserMessage {
+                    device_id: device,
+                    text: "a fox".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    // The session's title is its first prompt, so the prompt is the only hit.
+    let found = core.search("fox", None);
+    assert_eq!(found.hits.len(), 1, "{found:?}");
+    assert_eq!(
+        found.hits[0].item.as_ref().map(|item| item.kind.clone()),
+        Some(HitKind::UserMessage)
+    );
+}
+
+#[test]
 fn a_scoped_search_skips_other_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let (core, seam, _requests, device) = paired_core(dir.path());
