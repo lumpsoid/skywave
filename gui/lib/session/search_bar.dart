@@ -12,8 +12,6 @@ class SessionSearchBar extends StatefulWidget {
   const SessionSearchBar({
     required this.search,
     required this.send,
-    required this.newestVisibleKey,
-    required this.onStepped,
     required this.onEdit,
     this.focusNode,
     super.key,
@@ -21,12 +19,6 @@ class SessionSearchBar extends StatefulWidget {
 
   final SearchUpdate search;
   final SendIntent send;
-
-  /// The newest row in view, for Enter's step.
-  final String? Function() newestVisibleKey;
-
-  /// After Enter: hand the keyboard to the timeline, for n/N.
-  final VoidCallback onStepped;
 
   /// Tapped: opens the search page, scoped to this session, to edit the
   /// query.
@@ -54,12 +46,8 @@ class _SessionSearchBarState extends State<SessionSearchBar> {
     super.dispose();
   }
 
-  void _step(bool? older) => widget.send(
-    GuiIntentSearchStep(
-      older: older,
-      fromKey: older == null ? widget.newestVisibleKey() : null,
-    ),
-  );
+  void _step(bool older) =>
+      widget.send(GuiIntentSearchStep(older: older, fromKey: null));
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -103,9 +91,8 @@ class _SessionSearchBarState extends State<SessionSearchBar> {
                     child: TextField(
                       controller: _field,
                       focusNode: widget.focusNode,
-                      autofocus: true,
+                      autofocus: false,
                       readOnly: true,
-                      textInputAction: TextInputAction.search,
                       onTap: widget.onEdit,
                       decoration: const InputDecoration(
                         isDense: true,

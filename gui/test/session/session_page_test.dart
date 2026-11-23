@@ -1941,6 +1941,11 @@ void main() {
     }
     expect(marked, ['👋 w']);
 
+    // n steps older from the timeline, which the opened bar handed focus to.
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    expect(sent.last, const GuiIntentSearchStep(older: true));
+
     // ↑ steps older; Esc closes. The tap focuses the read-only bar (and asks
     // for the search page, which the test does not check here).
     await tester.tap(find.byType(TextField).first);
@@ -2122,6 +2127,59 @@ void main() {
       sent.last,
       const GuiIntentAct(action: ActionIntentOpenSearch(sessionId: 's1')),
     );
+  });
+
+  testWidgets('opening the bar hands focus to the timeline', (tester) async {
+    final search = SearchHolder();
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([row('s:1', 'row 1')]),
+      search: search,
+      sent: sent,
+    );
+    search.apply(
+      const SearchUpdate(
+        open: true,
+        query: 'row',
+        countLabel: '1 of 1',
+        wrapped: false,
+        currentKey: 's:1',
+        hits: [],
+      ),
+    );
+    await tester.pumpAndSettle();
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    expect(sent, [const GuiIntentSearchStep(older: true)]);
+  });
+
+  testWidgets('a search open at mount hands focus to the timeline', (
+    tester,
+  ) async {
+    final search = SearchHolder()
+      ..apply(
+        const SearchUpdate(
+          open: true,
+          query: 'row',
+          countLabel: '1 of 1',
+          wrapped: false,
+          currentKey: 's:1',
+          hits: [],
+        ),
+      );
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([row('s:1', 'row 1')]),
+      search: search,
+      sent: sent,
+    );
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    expect(sent, [const GuiIntentSearchStep(older: true)]);
   });
 
   testWidgets('interrupt only while there is a turn and none on its way', (
