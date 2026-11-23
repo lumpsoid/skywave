@@ -350,6 +350,24 @@ void main() {
     ]);
   });
 
+  testWidgets('Ctrl+F opens the search over every session', (tester) async {
+    await pump(tester, list(rows: [sessionRow('a')]));
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentOpenSearch(sessionId: null)),
+    ]);
+  });
+
+  testWidgets('the search button opens the search', (tester) async {
+    await pump(tester, list());
+    await tester.tap(find.byTooltip('Search (Ctrl+F)'));
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentOpenSearch(sessionId: null)),
+    ]);
+  });
+
   testWidgets('a removed worktree shows a marker', (tester) async {
     final semantics = tester.ensureSemantics();
     await pump(tester, list(rows: [sessionRow('a', worktreeRemoved: true)]));
