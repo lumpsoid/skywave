@@ -565,6 +565,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .filter(|r| r.session_id == session.id.0.to_string())
             .cloned(),
         conversation_only: ui.conversation_only,
+        screen_enabled: session.screen_enabled,
     }
     .with_recipient(session)
 }
@@ -1808,6 +1809,7 @@ mod tests {
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
+            screen_enabled: false,
             app_screen: Default::default(),
             last_seq: Seq(0),
             unread_from: None,

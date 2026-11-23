@@ -4244,13 +4244,13 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
     let safe = [V::Ask, V::AcceptEdits, V::Plan, V::Auto, V::DontAsk];
     assert_eq!(offered(&agent), safe);
     assert!(agent.modes.iter().all(|m| !m.needs_confirmation));
-    rig.hello(false, true);
+    rig.hello(false, true, false);
     let agent = rig.agent();
     assert_eq!(offered(&agent)[..5], safe);
     assert_eq!(offered(&agent)[5], V::Bypass);
     assert!(agent.modes[5].needs_confirmation);
     assert!(agent.modes[0].current);
-    rig.hello(false, false);
+    rig.hello(false, false, false);
     assert_eq!(offered(&rig.agent()), safe, "a later hello takes it back");
     assert!(agent.models[0].current);
 
@@ -5454,12 +5454,17 @@ fn nothing_is_marked_read_from_a_subagents_view() {
 impl Rig {
     /// The server says whether it runs shell commands, as its `hello` does.
     fn shell_enabled(&mut self, shell: bool) {
-        self.hello(shell, false);
+        self.hello(shell, false, false);
     }
 
-    /// The server's `hello`: whether it runs shell commands and whether
-    /// it allows bypass mode.
-    fn hello(&mut self, shell: bool, bypass: bool) {
+    /// The server says whether it drives screens, as its `hello` does.
+    fn screen_enabled(&mut self, screen: bool) {
+        self.hello(false, false, screen);
+    }
+
+    /// The server's `hello`: whether it runs shell commands, whether
+    /// it allows bypass mode and whether it drives screens.
+    fn hello(&mut self, shell: bool, bypass: bool, screen: bool) {
         self.seam
             .hello_received(&skywave_proto::HelloResponse {
                 protocol_version: skywave_proto::PROTOCOL_VERSION,
@@ -5473,7 +5478,7 @@ impl Rig {
                 },
                 devices: Vec::new(),
                 shell,
-                screen: false,
+                screen,
                 bypass,
                 login_expires: None,
                 agent_login_offered: false,
@@ -5567,6 +5572,19 @@ fn shell_mode_is_refused_while_the_server_runs_no_shell_commands() {
         session_id: rig.session.0.to_string(),
     });
     assert_eq!(rig.kinds(), ["set mode"]);
+}
+
+#[test]
+fn the_app_screen_entry_shows_only_where_the_server_drives_screens() {
+    let mut rig = Rig::new();
+    assert!(
+        !rig.open_session().screen_enabled,
+        "off until a server said so"
+    );
+    rig.screen_enabled(true);
+    assert!(rig.open_session().screen_enabled);
+    rig.screen_enabled(false);
+    assert!(!rig.open_session().screen_enabled);
 }
 
 #[test]

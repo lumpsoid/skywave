@@ -738,6 +738,8 @@ pub struct SessionScreen {
     /// Only the conversation shows: the timeline's rows leave out tool
     /// calls, but one an approval waits on (`ToggleConversationOnly`).
     pub conversation_only: bool,
+    /// The server drives screens: the App screen entry shows.
+    pub screen_enabled: bool,
 }
 
 /// The questions the stop confirmations ask, one per action.

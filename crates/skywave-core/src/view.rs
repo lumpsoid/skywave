@@ -1433,6 +1433,9 @@ pub struct SessionView {
     /// [`subagent`](Self::subagent) narrows the timeline to: they are
     /// session-wide and never in the timeline.
     pub shell: ShellView,
+    /// Whether the server drives screens, as its last `hello` said; stored,
+    /// so it shows offline too.
+    pub screen_enabled: bool,
     /// The app screen (D65), session-wide like the shell.
     pub app_screen: AppScreenView,
     /// Seq of the session's newest event: what
@@ -2457,6 +2460,7 @@ mod tests {
             shell_draft: None,
             draft_rev: 0,
             shell: ShellView::default(),
+            screen_enabled: false,
             app_screen: AppScreenView::default(),
             last_seq: Seq(6),
             unread_from: None,
