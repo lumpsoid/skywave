@@ -491,12 +491,14 @@ fn perform(
             } => {
                 let (core, done) = (hub.core.clone(), searched.clone());
                 tokio::spawn(async move {
-                    if let Ok(found) =
-                        tokio::task::spawn_blocking(move || core.search(&query, scope)).await
-                    {
-                        // Nothing waits for the answer once the loop has ended.
-                        let _ = done.send((asked, found));
-                    }
+                    let found = tokio::task::spawn_blocking(move || core.search(&query, scope))
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::error!("the search could not run: {err}");
+                            SessionsFound::default()
+                        });
+                    // Nothing waits for the answer once the loop has ended.
+                    let _ = done.send((asked, found));
                 });
             }
             Out::Suspend => {

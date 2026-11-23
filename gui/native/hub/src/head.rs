@@ -1322,16 +1322,6 @@ impl Head {
                     self.copied(copy(content, COPY_MAX), clock, out)?;
                 }
             }
-            GuiIntent::SearchTyped { query } => {
-                let Some((view, session)) = open_session(&self.view).zip(self.session.as_mut())
-                else {
-                    return Ok(());
-                };
-                let query = clean_query(&query);
-                let search = session.search.get_or_insert_with(TimelineSearch::new);
-                search.wrapped = false;
-                search.edit(view, |text| *text = query, BlobText::read);
-            }
             GuiIntent::SearchStep { older, from_key } => {
                 let from = from_key.as_deref().map(parse_key).transpose()?;
                 let Some((view, session)) = open_session(&self.view).zip(self.session.as_mut())

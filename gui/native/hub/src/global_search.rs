@@ -37,23 +37,29 @@ pub struct GlobalSearch {
     due: Option<Instant>,
     /// The number of the newest search asked.
     asked: u64,
-    /// The newest answer for the current query and scope.
+    /// The query the newest search asked was for.
+    asked_query: String,
+    /// The newest answer kept, for the current scope.
     found: Option<SessionsFound>,
+    /// The query `found` answers: it lags the query while a search is due or
+    /// in flight.
+    found_query: String,
     /// The item of the hit opened last, until its session shows it.
     reveal: Option<Reveal>,
 }
 
 impl GlobalSearch {
-    /// The query is now `query`, typed at `now`. Empty: there is nothing to
-    /// find, so the hits go and an answer still on its way is dropped.
-    /// Otherwise the search is due once typing pauses, and the hits held stay
-    /// until the answer comes.
+    /// The query is now `query`, typed at `now`. Any search asked so far is
+    /// now for an older query, so its answer, still on its way, is dropped.
+    /// Empty: there is nothing to find, so the hits go too. Otherwise the
+    /// search is due once typing pauses, and the hits held stay until the
+    /// next answer comes.
     pub fn typed(&mut self, query: String, now: Instant) {
         self.query = query;
+        self.asked += 1;
         if self.query.is_empty() {
             self.found = None;
             self.due = None;
-            self.asked += 1;
         } else {
             self.due = Some(now + SEARCH_AFTER);
         }
@@ -106,7 +112,8 @@ impl GlobalSearch {
         }
         self.due = None;
         self.asked += 1;
-        Some((self.asked, self.query.clone(), self.scope))
+        self.asked_query = self.query.clone();
+        Some((self.asked, self.asked_query.clone(), self.scope))
     }
 
     /// The answer to search number `asked`. Kept only when it is the newest
@@ -114,6 +121,7 @@ impl GlobalSearch {
     pub fn answered(&mut self, asked: u64, found: SessionsFound) {
         if asked == self.asked {
             self.found = Some(found);
+            self.found_query = self.asked_query.clone();
         }
     }
 
@@ -136,7 +144,7 @@ impl GlobalSearch {
         self.reveal = hit.item.as_ref().map(|item| Reveal {
             session,
             seq: item.seq,
-            query: self.query.clone(),
+            query: self.found_query.clone(),
         });
         Some(session)
     }
@@ -157,7 +165,7 @@ impl GlobalSearch {
 /// as `view` says, with the times labelled at `wall_ms`.
 pub fn screen(view: &SearchView, search: &GlobalSearch, wall_ms: i64) -> ScreenView {
     let now = DateTime::<Utc>::from_timestamp_millis(wall_ms).unwrap_or_default();
-    let query = Query::new(&search.query);
+    let query = Query::new(&search.found_query);
     let rows = search
         .found
         .iter()
@@ -169,8 +177,8 @@ pub fn screen(view: &SearchView, search: &GlobalSearch, wall_ms: i64) -> ScreenV
         scope_title: view.scope.as_ref().map(|s| clean_line(&s.title)),
         query: search.query.clone(),
         count_label: (!search.query.is_empty()).then(|| match &search.found {
-            Some(found) => search_hits::count_label(found),
-            None => "searching…".to_owned(),
+            Some(found) if search.found_query == search.query => search_hits::count_label(found),
+            _ => "searching…".to_owned(),
         }),
         partial_label: search.found.as_ref().and_then(search_hits::partial),
         rows,

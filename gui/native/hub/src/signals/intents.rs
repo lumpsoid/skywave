@@ -239,10 +239,6 @@ pub enum GuiIntent {
         key: String,
         what: CopyWhat,
     },
-    /// The search's query, opening a search if none is open.
-    SearchTyped {
-        query: String,
-    },
     /// Jump to the next older (`Some(true)`) or newer match, round the
     /// ends; `None` jumps to the nearest at or above `from_key` (the
     /// newest visible row; the end when `None`).

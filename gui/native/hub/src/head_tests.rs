@@ -8632,6 +8632,16 @@ fn global_search_waits_for_typing_to_pause() {
     let mut rig = Rig::new();
     fox_data(&mut rig);
     open_search(&mut rig, None);
+    let outs = rig.intent(GuiIntent::GlobalSearchTyped { query: "fo".into() });
+    assert!(
+        !outs.iter().any(|o| matches!(o, Out::SearchSessions { .. })),
+        "no search while typing"
+    );
+    let outs = rig.wait(SEARCH_AFTER / 2);
+    assert!(
+        !outs.iter().any(|o| matches!(o, Out::SearchSessions { .. })),
+        "no search before typing pauses"
+    );
     let outs = rig.intent(GuiIntent::GlobalSearchTyped {
         query: "fox".into(),
     });
@@ -8639,8 +8649,17 @@ fn global_search_waits_for_typing_to_pause() {
         !outs.iter().any(|o| matches!(o, Out::SearchSessions { .. })),
         "no search while typing"
     );
+    let outs = rig.wait(SEARCH_AFTER / 2);
+    assert!(
+        !outs.iter().any(|o| matches!(o, Out::SearchSessions { .. })),
+        "typing again restarts the wait"
+    );
 
-    let found = the_search(rig.wait(SEARCH_AFTER));
+    let found = the_search(rig.wait(SEARCH_AFTER / 2));
+    let Out::SearchSessions { query, .. } = &found else {
+        panic!("not a search")
+    };
+    assert_eq!(query, "fox");
     searched(&mut rig, vec![found]);
     let (count, rows) = search_page(&rig);
     assert_eq!(count.as_deref(), Some("2 matches"));
@@ -8696,6 +8715,32 @@ fn a_stale_answer_is_dropped() {
     assert_eq!(count.as_deref(), Some("1 match"));
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].snippet.contains("quick fox"), "{:?}", rows[0]);
+}
+
+#[test]
+fn an_answer_for_an_older_query_is_dropped_while_typing() {
+    let mut rig = Rig::new();
+    fox_data(&mut rig);
+    open_search(&mut rig, None);
+    rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "fox".into(),
+    });
+    let fox = the_search(rig.wait(SEARCH_AFTER));
+    rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "quick".into(),
+    });
+
+    searched(&mut rig, vec![fox]);
+    let (count, rows) = search_page(&rig);
+    assert_eq!(count.as_deref(), Some("searching…"), "\"fox\" is stale");
+    assert!(rows.is_empty(), "{rows:?}");
+
+    let quick = the_search(rig.wait(SEARCH_AFTER));
+    searched(&mut rig, vec![quick]);
+    let (count, rows) = search_page(&rig);
+    assert_eq!(count.as_deref(), Some("1 match"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].snippet.contains("quick"), "{:?}", rows[0]);
 }
 
 #[test]
@@ -8767,4 +8812,5 @@ fn a_session_hit_opens_without_a_search() {
     );
     let update = rig.head.sent.search.clone().expect("a search update");
     assert!(!update.open, "{update:?}");
+    assert!(update.query.is_empty(), "{update:?}");
 }
