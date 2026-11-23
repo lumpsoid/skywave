@@ -178,6 +178,20 @@ pub enum ScreenView {
         /// list.
         empty_label: Option<String>,
     },
+    /// The search page: hits from every session, or from `scope_id`'s only.
+    Search {
+        /// The one session searched; `None` searches every session.
+        scope_id: Option<String>,
+        scope_title: Option<String>,
+        /// The query the hub holds, for the field to start with.
+        query: String,
+        /// `searching…`, `no matches`, `12 matches`, `first 200 matches`; `None` with no query.
+        count_label: Option<String>,
+        /// What the search could not look through (outputs not downloaded, ...).
+        partial_label: Option<String>,
+        /// Session hits first, then items newest first.
+        rows: Vec<SearchRowView>,
+    },
     /// Every approval this device can answer, from every session, oldest
     /// first.
     Approvals {
@@ -403,6 +417,20 @@ pub struct WorktreeRemoveView {
 pub struct WorktreeSessionView {
     pub session_id: String,
     pub title: String,
+}
+
+/// One hit of the search page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct SearchRowView {
+    /// Opens the hit with `GuiIntent::GlobalSearchOpen`.
+    pub key: String,
+    pub session_title: String,
+    /// `Prompt`, `Agent`, a tool's name, `Bash output`, `Session`, ...
+    pub kind_label: String,
+    pub time_label: String,
+    /// The matching line, cut round the first match.
+    pub snippet: String,
+    pub matched: Vec<Utf16Range>,
 }
 
 /// The usage limits as listed, on their page and a session's info page.

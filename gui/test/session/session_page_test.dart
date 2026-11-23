@@ -1941,13 +1941,17 @@ void main() {
     }
     expect(marked, ['👋 w']);
 
-    // Enter steps from the newest row in view; ↑ steps older; Esc closes.
+    // n steps older from the timeline, which the opened bar handed focus to.
     sent.clear();
-    await tester.showKeyboard(find.byType(TextField).first);
-    await tester.testTextInput.receiveAction(TextInputAction.search);
-    await tester.pump();
-    expect(sent, [const GuiIntentSearchStep(fromKey: 's:2')]);
     await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    expect(sent.last, const GuiIntentSearchStep(older: true));
+
+    // ↑ steps older; Esc closes. The tap focuses the read-only bar (and asks
+    // for the search page, which the test does not check here).
+    await tester.tap(find.byType(TextField).first);
+    await tester.pump();
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
     expect(sent.last, const GuiIntentSearchStep(older: true));
     await tester.sendKeyEvent(LogicalKeyboardKey.escape);
     expect(sent.last, const GuiIntentSearchClose());
@@ -2082,9 +2086,100 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
     await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
     expect(sent.sublist(sent.length - 2), [
-      const GuiIntentSearchTyped(query: ''),
+      const GuiIntentAct(action: ActionIntentOpenSearch(sessionId: 's1')),
       const GuiIntentAct(action: ActionIntentInterrupt(sessionId: 's1')),
     ]);
+  });
+
+  testWidgets('tapping the open search bar opens the scoped search page', (
+    tester,
+  ) async {
+    final search = SearchHolder();
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([row('s:1', 'row 1')]),
+      search: search,
+      sent: sent,
+    );
+    search.apply(
+      const SearchUpdate(
+        open: true,
+        query: 'row',
+        countLabel: '1 of 1',
+        wrapped: false,
+        currentKey: 's:1',
+        hits: [],
+      ),
+    );
+    await tester.pumpAndSettle();
+    final field = find.byType(TextField).first;
+    expect(tester.widget<TextField>(field).readOnly, isTrue);
+    expect(
+      tester.widget<TextField>(field).controller!.text,
+      'row',
+      reason: 'the bar shows the query',
+    );
+    await tester.tap(field);
+    await tester.pump();
+    expect(
+      sent.last,
+      const GuiIntentAct(action: ActionIntentOpenSearch(sessionId: 's1')),
+    );
+  });
+
+  testWidgets('opening the bar hands focus to the timeline', (tester) async {
+    final search = SearchHolder();
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([row('s:1', 'row 1')]),
+      search: search,
+      sent: sent,
+    );
+    search.apply(
+      const SearchUpdate(
+        open: true,
+        query: 'row',
+        countLabel: '1 of 1',
+        wrapped: false,
+        currentKey: 's:1',
+        hits: [],
+      ),
+    );
+    await tester.pumpAndSettle();
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    expect(sent, [const GuiIntentSearchStep(older: true)]);
+  });
+
+  testWidgets('a search open at mount hands focus to the timeline', (
+    tester,
+  ) async {
+    final search = SearchHolder()
+      ..apply(
+        const SearchUpdate(
+          open: true,
+          query: 'row',
+          countLabel: '1 of 1',
+          wrapped: false,
+          currentKey: 's:1',
+          hits: [],
+        ),
+      );
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([row('s:1', 'row 1')]),
+      search: search,
+      sent: sent,
+    );
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    expect(sent, [const GuiIntentSearchStep(older: true)]);
   });
 
   testWidgets('interrupt only while there is a turn and none on its way', (
@@ -2839,7 +2934,10 @@ void main() {
         ),
         ('Rename', const GuiIntentRenameOpen(sessionId: 's1')),
         ('Conversation only', const GuiIntentToggleConversationOnly()),
-        ('Search', const GuiIntentSearchTyped(query: '')),
+        (
+          'Search',
+          const GuiIntentAct(action: ActionIntentOpenSearch(sessionId: 's1')),
+        ),
       ]) {
         await tester.tap(byTooltip(label));
         await tester.pumpAndSettle();

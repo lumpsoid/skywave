@@ -10,13 +10,16 @@
 //! never downloads one, and says how many it could not search. A timeline
 //! narrowed to one context is searched as shown.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::blobs::read_head;
 use crate::view::{
-    AgentSetting, BlobId, BlobState, BlobView, Effort, Entry, FullView, ImportedEntry,
-    TimelineItem, ToolOutcome, ToolView,
+    AgentSetting, BlobId, BlobState, BlobView, Effort, Entry, FullView, ImportedEntry, Seq,
+    SessionId, TimelineItem, ToolOutcome, ToolView,
 };
 
 /// Most of a downloaded blob a search reads: the head of a longer one.
@@ -352,6 +355,146 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         | Entry::TurnUsage(_)
         | Entry::ImportFinished { .. } => Vec::new(),
     }
+}
+
+/// Most item hits a [`SessionsFound`] holds.
+pub const SEARCH_HITS_MAX: usize = 200;
+
+/// Longest matching line an [`ItemHit`] keeps whole; a longer one is cut
+/// round its first match.
+const LINE_MAX_BYTES: usize = 2048;
+
+/// What kind of item a search hit is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HitKind {
+    UserMessage,
+    AgentMessage,
+    Tool { name: String },
+    Other,
+}
+
+impl HitKind {
+    /// The kind of item `entry` is.
+    pub fn of(entry: &Entry) -> HitKind {
+        match entry {
+            Entry::UserMessage { .. }
+            | Entry::Imported {
+                entry: ImportedEntry::UserMessage { .. },
+                ..
+            } => HitKind::UserMessage,
+            Entry::AgentMessage { .. }
+            | Entry::Imported {
+                entry: ImportedEntry::AgentMessage { .. },
+                ..
+            } => HitKind::AgentMessage,
+            Entry::Tool(view)
+            | Entry::Imported {
+                entry: ImportedEntry::Tool(view),
+                ..
+            } => HitKind::Tool {
+                name: view.name.clone(),
+            },
+            Entry::ToolCall { name, .. } => HitKind::Tool { name: name.clone() },
+            Entry::Approval { tool, .. } => HitKind::Tool { name: tool.clone() },
+            _ => HitKind::Other,
+        }
+    }
+}
+
+/// One matching timeline item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemHit {
+    pub seq: Seq,
+    pub at: DateTime<Utc>,
+    pub kind: HitKind,
+    /// The first matching line, uncleaned; a long one cut round its first
+    /// match, `…` marking the cuts.
+    pub line: String,
+    /// The line is from a downloaded output, not the item's own text.
+    pub output: bool,
+}
+
+/// A hit in one session: an item, or (`item: None`) the session's name or workdir.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionHit {
+    pub session: SessionId,
+    pub title: String,
+    pub workdir: Option<String>,
+    pub last_activity: DateTime<Utc>,
+    pub item: Option<ItemHit>,
+}
+
+/// What a search over sessions found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionsFound {
+    /// Session hits first, then item hits newest first.
+    pub hits: Vec<SessionHit>,
+    /// The search stopped at [`SEARCH_HITS_MAX`] item hits: more may match.
+    pub more: bool,
+    pub not_downloaded: usize,
+    pub cut: usize,
+}
+
+/// `item` as a hit for `query`, given the hit `find` made of it and the
+/// blob texts it read: the first of the item's own texts that matches, else
+/// the blob line. `None` for an item that is not `Logged`.
+pub fn item_hit(
+    item: &TimelineItem,
+    hit: &Hit,
+    query: &Query,
+    blobs: &HashMap<BlobId, BlobText>,
+) -> Option<ItemHit> {
+    let TimelineItem::Logged { seq, at, entry, .. } = item else {
+        return None;
+    };
+    let (line, output) = match texts(item).into_iter().find(|text| query.matches(text)) {
+        Some(text) => {
+            let line = query.first_line(text).unwrap_or(0);
+            (text.split('\n').nth(line).unwrap_or_default(), false)
+        }
+        None => {
+            let blob = hit.blob?;
+            let text = blobs.get(&blob.id)?;
+            (
+                text.text.split('\n').nth(blob.line).unwrap_or_default(),
+                true,
+            )
+        }
+    };
+    Some(ItemHit {
+        seq: *seq,
+        at: *at,
+        kind: HitKind::of(entry),
+        line: cut_round_match(line, query),
+        output,
+    })
+}
+
+/// `line` whole if it is at most [`LINE_MAX_BYTES`] long, else the window of
+/// it round `query`'s first match there, with `…` where it was cut.
+fn cut_round_match(line: &str, query: &Query) -> String {
+    if line.len() <= LINE_MAX_BYTES {
+        return line.to_owned();
+    }
+    let matched = query.ranges(line).first().map_or(0, |range| range.start);
+    // Context kept before the match.
+    let mut start = matched.saturating_sub(512);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + LINE_MAX_BYTES).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&line[start..end]);
+    if end < line.len() {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]

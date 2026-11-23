@@ -90,7 +90,7 @@ pub fn update(search: &TimelineSearch, view: &SessionView, rows: &[TimelineRow])
     }
 }
 
-fn utf16_range(range: Range<u64>) -> Utf16Range {
+pub(crate) fn utf16_range(range: Range<u64>) -> Utf16Range {
     let unit = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
     Utf16Range {
         start: unit(range.start),

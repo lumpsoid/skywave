@@ -8,6 +8,7 @@ use std::thread;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::attachment::{AttachedFile, AttachedImage};
+use skywave_core::search::{HitKind, ItemHit, SEARCH_HITS_MAX, SessionsFound};
 use skywave_core::{
     Action, AppScreenView, Attention, BlobState, BlobStatus, CaptureFormat, ComposerMode,
     ContentHash, Core, CoreError, Delivery, DeviceRef, Draft, Entry, FailReason, Fingerprint,
@@ -18,8 +19,9 @@ use skywave_core::{
     ViewState,
 };
 use skywave_proto::{
-    ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
-    DeviceId, Event, EventBatch, EventKind, Full, RejectReason, Seq, SessionId, ToolResult,
+    ApprovalId, BlobId, BlobRef, CallId, CommandId, CommandKind, CommandResult, ContextId,
+    Decision, DeviceId, Event, EventBatch, EventKind, Full, RejectReason, Seq, SessionId, ToolCall,
+    ToolDisplay, ToolKind, ToolResult,
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
@@ -3155,4 +3157,346 @@ fn a_session_with_an_event_that_no_longer_decodes_can_be_deleted() {
     assert!(store.session(r.sid).unwrap().is_none());
     assert!(store.session_events(r.sid).unwrap().is_empty());
     assert!(store.load().unwrap().deleted.contains(&r.sid));
+}
+
+fn created(workdir: &str) -> EventKind {
+    EventKind::SessionCreated {
+        workdir: workdir.into(),
+        context_name: "start".into(),
+        from: None,
+        worktree: None,
+    }
+}
+
+/// Session `a` with a "fox" message and a "fox" tool call, and session `b`
+/// with a "fox" reply and a reply that does not match.
+fn two_sessions_with_fox(seam: &Seam, device: DeviceId) -> (SessionId, SessionId) {
+    let (a, b) = (SessionId::new(), SessionId::new());
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(a, 0, created("/srv/a")),
+            event(b, 0, created("/srv/b")),
+            event(
+                a,
+                1,
+                EventKind::UserMessage {
+                    device_id: device,
+                    text: "a fox asked".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            event(
+                a,
+                2,
+                EventKind::ToolCall(ToolCall {
+                    call: None,
+                    parent: None,
+                    name: "Bash".into(),
+                    display: ToolDisplay {
+                        kind: ToolKind::Other,
+                        title: "grep fox".into(),
+                        detail: None,
+                        body: None,
+                    },
+                    input: None,
+                }),
+            ),
+            event(
+                b,
+                3,
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: "the fox ran".into(),
+                    full: None,
+                },
+            ),
+            event(
+                b,
+                4,
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: "nothing here".into(),
+                    full: None,
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    (a, b)
+}
+
+#[test]
+fn search_finds_items_across_sessions_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let (a, b) = two_sessions_with_fox(&seam, device);
+    let found = core.search("fox", None);
+    assert_eq!(found.hits.len(), 3, "{found:?}");
+    assert!(!found.more);
+    assert_eq!(
+        found.hits.iter().map(|hit| hit.session).collect::<Vec<_>>(),
+        [b, a, a]
+    );
+    let items: Vec<&ItemHit> = found
+        .hits
+        .iter()
+        .map(|hit| hit.item.as_ref().expect("an item hit"))
+        .collect();
+    let at = |minute| Utc.with_ymd_and_hms(2026, 10, 29, 11, minute, 0).unwrap();
+    assert_eq!(
+        items.iter().map(|item| item.at).collect::<Vec<_>>(),
+        [at(3), at(2), at(1)]
+    );
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.kind.clone())
+            .collect::<Vec<_>>(),
+        [
+            HitKind::AgentMessage,
+            HitKind::Tool {
+                name: "Bash".into()
+            },
+            HitKind::UserMessage,
+        ]
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item.line.contains("fox") && !item.output)
+    );
+}
+
+#[test]
+fn search_finds_a_session_by_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(sid, 0, created("/srv/a")),
+            event(
+                sid,
+                1,
+                EventKind::SessionRenamed {
+                    name: Some("fox hunt".into()),
+                    by: device,
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    let found = core.search("fox", None);
+    // The session hit comes first. The rename is also a timeline item that
+    // names the session, so it is an item hit after the session hit.
+    assert_eq!(found.hits.len(), 2, "{found:?}");
+    assert_eq!(found.hits[0].item, None);
+    assert_eq!(found.hits[0].title, "fox hunt");
+    assert_eq!(
+        found.hits[1].item.as_ref().map(|item| item.kind.clone()),
+        Some(HitKind::Other)
+    );
+}
+
+#[test]
+fn an_unnamed_session_is_not_a_session_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(sid, 0, created("/srv/a")),
+            event(
+                sid,
+                1,
+                EventKind::UserMessage {
+                    device_id: device,
+                    text: "a fox".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    // The session's title is its first prompt, so the prompt is the only hit.
+    let found = core.search("fox", None);
+    assert_eq!(found.hits.len(), 1, "{found:?}");
+    assert_eq!(
+        found.hits[0].item.as_ref().map(|item| item.kind.clone()),
+        Some(HitKind::UserMessage)
+    );
+}
+
+#[test]
+fn a_scoped_search_skips_other_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let (a, _b) = two_sessions_with_fox(&seam, device);
+    let found = core.search("fox", Some(a));
+    assert_eq!(found.hits.len(), 2, "{found:?}");
+    assert!(
+        found
+            .hits
+            .iter()
+            .all(|hit| hit.session == a && hit.item.is_some())
+    );
+}
+
+#[test]
+fn search_skips_subagent_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, _device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(sid, 0, created("/srv/a")),
+            event(
+                sid,
+                1,
+                EventKind::AgentMessage {
+                    parent: Some(CallId::new()),
+                    text: "a fox in a subagent".into(),
+                    full: None,
+                },
+            ),
+            event(
+                sid,
+                2,
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: "a fox here".into(),
+                    full: None,
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    // The main timeline's message is found; the subagent's is not.
+    let found = core.search("fox", None);
+    assert_eq!(found.hits.len(), 1, "{found:?}");
+    assert_eq!(
+        found.hits[0].item.as_ref().map(|item| item.line.as_str()),
+        Some("a fox here")
+    );
+}
+
+#[test]
+fn an_empty_query_finds_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    two_sessions_with_fox(&seam, device);
+    assert_eq!(core.search("", None), SessionsFound::default());
+}
+
+#[test]
+fn search_stops_at_its_hit_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    let mut events = vec![event(sid, 0, created("/srv/a"))];
+    let base = Utc.with_ymd_and_hms(2026, 10, 29, 11, 0, 0).unwrap();
+    for i in 0..=SEARCH_HITS_MAX {
+        let text = match i {
+            0 => "fox oldest".to_owned(),
+            SEARCH_HITS_MAX => "fox newest".to_owned(),
+            n => format!("fox {n}"),
+        };
+        let mut message = event(
+            sid,
+            1,
+            EventKind::UserMessage {
+                device_id: device,
+                text,
+                attachments: Vec::new(),
+            },
+        );
+        // Seconds: an hour has fewer than 201 minutes, and `event` takes minutes.
+        message.at = base + chrono::TimeDelta::seconds(i as i64);
+        events.push(message);
+    }
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events,
+    })
+    .unwrap();
+    let found = core.search("fox", None);
+    assert_eq!(found.hits.len(), SEARCH_HITS_MAX);
+    assert!(found.more);
+    let lines: Vec<&str> = found
+        .hits
+        .iter()
+        .filter_map(|hit| hit.item.as_ref())
+        .map(|item| item.line.as_str())
+        .collect();
+    assert!(lines.contains(&"fox newest"), "{lines:?}");
+    assert!(!lines.contains(&"fox oldest"), "{lines:?}");
+}
+
+#[test]
+fn a_long_line_is_cut_round_its_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    let text = format!("{}fox{}", "a".repeat(5000), "b".repeat(5000));
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(sid, 0, created("/srv/a")),
+            event(
+                sid,
+                1,
+                EventKind::UserMessage {
+                    device_id: device,
+                    text,
+                    attachments: Vec::new(),
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    let found = core.search("fox", None);
+    assert_eq!(found.hits.len(), 1, "{found:?}");
+    let line = found.hits[0].item.as_ref().map(|item| item.line.as_str());
+    let line = line.unwrap_or_default();
+    assert!(line.starts_with('…'), "{line}");
+    assert!(line.ends_with('…'), "{line}");
+    assert!(line.contains("fox"), "{line}");
+    assert!(
+        line.len() <= 2048 + 2 * '…'.len_utf8(),
+        "{} bytes",
+        line.len()
+    );
+}
+
+#[test]
+fn search_opens_scoped_and_back_returns_to_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, _requests, sid) = core_with_session(dir.path());
+    core.dispatch(Action::OpenSearch(Some(sid))).unwrap();
+    let view = core.view();
+    let Screen::Search(search) = &view.screen else {
+        panic!("expected the search page, got {:?}", view.screen);
+    };
+    assert_eq!(search.scope.as_ref().map(|scope| scope.id), Some(sid));
+    assert!(view.can_go_back);
+    core.dispatch(Action::Back).unwrap();
+    assert!(matches!(core.view().screen, Screen::Session(_)));
+}
+
+#[test]
+fn search_over_every_session_goes_back_to_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, _requests, _sid) = core_with_session(dir.path());
+    core.dispatch(Action::OpenSearch(None)).unwrap();
+    let view = core.view();
+    let Screen::Search(search) = &view.screen else {
+        panic!("expected the search page, got {:?}", view.screen);
+    };
+    assert!(search.scope.is_none());
+    core.dispatch(Action::Back).unwrap();
+    assert!(matches!(core.view().screen, Screen::SessionList(_)));
 }

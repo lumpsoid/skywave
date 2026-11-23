@@ -65,6 +65,11 @@ class _SessionPageState extends State<SessionPage> {
   final _composerFocus = FocusNode(debugLabel: 'composer');
   final _searchFocus = FocusNode(debugLabel: 'search');
   SearchHolder? _ownSearch;
+
+  /// The search holder this page listens to, and whether its search was open
+  /// at the last change.
+  SearchHolder? _listened;
+  bool _searchOpen = false;
   ShellHolder? _ownShell;
   AppScreenHolder? _ownAppScreen;
 
@@ -90,8 +95,43 @@ class _SessionPageState extends State<SessionPage> {
   late final _work = ValueNotifier<SessionScreen>(widget.screen);
 
   @override
+  void initState() {
+    super.initState();
+    _listenToSearch();
+    // The hub sends the session with its open search: it is open at mount.
+    if (_searchOpen) _focusTimelineAfterFrame();
+  }
+
+  /// Listens to the search this page shows, as it is now: a search that
+  /// opens hands the keyboard to the timeline, for n/N.
+  void _listenToSearch() {
+    final search = _search;
+    if (identical(search, _listened)) return;
+    _listened?.removeListener(_onSearchChanged);
+    _listened = search;
+    _searchOpen = search.search?.open ?? false;
+    search.addListener(_onSearchChanged);
+  }
+
+  void _onSearchChanged() {
+    final open = _search.search?.open ?? false;
+    if (open == _searchOpen) return;
+    _searchOpen = open;
+    if (open) _focusTimelineAfterFrame();
+  }
+
+  /// Hands the keyboard to the timeline after the frame: the bar that just
+  /// opened is in the tree then.
+  void _focusTimelineAfterFrame() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _timelineView.currentState?.focusNode.requestFocus();
+    });
+  }
+
+  @override
   void didUpdateWidget(SessionPage oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _listenToSearch();
     // After the frame: the sheet rebuilds from this, not during our build.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _work.value = widget.screen;
@@ -142,6 +182,7 @@ class _SessionPageState extends State<SessionPage> {
   void dispose() {
     _composerFocus.dispose();
     _searchFocus.dispose();
+    _listened?.removeListener(_onSearchChanged);
     _ownSearch?.dispose();
     _ownShell?.dispose();
     _ownAppScreen?.dispose();
@@ -288,14 +329,9 @@ class _SessionPageState extends State<SessionPage> {
     );
   }
 
-  void _openSearch() {
-    final search = _search.search;
-    if (search != null && search.open) {
-      _searchFocus.requestFocus();
-    } else {
-      widget.send(GuiIntentSearchTyped(query: search?.query ?? ''));
-    }
-  }
+  /// Opens the search page, scoped to this session.
+  void _openSearch() =>
+      widget.send.act(ActionIntentOpenSearch(sessionId: _screen.sessionId));
 
   /// Reveals the call an approval gates, expanded.
   void _showCall(String key) {
@@ -714,10 +750,7 @@ class _SessionPageState extends State<SessionPage> {
                       search: search,
                       send: widget.send,
                       focusNode: _searchFocus,
-                      newestVisibleKey: () =>
-                          _timelineView.currentState?.newestVisibleKey(),
-                      onStepped: () =>
-                          _timelineView.currentState?.focusNode.requestFocus(),
+                      onEdit: _openSearch,
                     );
                   },
                 ),

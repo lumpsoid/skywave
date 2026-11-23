@@ -239,10 +239,6 @@ pub enum GuiIntent {
         key: String,
         what: CopyWhat,
     },
-    /// The search's query, opening a search if none is open.
-    SearchTyped {
-        query: String,
-    },
     /// Jump to the next older (`Some(true)`) or newer match, round the
     /// ends; `None` jumps to the nearest at or above `from_key` (the
     /// newest visible row; the end when `None`).
@@ -251,6 +247,15 @@ pub enum GuiIntent {
         from_key: Option<String>,
     },
     SearchClose,
+    /// The search page's query; searched once typing pauses.
+    GlobalSearchTyped {
+        query: String,
+    },
+    /// Open the search page's hit `key`: its session, at the item, the matches
+    /// marked.
+    GlobalSearchOpen {
+        key: String,
+    },
     /// Open the new-session prompt.
     CreateOpen,
     /// The workdir input changed.
@@ -519,6 +524,10 @@ pub enum ActionIntent {
     },
     OpenSession {
         session_id: String,
+    },
+    /// Open the search page, over `session_id`'s session only, or every session.
+    OpenSearch {
+        session_id: Option<String>,
     },
     /// The session's workdir screen, at its changes; it reads them.
     OpenWorkdir {

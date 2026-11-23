@@ -3,6 +3,7 @@
 //! change.
 
 use std::any::Any;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -26,8 +27,9 @@ use crate::identity::{IdentityError, Pairing};
 use crate::lock::{DataDirLock, LockError};
 use crate::model::{Effect, Model, Paired};
 use crate::seam::{Request, Seam};
+use crate::search::{BlobText, Query, SEARCH_HITS_MAX, SessionHit, SessionsFound, find, item_hit};
 use crate::store::{Store, StoreError};
-use crate::view::{BlobId, ViewState};
+use crate::view::{BlobId, SessionId, ViewState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -422,6 +424,75 @@ impl Core {
     /// The current snapshot, for heads that poll instead of subscribing.
     pub fn view(&self) -> ViewState {
         lock(&self.shared.state).model.view()
+    }
+
+    /// Every session's items `text` matches, or only `scope`'s, and the
+    /// sessions whose name or workdir it matches (see `search::SessionsFound`).
+    /// The state is locked once per session, to build its timeline; matching
+    /// and reading downloaded outputs happen outside the lock. Blocking: call
+    /// it off the UI thread.
+    pub fn search(&self, text: &str, scope: Option<SessionId>) -> SessionsFound {
+        let query = Query::new(text);
+        if query.is_empty() {
+            return SessionsFound::default();
+        }
+        let targets = lock(&self.shared.state).model.search_targets(scope);
+        let mut found = SessionsFound::default();
+        let mut items: Vec<SessionHit> = Vec::new();
+        for target in targets {
+            let workdir_matches = target
+                .workdir
+                .as_deref()
+                .is_some_and(|workdir| query.matches(workdir));
+            // An unnamed session's title is its first prompt, already an item hit.
+            if (target.named && query.matches(&target.title)) || workdir_matches {
+                found.hits.push(SessionHit {
+                    session: target.id,
+                    title: target.title.clone(),
+                    workdir: target.workdir.clone(),
+                    last_activity: target.last_activity,
+                    item: None,
+                });
+            }
+            if items.len() >= SEARCH_HITS_MAX {
+                found.more = true;
+                continue;
+            }
+            let timeline = {
+                let state = lock(&self.shared.state);
+                let Ok(events) = state.store.session_events(target.id) else {
+                    continue;
+                };
+                state.model.search_timeline(target.id, &events)
+            };
+            let mut texts: HashMap<BlobId, BlobText> = HashMap::new();
+            let result = find(&timeline, &query, &mut |blob| {
+                let text = BlobText::read(blob)?;
+                texts.insert(blob.id, text.clone());
+                Some(text)
+            });
+            found.not_downloaded += result.not_downloaded;
+            found.cut += result.cut;
+            // Newest first, so the cap keeps each session's newest hits.
+            for hit in result.hits.iter().rev() {
+                if items.len() >= SEARCH_HITS_MAX {
+                    found.more = true;
+                    break;
+                }
+                if let Some(item) = item_hit(&timeline[hit.index], hit, &query, &texts) {
+                    items.push(SessionHit {
+                        session: target.id,
+                        title: target.title.clone(),
+                        workdir: target.workdir.clone(),
+                        last_activity: target.last_activity,
+                        item: Some(item),
+                    });
+                }
+            }
+        }
+        items.sort_by_key(|hit| Reverse(hit.item.as_ref().map(|item| item.at)));
+        found.hits.extend(items);
+        found
     }
 
     /// Calls `watcher` if the core fails: a panic in its sync engine (any

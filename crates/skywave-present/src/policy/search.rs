@@ -314,25 +314,10 @@ impl TimelineSearch {
         byte_ranges_to_utf16(text, &self.query.ranges(text))
     }
 
-    /// What the search could not look through, if anything: `3 outputs not
-    /// downloaded`, `1 output searched only in its first 1.0 MiB`.
+    /// What the search could not look through, if anything: see
+    /// [`partial_label`].
     pub fn partial(&self) -> Option<String> {
-        let outputs = |n: usize| if n == 1 { "output" } else { "outputs" };
-        let mut out = Vec::new();
-        match self.found.not_downloaded {
-            0 => {}
-            n => out.push(format!("{n} {} not downloaded", outputs(n))),
-        }
-        match self.found.cut {
-            0 => {}
-            n => out.push(format!(
-                "{n} {} searched only in {} first {}",
-                outputs(n),
-                if n == 1 { "its" } else { "their" },
-                bytes(HEAD_BYTES)
-            )),
-        }
-        (!out.is_empty()).then(|| out.join(" · "))
+        partial_label(self.found.not_downloaded, self.found.cut)
     }
 
     /// How the search stands: `3 of 17`, `17 matches` before a jump, `no
@@ -350,6 +335,27 @@ impl TimelineSearch {
     pub fn status(&self, view: &SessionView) -> String {
         format!("/{} · {}", self.query.as_str(), self.count(view))
     }
+}
+
+/// What a search could not look through, if anything: `3 outputs not
+/// downloaded`, `1 output searched only in its first 1.0 MiB`.
+pub fn partial_label(not_downloaded: usize, cut: usize) -> Option<String> {
+    let outputs = |n: usize| if n == 1 { "output" } else { "outputs" };
+    let mut out = Vec::new();
+    match not_downloaded {
+        0 => {}
+        n => out.push(format!("{n} {} not downloaded", outputs(n))),
+    }
+    match cut {
+        0 => {}
+        n => out.push(format!(
+            "{n} {} searched only in {} first {}",
+            outputs(n),
+            if n == 1 { "its" } else { "their" },
+            bytes(HEAD_BYTES)
+        )),
+    }
+    (!out.is_empty()).then(|| out.join(" · "))
 }
 
 #[cfg(test)]

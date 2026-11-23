@@ -50,7 +50,7 @@ pub use expand::ExpandFetch;
 pub use history::{PromptHistory, Recall};
 pub use history_search::{HistoryMatch, search_history};
 pub use read::{READ_MARK_EVERY, ReadMarker};
-pub use search::{Jump, TimelineSearch};
+pub use search::{Jump, TimelineSearch, partial_label};
 pub use shell::shell_stop;
 pub use workdir_picker::{WorkdirPicker, choosable};
 

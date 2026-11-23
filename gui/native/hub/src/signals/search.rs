@@ -6,7 +6,8 @@ use serde::Serialize;
 /// by the hub: its row arrives expanded on the timeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, RustSignal)]
 pub struct SearchUpdate {
-    /// A search is open (`SearchTyped`) and not closed (`SearchClose`).
+    /// A search is open: the hub opens it when a search page hit is opened
+    /// (`GlobalSearchOpen`), and `SearchClose` closes it.
     pub open: bool,
     pub query: String,
     /// `3 of 17`, `17 matches`, `no matches`.

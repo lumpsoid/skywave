@@ -104,6 +104,10 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
                     .block(Block::bordered().title(" Worktrees ")),
                 body,
             ),
+            Screen::Search(_) => frame.render_widget(
+                Paragraph::new("Search is in the GUI.").block(Block::bordered().title(" Search ")),
+                body,
+            ),
             Screen::Approvals(view) => frame.render_widget(
                 Paragraph::new(format!(
                     "Approvals: {} waiting · answer them in the GUI or in each session",
@@ -1022,7 +1026,9 @@ fn footer_keys(app: &App) -> &'static str {
         Screen::Storage(_) => {
             "↑↓ select · D delete · K crop · r refresh · Tab list · Esc back · ? help · q quit"
         }
-        Screen::Worktrees(_) | Screen::Approvals(_) => "Esc back · ? help · q quit",
+        Screen::Worktrees(_) | Screen::Approvals(_) | Screen::Search(_) => {
+            "Esc back · ? help · q quit"
+        }
         Screen::Workdir(view) => match view.pane {
             WorkdirPane::Changes | WorkdirPane::Commits | WorkdirPane::Dir { .. } => {
                 "↑↓ select · Enter open · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
@@ -1413,6 +1419,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         Screen::Approvals(_) => {
             lines.extend([section("Approvals"), key("Esc", "back to sessions")])
         }
+        Screen::Search(_) => lines.extend([section("Search"), key("Esc", "back")]),
         Screen::Workdir(_) => lines.extend([
             section("Workdir (w on a session's timeline)"),
             key("Tab", "switch between changes and files"),

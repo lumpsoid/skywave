@@ -58,6 +58,7 @@ pub mod markdown;
 pub mod output;
 pub mod policy;
 pub mod question;
+pub mod search_hits;
 pub mod sections;
 pub mod session_info;
 pub mod session_list;

@@ -51,14 +51,14 @@ use crate::view::{
     LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
     PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
     PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER,
-    SafetyFeedbackView, SafetyRuleView, Screen, ScreenRequest, ScreenRequestState, Seq,
-    ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow,
-    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
-    ShellView, Snippet, SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader,
-    SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView,
-    UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WaitingApproval,
-    WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession,
-    WorktreesView,
+    SafetyFeedbackView, SafetyRuleView, Screen, ScreenRequest, ScreenRequestState, SearchScope,
+    SearchView, Seq, ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef,
+    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun,
+    ShellRunState, ShellView, Snippet, SnippetId, StorageReport, StorageSession, StorageView,
+    SubagentHeader, SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome,
+    ToolView, UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState,
+    WaitingApproval, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView,
+    WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -131,6 +131,16 @@ struct Title {
     rename: Option<Outgoing>,
 }
 
+/// A session a search looks through.
+pub(crate) struct SearchTarget {
+    pub id: SessionId,
+    pub title: String,
+    /// `title` is a name the user gave, not the session's first prompt.
+    pub named: bool,
+    pub workdir: Option<String>,
+    pub last_activity: DateTime<Utc>,
+}
+
 /// The screen shown, with what only that screen keeps: leaving it drops
 /// that.
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +158,10 @@ enum Place {
     /// The usage limits page, opened from the session on screen, if any:
     /// back returns there.
     UsageLimits(Option<SessionId>),
+    /// The search page; `scope` its one session, if any.
+    Search {
+        scope: Option<SessionId>,
+    },
     Session {
         id: SessionId,
         /// Its events, once loaded from the replica.
@@ -1285,6 +1299,13 @@ impl Model {
                 self.place = Place::session(id);
                 vec![Effect::LoadSession(id)]
             }
+            Action::OpenSearch(scope) => {
+                if self.device().is_none() || scope.is_some_and(|id| self.summary(id).is_none()) {
+                    return Vec::new();
+                }
+                self.place = Place::Search { scope };
+                Vec::new()
+            }
             Action::OpenNextApproval => match self.next_approval() {
                 Some(id) => self.dispatch(Action::OpenSession(id)),
                 None => Vec::new(),
@@ -1602,6 +1623,12 @@ impl Model {
             Place::ServerAddresses => Route::Settings,
             Place::UsageLimits(from) => {
                 return Some(match from.filter(|id| self.summary(*id).is_some()) {
+                    Some(id) => Action::OpenSession(id),
+                    None => Action::Navigate(Route::SessionList),
+                });
+            }
+            Place::Search { scope } => {
+                return Some(match scope.filter(|id| self.summary(*id).is_some()) {
                     Some(id) => Action::OpenSession(id),
                     None => Action::Navigate(Route::SessionList),
                 });
@@ -3233,6 +3260,15 @@ impl Model {
                 None => Screen::SessionList(self.session_list(ListKind::Active, None)),
             },
             Place::Crop(page) => Screen::Crop(self.crop_view(page)),
+            // A scope whose session is gone searches every session's page.
+            Place::Search { scope } => Screen::Search(SearchView {
+                scope: scope.and_then(|id| {
+                    self.summary(id).map(|summary| SearchScope {
+                        id,
+                        title: self.title(summary).text,
+                    })
+                }),
+            }),
         }
     }
 
@@ -4567,6 +4603,39 @@ impl Model {
                 .map(|e| e.command.id);
         }
         contexts
+    }
+
+    /// The sessions a search looks through, in the session list's order:
+    /// only `scope`'s when it is given.
+    pub(crate) fn search_targets(&self, scope: Option<SessionId>) -> Vec<SearchTarget> {
+        self.sessions
+            .iter()
+            .filter(|summary| scope.is_none_or(|id| summary.id == id))
+            .map(|summary| {
+                let title = self.title(summary);
+                SearchTarget {
+                    id: summary.id,
+                    title: title.text,
+                    named: title.named,
+                    workdir: summary.workdir.clone(),
+                    last_activity: summary.last_activity,
+                }
+            })
+            .collect()
+    }
+
+    /// The session's items a search looks through: its logged items outside
+    /// any subagent, in log order.
+    pub(crate) fn search_timeline(
+        &self,
+        id: SessionId,
+        events: &[(Seq, Event)],
+    ) -> Vec<TimelineItem> {
+        self.timeline(id, events)
+            .0
+            .into_iter()
+            .filter(|item| matches!(item, TimelineItem::Logged { parent: None, .. }))
+            .collect()
     }
 
     /// The session's timeline and the rules granted in it, in log order.
@@ -14467,6 +14536,7 @@ mod tests {
             Screen::Storage(_) => "storage",
             Screen::Worktrees(_) => "worktrees",
             Screen::Approvals(_) => "approvals",
+            Screen::Search(_) => "search",
             Screen::UsageLimits(_) => "usage limits",
             Screen::SessionInfo(_) => "session info",
             Screen::Workdir(_) => "workdir",

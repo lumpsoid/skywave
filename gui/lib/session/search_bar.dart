@@ -4,17 +4,15 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The search through the timeline, while the hub has one open: the
-/// query (each edit is `SearchTyped`), how many matches and where, and
-/// steps through them. Enter jumps to the nearest match at or above the
-/// newest row in view; ↑/↓ (or n/N on the timeline) step older and newer;
-/// Esc closes it.
+/// The search through the timeline, while the hub has one open: how many
+/// matches and where, and steps through them. ↑/↓ (or n/N on the timeline)
+/// step older and newer; Esc closes it. The query is edited on the search
+/// page: tapping it opens that page.
 class SessionSearchBar extends StatefulWidget {
   const SessionSearchBar({
     required this.search,
     required this.send,
-    required this.newestVisibleKey,
-    required this.onStepped,
+    required this.onEdit,
     this.focusNode,
     super.key,
   });
@@ -22,11 +20,9 @@ class SessionSearchBar extends StatefulWidget {
   final SearchUpdate search;
   final SendIntent send;
 
-  /// The newest row in view, for Enter's step.
-  final String? Function() newestVisibleKey;
-
-  /// After Enter: hand the keyboard to the timeline, for n/N.
-  final VoidCallback onStepped;
+  /// Tapped: opens the search page, scoped to this session, to edit the
+  /// query.
+  final VoidCallback onEdit;
   final FocusNode? focusNode;
 
   @override
@@ -37,17 +33,21 @@ class _SessionSearchBarState extends State<SessionSearchBar> {
   late final _field = TextEditingController(text: widget.search.query);
 
   @override
+  void didUpdateWidget(SessionSearchBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_field.text != widget.search.query) {
+      _field.text = widget.search.query;
+    }
+  }
+
+  @override
   void dispose() {
     _field.dispose();
     super.dispose();
   }
 
-  void _step(bool? older) => widget.send(
-    GuiIntentSearchStep(
-      older: older,
-      fromKey: older == null ? widget.newestVisibleKey() : null,
-    ),
-  );
+  void _step(bool older) =>
+      widget.send(GuiIntentSearchStep(older: older, fromKey: null));
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -91,18 +91,13 @@ class _SessionSearchBarState extends State<SessionSearchBar> {
                     child: TextField(
                       controller: _field,
                       focusNode: widget.focusNode,
-                      autofocus: true,
-                      textInputAction: TextInputAction.search,
-                      onChanged: (query) =>
-                          widget.send(GuiIntentSearchTyped(query: query)),
-                      onSubmitted: (_) {
-                        _step(null);
-                        widget.onStepped();
-                      },
+                      autofocus: false,
+                      readOnly: true,
+                      onTap: widget.onEdit,
                       decoration: const InputDecoration(
                         isDense: true,
                         prefixIcon: Icon(Icons.search),
-                        hintText: 'Search this session',
+                        hintText: 'Search',
                         border: InputBorder.none,
                       ),
                     ),
