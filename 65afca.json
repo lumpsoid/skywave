@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-23T09:01:55.969540+00:00",
+      "status": "2026-11-23T09:01:55.969540+00:00",
+      "title": "2026-11-23T09:01:55.969540+00:00"
+    },
+    "tags": {
+      "ci": [
+        "2026-11-23T09:01:55.969540+00:00",
+        false
+      ],
+      "followup": [
+        "2026-11-23T09:01:55.969540+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "ci.yml runs on push to main, pull_request and workflow_dispatch, so agent-ci (which pushes and waits for a push run) times out with exit 2 on feat/* branches. The drive for 4632d9 had to run 'gh workflow run CI --ref <branch>' by hand. Either let agent-ci dispatch the workflow, or add a branch push trigger.",
+  "created": "2026-11-23T09:01:55.969540+00:00",
+  "id": "65afca",
+  "status": "open",
+  "tags": [
+    "ci",
+    "followup"
+  ],
+  "title": "agent-ci finds no run on a work branch",
+  "updated": "2026-11-23T09:01:55.969540+00:00"
+}
