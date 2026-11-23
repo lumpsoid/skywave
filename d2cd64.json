@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-23T09:33:06.742144+00:00",
+      "status": "2026-11-23T09:33:06.742144+00:00",
+      "title": "2026-11-23T09:33:06.742144+00:00"
+    },
+    "tags": {
+      "followup": [
+        "2026-11-23T09:33:06.742144+00:00",
+        false
+      ],
+      "screen": [
+        "2026-11-23T09:33:06.742144+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Part of e553ce. After a failed dispatch (or a send A, edit, send B race where A's ack clears B), _TextEntryState keeps _sent/_sentAim, so the same text to the same capture is skipped silently until the text or capture changes. A hub-side result signal for a failed ScreenText dispatch would reset it.",
+  "created": "2026-11-23T09:33:06.742144+00:00",
+  "id": "d2cd64",
+  "status": "open",
+  "tags": [
+    "followup",
+    "screen"
+  ],
+  "title": "retry app screen text after a failed dispatch",
+  "updated": "2026-11-23T09:33:06.742144+00:00"
+}
