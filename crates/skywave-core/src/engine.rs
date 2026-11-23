@@ -436,6 +436,7 @@ impl Engine {
             // a press that lands mid-connect cannot skip the next wait.
             Request::RetryNow => self.retry_now.notify_waiters(),
             Request::DownloadBlob(id) => self.blobs.want(id),
+            Request::StopBlob(id) => self.blobs.cancel(id),
             Request::BlobsPurged(ids) => self.blobs.purged(&ids),
             Request::BlobPolicyChanged(policy) => {
                 let blobs = self.seam.blobs().unwrap_or_else(|error| {

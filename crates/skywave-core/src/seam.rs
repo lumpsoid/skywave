@@ -67,6 +67,8 @@ pub enum Request {
     DraftImagesChanged,
     /// The user wants this blob's content.
     DownloadBlob(BlobId),
+    /// Stop blob `id`'s download, keeping what it got (the user stopped it).
+    StopBlob(BlobId),
     BlobPolicyChanged(BlobPolicy),
     /// These blobs left the replica (with a locally deleted session, or no
     /// longer named by a refreshed workdir answer), their files already
