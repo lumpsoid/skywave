@@ -29,8 +29,9 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 ///
 /// Desktop keys, as in the TUI: Ctrl+X interrupts (unless text is
 /// selected: then it cuts; in shell mode it stops the shell), Ctrl+F
-/// searches, PgUp/PgDn scroll, Esc closes the search, leaves the
-/// composer, or goes back.
+/// searches, Ctrl+Shift+A approves and Ctrl+Shift+D denies the approval
+/// on screen (or declines the question), PgUp/PgDn scroll, Esc closes the
+/// search, leaves the composer, or goes back.
 class SessionPage extends StatefulWidget {
   const SessionPage({
     required this.screen,
@@ -753,8 +754,9 @@ class _SessionPageState extends State<SessionPage> {
                           onShowCall: question.callKey == null
                               ? null
                               : () => _showCall(question.callKey!),
-                          // Ctrl+Shift+D goes to the approval when both show.
-                          shortcuts: screen.approval == null,
+                          // Ctrl+Shift+D goes to the approval when it can
+                          // be answered; otherwise it declines the question.
+                          shortcuts: screen.approval?.canAnswer != true,
                         ),
                       if (screen.approval case final approval?)
                         ApprovalPanelView(
