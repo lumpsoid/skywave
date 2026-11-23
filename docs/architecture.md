@@ -1090,7 +1090,7 @@ logs) an event that no longer decodes rather than failing.
   `ListKind::Active`, `Archived` and `All`; the all list marks its archived
   rows, and back from a session returns to the list last shown, so
   archiving or unarchiving the open session doesn't move the user to another
-  list.
+  list; that list also shows when the open session is deleted.
 - **Worktrees** (D52): the replica's `sessions` table has a `worktree`
   column (the JSON `{repo, branch}` of the session's `SessionCreated`, NULL
   when it has none) and a `worktree_removed` column (set by
