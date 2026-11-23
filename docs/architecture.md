@@ -1309,8 +1309,9 @@ no longer decodes rather than failing.
   `NotDownloaded`; asking for it, or `Eager` again, resumes from there. The
   user stops one by hand with `Action::StopBlobDownload`, asked for or not and
   whatever the policy: it ends the same way, `Stopped` with its `.part`, and
-  nothing asks for it again on its own (captures, the shown workdir blob)
-  until the user does (`DownloadBlob`, or a new workdir download of it). A
+  the device asks for it again on its own only when the policy is set to
+  `Eager` (a restart under `Eager`, or switching back to it); captures and
+  the shown workdir blob do not, until the user does (`DownloadBlob`, or a new workdir download of it). A
   restart queues `Downloading` rows, and `Stopped` ones only under
   `Eager`, so it never resumes under `OnDemand` what nobody asked for;
   only a kill between the

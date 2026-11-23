@@ -498,7 +498,8 @@ pub enum Action {
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
     /// Stop blob's download, asked for or under way, keeping what it got: it
-    /// shows as not downloaded, nothing asks for it again on its own, and
+    /// shows as not downloaded, only the `Eager` policy, set again or
+    /// restored at start, asks for it again on its own, and
     /// [`Action::DownloadBlob`] resumes it. A no-op otherwise.
     StopBlobDownload(BlobId),
     /// Delete a blob from the server and from every device. Queued in the

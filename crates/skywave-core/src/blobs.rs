@@ -1040,7 +1040,18 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
                         break;
                     }
                 },
-                Slot::Wanted => tokio::time::sleep(next_in).await,
+                // Stopped meanwhile (the user, `BlobQueue::cancel`): no more tries.
+                Slot::Wanted => {
+                    let stopped = tokio::select! {
+                        biased;
+                        () = ctx.queue.dropped(&claim.item) => true,
+                        () = tokio::time::sleep(next_in) => false,
+                    };
+                    if stopped {
+                        tracing::debug!(?id, "blob download stopped while waiting to retry");
+                        break claim.stopped();
+                    }
+                }
             }
         }
     }
@@ -3798,6 +3809,39 @@ mod tests {
         f.queue.cancel(f.blob.id);
         assert!(waiting(&f.queue).is_empty());
         assert!(f.takes_nothing().await);
+    }
+
+    /// A download the user asked for, retrying on the Wanted worker while
+    /// the link is down, stops at once when cancelled: it does not sit out
+    /// its minute-long backoff first.
+    #[tokio::test]
+    async fn a_download_waiting_to_retry_stops_when_cancelled() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        // The first try gets two chunks, then the link goes down.
+        *f.server.break_after.lock().unwrap() = Some(2);
+        let server = f.server.clone();
+        let id = f.blob.id;
+        *f.server.mid_body.lock().unwrap() = Some(Box::new(move || {
+            server.held.lock().unwrap().insert(id, Hold::Offline);
+        }));
+        f.queue.want(id);
+        let downloader = tokio::spawn(run_downloader(
+            f.ctx_backing_off(Duration::from_secs(60), Duration::from_secs(60)),
+        ));
+        // The second try, on the Wanted worker, fails too: it is then in
+        // its wait.
+        until("retrying offline", || {
+            f.server.calls.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+
+        f.queue.cancel(id);
+        until("stopped", || f.stopped_idle()).await;
+        assert!(matches!(f.status(), BlobStatus::Stopped { .. }));
+        assert!(waiting(&f.queue).is_empty());
+        assert!(f.takes_nothing().await);
+        downloader.abort();
+        let _ = downloader.await;
     }
 
     /// An eager worker retrying a blob while the link is down lets it go
