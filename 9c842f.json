@@ -3,7 +3,7 @@
     "deleted": null,
     "fields": {
       "body": "2026-11-22T20:53:41.236012+00:00",
-      "status": "2026-11-22T20:53:41.236012+00:00",
+      "status": "2026-11-23T09:33:06.517194+00:00",
       "title": "2026-11-22T20:53:41.236012+00:00"
     },
     "tags": {
@@ -21,11 +21,11 @@
   "body": "Part of e553ce. _TextEntryState._type clears the field before the hub checks the aim; a stale aim shows a notice and the typed text is lost. Keep the text until the request is queued.",
   "created": "2026-11-22T20:53:41.236012+00:00",
   "id": "9c842f",
-  "status": "open",
+  "status": "done",
   "tags": [
     "followup",
     "screen"
   ],
   "title": "keep app screen text when its aim went stale",
-  "updated": "2026-11-22T20:53:41.236012+00:00"
+  "updated": "2026-11-23T09:33:06.517194+00:00"
 }
