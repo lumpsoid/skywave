@@ -11214,6 +11214,9 @@ mod tests {
         ));
         f.log_stamped(adopted, rest);
         assert_eq!(f.events.len() as u64, finished.0);
+        // Its import is in: the creation opens it, as the dialog asked.
+        assert_eq!(f.model.open_session(), Some(adopted));
+        f.dispatch(Action::Navigate(Route::SessionList));
         let list = f.list_view();
         assert_eq!(list.creating, Vec::new());
         assert!(!list.sessions[0].importing);
