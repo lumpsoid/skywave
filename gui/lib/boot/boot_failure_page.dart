@@ -1,4 +1,5 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 
 /// Rust's boot failure with a Retry (worded [retryLabel]: "Restart" after
 /// the hub crashed), and "Reset local data" when [onReset] is given (the
@@ -37,7 +38,17 @@ class BootFailurePage extends StatelessWidget {
                   ElevatedButton(onPressed: onRetry, child: Text(retryLabel)),
                   if (onReset != null)
                     OutlinedButton(
-                      onPressed: onReset,
+                      onPressed: () async {
+                        if (await confirmIrreversible(
+                          context,
+                          question:
+                              'Reset local data? Messages not sent yet are '
+                              'lost; your sessions sync again from the server.',
+                          action: 'Reset',
+                        )) {
+                          onReset();
+                        }
+                      },
                       child: const Text('Reset local data'),
                     ),
                 ],
