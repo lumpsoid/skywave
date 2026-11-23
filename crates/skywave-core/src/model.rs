@@ -7085,6 +7085,97 @@ mod tests {
         assert!(!answer.retryable);
     }
 
+    // A double tap: the first answer is queued, the second sends nothing.
+    #[test]
+    fn a_second_answer_while_the_first_is_queued_sends_nothing() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let approval = ApprovalId::new();
+        f.log(
+            sid,
+            vec![EventKind::ApprovalRequested {
+                id: approval,
+                call: None,
+                tool: "bash".into(),
+                summary: "ls".into(),
+                input: None,
+                suggestions: Vec::new(),
+                shell: None,
+            }],
+        );
+        f.open(sid);
+        let approve = Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: None,
+        };
+        let first = queued(&f.dispatch(approve.clone()));
+        assert!(matches!(
+            first.kind,
+            CommandKind::ResolveApproval { id, decision: Decision::Approve, .. } if id == approval
+        ));
+        assert!(f.dispatch(approve).is_empty());
+        let deny = Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Deny,
+            rule: None,
+        };
+        assert!(f.dispatch(deny).is_empty());
+
+        // The same for a question, in a fresh session.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let question = ApprovalId::new();
+        let call = CallId::new();
+        let option = |label: &str| skywave_proto::QuestionOption {
+            label: label.into(),
+            description: format!("{label} bread"),
+            preview: None,
+        };
+        let questions = vec![Question {
+            header: "Bread".into(),
+            text: "Which bread?".into(),
+            options: vec![option("Rye"), option("Spelt")],
+            multi_select: false,
+        }];
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(call), ToolKind::Other, "Which bread?"),
+                EventKind::QuestionAsked {
+                    id: question,
+                    call: Some(call),
+                    questions,
+                },
+            ],
+        );
+        f.open(sid);
+        let answer = |picked: Vec<u8>| skywave_proto::QuestionAnswer {
+            picked,
+            other: None,
+        };
+        let reply = Action::AnswerQuestion {
+            id: question,
+            answers: vec![answer(vec![1])],
+        };
+        let queued_answer = queued(&f.dispatch(reply.clone()));
+        assert_eq!(
+            queued_answer.kind,
+            CommandKind::AnswerQuestion {
+                id: question,
+                answers: vec![answer(vec![1])],
+            }
+        );
+        assert!(f.dispatch(reply).is_empty());
+        let deny = Action::ResolveApproval {
+            id: question,
+            decision: Decision::Deny,
+            rule: None,
+        };
+        assert!(f.dispatch(deny).is_empty());
+    }
+
     #[test]
     fn a_granted_rule_shows_on_every_device_and_counts() {
         let mut f = Fixture::paired();
