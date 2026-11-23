@@ -14,6 +14,7 @@
 //!   the core, per platform.
 //! - `prefs`: the head's own preferences, in a file beside the core's data.
 
+mod app_screen;
 mod attach;
 mod boot;
 mod clip;

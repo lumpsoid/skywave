@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use skywave_proto::{Fingerprint, ImageType, Worktree, WorktreeList};
+use skywave_proto::{
+    CaptureFormat, Fingerprint, ImageType, ScreenAction, ScreenDevice, ScreenOutcome, Worktree,
+    WorktreeList,
+};
 use uuid::Uuid;
 
 pub use skywave_proto::{
@@ -1430,6 +1433,8 @@ pub struct SessionView {
     /// [`subagent`](Self::subagent) narrows the timeline to: they are
     /// session-wide and never in the timeline.
     pub shell: ShellView,
+    /// The app screen (D65), session-wide like the shell.
+    pub app_screen: AppScreenView,
     /// Seq of the session's newest event: what
     /// [`Action::MarkRead`](crate::Action::MarkRead) marks through once the
     /// end of the timeline was on screen.
@@ -1565,6 +1570,83 @@ pub enum ShellRunState {
     /// Started and not finished.
     Running,
     Finished(ShellEnd),
+}
+
+/// The session's app screen (D65): the devices the server last listed,
+/// each device's latest capture, and the screen requests.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppScreenView {
+    /// The attached devices, as the newest `Devices` listing said; empty
+    /// before any.
+    pub devices: Vec<ScreenDevice>,
+    /// Each device's latest capture, the one inputs aim at, in the order
+    /// the devices were first captured.
+    pub captures: Vec<AppCapture>,
+    /// Every device's logged requests in log order, then this device's
+    /// not yet in the log, in send order.
+    pub requests: Vec<ScreenRequest>,
+}
+
+impl AppScreenView {
+    /// `device`'s latest capture, if it has one.
+    pub fn latest(&self, device: &str) -> Option<&AppCapture> {
+        self.captures.iter().find(|c| c.device == device)
+    }
+}
+
+/// A device's latest capture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppCapture {
+    /// The attached device's serial.
+    pub device: String,
+    /// The request that took it: the id an input aims at.
+    pub capture: CommandId,
+    pub format: CaptureFormat,
+    /// The image's size in pixels; inputs give coordinates in these.
+    pub width: u32,
+    pub height: u32,
+    /// The device screen's size in pixels.
+    pub screen_width: u32,
+    pub screen_height: u32,
+    /// The image, with its download state.
+    pub content: FullView,
+    pub taken_at: DateTime<Utc>,
+}
+
+/// One screen request, this device's or another's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreenRequest {
+    /// The command id; for a capture, the id inputs aim at.
+    pub request: CommandId,
+    pub action: ScreenAction,
+    /// Who asked for it.
+    pub by: DeviceRef,
+    pub state: ScreenRequestState,
+    /// When the server logged it; `None` while only queued here.
+    pub requested_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    /// This device's delivery state; `None` for another device's.
+    pub outgoing: Option<Outgoing>,
+    /// Whether `Action::Discard` takes it back or dismisses it.
+    pub discardable: bool,
+    pub delivery: Option<Delivery>,
+}
+
+impl ScreenRequest {
+    /// The server refused it for good.
+    pub fn refused(&self) -> bool {
+        matches!(self.outgoing, Some(Outgoing::Failed(_)))
+    }
+}
+
+/// Where a screen request is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScreenRequestState {
+    /// Only in this device's outbox.
+    Pending,
+    /// Logged; the runner has not finished it.
+    Queued,
+    Done(ScreenOutcome),
 }
 
 /// One of a session's contexts as a picker lists it.
@@ -2375,6 +2457,7 @@ mod tests {
             shell_draft: None,
             draft_rev: 0,
             shell: ShellView::default(),
+            app_screen: AppScreenView::default(),
             last_seq: Seq(6),
             unread_from: None,
         };

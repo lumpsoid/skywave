@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use skywave_proto::{ContentHash, SafetyJudgment};
+use skywave_proto::{ContentHash, SafetyJudgment, ScreenAction};
 
 use crate::attachment::{AttachedFile, AttachedImage};
 use crate::login::LoginCode;
@@ -151,6 +151,16 @@ pub enum Action {
         session_id: SessionId,
         run: CommandId,
     },
+    /// Queue a screen action for the session (D65): list the server's
+    /// attached devices, capture one, or send it an input. An input names
+    /// the capture it was aimed at; the server refuses it as
+    /// `ScreenStale` once that capture is no longer the device's latest,
+    /// so a queued input is never applied to a screen that moved on. A
+    /// no-op for an unknown session.
+    Screen {
+        session_id: SessionId,
+        action: ScreenAction,
+    },
     /// Switch what the session's composer writes on this device. Kept per
     /// session across restarts; a no-op for an unknown session.
     SetComposerMode {
@@ -226,9 +236,10 @@ pub enum Action {
         text: String,
     },
     DeleteSnippet(SnippetId),
-    /// Take back one of this device's messages, shell runs or session
-    /// creations that the server never saw, or dismiss one it refused. Only
-    /// items shown as `discardable` can be; anything else is a no-op.
+    /// Take back one of this device's messages, shell runs, screen actions
+    /// or session creations that the server never saw, or dismiss one it
+    /// refused. Only items shown as `discardable` can be; anything else is a
+    /// no-op.
     Discard(CommandId),
     /// Take back a `discardable` message into its session's draft, ahead of
     /// what the draft held, its images ahead of the draft's, to edit and send

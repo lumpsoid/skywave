@@ -3,6 +3,7 @@ use std::fmt;
 use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
+use super::app_screen::AppScreenKeyView;
 use super::crop::{BlobUseView, LineSpanView};
 use super::screen::{
     EffortView, PermissionModeView, StorageGroupingView, UsageGroupingView, UsageSpanView,
@@ -97,6 +98,60 @@ pub enum GuiIntent {
     CopyShellOutput {
         session_id: String,
         run_id: String,
+    },
+    /// Show the open session's app screen in place of the timeline, or the
+    /// timeline again. Opening it lists the devices, unless they are listed
+    /// or being listed.
+    AppScreenToggle {
+        session_id: String,
+    },
+    /// List the attached devices again.
+    AppScreenDevices {
+        session_id: String,
+    },
+    /// Show the device `serial`: its latest capture is asked for.
+    AppScreenSelect {
+        session_id: String,
+        serial: String,
+    },
+    /// Capture the shown device's screen again.
+    AppScreenCapture {
+        session_id: String,
+    },
+    /// A tap at `x`, `y` of the capture `capture_id` (the update's), in its
+    /// pixels.
+    AppScreenTap {
+        session_id: String,
+        capture_id: String,
+        x: u32,
+        y: u32,
+    },
+    /// A swipe of the capture `capture_id`, in its pixels.
+    AppScreenSwipe {
+        session_id: String,
+        capture_id: String,
+        from_x: u32,
+        from_y: u32,
+        to_x: u32,
+        to_y: u32,
+    },
+    /// Text typed into the capture `capture_id`'s screen; blank types nothing.
+    AppScreenText {
+        session_id: String,
+        capture_id: String,
+        text: String,
+    },
+    /// A hardware key pressed on the capture `capture_id`'s screen.
+    AppScreenKey {
+        session_id: String,
+        capture_id: String,
+        key: AppScreenKeyView,
+    },
+    /// Dismiss the open session's app screen request `request_id`, when it
+    /// is refused or stale and the core can take it back.
+    AppScreenDismiss {
+        session_id: String,
+        request_id: String,
     },
     /// Run a shell snippet's text as a command at once, on no condition;
     /// the composer keeps what it holds.

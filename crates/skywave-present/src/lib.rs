@@ -46,6 +46,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod app_screen;
 pub mod blob_actions;
 pub mod clip;
 pub mod crop;

@@ -78,7 +78,10 @@ pub use projection::{BlobFate, ContextFill, SessionSummary, SessionUsage, TurnRe
 pub use seam::{Request, Seam};
 pub use search::Query;
 pub use skywave_proto::PROTOCOL_VERSION;
-pub use skywave_proto::{ContentHash, Fingerprint, ImageType};
+pub use skywave_proto::{
+    CaptureFormat, ContentHash, Fingerprint, ImageType, ScreenAction, ScreenDevice, ScreenImage,
+    ScreenKey, ScreenOutcome, ScreenShot,
+};
 pub use store::{
     Applied, AttachmentRefusal, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry,
     OutboxStatus, PendingCrop, ReadMark, SafetyRule, ServerFacts, Settings, Snapshot, Store,
@@ -89,24 +92,25 @@ pub use transport::{
     UploadFile,
 };
 pub use view::{
-    AgentSetting, AgentView, AgentWork, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus,
-    ApprovalsView, Asks, Attention, BackgroundTask, BlobChange, BlobCommand, BlobId, BlobPending,
-    BlobState, BlobView, BodyFormat, BodyView, CallId, Candidate, CandidateSource, CommandId,
-    Completion, CompletionStatus, ComposerMode, ContextId, ContextView, ConversationItem,
-    ConversationPicker, ConversationsStatus, ConversationsUnavailable, CropContent, CropView,
-    Decision, Delivery, DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo, FailReason,
-    FeedbackSent, FullView, IdleAlert, ImportOutcome, ImportedEntry, Link, LinkFailure,
-    LinkRejection, ListKind, MessageImage, ModelChoice, Outgoing, PairedInfo, PairedLink,
-    PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule, PendingSession,
-    PermissionMode, PushState, QUESTION_TOOL, Question, QuestionAnswer, QuestionOption,
-    QuestionPrompt, Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER,
-    SafetyFeedbackView, SafetyJudgment, SafetyRuleView, Schedule, ScheduleId, Screen, Seq,
-    ServerAddressesView, SessionId, SessionListView, SessionRef, SessionRow, SessionState,
-    SessionView, SettingChange, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
-    ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus, SubagentUsage, TaskId, TaskKind,
-    TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession,
-    UsageView, ViewState, WaitingApproval, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane,
-    WorkdirPush, WorkdirView,
+    AgentSetting, AgentView, AgentWork, Answer, AppCapture, AppScreenView, ApprovalId,
+    ApprovalPrompt, ApprovalStatus, ApprovalsView, Asks, Attention, BackgroundTask, BlobChange,
+    BlobCommand, BlobId, BlobPending, BlobState, BlobView, BodyFormat, BodyView, CallId, Candidate,
+    CandidateSource, CommandId, Completion, CompletionStatus, ComposerMode, ContextId, ContextView,
+    ConversationItem, ConversationPicker, ConversationsStatus, ConversationsUnavailable,
+    CropContent, CropView, Decision, Delivery, DeviceId, DeviceRef, Draft, Effort, Entry,
+    ErrorInfo, FailReason, FeedbackSent, FullView, IdleAlert, ImportOutcome, ImportedEntry, Link,
+    LinkFailure, LinkRejection, ListKind, MessageImage, ModelChoice, Outgoing, PairedInfo,
+    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
+    PendingSession, PermissionMode, PushState, QUESTION_TOOL, Question, QuestionAnswer,
+    QuestionOption, QuestionPrompt, Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen,
+    SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyJudgment, SafetyRuleView, Schedule, ScheduleId,
+    Screen, ScreenRequest, ScreenRequestState, Seq, ServerAddressesView, SessionId,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    SubagentHeader, SubagentStatus, SubagentUsage, TaskId, TaskKind, TimelineItem, ToolApproval,
+    ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState,
+    WaitingApproval, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirPush,
+    WorkdirView,
 };
 pub use view::{
     BlobStorage, BlobUse, DeviceSessionStorage, DeviceStorage, LineSpan, SessionStorage,

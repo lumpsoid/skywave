@@ -24,19 +24,20 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use skywave_core::{
-    Action, ApprovalStatus, Decision, DeviceRef, EngineConfig, Entry, FailReason, Link,
-    OutboxStatus, Outgoing, RejectReason, SessionState as ViewSessionState, TimelineItem,
-    TransportConfig,
+    Action, AppCapture, ApprovalStatus, BlobState, BlobView, Decision, DeviceRef, EngineConfig,
+    Entry, FailReason, FullView, Link, OutboxStatus, Outgoing, RejectReason, Screen,
+    SessionState as ViewSessionState, TimelineItem, TransportConfig, ViewState,
 };
 use skywave_proto::{
-    ApprovalId, CommandKind, CommandResult, Event, EventKind, SessionId, SessionState,
+    ApprovalId, CommandId, CommandKind, CommandResult, ContentHash, Event, EventKind, ScreenAction,
+    ScreenKey, ScreenOutcome, ScreenShot, SessionId, SessionState,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, LinkStats, Rng, seed};
 use skywaved::agent::HistoryRead;
 use skywaved::agent::fake::{FakeAgent, FakeInput, FakeOutside, FakeScript, Gate, Step};
 use support::{
     Client, Daemon, SOON, adopted_history, assert_exactly_once, assert_same_log, assert_same_view,
-    config, count, is_reconnecting, user_messages,
+    config, count, is_reconnecting, screen_png, user_messages,
 };
 
 const KIB: u64 = 1024;
@@ -763,6 +764,299 @@ async fn offline_compose_drains_over_a_lossy_link() {
     assert_eq!(logged_messages(&events, session), texts);
     assert_eq!(delivered_messages(&agent, session), texts);
     assert_same_log(&events, &client.local_events());
+}
+
+// ---- 6. screen inputs -------------------------------------------------------
+
+/// The serial the fake adb reports.
+const SERIAL: &str = "emulator-5554";
+
+/// Queues `action` for `session` on `client`.
+fn screen_action(client: &Client, session: SessionId, action: ScreenAction) {
+    client.dispatch(Action::Screen {
+        session_id: session,
+        action,
+    });
+}
+
+/// The open session's latest capture of [`SERIAL`], as `view` shows it.
+fn latest_capture(view: &ViewState, session: SessionId) -> Option<AppCapture> {
+    match &view.screen {
+        Screen::Session(s) if s.id == session => s.app_screen.latest(SERIAL).cloned(),
+        _ => None,
+    }
+}
+
+/// The outcome the server logged for the screen request `request`, once it
+/// has run.
+fn screen_done(events: &[Event], request: CommandId) -> Option<ScreenOutcome> {
+    events.iter().find_map(|e| match &e.kind {
+        EventKind::ScreenDone {
+            request: done,
+            outcome,
+            ..
+        } if *done == request => Some(outcome.clone()),
+        _ => None,
+    })
+}
+
+/// A tap queued while its device's link is down, aimed at a capture the
+/// screen has since moved on from, is refused at accept as `ScreenStale`:
+/// it never runs, and the log holds no request for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tap_queued_offline_is_refused_once_the_screen_moved_on() {
+    let seed = seed();
+    let daemon = Daemon::start_with_screen(FakeAgent::new(FakeScript::new())).await;
+    let (a, proxy_a) = device(&daemon, seed, "a", lossy()).await;
+    let (b, _proxy_b) = device(&daemon, seed + 1, "b", LinkProfile::clean()).await;
+    let session = a.create_session(&daemon).await;
+    a.open_session(session, |_| true).await;
+    screen_action(
+        &a,
+        session,
+        ScreenAction::Capture {
+            device: SERIAL.into(),
+            full: false,
+        },
+    );
+    let view = a
+        .wait("A's first capture", |_, view| {
+            latest_capture(view, session).is_some()
+        })
+        .await;
+    let c1 = latest_capture(&view, session).unwrap().capture;
+    daemon.settle(&[&a, &b], SOON).await;
+    b.open_session(session, |s| s.app_screen.latest(SERIAL).is_some())
+        .await;
+
+    proxy_a.down();
+    screen_action(
+        &a,
+        session,
+        ScreenAction::Tap {
+            device: SERIAL.into(),
+            aim: c1,
+            x: 10,
+            y: 10,
+        },
+    );
+    let tap = a.outbox().last().unwrap().command.id;
+
+    // B's key, aimed at c1 while it is still the latest, moves the screen on.
+    daemon.next_screen(&screen_png([200, 40, 40]));
+    screen_action(
+        &b,
+        session,
+        ScreenAction::Key {
+            device: SERIAL.into(),
+            aim: c1,
+            key: ScreenKey::Back,
+        },
+    );
+    b.wait("B's key moved the screen on", |_, view| {
+        latest_capture(view, session).is_some_and(|c| c.capture != c1)
+    })
+    .await;
+
+    proxy_a.up();
+    poll("A's tap answered", SOON, || {
+        a.outbox()
+            .iter()
+            .any(|e| e.command.id == tap && matches!(e.status, OutboxStatus::Done(_)))
+    })
+    .await;
+    daemon.settle(&[&a, &b], SOON).await;
+
+    let events = daemon.events();
+    let entry = a
+        .outbox()
+        .into_iter()
+        .find(|e| e.command.id == tap)
+        .unwrap();
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Done(CommandResult::Rejected {
+            reason: RejectReason::ScreenStale
+        })
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::ScreenRequested {
+                action: ScreenAction::Tap { .. },
+                ..
+            }
+        )),
+        "a refused tap is not logged"
+    );
+    assert_exactly_once(&daemon, &[&a, &b]);
+    assert_same_log(&events, &a.local_events());
+    assert_same_log(&events, &b.local_events());
+}
+
+/// A capture's download that the link drops part way through resumes and
+/// lands whole: the file holds exactly the image the log names.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "blocked: a blob download makes no progress when the link drops under ~128 KiB per connection (task e82db6)"]
+async fn a_capture_download_survives_a_dropped_link() {
+    let seed = seed();
+    let daemon = Daemon::start_with_screen(FakeAgent::new(FakeScript::new())).await;
+    let profile = lossy().drop_after_bytes(16 * KIB..=48 * KIB);
+    let (client, proxy) = device(&daemon, seed, "lossy", profile).await;
+    let session = client.create_session(&daemon).await;
+    client.open_session(session, |_| true).await;
+    screen_action(
+        &client,
+        session,
+        ScreenAction::Capture {
+            device: SERIAL.into(),
+            full: false,
+        },
+    );
+
+    // Opening the session asked for the capture's download at once.
+    let view = client
+        .wait("the capture downloaded", |_, view| {
+            matches!(
+                latest_capture(view, session),
+                Some(AppCapture {
+                    content: FullView::Blob(BlobView {
+                        state: BlobState::Available { .. },
+                        ..
+                    }),
+                    ..
+                })
+            )
+        })
+        .await;
+    let capture = latest_capture(&view, session).unwrap();
+    let FullView::Blob(blob) = &capture.content else {
+        unreachable!()
+    };
+    let BlobState::Available { path } = &blob.state else {
+        unreachable!()
+    };
+    let bytes = std::fs::read(path).unwrap();
+
+    let image = daemon
+        .events()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ScreenDone {
+                request,
+                outcome:
+                    ScreenOutcome::Done {
+                        shot: ScreenShot::Image(image),
+                    },
+                ..
+            } if *request == capture.capture => Some(image.clone()),
+            _ => None,
+        })
+        .expect("the capture's image in the log");
+    // The premise of the drops: the download outlasts the drop window, so
+    // the link cuts it part way through.
+    assert!(
+        image.image.size > 48 * KIB,
+        "the capture must be bigger than the drop window's 48 KiB bound for a \
+         drop mid-download, got {} bytes",
+        image.image.size
+    );
+    assert_eq!(blob.id, image.image.id);
+    assert_eq!(ContentHash::of(&bytes), image.image.sha256);
+    assert!(
+        proxy.stats().dropped() > 0,
+        "the link dropped: {:?}",
+        proxy.stats()
+    );
+}
+
+/// Two devices tap the same capture at once over bad links. The runner
+/// runs the first tap it gets and the screen moves on; the other is refused
+/// at accept or runs as `Stale`. Exactly one tap runs, and both devices
+/// converge on the log.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_devices_tapping_at_once_apply_one_tap() {
+    let seed = seed();
+    let daemon = Daemon::start_with_screen(FakeAgent::new(FakeScript::new())).await;
+    let (a, _proxy_a) = device(&daemon, seed, "a", lossy()).await;
+    let (b, _proxy_b) = device(&daemon, seed + 1, "b", lossy()).await;
+    let session = a.create_session(&daemon).await;
+    a.open_session(session, |_| true).await;
+    screen_action(
+        &a,
+        session,
+        ScreenAction::Capture {
+            device: SERIAL.into(),
+            full: false,
+        },
+    );
+    let view = a
+        .wait("A's first capture", |_, view| {
+            latest_capture(view, session).is_some()
+        })
+        .await;
+    let c1 = latest_capture(&view, session).unwrap().capture;
+    daemon.settle(&[&a, &b], SOON).await;
+    b.open_session(session, |s| s.app_screen.latest(SERIAL).is_some())
+        .await;
+
+    daemon.next_screen(&screen_png([200, 40, 40]));
+    let tap_at = |aim| ScreenAction::Tap {
+        device: SERIAL.into(),
+        aim,
+        x: 10,
+        y: 10,
+    };
+    screen_action(&a, session, tap_at(c1));
+    let tap_a = a.outbox().last().unwrap().command.id;
+    screen_action(&b, session, tap_at(c1));
+    let tap_b = b.outbox().last().unwrap().command.id;
+
+    poll("both taps answered, and any accepted one run", SOON, || {
+        let events = daemon.events();
+        [(&a, tap_a), (&b, tap_b)].iter().all(|(client, tap)| {
+            match client
+                .outbox()
+                .into_iter()
+                .find(|e| e.command.id == *tap)
+                .map(|e| e.status)
+            {
+                Some(OutboxStatus::Done(CommandResult::Accepted { .. })) => {
+                    screen_done(&events, *tap).is_some()
+                }
+                Some(OutboxStatus::Done(_)) => true,
+                _ => false,
+            }
+        })
+    })
+    .await;
+    daemon.settle(&[&a, &b], SOON).await;
+
+    let events = daemon.events();
+    let mut ran = 0;
+    for (client, tap) in [(&a, tap_a), (&b, tap_b)] {
+        let status = client
+            .outbox()
+            .into_iter()
+            .find(|e| e.command.id == tap)
+            .unwrap()
+            .status;
+        match status {
+            OutboxStatus::Done(CommandResult::Accepted { .. }) => match screen_done(&events, tap) {
+                Some(ScreenOutcome::Done { .. }) => ran += 1,
+                Some(ScreenOutcome::Stale { .. }) => {}
+                other => panic!("an accepted tap ended as {other:?}"),
+            },
+            OutboxStatus::Done(CommandResult::Rejected {
+                reason: RejectReason::ScreenStale,
+            }) => {}
+            other => panic!("a tap ended as {other:?}"),
+        }
+    }
+    assert_eq!(ran, 1, "exactly one tap ran");
+    assert_exactly_once(&daemon, &[&a, &b]);
+    assert_same_log(&events, &a.local_events());
+    assert_same_log(&events, &b.local_events());
 }
 
 // ---- soak -------------------------------------------------------------------

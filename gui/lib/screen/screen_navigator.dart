@@ -149,6 +149,7 @@ class ScreenNavigator extends StatelessWidget {
           screen: session,
           timeline: holders.timeline,
           shell: holders.shell,
+          appScreen: holders.appScreen,
           search: holders.search,
           send: send,
         ),

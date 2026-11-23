@@ -15,8 +15,8 @@ use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ContentHash, ConversationsResult,
     DeviceInfo, DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem,
     LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RepoListing, RuleSuggestion,
-    SafetyJudgment, SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind,
-    ToolResult, WorktreeList, answers_fit,
+    SafetyJudgment, ScreenOutcome, ScreenShot, SessionOrigin, SessionState as LogState, TaskId,
+    ToolCall, ToolKind, ToolResult, WorktreeList, answers_fit,
 };
 
 use crate::action::{Action, Route};
@@ -42,15 +42,16 @@ use crate::store::{
 use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
-    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, ApprovalsView,
-    Asks, Attention, BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobUse, BlobView,
-    BodyView, CallId, ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView,
-    CropContent, CropView, Decision, Delivery, DeviceId, DeviceRef, DeviceStorage, DiffBody, Draft,
-    Entry, ErrorInfo, FailReason, FeedbackSent, FileBody, FileChange, FileResult, FullView,
-    IdleAlert, ImportedEntry, LineSpan, Link, LinkRejection, ListKind, LoginView, MessageImage,
-    ModelChoice, Outgoing, PairedInfo, PairedLink, PairingStatus, PairingView, Pause,
-    PendingApprovalRef, PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt,
-    RunWhen, SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, Seq,
+    AgentSetting, AgentView, Answer, AppCapture, AppScreenView, ApprovalId, ApprovalPrompt,
+    ApprovalStatus, ApprovalsView, Asks, Attention, BlobChange, BlobCommand, BlobId, BlobPending,
+    BlobState, BlobUse, BlobView, BodyView, CallId, ChangedFile, ChangesResult, CommandId,
+    ComposerMode, ContextId, ContextView, CropContent, CropView, Decision, Delivery, DeviceId,
+    DeviceRef, DeviceStorage, DiffBody, Draft, Entry, ErrorInfo, FailReason, FeedbackSent,
+    FileBody, FileChange, FileResult, FullView, IdleAlert, ImportedEntry, LineSpan, Link,
+    LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
+    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
+    PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER,
+    SafetyFeedbackView, SafetyRuleView, Screen, ScreenRequest, ScreenRequestState, Seq,
     ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef, SessionRow,
     SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
     ShellView, Snippet, SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader,
@@ -946,6 +947,12 @@ impl Model {
                     self.drafts.remove(&(session_id, ComposerMode::Shell));
                 }
                 effects
+            }
+            Action::Screen { session_id, action } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::Screen { session_id, action }, Vec::new())
             }
             Action::StopShell { session_id, run } => {
                 if self.summary(session_id).is_none() {
@@ -2282,7 +2289,7 @@ impl Model {
             // As the store decides it (`Store::apply_batch`): before a
             // crop's `into` registers, the old blob goes unless a crop
             // finds it held; a blob with a fate never registers again.
-            if let Some((blob, fate)) = BlobFate::of(&event.kind) {
+            for (blob, fate) in BlobFate::all(&event.kind) {
                 let held = matches!(fate, BlobFate::Cropped { .. }) && self.blob_held(blob);
                 self.fates.entry(blob).or_insert(fate);
                 if !held {
@@ -3212,6 +3219,43 @@ impl Model {
         Some(Request::CountLines { req, path })
     }
 
+    /// Each device's latest capture in the open session, asked for once
+    /// whatever the blob policy: the app screen shows it (D65).
+    pub(crate) fn want_captures(&mut self) -> Vec<Request> {
+        let Place::Session { id, open, .. } = &self.place else {
+            return Vec::new();
+        };
+        let events = open.as_ref().map_or(&[][..], |open| open.events.as_slice());
+        // Only a `Done` image names a capture: without one, skip the fold
+        // of the whole log.
+        let some_capture = events.iter().any(|(_, event)| {
+            matches!(
+                event.kind,
+                EventKind::ScreenDone {
+                    outcome: ScreenOutcome::Done {
+                        shot: ScreenShot::Image(_),
+                    },
+                    ..
+                }
+            )
+        });
+        if !some_capture {
+            return Vec::new();
+        }
+        let ids: Vec<BlobId> = self
+            .app_screen_view(*id, events)
+            .captures
+            .iter()
+            .filter_map(|capture| match &capture.content {
+                FullView::Blob(blob) => Some(blob.id),
+                FullView::Inline(_) | FullView::Lost | FullView::Deleted { .. } => None,
+            })
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.want_blob(id))
+            .collect()
+    }
+
     /// The answer to [`Request::CountLines`] `req`; any but the one the
     /// page waits on is ignored.
     pub(crate) fn lines_counted(&mut self, req: u64, result: std::io::Result<u64>) {
@@ -3697,6 +3741,7 @@ impl Model {
             shell_draft: self.drafts.get(&(id, ComposerMode::Shell)).cloned(),
             draft_rev: self.draft_rev,
             shell: self.shell_view(id, events),
+            app_screen: self.app_screen_view(id, events),
             last_seq: summary.last_seq,
             unread_from: open.and_then(|open| open.unread_from),
         })
@@ -3969,6 +4014,118 @@ impl Model {
             cwd,
             runs,
         }
+    }
+
+    /// The session's app screen (D65): the loaded `events` (the open
+    /// session's) folded in log order, then this device's requests not in
+    /// them yet, as the shell's runs are. A `Devices` listing sets the
+    /// devices; a new image sets its requesting device's latest capture.
+    fn app_screen_view(&self, id: SessionId, events: &[(Seq, Event)]) -> AppScreenView {
+        let outbox: HashMap<CommandId, &OutboxEntry> =
+            self.outbox.iter().map(|e| (e.command.id, e)).collect();
+        let mut screen = AppScreenView::default();
+        let find = |requests: &[ScreenRequest], request: CommandId| -> Option<usize> {
+            requests.iter().position(|r| r.request == request)
+        };
+        for (_, event) in events {
+            match &event.kind {
+                EventKind::ScreenRequested { action, by } => {
+                    // The server logs each with its command id, the request's.
+                    let Some(request) = event
+                        .command_id
+                        .filter(|request| find(&screen.requests, *request).is_none())
+                    else {
+                        continue;
+                    };
+                    let sent = outbox.get(&request);
+                    screen.requests.push(ScreenRequest {
+                        request,
+                        action: action.clone(),
+                        by: DeviceRef {
+                            me: self.is_own_message(sent.is_some(), *by),
+                            ..self.device_ref(*by)
+                        },
+                        state: ScreenRequestState::Queued,
+                        requested_at: Some(event.at),
+                        finished_at: None,
+                        outgoing: sent.map(|e| Outgoing::from(&e.status)),
+                        discardable: sent.is_some_and(|e| e.discardable()),
+                        delivery: sent.and_then(|e| Delivery::of(e)),
+                    });
+                }
+                EventKind::ScreenDone {
+                    request, outcome, ..
+                } => {
+                    let found = find(&screen.requests, *request);
+                    if let Some(i) = found {
+                        let r = &mut screen.requests[i];
+                        r.state = ScreenRequestState::Done(outcome.clone());
+                        r.finished_at = Some(event.at);
+                    }
+                    match outcome {
+                        ScreenOutcome::Devices { devices } => screen.devices = devices.clone(),
+                        ScreenOutcome::Done {
+                            shot: ScreenShot::Image(image),
+                        } => {
+                            let Some(i) = found else {
+                                continue;
+                            };
+                            let Some(device) = screen.requests[i].action.device() else {
+                                continue;
+                            };
+                            let capture = AppCapture {
+                                device: device.to_owned(),
+                                capture: *request,
+                                format: image.format,
+                                width: image.width,
+                                height: image.height,
+                                screen_width: image.screen_width,
+                                screen_height: image.screen_height,
+                                content: self.fated_view(&image.image),
+                                taken_at: event.at,
+                            };
+                            match screen
+                                .captures
+                                .iter()
+                                .position(|c| c.device == capture.device)
+                            {
+                                Some(slot) => screen.captures[slot] = capture,
+                                None => screen.captures.push(capture),
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(me) = self.device() {
+            let logged: HashSet<CommandId> = screen.requests.iter().map(|r| r.request).collect();
+            screen
+                .requests
+                .extend(self.outbox.iter().filter_map(|e| match &e.command.kind {
+                    CommandKind::Screen { session_id, action }
+                        if *session_id == id && !logged.contains(&e.command.id) =>
+                    {
+                        Some(ScreenRequest {
+                            request: e.command.id,
+                            action: action.clone(),
+                            by: DeviceRef {
+                                me: true,
+                                ..self.device_ref(me)
+                            },
+                            state: ScreenRequestState::Pending,
+                            requested_at: None,
+                            finished_at: None,
+                            outgoing: Some(Outgoing::from(&e.status)),
+                            discardable: e.discardable(),
+                            delivery: Delivery::of(e),
+                        })
+                    }
+                    _ => None,
+                }));
+        }
+        screen
     }
 
     /// This device's newest outbox command that `is` takes, with its outgoing

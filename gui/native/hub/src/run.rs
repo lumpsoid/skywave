@@ -448,6 +448,7 @@ fn perform(
             }
             Out::Timeline(update) => update.send_signal_to_dart(),
             Out::Shell(update) => update.send_signal_to_dart(),
+            Out::AppScreen(update) => update.send_signal_to_dart(),
             Out::Search(update) => update.send_signal_to_dart(),
             Out::CropLines(update) => update.send_signal_to_dart(),
             Out::WorkdirText(update) => update.send_signal_to_dart(),

@@ -562,7 +562,7 @@ pub enum BlobFate {
 
 impl BlobFate {
     /// The blob `kind` decides the fate of, with that fate.
-    pub(crate) fn of(kind: &EventKind) -> Option<(BlobId, BlobFate)> {
+    fn of(kind: &EventKind) -> Option<(BlobId, BlobFate)> {
         match kind {
             EventKind::BlobDeleted { blob, by, .. } => Some((*blob, BlobFate::Deleted { by: *by })),
             EventKind::BlobCropped {
@@ -583,6 +583,20 @@ impl BlobFate {
             )),
             _ => None,
         }
+    }
+
+    /// Every fate `kind` decides: [`BlobFate::of`]'s, and each capture a
+    /// `ScreenDone` pruned, deleted as by the device that asked (D65).
+    pub(crate) fn all(kind: &EventKind) -> Vec<(BlobId, BlobFate)> {
+        let mut fates: Vec<_> = Self::of(kind).into_iter().collect();
+        if let EventKind::ScreenDone { pruned, by, .. } = kind {
+            fates.extend(
+                pruned
+                    .iter()
+                    .map(|blob| (*blob, BlobFate::Deleted { by: *by })),
+            );
+        }
+        fates
     }
 }
 
