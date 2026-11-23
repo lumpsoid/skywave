@@ -1383,6 +1383,7 @@ fn hello() -> HelloResponse {
             name: "phone".into(),
         }],
         shell: true,
+        screen: true,
         bypass: true,
         login_expires: Some(at()),
         agent_login_offered: true,
@@ -2260,8 +2261,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v42() {
-    assert_eq!(PROTOCOL_VERSION, 42);
+fn protocol_is_v43() {
+    assert_eq!(PROTOCOL_VERSION, 43);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

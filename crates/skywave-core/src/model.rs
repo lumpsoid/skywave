@@ -3741,6 +3741,7 @@ impl Model {
             shell_draft: self.drafts.get(&(id, ComposerMode::Shell)).cloned(),
             draft_rev: self.draft_rev,
             shell: self.shell_view(id, events),
+            screen_enabled: self.settings.server.screen_enabled,
             app_screen: self.app_screen_view(id, events),
             last_seq: summary.last_seq,
             unread_from: open.and_then(|open| open.unread_from),

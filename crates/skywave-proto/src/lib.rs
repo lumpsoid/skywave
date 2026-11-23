@@ -230,7 +230,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`EventKind::ScreenRequested`], [`EventKind::ScreenDone`],
 /// [`BlobUse::ScreenCapture`] and the refusals [`RejectReason::ScreenDisabled`],
 /// [`RejectReason::ScreenStale`] and [`RejectReason::BadScreenInput`].
-pub const PROTOCOL_VERSION: u32 = 42;
+///
+/// v43: `HelloResponse::screen` advertises `[screen] enabled`.
+pub const PROTOCOL_VERSION: u32 = 43;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2914,6 +2916,9 @@ pub struct HelloResponse {
     /// Whether the server runs shell commands (`RunShell`); when off it
     /// refuses them as `ShellDisabled`.
     pub shell: bool,
+    /// Whether the server drives screens (`Screen`, `[screen] enabled`); when
+    /// off it refuses them as `ScreenDisabled`.
+    pub screen: bool,
     /// Whether the server's operator allows [`PermissionMode::Bypass`];
     /// when not, a `SetPermissionMode` asking for it is `BypassDisabled`.
     pub bypass: bool,

@@ -2154,6 +2154,7 @@ mod tests {
             shell_draft: None,
             draft_rev: 0,
             shell: Default::default(),
+            screen_enabled: false,
             app_screen: Default::default(),
             last_seq: skywave_core::Seq(1),
             unread_from: None,

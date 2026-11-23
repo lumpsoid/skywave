@@ -161,7 +161,7 @@ every version.
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
-| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, whether it allows bypass mode (`agent.allow_bypass`, D38), when the agent's login expires (`login_expires`), whether a device may log the agent in (`agent_login_offered`) and whether the agent is logged out (`agent_logged_out`, true only for a definite "not logged in"); see "The agent's login". Since v29. |
+| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, whether it drives screens (`[screen] enabled`, D65), whether it allows bypass mode (`agent.allow_bypass`, D38), when the agent's login expires (`login_expires`), whether a device may log the agent in (`agent_login_offered`) and whether the agent is logged out (`agent_logged_out`, true only for a definite "not logged in"); see "The agent's login". Since v29. |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
@@ -1071,7 +1071,7 @@ logs) an event that no longer decodes rather than failing.
   `usage_limits` keeps the latest answer to the usage limits read.
   `server_facts` keeps what the last `hello` said of the server
   (`ServerFacts`, `Settings::server`): whether it runs shell commands,
-  whether it allows bypass mode, when its agent's login expires
+  whether it drives screens, whether it allows bypass mode, when its agent's login expires
   (`login_expires`), whether a device may log the agent in
   (`agent_login_offered`) and whether the agent is logged out
   (`agent_logged_out`). One row, replaced whole by each `hello` and

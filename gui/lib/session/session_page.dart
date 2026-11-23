@@ -461,12 +461,15 @@ class _SessionPageState extends State<SessionPage> {
           ),
         ),
       ),
-      _MenuItem(
-        icon: Icons.phone_android,
-        title: 'App screen',
-        onTap: () =>
-            widget.send(GuiIntentAppScreenToggle(sessionId: screen.sessionId)),
-      ),
+      // Only where the server drives screens (`[screen] enabled`).
+      if (screen.screenEnabled)
+        _MenuItem(
+          icon: Icons.phone_android,
+          title: 'App screen',
+          onTap: () => widget.send(
+            GuiIntentAppScreenToggle(sessionId: screen.sessionId),
+          ),
+        ),
     ];
 
     return Stack(

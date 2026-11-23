@@ -515,6 +515,7 @@ async fn hello(
             log,
             devices,
             shell: api.log.shell_enabled(),
+            screen: api.log.screen_enabled(),
             bypass: api.log.bypass_allowed(),
             login_expires,
             agent_login_offered: api.login.offered(),

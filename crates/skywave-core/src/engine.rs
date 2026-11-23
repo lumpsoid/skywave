@@ -1849,6 +1849,7 @@ mod tests {
                     log: one_run(),
                     devices: Vec::new(),
                     shell: false,
+                    screen: false,
                     bypass: false,
                     login_expires: None,
                     agent_login_offered: false,
@@ -2281,6 +2282,7 @@ mod tests {
                     log: one_run(),
                     devices: Vec::new(),
                     shell: false,
+                    screen: false,
                     bypass: false,
                     login_expires: None,
                     agent_login_offered: false,
@@ -2534,12 +2536,13 @@ mod tests {
         .unwrap();
         db.execute_batch(
             "DROP TABLE safety_rules;
+             ALTER TABLE server_facts DROP COLUMN screen_enabled;
              ALTER TABLE sessions DROP COLUMN safety_check;
              ALTER TABLE sessions DROP COLUMN worktree_removed;
              ALTER TABLE sessions DROP COLUMN worktree;",
         )
         .unwrap();
-        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 9)
+        db.pragma_update(None, "user_version", crate::store::SCHEMA_VERSION - 10)
             .unwrap();
         drop(db);
         crate::identity::write_legacy_identity(
@@ -3102,6 +3105,7 @@ mod tests {
                     log: one_run(),
                     devices: Vec::new(),
                     shell: false,
+                    screen: false,
                     bypass: false,
                     login_expires: None,
                     agent_login_offered: false,
@@ -4876,6 +4880,7 @@ mod tests {
                         name: "phone".into(),
                     }],
                     shell: false,
+                    screen: false,
                     bypass: false,
                     login_expires: None,
                     agent_login_offered: false,

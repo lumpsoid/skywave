@@ -579,6 +579,12 @@ WHERE json_extract(event, '$.kind.type') = 'safety_rule_set'
         WHERE json_extract(event, '$.kind.type') = 'safety_rule_set'
         GROUP BY json_extract(event, '$.kind.words'));
 "#),
+    // `ServerFacts::screen_enabled`. A replica migrated from before reads
+    // "off" until the next `hello` rewrites the row.
+    Sql(r#"
+ALTER TABLE server_facts ADD COLUMN screen_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK (screen_enabled IN (0, 1));
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -652,7 +658,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
     v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
-    v39_to_v40, v40_to_v41, v41_to_v42,
+    v39_to_v40, v40_to_v41, v41_to_v42, v42_to_v43,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -815,6 +821,12 @@ fn v41_to_v42(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// v42 to v43: `HelloResponse::screen`; nothing stored changes (the facts a hello reports are
+/// kept as columns, not wire JSON).
+fn v42_to_v43(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
 /// The files SQLite keeps beside [`DB_FILE`] in WAL mode.
 const WAL_FILES: [&str; 2] = ["core.db-wal", "core.db-shm"];
 
@@ -960,6 +972,8 @@ pub struct Settings {
 pub struct ServerFacts {
     /// Whether the server runs shell commands.
     pub shell_enabled: bool,
+    /// Whether the server drives screens (`[screen] enabled`).
+    pub screen_enabled: bool,
     /// Whether the server allows bypass mode.
     pub bypass_allowed: bool,
     /// When the agent's login expires; `None` when none was reported.
@@ -975,6 +989,7 @@ impl ServerFacts {
     pub fn of(hello: &HelloResponse) -> Self {
         ServerFacts {
             shell_enabled: hello.shell,
+            screen_enabled: hello.screen,
             bypass_allowed: hello.bypass,
             login_expires: hello.login_expires,
             agent_login_offered: hello.agent_login_offered,
@@ -2955,7 +2970,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT shell_enabled, bypass_allowed, login_expires, agent_login_offered,
-                    agent_logged_out
+                    agent_logged_out, screen_enabled
                  FROM server_facts WHERE id = 1",
                 [],
                 |row| {
@@ -2965,6 +2980,7 @@ impl Store {
                         login_expires: opt_time_col(row, 2)?,
                         agent_login_offered: row.get(3)?,
                         agent_logged_out: row.get(4)?,
+                        screen_enabled: row.get(5)?,
                     })
                 },
             )
@@ -3029,19 +3045,21 @@ impl Store {
     pub fn set_server_facts(&self, facts: &ServerFacts) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO server_facts (id, shell_enabled, bypass_allowed, login_expires,
-                 agent_login_offered, agent_logged_out)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                 agent_login_offered, agent_logged_out, screen_enabled)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (id) DO UPDATE SET shell_enabled = excluded.shell_enabled,
                  bypass_allowed = excluded.bypass_allowed,
                  login_expires = excluded.login_expires,
                  agent_login_offered = excluded.agent_login_offered,
-                 agent_logged_out = excluded.agent_logged_out",
+                 agent_logged_out = excluded.agent_logged_out,
+                 screen_enabled = excluded.screen_enabled",
             params![
                 facts.shell_enabled,
                 facts.bypass_allowed,
                 facts.login_expires.map(|at| at.to_rfc3339()),
                 facts.agent_login_offered,
                 facts.agent_logged_out,
+                facts.screen_enabled,
             ],
         )?;
         Ok(())
