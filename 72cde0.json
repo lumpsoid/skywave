@@ -3,7 +3,7 @@
     "deleted": null,
     "fields": {
       "body": "2026-11-22T20:53:41.344182+00:00",
-      "status": "2026-11-22T20:53:41.344182+00:00",
+      "status": "2026-11-23T09:33:06.627914+00:00",
       "title": "2026-11-22T20:53:41.344182+00:00"
     },
     "tags": {
@@ -21,11 +21,11 @@
   "body": "Part of e553ce. Offline, N presses of Capture/Select queue N captures; each runs later and prunes the previous. Skip a capture when one for the device is still waiting.",
   "created": "2026-11-22T20:53:41.344182+00:00",
   "id": "72cde0",
-  "status": "open",
+  "status": "done",
   "tags": [
     "followup",
     "screen"
   ],
   "title": "coalesce repeated screen captures queued offline",
-  "updated": "2026-11-22T20:53:41.344182+00:00"
+  "updated": "2026-11-23T09:33:06.627914+00:00"
 }
