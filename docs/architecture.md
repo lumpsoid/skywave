@@ -1088,8 +1088,9 @@ logs) an event that no longer decodes rather than failing.
   (`GuiIntent::SetPlainList`): a group sits where its newest row does, and
   its rows keep this order within it. The list has three scopes,
   `ListKind::Active`, `Archived` and `All`; the all list marks its archived
-  rows, and back from a session returns to the all list when it was the one
-  last shown.
+  rows, and back from a session returns to the list last shown, so
+  archiving or unarchiving the open session doesn't move the user to another
+  list.
 - **Worktrees** (D52): the replica's `sessions` table has a `worktree`
   column (the JSON `{repo, branch}` of the session's `SessionCreated`, NULL
   when it has none) and a `worktree_removed` column (set by

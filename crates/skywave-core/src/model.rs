@@ -336,8 +336,9 @@ pub(crate) struct Model {
     paired: Option<Paired>,
     pairing: PairingStatus,
     place: Place,
-    /// The session list last shown, so back from a session returns to the
-    /// all list when that was the one.
+    /// The session list last shown, so back from a session returns to it:
+    /// archiving or unarchiving the open session doesn't move the user to
+    /// another list.
     last_list: ListKind,
     settings: Settings,
     cursor: Seq,
@@ -1546,7 +1547,9 @@ impl Model {
     /// Where [`Action::Back`] goes from the screen shown, as the action
     /// that goes there; `None` where back leaves the app. Follows
     /// [`Model::screen`]: an unpaired device sees pairing, a session gone
-    /// from the replica shows the active list.
+    /// from the replica shows the active list. Back from a session returns
+    /// to the list last shown (`last_list`), whether or not the session was
+    /// archived meanwhile.
     fn back(&self) -> Option<Action> {
         self.device()?;
         let route = match &self.place {
@@ -1571,13 +1574,11 @@ impl Model {
                 return Some(Action::OpenSession(*id));
             }
             Place::Session { id, .. } => {
-                let archived = self.archived(self.summary(*id)?);
-                if self.last_list == ListKind::All {
-                    Route::AllSessions
-                } else if archived {
-                    Route::ArchivedSessions
-                } else {
-                    Route::SessionList
+                self.summary(*id)?;
+                match self.last_list {
+                    ListKind::Active => Route::SessionList,
+                    ListKind::Archived => Route::ArchivedSessions,
+                    ListKind::All => Route::AllSessions,
                 }
             }
             Place::Workdir { id, pane, .. } => {
@@ -8443,6 +8444,33 @@ mod tests {
     }
 
     #[test]
+    fn archiving_the_open_session_keeps_back_on_the_active_list() {
+        let mut f = Fixture::paired();
+        let open = f.session("/srv/open");
+        f.dispatch(Action::Navigate(Route::SessionList));
+        f.open(open);
+        queued(&f.dispatch(archive(open, true)));
+        assert!(f.session_view().archived);
+
+        f.dispatch(Action::Back);
+        assert_eq!(f.list_view().kind, ListKind::Active);
+    }
+
+    #[test]
+    fn unarchiving_the_open_session_keeps_back_on_the_archived_list() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        queued(&f.dispatch(archive(old, true)));
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        f.open(old);
+        queued(&f.dispatch(archive(old, false)));
+        assert!(!f.session_view().archived);
+
+        f.dispatch(Action::Back);
+        assert_eq!(f.list_view().kind, ListKind::Archived);
+    }
+
+    #[test]
     fn the_all_list_shows_both_in_order_and_back_returns_to_it() {
         let mut f = Fixture::paired();
         let old = f.session("/srv/old");
@@ -8473,7 +8501,7 @@ mod tests {
         f.dispatch(Action::Navigate(Route::SessionList));
         f.open(old);
         f.dispatch(Action::Back);
-        assert_eq!(f.list_view().kind, ListKind::Archived);
+        assert_eq!(f.list_view().kind, ListKind::Active);
     }
 
     #[test]
@@ -14377,7 +14405,7 @@ mod tests {
             &mut f,
             |f| f.open(archived),
             "archived session",
-            "archived list",
+            "active list",
         );
     }
 
