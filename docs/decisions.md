@@ -1184,7 +1184,11 @@ it on every request and decodes every reply that is marked
   still, with a window of at most 2 MiB per download at this level. The
   server encodes on blocking threads (a batch after its read, off the
   database connection; a blob a piece at a time), never on a connection's
-  task.
+  task. A blob's encoder is flushed every 8 KiB of content, so a link that
+  drops every few tens of KiB still makes progress on every try (a whole
+  128 KiB block would never arrive); the cost is a few bytes of block
+  header per 8 KiB and fresh entropy tables, small next to the ratio since
+  the window carries across flushes.
 - **zstd through the `zstd` crate**, which builds the C library with
   `cc`, as rusqlite's bundled SQLite already is on every target the hub
   builds for (Android included).

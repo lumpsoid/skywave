@@ -19,6 +19,12 @@ pub const LEVEL: i32 = 3;
 /// Read size when streaming a blob.
 pub(crate) const BLOB_CHUNK: usize = 64 * 1024;
 
+/// A blob frame ends a zstd block after this much content, so a download cut
+/// anywhere decoded all but at most this much of what it received (a link
+/// that drops every few tens of KiB still makes progress on each try, task
+/// e82db6).
+const FLUSH_EVERY: usize = 8 * 1024;
+
 /// Whether the request's `Accept-Encoding` asks for zstd.
 pub(crate) fn wants_zstd(headers: &HeaderMap) -> bool {
     headers
@@ -74,9 +80,9 @@ pub(crate) async fn json<T: serde::Serialize + Send + 'static>(
 
 /// The body of a compressed blob response: one zstd frame of `len` bytes
 /// of `file` from where it stands, made a piece at a time on blocking
-/// threads. A piece is what the encoder emits after one or more
-/// [`BLOB_CHUNK`] reads (it buffers up to a block, 128 KiB of input); the
-/// last one ends the frame.
+/// threads. A piece is what the encoder emits for one [`BLOB_CHUNK`] read,
+/// flushed every [`FLUSH_EVERY`] bytes of input so that each such slice ends
+/// a decodable block; the last piece ends the frame.
 pub(crate) fn blob_frame(file: File, len: u64) -> Body {
     let frames = Frames {
         file: file.take(len),
@@ -123,7 +129,10 @@ impl Frames {
                 let encoder = self.encoder.take().expect("started above");
                 return Ok(Some(encoder.finish()?.into()));
             }
-            encoder.write_all(&buf[..n])?;
+            for slice in buf[..n].chunks(FLUSH_EVERY) {
+                encoder.write_all(slice)?;
+                encoder.flush()?;
+            }
             let piece = std::mem::take(encoder.get_mut());
             if !piece.is_empty() {
                 return Ok(Some(piece.into()));
@@ -155,5 +164,73 @@ mod tests {
         assert!(frame.len() < 500_000 / 3, "{} bytes", frame.len());
         let decoded = zstd::stream::decode_all(&frame[..]).unwrap();
         assert_eq!(decoded, &content[1000..501_000]);
+    }
+
+    /// A frame cut short decodes to a prefix of the content that holds all
+    /// but the last, unfinished block, so a retry resumes from there.
+    #[tokio::test]
+    async fn a_cut_blob_frame_decodes_most_of_what_arrived() {
+        let mut words = 0x2545_F491_4F6C_DD1Du64;
+        let text: Vec<u8> = (0u32..)
+            .flat_map(|i| {
+                words ^= words << 13;
+                words ^= words >> 7;
+                words ^= words << 17;
+                format!("line {i} {words:016x}\n").into_bytes()
+            })
+            .take(300_000)
+            .collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let random: Vec<u8> = std::iter::repeat_with(|| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        })
+        .flatten()
+        .take(300_000)
+        .collect();
+        for (kind, content, compressible) in [
+            ("compressible", text, true),
+            // Passes without the flush too (raw blocks stream): guards the prefix, not the bug.
+            ("incompressible", random, false),
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&content).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let frame = blob_frame(file, content.len() as u64)
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
+            assert!(
+                frame.len() > 40 * 1024,
+                "{kind}: frame is {} bytes, too short for the cuts below",
+                frame.len()
+            );
+            for cut in [12 * 1024, 20 * 1024, 40 * 1024] {
+                let mut decoder = zstd::stream::write::Decoder::new(Vec::new()).unwrap();
+                decoder.write_all(&frame[..cut]).unwrap();
+                decoder.flush().unwrap();
+                let decoded = decoder.get_ref();
+                assert!(
+                    content.starts_with(decoded),
+                    "{kind}, cut at {cut}: decoded bytes are not a prefix of the content"
+                );
+                if compressible {
+                    assert!(
+                        decoded.len() >= FLUSH_EVERY,
+                        "{kind}, cut at {cut}: decoded {} bytes",
+                        decoded.len()
+                    );
+                } else {
+                    assert!(
+                        decoded.len() + FLUSH_EVERY + 1024 >= cut,
+                        "{kind}, cut at {cut}: decoded {} bytes",
+                        decoded.len()
+                    );
+                }
+            }
+        }
     }
 }

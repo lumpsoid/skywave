@@ -108,7 +108,9 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
   The decoder emits only bytes of the content, in order (a compressed
   block once all of it arrived, a raw one possibly as it streams in), so
   what a cut download got is a correct start of the content and resumes
-  from there. A compressed blob response is streamed with no
+  from there. A blob frame ends a block every 8 KiB of content
+  (`FLUSH_EVERY`), so a cut download loses at most 8 KiB of content from
+  what arrived. A compressed blob response is streamed with no
   `Content-Length` and names its decoded length in
   `skywave-decoded-length`; a compressed batch is sent whole, with the
   frame's `Content-Length`.
