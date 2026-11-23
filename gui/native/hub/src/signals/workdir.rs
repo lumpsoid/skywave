@@ -78,6 +78,9 @@ pub struct WorkdirDownloadRow {
     /// The file on this device once the blob is available: the head
     /// copies it to where the user saves it.
     pub local_path: Option<String>,
+    /// Cancel would stop it: the server is asked, or its content is asked for
+    /// or downloading.
+    pub can_cancel: bool,
 }
 
 /// A device file pushed into the workdir.
@@ -98,6 +101,8 @@ pub struct WorkdirPushRow {
     pub existing_sha256: Option<String>,
     /// Neither done nor waiting on the user: the head offers to try again.
     pub failed: bool,
+    /// Cancel would stop it: it is pushing.
+    pub can_cancel: bool,
 }
 
 /// How a changed file changed.

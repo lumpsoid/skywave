@@ -383,12 +383,18 @@ fn download_row(download: &WorkdirDownload) -> WorkdirDownloadRow {
             ),
             (WorkdirFetch::Idle, None, _) => ("Not asked yet.".to_owned(), false, None, None),
         };
+    let can_cancel = matches!(download.fetch, WorkdirFetch::Loading)
+        || matches!(
+            download.blob.as_ref().map(|blob| &blob.state),
+            Some(BlobState::Requested { .. } | BlobState::Downloading { .. })
+        );
     WorkdirDownloadRow {
         path: download.path.clone(),
         label: clean_line(&label),
         failed,
         blob,
         local_path,
+        can_cancel,
     }
 }
 
@@ -491,6 +497,7 @@ fn push_row(push: &WorkdirPush) -> WorkdirPushRow {
         done,
         existing_sha256,
         failed,
+        can_cancel: matches!(push.state, PushState::Pushing),
     }
 }
 

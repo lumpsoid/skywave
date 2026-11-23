@@ -7792,6 +7792,18 @@ mod workdir {
                 replace: Some(ContentHash::of(b"old").to_string()),
             },
         });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::CancelWorkdirDownload {
+                session_id: rig.session.0.to_string(),
+                path: "bin/app".into(),
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::CancelWorkdirPush {
+                session_id: rig.session.0.to_string(),
+                path: "docs/notes.txt".into(),
+            },
+        });
         let workdir: Vec<_> = rig
             .actions
             .iter()
@@ -7803,6 +7815,8 @@ mod workdir {
                         | Action::RefreshWorkdir
                         | Action::DownloadWorkdirFile { .. }
                         | Action::PushWorkdirFile { .. }
+                        | Action::CancelWorkdirDownload { .. }
+                        | Action::CancelWorkdirPush { .. }
                 )
             })
             .cloned()
@@ -7835,6 +7849,14 @@ mod workdir {
                     source: "/home/me/notes.txt".into(),
                     path: "docs/notes.txt".into(),
                     replace: Some(ContentHash::of(b"old")),
+                },
+                Action::CancelWorkdirDownload {
+                    session_id: rig.session,
+                    path: "bin/app".into(),
+                },
+                Action::CancelWorkdirPush {
+                    session_id: rig.session,
+                    path: "docs/notes.txt".into(),
                 },
             ]
         );
@@ -7946,17 +7968,23 @@ mod workdir {
                     row.failed,
                     row.blob.as_ref().map(|blob| blob.state),
                     row.local_path.clone(),
+                    row.can_cancel,
                 )
             })
             .collect();
         assert_eq!(
             flags,
             [
-                (false, None, None),
-                (true, None, None),
-                (true, None, None),
-                (false, Some(BlobStateKind::Downloading), None),
-                (false, Some(BlobStateKind::Available), Some(ready_path)),
+                (false, None, None, true),
+                (true, None, None, false),
+                (true, None, None, false),
+                (false, Some(BlobStateKind::Downloading), None, true),
+                (
+                    false,
+                    Some(BlobStateKind::Available),
+                    Some(ready_path),
+                    false
+                ),
             ]
         );
     }
@@ -8013,6 +8041,11 @@ mod workdir {
                     reason: "gone".into(),
                 }),
             },
+            WorkdirPush {
+                path: "h.bin".into(),
+                source: source("h.bin"),
+                state: PushState::Done(PushOutcome::Cancelled),
+            },
         ];
         let screen = shown_with(
             &mut rig,
@@ -8026,7 +8059,7 @@ mod workdir {
         assert_eq!(
             rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
             [
-                "a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin", "g.bin"
+                "a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin", "g.bin", "h.bin"
             ]
         );
         assert_eq!(
@@ -8041,6 +8074,7 @@ mod workdir {
                 "A file is already there (3 B)",
                 "Too large to send",
                 "Cannot read the file: gone",
+                "Cancelled before writing: nothing written. Retry resumes the upload.",
             ]
         );
         let flags: Vec<_> = rows
@@ -8051,24 +8085,27 @@ mod workdir {
                     row.done,
                     row.existing_sha256.clone(),
                     row.failed,
+                    row.can_cancel,
                 )
             })
             .collect();
         assert_eq!(
             flags,
             [
-                (true, false, None, false),
-                (false, false, None, true),
-                (false, true, None, false),
-                (false, true, None, false),
+                (true, false, None, false, true),
+                (false, false, None, true, false),
+                (false, true, None, false, false),
+                (false, true, None, false, false),
                 (
                     false,
                     false,
                     Some(ContentHash::of(b"old").to_string()),
+                    false,
                     false
                 ),
-                (false, false, None, true),
-                (false, false, None, true),
+                (false, false, None, true, false),
+                (false, false, None, true, false),
+                (false, false, None, true, false),
             ]
         );
     }

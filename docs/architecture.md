@@ -1928,14 +1928,16 @@ skywave-core                 all logic, sync, replica
 - **Workdir download and push** (D54, D56). A file row in a directory listing
   and the file pane's app bar carry Download
   (`ActionIntentDownloadWorkdirFile`).
-  The downloads panel shows each download: its progress, Retry when it failed,
-  and Save… once the file is on the device. Save… is the system save sheet on
+  The downloads panel shows each download: its progress, Cancel while it is
+  under way, Download to resume a stopped one, Retry when it failed, and Save…
+  once the file is on the device. Save… is the system save sheet on
   Android and iOS (`flutter_file_dialog`), and `file_selector`'s
   `getSaveLocation` on desktop, which copies the file
   (`gui/lib/workdir/saving.dart`). The directory pane's push action picks a
   device file (`pickPushFile`), proposes `<shown dir>/<file name>` in a target
   dialog, and sends `ActionIntentPushWorkdirFile`. The pushes panel shows each
-  push's one line of progress or outcome, Retry when it failed, and Replace…
+  push's one line of progress or outcome, Cancel while it pushes, Retry when it
+  failed or was cancelled, and Replace…
   when the path holds another file: asked first, then pushed again with the
   hash found. A written file's timeline row reads `<path> written by <who>`,
   or `replaced` when it replaced one.

@@ -212,6 +212,14 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
                 replace,
             }
         }
+        ActionIntent::CancelWorkdirDownload { session_id, path } => Action::CancelWorkdirDownload {
+            session_id: id("session", &session_id)?,
+            path,
+        },
+        ActionIntent::CancelWorkdirPush { session_id, path } => Action::CancelWorkdirPush {
+            session_id: id("session", &session_id)?,
+            path,
+        },
         ActionIntent::DeleteBlob { blob_id } => Action::DeleteBlob(id("blob", &blob_id)?),
         ActionIntent::CropBlob { blob_id, keep } => Action::CropBlob {
             blob: id("blob", &blob_id)?,
