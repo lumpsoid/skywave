@@ -360,6 +360,10 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
 /// Most item hits a [`SessionsFound`] holds.
 pub const SEARCH_HITS_MAX: usize = 200;
 
+/// Longest matching line an [`ItemHit`] keeps whole; a longer one is cut
+/// round its first match.
+const LINE_MAX_BYTES: usize = 2048;
+
 /// What kind of item a search hit is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitKind {
@@ -403,7 +407,8 @@ pub struct ItemHit {
     pub seq: Seq,
     pub at: DateTime<Utc>,
     pub kind: HitKind,
-    /// The first matching line, whole and uncleaned.
+    /// The first matching line, uncleaned; a long one cut round its first
+    /// match, `…` marking the cuts.
     pub line: String,
     /// The line is from a downloaded output, not the item's own text.
     pub output: bool,
@@ -460,9 +465,36 @@ pub fn item_hit(
         seq: *seq,
         at: *at,
         kind: HitKind::of(entry),
-        line: line.to_owned(),
+        line: cut_round_match(line, query),
         output,
     })
+}
+
+/// `line` whole if it is at most [`LINE_MAX_BYTES`] long, else the window of
+/// it round `query`'s first match there, with `…` where it was cut.
+fn cut_round_match(line: &str, query: &Query) -> String {
+    if line.len() <= LINE_MAX_BYTES {
+        return line.to_owned();
+    }
+    let matched = query.ranges(line).first().map_or(0, |range| range.start);
+    // Context kept before the match.
+    let mut start = matched.saturating_sub(512);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + LINE_MAX_BYTES).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&line[start..end]);
+    if end < line.len() {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]

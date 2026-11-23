@@ -3368,16 +3368,25 @@ fn search_stops_at_its_hit_limit() {
     let (core, seam, _requests, device) = paired_core(dir.path());
     let sid = SessionId::new();
     let mut events = vec![event(sid, 0, created("/srv/a"))];
+    let base = Utc.with_ymd_and_hms(2026, 10, 29, 11, 0, 0).unwrap();
     for i in 0..=SEARCH_HITS_MAX {
-        events.push(event(
+        let text = match i {
+            0 => "fox oldest".to_owned(),
+            SEARCH_HITS_MAX => "fox newest".to_owned(),
+            n => format!("fox {n}"),
+        };
+        let mut message = event(
             sid,
             1,
             EventKind::UserMessage {
                 device_id: device,
-                text: format!("fox {i}"),
+                text,
                 attachments: Vec::new(),
             },
-        ));
+        );
+        // Seconds: an hour has fewer than 201 minutes, and `event` takes minutes.
+        message.at = base + chrono::TimeDelta::seconds(i as i64);
+        events.push(message);
     }
     seam.apply_events(&EventBatch {
         from: Seq(1),
@@ -3387,6 +3396,50 @@ fn search_stops_at_its_hit_limit() {
     let found = core.search("fox", None);
     assert_eq!(found.hits.len(), SEARCH_HITS_MAX);
     assert!(found.more);
+    let lines: Vec<&str> = found
+        .hits
+        .iter()
+        .filter_map(|hit| hit.item.as_ref())
+        .map(|item| item.line.as_str())
+        .collect();
+    assert!(lines.contains(&"fox newest"), "{lines:?}");
+    assert!(!lines.contains(&"fox oldest"), "{lines:?}");
+}
+
+#[test]
+fn a_long_line_is_cut_round_its_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    let text = format!("{}fox{}", "a".repeat(5000), "b".repeat(5000));
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(sid, 0, created("/srv/a")),
+            event(
+                sid,
+                1,
+                EventKind::UserMessage {
+                    device_id: device,
+                    text,
+                    attachments: Vec::new(),
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    let found = core.search("fox", None);
+    assert_eq!(found.hits.len(), 1, "{found:?}");
+    let line = found.hits[0].item.as_ref().map(|item| item.line.as_str());
+    let line = line.unwrap_or_default();
+    assert!(line.starts_with('…'), "{line}");
+    assert!(line.ends_with('…'), "{line}");
+    assert!(line.contains("fox"), "{line}");
+    assert!(
+        line.len() <= 2048 + 2 * '…'.len_utf8(),
+        "{} bytes",
+        line.len()
+    );
 }
 
 #[test]

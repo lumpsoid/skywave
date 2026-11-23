@@ -472,7 +472,8 @@ impl Core {
             });
             found.not_downloaded += result.not_downloaded;
             found.cut += result.cut;
-            for hit in &result.hits {
+            // Newest first, so the cap keeps each session's newest hits.
+            for hit in result.hits.iter().rev() {
                 if items.len() >= SEARCH_HITS_MAX {
                     found.more = true;
                     break;
