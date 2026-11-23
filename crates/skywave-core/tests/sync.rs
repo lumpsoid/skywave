@@ -57,6 +57,12 @@ async fn an_unpaired_device_is_unpaired_until_it_pairs() {
     client
         .core
         .subscribe(move |view| sink.send_modify(|links| links.push(view.link)));
+    // The first snapshot comes on the delivery thread; pairing before it
+    // arrives could let a newer one overtake it.
+    tokio::time::timeout(SOON, links.wait_for(|links| !links.is_empty()))
+        .await
+        .expect("the sink's first snapshot")
+        .unwrap();
     daemon.pair(&client, &proxy.address()).await;
 
     let links = tokio::time::timeout(
