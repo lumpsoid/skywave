@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "deleted": null,
+    "fields": {
+      "body": "2026-11-23T03:10:22.140188+00:00",
+      "status": "2026-11-23T03:10:22.140188+00:00",
+      "title": "2026-11-23T03:10:22.140188+00:00"
+    },
+    "tags": {
+      "bug": [
+        "2026-11-23T03:10:22.140188+00:00",
+        false
+      ],
+      "screen": [
+        "2026-11-23T03:10:22.140188+00:00",
+        false
+      ]
+    },
+    "v": 2
+  },
+  "body": "Found by a_capture_download_survives_a_dropped_link (crates/skywave-core/tests/link.rs, #[ignore]d until this is fixed): a 183208 B JPEG capture behind lossy().drop_after_bytes(16..=48 KiB) stays Downloading{got:0} for 20 s; reproduces with SKYWAVE_LINK_SEED=13606245370793176813. Resume by Range from .part exists (blobs.rs:1353, https.rs:1174, api.rs:1716), but got is recorded only after decoded bytes. Suspect: the server's zstd blob frame (skywaved/src/encoding.rs:78, buffers up to a 128 KiB block) yields no decodable bytes before each cut, so every try is zero-progress and backoff escalates. Check block type for incompressible data, and consider smaller frames/blocks or no compression for already-compressed blobs (JPEG/PNG). Un-ignore the test when fixed.",
+  "created": "2026-11-23T03:10:22.140188+00:00",
+  "id": "e82db6",
+  "status": "open",
+  "tags": [
+    "bug",
+    "screen"
+  ],
+  "title": "blob downloads make no progress when the link drops under ~128 KiB per connection",
+  "updated": "2026-11-23T03:10:22.140188+00:00"
+}
