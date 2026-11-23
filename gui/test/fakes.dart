@@ -145,6 +145,7 @@ ScreenUpdate sessionScreen({SubagentHeaderView? subagent}) => ScreenUpdate(
       canInterrupt: false,
       interruptBusy: false,
       canClear: false,
+      screenEnabled: false,
       stopHeadings: _headings,
       tasks: const [],
       schedules: const [],

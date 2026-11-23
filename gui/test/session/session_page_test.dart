@@ -2176,6 +2176,35 @@ void main() {
     }
   });
 
+  testWidgets('App screen is offered only where the server drives screens', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    Future<void> openMore({required bool screenEnabled}) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(screenEnabled: screenEnabled),
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(byTooltip('More'));
+      await tester.pumpAndSettle();
+    }
+
+    await openMore(screenEnabled: false);
+    expect(find.text('App screen'), findsNothing);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    await openMore(screenEnabled: true);
+    expect(find.text('App screen'), findsOneWidget);
+    await tester.tap(find.text('App screen'));
+    await tester.pumpAndSettle();
+    expect(sent.whereType<GuiIntentAppScreenToggle>(), [
+      const GuiIntentAppScreenToggle(sessionId: 's1'),
+    ]);
+  });
+
   group('contexts', () {
     const two = [
       ContextRow(

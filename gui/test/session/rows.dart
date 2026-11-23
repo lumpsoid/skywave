@@ -187,6 +187,7 @@ SessionScreen screenWith({
   bool interruptBusy = false,
   String? interruptRefusal,
   bool canClear = false,
+  bool screenEnabled = false,
   List<ContextRow> contexts = const [
     ContextRow(contextId: 'c1', label: 'start', current: true, canMove: false),
   ],
@@ -213,6 +214,7 @@ SessionScreen screenWith({
   interruptBusy: interruptBusy,
   interruptRefusal: interruptRefusal,
   canClear: canClear,
+  screenEnabled: screenEnabled,
   workLabel: workLabel,
   stopWarning: stopWarning,
   stopHeadings: const StopHeadings(
