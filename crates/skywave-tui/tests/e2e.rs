@@ -282,12 +282,12 @@ impl Tui {
         .await;
     }
 
-    /// F4 through the new-session prompt, then opens the session.
+    /// F4 through the new-session prompt; the session opens once it is created.
     async fn create_session(&mut self, daemon: &Daemon) {
         self.key(KeyCode::Char('n'));
         self.type_text(&daemon.workdir());
         self.key(KeyCode::Enter);
-        self.open_session().await;
+        self.wait_for("agent idle").await;
     }
 
     /// Opens the first session once it is in the list.
