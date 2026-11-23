@@ -3,7 +3,7 @@
     "deleted": null,
     "fields": {
       "body": "2026-11-22T20:15:54.773836+00:00",
-      "status": "2026-11-22T20:15:54.773836+00:00",
+      "status": "2026-11-23T09:01:55.857718+00:00",
       "title": "2026-11-22T20:15:54.773836+00:00"
     },
     "tags": {
@@ -21,11 +21,11 @@
   "body": "Part of e553ce. The GUI offers App screen on every server because HelloResponse has no screen flag (only shell: bool); a disabled server answers ScreenDisabled. Add screen: bool to hello (protocol bump + no-op PROTOCOL_STEPS step in db.rs and store.rs), store it in ServerFacts like shell_enabled, and hide the menu item when off.",
   "created": "2026-11-22T20:15:54.773836+00:00",
   "id": "4632d9",
-  "status": "open",
+  "status": "done",
   "tags": [
     "followup",
     "screen"
   ],
   "title": "advertise [screen] enabled in hello",
-  "updated": "2026-11-22T20:15:54.773836+00:00"
+  "updated": "2026-11-23T09:01:55.857718+00:00"
 }
