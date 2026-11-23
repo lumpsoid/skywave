@@ -170,8 +170,14 @@ mod tests {
     /// but the last, unfinished block, so a retry resumes from there.
     #[tokio::test]
     async fn a_cut_blob_frame_decodes_most_of_what_arrived() {
+        let mut words = 0x2545_F491_4F6C_DD1Du64;
         let text: Vec<u8> = (0u32..)
-            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .flat_map(|i| {
+                words ^= words << 13;
+                words ^= words >> 7;
+                words ^= words << 17;
+                format!("line {i} {words:016x}\n").into_bytes()
+            })
             .take(300_000)
             .collect();
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -186,6 +192,7 @@ mod tests {
         .collect();
         for (kind, content, compressible) in [
             ("compressible", text, true),
+            // Passes without the flush too (raw blocks stream): guards the prefix, not the bug.
             ("incompressible", random, false),
         ] {
             let mut file = tempfile::tempfile().unwrap();
@@ -196,10 +203,12 @@ mod tests {
                 .await
                 .unwrap()
                 .to_bytes();
+            assert!(
+                frame.len() > 40 * 1024,
+                "{kind}: frame is {} bytes, too short for the cuts below",
+                frame.len()
+            );
             for cut in [12 * 1024, 20 * 1024, 40 * 1024] {
-                if cut >= frame.len() {
-                    continue;
-                }
                 let mut decoder = zstd::stream::write::Decoder::new(Vec::new()).unwrap();
                 decoder.write_all(&frame[..cut]).unwrap();
                 decoder.flush().unwrap();
