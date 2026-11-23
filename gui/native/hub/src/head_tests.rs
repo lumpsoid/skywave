@@ -6769,6 +6769,47 @@ fn a_tap_aims_at_the_latest_capture() {
 }
 
 #[test]
+fn typed_text_counts_once_the_core_took_it() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, logged) = log_capture(&mut rig);
+    let before = app_screens(&logged).pop().unwrap().typed;
+
+    let outs = rig.intent(GuiIntent::AppScreenText {
+        session_id: session.clone(),
+        capture_id: capture.0.to_string(),
+        text: "hi".into(),
+    });
+    assert!(notices(&outs).is_empty(), "{outs:?}");
+    assert!(
+        matches!(screen_actions(&rig).last(), Some(ScreenAction::Text { .. })),
+        "{:?}",
+        rig.actions
+    );
+
+    // The count moves once the core took the text: `results` is that result.
+    let results = rig.results();
+    let typed = app_screens(&results).last().map_or(before, |u| u.typed);
+    assert_eq!(typed, before + 1, "{results:?}");
+
+    // A stale aim types nothing: it is said, and the count stays.
+    let outs = rig.intent(GuiIntent::AppScreenText {
+        session_id: session,
+        capture_id: CommandId::new().0.to_string(),
+        text: "hi".into(),
+    });
+    assert_eq!(
+        notices(&outs),
+        ["the screen changed; aim again on the new capture".to_owned()]
+    );
+    let results = rig.results();
+    assert!(
+        app_screens(&results).iter().all(|u| u.typed == typed),
+        "{results:?}"
+    );
+}
+
+#[test]
 fn a_refused_screen_request_is_dismissed() {
     let mut rig = Rig::new();
     let session = rig.session.0.to_string();

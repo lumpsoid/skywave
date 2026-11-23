@@ -19,6 +19,9 @@ pub struct AppScreenUpdate {
     /// The device's newest requests and device listings, oldest first, at
     /// most 20.
     pub requests: Vec<AppScreenRow>,
+    /// Bumped each time typed text was queued in this session; the field
+    /// clears on a change.
+    pub typed: u32,
 }
 
 /// One attached device, as the device list shows it.

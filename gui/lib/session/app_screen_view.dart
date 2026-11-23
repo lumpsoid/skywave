@@ -161,6 +161,7 @@ class AppScreenView extends StatelessWidget {
             _TextEntry(
               sessionId: sessionId,
               captureId: capture?.captureId,
+              typed: update?.typed ?? 0,
               send: send,
             ),
             Padding(
@@ -287,11 +288,13 @@ class _ScreenImageState extends State<_ScreenImage> {
 }
 
 /// The text field and its send: the text goes to the capture's screen, then
-/// the field clears.
+/// the field clears once the hub says the core queued it (a stale aim keeps
+/// the text, so it can be aimed again).
 class _TextEntry extends StatefulWidget {
   const _TextEntry({
     required this.sessionId,
     required this.captureId,
+    required this.typed,
     required this.send,
   });
 
@@ -300,6 +303,10 @@ class _TextEntry extends StatefulWidget {
   /// The capture the text types into; null while there is none, and then
   /// the send is off.
   final String? captureId;
+
+  /// The hub's count of typed text queued in this session; the field clears
+  /// when it changes.
+  final int typed;
   final SendIntent send;
 
   @override
@@ -309,13 +316,27 @@ class _TextEntry extends StatefulWidget {
 class _TextEntryState extends State<_TextEntry> {
   final _controller = TextEditingController();
 
+  /// The text sent and not yet queued, or null.
+  String? _sent;
+
   @override
   void dispose() {
     _controller.dispose();
     super.dispose();
   }
 
+  @override
+  void didUpdateWidget(_TextEntry oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Text edited after the send is the user's and stays.
+    if (widget.typed != oldWidget.typed && _controller.text == _sent) {
+      _controller.clear();
+      _sent = null;
+    }
+  }
+
   void _type(String captureId) {
+    _sent = _controller.text;
     widget.send(
       GuiIntentAppScreenText(
         sessionId: widget.sessionId,
@@ -323,7 +344,6 @@ class _TextEntryState extends State<_TextEntry> {
         text: _controller.text,
       ),
     );
-    _controller.clear();
   }
 
   @override

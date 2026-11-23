@@ -131,6 +131,9 @@ pub enum Out {
 enum Purpose {
     /// A message from the composer of this session.
     Send(SessionId),
+    /// Text typed into this session's app screen; counted once the core
+    /// took it.
+    ScreenText(SessionId),
     /// A draft save of the open session.
     Draft,
     /// The new-session prompt's workdir.
@@ -233,6 +236,9 @@ struct SessionHead {
     /// The device the app screen shows, as the user picked it; `None` for
     /// the default device.
     app_screen_device: Option<String>,
+    /// Bumped each time typed text of the app screen was queued; the GUI
+    /// clears its field on a change.
+    app_screen_typed: u32,
     /// The composer's message waiting for its result.
     sending: Option<Tag>,
 }
@@ -260,6 +266,7 @@ impl SessionHead {
             outputs: shell::Outputs::default(),
             app_screen: false,
             app_screen_device: None,
+            app_screen_typed: 0,
             sending: None,
         }
     }
@@ -650,6 +657,13 @@ impl Head {
                         }
                         session.saver.edited(clock.now);
                     }
+                }
+            }
+            Purpose::ScreenText(id) => {
+                if done.result.is_ok()
+                    && let Some(session) = self.session.as_mut().filter(|s| s.id == id)
+                {
+                    session.app_screen_typed += 1;
                 }
             }
             Purpose::Draft => {
@@ -1930,11 +1944,15 @@ impl Head {
         // The app screen goes out whole, when it changed; a head with no
         // session open sends the empty screen.
         let app = match (open, &self.session) {
-            (Some(view), Some(session)) => app_screen::update(
-                Some(view),
-                session.app_screen,
-                session.app_screen_device.as_deref(),
-            ),
+            (Some(view), Some(session)) => {
+                let mut app = app_screen::update(
+                    Some(view),
+                    session.app_screen,
+                    session.app_screen_device.as_deref(),
+                );
+                app.typed = session.app_screen_typed;
+                app
+            }
             _ => app_screen::update(None, false, None),
         };
         if self.sent.app_screen.as_ref() != Some(&app) {
@@ -1988,8 +2006,14 @@ impl Head {
         let Some(session) = self.open_head(session_id) else {
             return Ok(());
         };
+        let id = session.id;
         let selected = session.app_screen_device.clone();
         let blank = matches!(&input, Input::Text(text) if text.trim().is_empty());
+        let purpose = if matches!(&input, Input::Text(_)) {
+            Purpose::ScreenText(id)
+        } else {
+            Purpose::Plain
+        };
         let Some(view) = open_session(&self.view) else {
             return Ok(());
         };
@@ -1998,7 +2022,7 @@ impl Head {
         };
         match present::input(view, &device, aim, input) {
             Some(action) => {
-                self.dispatch_user(action, Purpose::Plain, clock, out);
+                self.dispatch_user(action, purpose, clock, out);
             }
             None if blank => {}
             None => {
