@@ -355,6 +355,9 @@ pub(crate) struct Model {
     /// the blob queue forgets un-started requests on a restart too. A
     /// `Failed` blob asked for again shows as requested.
     wanted: HashSet<BlobId>,
+    /// Blobs whose download the user stopped ([`Action::StopBlobDownload`]):
+    /// nothing asks for them on its own, only a new ask by hand. In memory only.
+    stopped: HashSet<BlobId>,
     /// The blob queue paused every download on a full device disk; the
     /// queue decides and reports it ([`Model::set_blobs_disk_full`]).
     blobs_disk_full: bool,
@@ -488,6 +491,7 @@ impl Model {
             blobs: BTreeMap::new(),
             fates: HashMap::new(),
             wanted: HashSet::new(),
+            stopped: HashSet::new(),
             blobs_disk_full: false,
             drafts: HashMap::new(),
             draft_images: HashMap::new(),
@@ -1371,6 +1375,7 @@ impl Model {
             Action::DownloadBlob(id) => match self.blobs.get(&id).map(|b| &b.status) {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
+                    self.stopped.remove(&id);
                     // A download already running shows its progress instead.
                     if matches!(
                         status,
@@ -1383,6 +1388,7 @@ impl Model {
                     vec![Effect::Request(Request::DownloadBlob(id))]
                 }
             },
+            Action::StopBlobDownload(id) => self.stop_blob(id),
             // The server decides whether the blob may go (its refusals
             // show as the view's `pending`): this replica may not know of
             // a delete or crop another device sent.
@@ -1700,11 +1706,25 @@ impl Model {
             record.status,
             BlobStatus::NotDownloaded | BlobStatus::Stopped { .. }
         );
-        if !not_here || self.wanted.contains(&id) {
+        if !not_here || self.wanted.contains(&id) || self.stopped.contains(&id) {
             return None;
         }
         self.wanted.insert(id);
         Some(Request::DownloadBlob(id))
+    }
+
+    /// Stops `id`'s download if it is asked for or under way
+    /// ([`Action::StopBlobDownload`]).
+    fn stop_blob(&mut self, id: BlobId) -> Vec<Effect> {
+        let Some(record) = self.blobs.get(&id) else {
+            return Vec::new();
+        };
+        let under_way = matches!(record.status, BlobStatus::Downloading { .. });
+        if !self.wanted.remove(&id) && !under_way {
+            return Vec::new();
+        }
+        self.stopped.insert(id);
+        vec![Effect::Request(Request::StopBlob(id))]
     }
 
     fn pair(&mut self, address: String, code: String, fingerprint: String) -> Vec<Effect> {
@@ -2887,6 +2907,10 @@ impl Model {
             _ => None,
         };
         self.workdirs.answered(ask, answer);
+        // Asked for by hand afresh: a download stopped before may go again.
+        if let Some(id) = download {
+            self.stopped.remove(&id);
+        }
         let downloaded = download.and_then(|id| self.want_blob(id));
         downloaded
             .into_iter()
@@ -2903,6 +2927,7 @@ impl Model {
         let had_drafts = !self.drafts.is_empty();
         self.reload(snapshot);
         self.wanted.clear();
+        self.stopped.clear();
         self.alerted.clear();
         self.alerted_at.clear();
         self.seen_working.clear();
@@ -2955,6 +2980,7 @@ impl Model {
     fn forget_blob(&mut self, id: BlobId) {
         self.blobs.remove(&id);
         self.wanted.remove(&id);
+        self.stopped.remove(&id);
     }
 
     /// The `from` of each crop pending to produce `into`: a `Cropped` fate
@@ -16434,6 +16460,59 @@ mod tests {
                 .is_empty()
             );
             assert!(!f.model.wanted.contains(&other.id));
+        }
+
+        #[test]
+        fn workdir_a_stopped_blob_is_asked_for_again_only_by_hand() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let diff = blob(10);
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            let set = changes(vec![changed(
+                "a.rs",
+                FileChange::Modified,
+                DiffBody::Blob(diff.clone()),
+            )]);
+            assert!(answer(&mut f, req, ask, set).is_empty());
+
+            let pane = WorkdirPane::Diff {
+                path: "a.rs".into(),
+                untracked: false,
+            };
+            assert_eq!(
+                requests(f.dispatch(Action::ShowWorkdir(pane.clone()))),
+                [Request::DownloadBlob(diff.id)]
+            );
+            // Stopped by hand: the request goes out, the blob shows as not
+            // downloaded, and nothing asks for it again on its own.
+            assert_eq!(
+                requests(f.dispatch(Action::StopBlobDownload(diff.id))),
+                [Request::StopBlob(diff.id)]
+            );
+            let WorkdirBody::Diff {
+                blob: Some(shown), ..
+            } = view(&f).body
+            else {
+                panic!("expected the diff");
+            };
+            assert_eq!(shown.state, BlobState::NotDownloaded { size: 10 });
+            assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes));
+            assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
+            // Stopping again, with nothing asked for or under way, does nothing.
+            assert!(f.dispatch(Action::StopBlobDownload(diff.id)).is_empty());
+            // Asked for by hand: it goes again and shows as requested.
+            assert_eq!(
+                requests(f.dispatch(Action::DownloadBlob(diff.id))),
+                [Request::DownloadBlob(diff.id)]
+            );
+            let WorkdirBody::Diff {
+                blob: Some(shown), ..
+            } = view(&f).body
+            else {
+                panic!("expected the diff");
+            };
+            assert_eq!(shown.state, BlobState::Requested { size: 10 });
         }
 
         #[test]
