@@ -719,14 +719,21 @@ impl Model {
                     .map(str::trim)
                     .filter(|w| !w.is_empty())
                     .map(str::to_owned);
-                self.enqueue(
+                let at = self.opening_from();
+                let effects = self.enqueue(
                     CommandKind::CreateSession {
                         workdir: workdir.to_owned(),
                         conversation,
                         worktree,
                     },
                     Vec::new(),
-                )
+                );
+                // Like `CreateSessionLike`: open it once it is logged, unless the
+                // user went elsewhere meanwhile.
+                if let (Some(at), Some(Effect::Enqueue(command, _))) = (at, effects.first()) {
+                    self.opening = Some((command.id, at));
+                }
+                effects
             }
             Action::CreateSessionLike(from) => {
                 let Some(at) = self.opening_from().filter(|at| match at {
@@ -9547,6 +9554,42 @@ mod tests {
         // Left the list meanwhile: stays where it went.
         f.dispatch(Action::Navigate(Route::ArchivedSessions));
         let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        f.dispatch(Action::Navigate(Route::Settings));
+        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        assert!(matches!(f.model.view().screen, Screen::Settings(_)));
+    }
+
+    #[test]
+    fn a_session_created_from_the_dialog_opens_once_it_is_logged() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let command = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/new".into(),
+            conversation: None,
+            worktree: None,
+        }));
+
+        // Another device's session in the same place is not it.
+        f.session("/srv/new");
+        assert_eq!(f.model.open_session(), None);
+
+        let new = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/new".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        };
+        f.log_commands(new, vec![(Some(command.id), created.clone())]);
+        assert_eq!(f.model.open_session(), Some(new));
+
+        // Gone elsewhere meanwhile: stays there.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let command = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/new".into(),
+            conversation: None,
+            worktree: None,
+        }));
         f.dispatch(Action::Navigate(Route::Settings));
         f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));

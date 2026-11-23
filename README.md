@@ -479,7 +479,7 @@ restore a backup.
    `skywave://pair` links is not supported yet.
 
 4. **Answer an approval.** Tap **New session**, enter a folder under one of
-   your `roots` and tap **Create** (to continue a Claude Code session started outside Skywave, paste its id in the optional field first); open the session and send a message.
+   your `roots` and tap **Create** (to continue a Claude Code session started outside Skywave, paste its id in the optional field first); the session opens once the server has created it: send a message.
    When the agent asks, the session shows an **Approval needed** panel with
    what it wants to do: tap **Approve** or **Deny**, or **Always allow**.
    Answers given offline are queued and go out when the phone is back

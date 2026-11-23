@@ -47,6 +47,9 @@ pub enum Action {
     ///
     /// `worktree` is a new branch to create a git worktree on; the session
     /// runs in that worktree. `None` or blank: run in `workdir`.
+    ///
+    /// Opens the session once its `SessionCreated` reaches the replica,
+    /// unless the user went elsewhere meanwhile.
     CreateSession {
         workdir: String,
         conversation: Option<String>,
