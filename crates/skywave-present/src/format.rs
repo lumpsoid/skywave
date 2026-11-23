@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use skywave_core::{
     AgentSetting, AgentView, AgentWork, AttachmentRefusal, BackgroundTask, BlobState, CallId,
     ContextFill, ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
@@ -876,6 +876,20 @@ pub fn ago(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+/// When a session was last active, as its list row says it: `ago` for the
+/// last day (`5 min ago`), then the date and minute in `tz`
+/// (`2026-10-31 16:02`).
+pub fn activity_label<Tz: TimeZone>(at: DateTime<Utc>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if (now - at).num_seconds() < 86_400 {
+        ago(at, now)
+    } else {
+        at.with_timezone(tz).format("%Y-%m-%d %H:%M").to_string()
+    }
+}
+
 /// A server path's last two components, `…/personal/skywave`; a shorter
 /// path whole.
 pub fn short_path(path: &str) -> String {
@@ -1183,6 +1197,7 @@ pub fn queued_label(run: &ShellRun) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::FixedOffset;
     use skywave_core::{
         BackgroundTask, CommandId, ModelChoice, Refusal, Schedule, ScheduleId, SettingChange,
         TaskId, TaskKind,
@@ -1270,6 +1285,19 @@ mod tests {
         assert_eq!(ago_at("2026-11-03T09:12:00Z"), "12 min ago");
         assert_eq!(ago_at("2026-11-08T10:00:00Z"), "5 d ago");
         assert_eq!(ago_at("2026-12-25T09:00:00Z"), "2026-11-03");
+    }
+
+    #[test]
+    fn an_activity_label_is_relative_for_a_day_then_local() {
+        let tz = FixedOffset::east_opt(2 * 3600).unwrap();
+        let at = |rfc: &str| DateTime::parse_from_rfc3339(rfc).unwrap().to_utc();
+        let activity = |now: &str| activity_label(at("2026-11-01T22:30:00Z"), at(now), &tz);
+        assert_eq!(activity("2026-11-01T22:35:00Z"), "5 min ago");
+        assert_eq!(activity("2026-11-02T21:00:00Z"), "22 h ago");
+        // Exactly a day on: the date rolls over in the zone, not in UTC.
+        assert_eq!(activity("2026-11-02T22:30:00Z"), "2026-11-02 00:30");
+        // A clock behind the agent's.
+        assert_eq!(activity("2026-11-01T22:00:00Z"), "just now");
     }
 
     #[test]
