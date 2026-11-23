@@ -652,7 +652,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
     v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
-    v39_to_v40, v40_to_v41, v41_to_v42,
+    v39_to_v40, v40_to_v41, v41_to_v42, v42_to_v43,
 ];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
@@ -812,6 +812,12 @@ fn v40_to_v41(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 /// v41 to v42: adds the `Screen` command, two event kinds and a blob use;
 /// nothing stored changes.
 fn v41_to_v42(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v42 to v43: `HelloResponse::screen`; nothing stored changes (the facts a hello reports are
+/// kept as columns, not wire JSON).
+fn v42_to_v43(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 

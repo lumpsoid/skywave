@@ -1429,6 +1429,7 @@ mod tests {
             },
             devices: Vec::new(),
             shell: false,
+            screen: false,
             bypass: false,
             login_expires: None,
             agent_login_offered: false,

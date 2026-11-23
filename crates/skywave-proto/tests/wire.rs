@@ -1383,6 +1383,7 @@ fn hello() -> HelloResponse {
             name: "phone".into(),
         }],
         shell: true,
+        screen: true,
         bypass: true,
         login_expires: Some(at()),
         agent_login_offered: true,

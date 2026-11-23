@@ -455,6 +455,7 @@ async fn hello_names_the_caller_and_records_last_seen() {
                 name: "laptop".into(),
             }],
             shell: false,
+            screen: false,
             bypass: false,
             login_expires: None,
             agent_login_offered: false,

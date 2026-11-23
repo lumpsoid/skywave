@@ -2341,6 +2341,41 @@ fn v42_opens_a_v41_replica_unchanged() {
     ));
 }
 
+/// A v42 replica's safety rule opens as v43 and reads back unchanged: v43
+/// added `HelloResponse::screen`, which hello never stores.
+#[test]
+fn v43_opens_a_v42_replica_unchanged() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let session = "01920000-0000-7000-8000-000000000001";
+    let v42 = format!(
+        r#"{{"session_id":"{session}","at":"2026-10-29T12:00:00Z","command_id":null,"context":"{session}","kind":{{"type":"safety_rule_set","words":["git","status"],"on":true,"by":"01920000-0000-7000-8000-000000000009"}}}}"#
+    );
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute(
+        "INSERT INTO events (seq, session_id, event) VALUES (1, ?1, ?2)",
+        rusqlite::params![session, v42],
+    )
+    .unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 42", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let id = SessionId(session.parse().unwrap());
+    let kinds: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, event)| event.kind)
+        .collect();
+    assert!(matches!(
+        &kinds[..],
+        [EventKind::SafetyRuleSet { on: true, .. }]
+    ));
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
@@ -4795,6 +4830,7 @@ fn hello_saying(facts: ServerFacts) -> skywave_proto::HelloResponse {
         },
         devices: Vec::new(),
         shell: facts.shell_enabled,
+        screen: false,
         bypass: facts.bypass_allowed,
         login_expires: facts.login_expires,
         agent_login_offered: facts.agent_login_offered,

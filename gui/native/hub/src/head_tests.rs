@@ -5473,6 +5473,7 @@ impl Rig {
                 },
                 devices: Vec::new(),
                 shell,
+                screen: false,
                 bypass,
                 login_expires: None,
                 agent_login_offered: false,
