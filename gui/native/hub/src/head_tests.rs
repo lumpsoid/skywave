@@ -6769,16 +6769,16 @@ fn a_tap_aims_at_the_latest_capture() {
 }
 
 #[test]
-fn typed_text_counts_once_the_core_took_it() {
+fn typed_text_is_answered_by_its_number() {
     let mut rig = Rig::new();
     let session = rig.session.0.to_string();
-    let (capture, logged) = log_capture(&mut rig);
-    let before = app_screens(&logged).pop().unwrap().typed;
+    let (capture, _) = log_capture(&mut rig);
 
     let outs = rig.intent(GuiIntent::AppScreenText {
         session_id: session.clone(),
         capture_id: capture.0.to_string(),
         text: "hi".into(),
+        seq: 7,
     });
     assert!(notices(&outs).is_empty(), "{outs:?}");
     assert!(
@@ -6786,26 +6786,191 @@ fn typed_text_counts_once_the_core_took_it() {
         "{:?}",
         rig.actions
     );
+    // The core has not taken it yet, so nothing answers it.
+    assert!(
+        app_screens(&outs).iter().all(|u| u.text_result
+            != Some(AppScreenTextResult {
+                seq: 7,
+                queued: true
+            })),
+        "{outs:?}"
+    );
 
-    // The count moves once the core took the text: `results` is that result.
+    // The core took it: `results` carries the answer, by its number.
     let results = rig.results();
-    let typed = app_screens(&results).last().map_or(before, |u| u.typed);
-    assert_eq!(typed, before + 1, "{results:?}");
+    assert_eq!(
+        app_screens(&results).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 7,
+            queued: true
+        }),
+        "{results:?}"
+    );
 
-    // A stale aim types nothing: it is said, and the count stays.
+    // A stale aim is refused: it is said, and its answer is not queued.
     let outs = rig.intent(GuiIntent::AppScreenText {
-        session_id: session,
+        session_id: session.clone(),
         capture_id: CommandId::new().0.to_string(),
         text: "hi".into(),
+        seq: 8,
     });
     assert_eq!(
         notices(&outs),
         ["the screen changed; aim again on the new capture".to_owned()]
     );
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 8,
+            queued: false
+        })
+    );
+
+    // Blank text types nothing, and its answer is not queued either.
+    let outs = rig.intent(GuiIntent::AppScreenText {
+        session_id: session,
+        capture_id: capture.0.to_string(),
+        text: "  ".into(),
+        seq: 9,
+    });
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 9,
+            queued: false
+        })
+    );
+}
+
+#[test]
+fn a_failed_screen_text_is_answered_not_queued() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, _) = log_capture(&mut rig);
+    rig.intent(GuiIntent::AppScreenText {
+        session_id: session,
+        capture_id: capture.0.to_string(),
+        text: "hi".into(),
+        seq: 3,
+    });
+    // The text's dispatch is the last action, so the last one handed out:
+    // `done` may still hold earlier dispatches, which are not this one.
+    assert!(
+        matches!(
+            rig.actions.last(),
+            Some(Action::Screen {
+                action: ScreenAction::Text { .. },
+                ..
+            })
+        ),
+        "{:?}",
+        rig.actions
+    );
+    let tag = rig.done.pop().unwrap().tag;
+    let outs = rig.head.on_dispatched(
+        Dispatched {
+            tag,
+            result: Err(CoreError::Runtime(std::io::Error::other("disk full"))),
+        },
+        rig.clock,
+    );
+    assert_eq!(errors(&outs).len(), 1, "{outs:?}");
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 3,
+            queued: false
+        })
+    );
+}
+
+#[test]
+fn an_older_text_answer_does_not_replace_the_newest() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, _) = log_capture(&mut rig);
+    // Send 1 is dispatched; its result stays in `rig.done` for now.
+    rig.intent(GuiIntent::AppScreenText {
+        session_id: session.clone(),
+        capture_id: capture.0.to_string(),
+        text: "a".into(),
+        seq: 1,
+    });
+    // Send 2 is refused for its stale aim: its answer is not queued.
+    let outs = rig.intent(GuiIntent::AppScreenText {
+        session_id: session,
+        capture_id: CommandId::new().0.to_string(),
+        text: "b".into(),
+        seq: 2,
+    });
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 2,
+            queued: false
+        }),
+        "{outs:?}"
+    );
+    // Send 1's result arrives now: it is not the newest send's answer.
     let results = rig.results();
     assert!(
-        app_screens(&results).iter().all(|u| u.typed == typed),
+        app_screens(&results)
+            .iter()
+            .all(|u| u.text_result.map(|r| r.seq) != Some(1)),
         "{results:?}"
+    );
+}
+
+#[test]
+fn a_new_text_send_clears_the_last_answer() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, _) = log_capture(&mut rig);
+    let send = |seq| GuiIntent::AppScreenText {
+        session_id: session.clone(),
+        capture_id: capture.0.to_string(),
+        text: "hi".into(),
+        seq,
+    };
+    rig.intent(send(4));
+    rig.results();
+    // The new send waits for its own answer: the last one is gone.
+    let outs = rig.intent(send(5));
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        None,
+        "{outs:?}"
+    );
+    let results = rig.results();
+    assert_eq!(
+        app_screens(&results).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 5,
+            queued: true
+        }),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn a_malformed_text_aim_is_answered_not_queued() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    log_capture(&mut rig);
+    let outs = rig.intent(GuiIntent::AppScreenText {
+        session_id: session,
+        capture_id: "nope".into(),
+        text: "hi".into(),
+        seq: 6,
+    });
+    assert_eq!(errors(&outs).len(), 1, "{outs:?}");
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 6,
+            queued: false
+        }),
+        "{outs:?}"
     );
 }
 

@@ -33,7 +33,7 @@ pub fn update(view: Option<&SessionView>, open: bool, device: Option<&str>) -> A
             device: None,
             capture: None,
             requests: Vec::new(),
-            typed: 0,
+            text_result: None,
         };
     };
     let app = &view.app_screen;
@@ -59,7 +59,7 @@ pub fn update(view: Option<&SessionView>, open: bool, device: Option<&str>) -> A
         device: shown,
         capture,
         requests: mine[skip..].iter().map(|r| request_row(r)).collect(),
-        typed: 0,
+        text_result: None,
     }
 }
 

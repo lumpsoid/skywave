@@ -18,7 +18,7 @@ AppScreenUpdate screenUpdate({
   List<AppScreenRow> requests = const [],
   List<AppScreenDevice> devices = const [],
   String? device,
-  int typed = 0,
+  AppScreenTextResult? textResult,
 }) => AppScreenUpdate(
   sessionId: 's1',
   open: true,
@@ -26,7 +26,7 @@ AppScreenUpdate screenUpdate({
   device: device,
   capture: capture,
   requests: requests,
-  typed: typed,
+  textResult: textResult,
 );
 
 AppScreenRow screenRow(
@@ -182,18 +182,30 @@ void main() {
     expect(text.captureId, 'c1');
     expect(_fieldText(tester), 'hello');
 
-    // The hub queued it: the count moved, and the field clears.
-    holder.apply(screenUpdate(capture: phoneCapture, typed: 1));
+    // The hub queued this send: its answer clears the field.
+    final seq = (sent.last as GuiIntentAppScreenText).seq;
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seq, queued: true),
+      ),
+    );
     await tester.pump();
     expect(_fieldText(tester), '');
 
-    // Text edited after the send is the user's: a count that moves while the
-    // field holds other text keeps it.
+    // Text edited after the send is the user's: a queued answer to that send
+    // keeps the text typed since.
     await tester.enterText(find.byKey(const Key('app-screen-text')), 'a');
     await tester.tap(find.byKey(const Key('app-screen-send')));
     await tester.pump();
+    final again = (sent.last as GuiIntentAppScreenText).seq;
     await tester.enterText(find.byKey(const Key('app-screen-text')), 'ab');
-    holder.apply(screenUpdate(capture: phoneCapture, typed: 2));
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: again, queued: true),
+      ),
+    );
     await tester.pump();
     expect(_fieldText(tester), 'ab');
   });
@@ -230,6 +242,122 @@ void main() {
     final retry = sent.last as GuiIntentAppScreenText;
     expect(retry.captureId, 'c2');
     expect(retry.text, 'hello');
+  });
+
+  testWidgets('a failed send can be sent again', (tester) async {
+    final holder = AppScreenHolder()
+      ..apply(screenUpdate(capture: phoneCapture));
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'hello');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    final seq = (sent.last as GuiIntentAppScreenText).seq;
+
+    // The hub could not queue it: the text stays.
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seq, queued: false),
+      ),
+    );
+    await tester.pump();
+    expect(_fieldText(tester), 'hello');
+
+    // Pressing send again sends it, with a number of its own.
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(2));
+    final again = sent.last as GuiIntentAppScreenText;
+    expect(again.text, 'hello');
+    expect(again.captureId, 'c1');
+    expect(again.seq, isNot(seq));
+  });
+
+  testWidgets("an older send's answer leaves newer text", (tester) async {
+    final holder = AppScreenHolder()
+      ..apply(screenUpdate(capture: phoneCapture));
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'a');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    final seqA = (sent.last as GuiIntentAppScreenText).seq;
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'b');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(2));
+    final seqB = (sent.last as GuiIntentAppScreenText).seq;
+
+    // The answer to the first send comes late: the field keeps 'b'.
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seqA, queued: true),
+      ),
+    );
+    await tester.pump();
+    expect(_fieldText(tester), 'b');
+
+    // The answer to the second send clears it.
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seqB, queued: true),
+      ),
+    );
+    await tester.pump();
+    expect(_fieldText(tester), '');
+  });
+
+  testWidgets("an older send's failure leaves the newer send waiting", (
+    tester,
+  ) async {
+    final holder = AppScreenHolder()
+      ..apply(screenUpdate(capture: phoneCapture));
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'a');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    final seqA = (sent.last as GuiIntentAppScreenText).seq;
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'b');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(2));
+    final seqB = (sent.last as GuiIntentAppScreenText).seq;
+
+    // The first send's refusal is stale: 'b' still waits, so a press adds
+    // nothing.
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seqA, queued: false),
+      ),
+    );
+    await tester.pump();
+    expect(_fieldText(tester), 'b');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(2));
+
+    // The second send's refusal lets 'b' go out again.
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seqB, queued: false),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(3));
+    expect((sent.last as GuiIntentAppScreenText).text, 'b');
   });
 
   testWidgets('stale requests show in the error colour', (tester) async {

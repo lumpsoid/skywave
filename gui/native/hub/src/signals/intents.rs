@@ -140,6 +140,9 @@ pub enum GuiIntent {
         session_id: String,
         capture_id: String,
         text: String,
+        /// The GUI's number for this send; the hub's answer
+        /// (`AppScreenUpdate::text_result`) carries it.
+        seq: u32,
     },
     /// A hardware key pressed on the capture `capture_id`'s screen.
     AppScreenKey {
