@@ -15,8 +15,8 @@ use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ContentHash, ConversationsResult,
     DeviceInfo, DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem,
     LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RepoListing, RuleSuggestion,
-    SafetyJudgment, ScreenOutcome, ScreenShot, SessionOrigin, SessionState as LogState, TaskId,
-    ToolCall, ToolKind, ToolResult, WorktreeList, answers_fit,
+    SafetyJudgment, ScreenAction, ScreenOutcome, ScreenShot, SessionOrigin,
+    SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, WorktreeList, answers_fit,
 };
 
 use crate::action::{Action, Route};
@@ -952,6 +952,14 @@ impl Model {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
                 }
+                let covered = matches!(
+                    &action,
+                    ScreenAction::Capture { device, full }
+                        if self.capture_waiting(session_id, device, *full)
+                );
+                if covered {
+                    return Vec::new();
+                }
                 self.enqueue(CommandKind::Screen { session_id, action }, Vec::new())
             }
             Action::StopShell { session_id, run } => {
@@ -1818,6 +1826,21 @@ impl Model {
         self.events(session_id)
             .iter()
             .any(|(_, e)| e.context == context && matches!(e.kind, EventKind::ContextMoved { .. }))
+    }
+
+    /// Whether an unsettled outbox entry already captures `device` (a full
+    /// capture, for `full`), so a new capture of it would only repeat it.
+    fn capture_waiting(&self, session_id: SessionId, device: &str, full: bool) -> bool {
+        self.outbox.iter().any(|e| {
+            !e.status.is_settled()
+                && matches!(
+                    &e.command.kind,
+                    CommandKind::Screen {
+                        session_id: queued,
+                        action: ScreenAction::Capture { device: waiting, full: waiting_full },
+                    } if *queued == session_id && waiting == device && (*waiting_full || !full)
+                )
+        })
     }
 
     /// What the session's composer writes on this device.

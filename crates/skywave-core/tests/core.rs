@@ -2503,6 +2503,54 @@ fn screen_requests_fold_from_the_log_and_this_devices_outbox() {
 }
 
 #[test]
+fn a_capture_waiting_in_the_outbox_takes_the_next_ones() {
+    let log = ScreenLog::new();
+    let pending = || {
+        log.log
+            .seam
+            .pending_outbox()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e.command.kind, CommandKind::Screen { .. }))
+            .count()
+    };
+
+    let first = log.send(capture_of("emulator-5554"));
+    assert_eq!(pending(), 1);
+    assert_eq!(
+        log.send(capture_of("emulator-5554")),
+        first,
+        "a capture still waiting takes the next one"
+    );
+    assert_eq!(pending(), 1);
+
+    let other = log.send(capture_of("emulator-5556"));
+    assert_ne!(other, first, "another device is not covered");
+    assert_eq!(pending(), 2);
+
+    let full = log.send(ScreenAction::Capture {
+        device: "emulator-5554".into(),
+        full: true,
+    });
+    assert_ne!(full, first, "a partial capture does not cover a full one");
+    assert_eq!(pending(), 3);
+
+    log.send(capture_of("emulator-5554"));
+    assert_eq!(pending(), 3, "a full capture waiting covers a partial one");
+
+    // Only captures coalesce: a tap queues every time.
+    let tap = ScreenAction::Tap {
+        device: "emulator-5554".into(),
+        aim: first,
+        x: 1,
+        y: 1,
+    };
+    log.send(tap.clone());
+    log.send(tap);
+    assert_eq!(pending(), 5, "a tap is not coalesced");
+}
+
+#[test]
 fn the_latest_capture_is_each_devices_last_image() {
     let mut log = ScreenLog::new();
     let other = DeviceId::new();
