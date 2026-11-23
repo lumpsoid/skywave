@@ -147,7 +147,7 @@ mod tests {
         let h = line_hit(HitKind::AgentMessage, "the fox", false);
         let (text, ranges) = snippet(&h, &Query::new("fox"));
         assert_eq!(text, "the fox");
-        assert_eq!(ranges, [4..7]);
+        assert_eq!(ranges, std::iter::once(4..7).collect::<Vec<_>>());
     }
 
     #[test]
@@ -167,11 +167,17 @@ mod tests {
         let s = session("Fix the parser", Some("/src/app"), None);
         assert_eq!(
             snippet(&s, &Query::new("parser")),
-            ("Fix the parser".to_owned(), vec![8..14])
+            (
+                "Fix the parser".to_owned(),
+                std::iter::once(8..14).collect::<Vec<_>>(),
+            )
         );
         assert_eq!(
             snippet(&s, &Query::new("app")),
-            ("/src/app".to_owned(), vec![5..8])
+            (
+                "/src/app".to_owned(),
+                std::iter::once(5..8).collect::<Vec<_>>(),
+            )
         );
         let bare = session("Fix", None, None);
         assert_eq!(

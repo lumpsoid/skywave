@@ -1653,7 +1653,11 @@ no longer decodes rather than failing.
   timeline's `Logged` items only (no subagent items, no pending ones); a
   session hit when its title or workdir matches. At most
   `search::SEARCH_HITS_MAX` (200) item hits, and `more` says the search stopped
-  there. Session hits come first, items newest first. Back returns to the
+  there. The cap keeps each session's newest hits, walking the sessions most
+  recently written first. A long matching line is cut to a window of
+  `LINE_MAX_BYTES` (2 KiB, `crates/skywave-core/src/search.rs`) round its first
+  match, with `…` marking each cut. Session hits come first, items newest
+  first. Back returns to the
   scoped session, else the session list. The TUI has inert arms for the
   screen and keeps its own `/` search.
 - **Agent login** (`ViewState::login_expires`, on every screen): Settings
