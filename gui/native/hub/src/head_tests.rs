@@ -8549,3 +8549,222 @@ mod blob_actions {
         assert!(rig.actions.is_empty());
     }
 }
+
+// Global search
+
+use crate::global_search::SEARCH_AFTER;
+use crate::signals::SearchRowView;
+
+/// Logs an agent message "the quick fox" in the open session, then a prompt
+/// "a fox elsewhere" in a second session, so both hold "fox".
+fn fox_data(rig: &mut Rig) {
+    rig.log(vec![EventKind::AgentMessage {
+        parent: None,
+        text: "the quick fox".into(),
+        full: None,
+    }]);
+    let other = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/other".into(),
+        context_name: "start".into(),
+        from: None,
+        worktree: None,
+    };
+    let prompt = EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "a fox elsewhere".into(),
+        attachments: Vec::new(),
+    };
+    rig.log_in(other, vec![created, prompt]);
+}
+
+/// Opens the search page, scoped to `session_id` when given.
+fn open_search(rig: &mut Rig, session_id: Option<String>) {
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::OpenSearch { session_id },
+    });
+    rig.results();
+    rig.view();
+}
+
+/// The one search in `outs`, which must hold exactly one.
+fn the_search(outs: Vec<Out>) -> Out {
+    let mut searches: Vec<Out> = outs
+        .into_iter()
+        .filter(|out| matches!(out, Out::SearchSessions { .. }))
+        .collect();
+    assert_eq!(searches.len(), 1, "one search goes out");
+    searches.remove(0)
+}
+
+/// Answers the searches in `outs` as the core would, and returns the rest.
+fn searched(rig: &mut Rig, outs: Vec<Out>) -> Vec<Out> {
+    let mut rest = Vec::new();
+    for out in outs {
+        match out {
+            Out::SearchSessions {
+                asked,
+                query,
+                scope,
+            } => {
+                let found = rig.core.search(&query, scope);
+                let more = rig.head.on_searched(asked, found, rig.clock);
+                rest.extend(rig.apply(more));
+            }
+            other => rest.push(other),
+        }
+    }
+    rest
+}
+
+/// The count label and rows of the search page the head last sent.
+fn search_page(rig: &Rig) -> (Option<String>, Vec<SearchRowView>) {
+    match sent_screen(rig) {
+        ScreenView::Search {
+            count_label, rows, ..
+        } => (count_label, rows),
+        other => panic!("not the search page: {other:?}"),
+    }
+}
+
+#[test]
+fn global_search_waits_for_typing_to_pause() {
+    let mut rig = Rig::new();
+    fox_data(&mut rig);
+    open_search(&mut rig, None);
+    let outs = rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "fox".into(),
+    });
+    assert!(
+        !outs.iter().any(|o| matches!(o, Out::SearchSessions { .. })),
+        "no search while typing"
+    );
+
+    let found = the_search(rig.wait(SEARCH_AFTER));
+    searched(&mut rig, vec![found]);
+    let (count, rows) = search_page(&rig);
+    assert_eq!(count.as_deref(), Some("2 matches"));
+    let kinds: Vec<&str> = rows.iter().map(|row| row.kind_label.as_str()).collect();
+    assert_eq!(kinds, ["Prompt", "Agent"], "the last logged comes first");
+    assert!(rows.iter().all(|row| !row.matched.is_empty()), "{rows:?}");
+}
+
+#[test]
+fn a_scoped_search_lists_only_its_session() {
+    let mut rig = Rig::new();
+    fox_data(&mut rig);
+    let session = rig.session.0.to_string();
+    open_search(&mut rig, Some(session.clone()));
+    rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "fox".into(),
+    });
+
+    let found = the_search(rig.wait(SEARCH_AFTER));
+    searched(&mut rig, vec![found]);
+    let (count, rows) = search_page(&rig);
+    assert_eq!(count.as_deref(), Some("1 match"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].key.starts_with(session.as_str()), "{:?}", rows[0]);
+    assert_eq!(rows[0].kind_label, "Agent");
+    let ScreenView::Search { scope_title, .. } = sent_screen(&rig) else {
+        panic!("not the search page");
+    };
+    assert!(scope_title.is_some(), "a scoped search is titled");
+}
+
+#[test]
+fn a_stale_answer_is_dropped() {
+    let mut rig = Rig::new();
+    fox_data(&mut rig);
+    open_search(&mut rig, None);
+    rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "fox".into(),
+    });
+    let fox = the_search(rig.wait(SEARCH_AFTER));
+    rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "quick".into(),
+    });
+    let quick = the_search(rig.wait(SEARCH_AFTER));
+
+    searched(&mut rig, vec![fox]);
+    let (count, rows) = search_page(&rig);
+    assert_eq!(count.as_deref(), Some("searching…"), "\"fox\" is stale");
+    assert!(rows.is_empty(), "{rows:?}");
+
+    searched(&mut rig, vec![quick]);
+    let (count, rows) = search_page(&rig);
+    assert_eq!(count.as_deref(), Some("1 match"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].snippet.contains("quick fox"), "{:?}", rows[0]);
+}
+
+#[test]
+fn opening_a_hit_marks_it_in_its_session() {
+    let mut rig = Rig::new();
+    fox_data(&mut rig);
+    open_search(&mut rig, None);
+    rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "fox".into(),
+    });
+    let found = the_search(rig.wait(SEARCH_AFTER));
+    searched(&mut rig, vec![found]);
+
+    let session = rig.session.0.to_string();
+    let (_, rows) = search_page(&rig);
+    let key = rows
+        .iter()
+        .find(|row| row.key.starts_with(session.as_str()))
+        .expect("the agent's message is a hit")
+        .key
+        .clone();
+    let (_, seq) = key.split_once(':').expect("an item hit's key has its seq");
+    rig.intent(GuiIntent::GlobalSearchOpen { key: key.clone() });
+    rig.results();
+    rig.view();
+
+    assert!(
+        matches!(sent_screen(&rig), ScreenView::Session { .. }),
+        "the session shows"
+    );
+    let update = rig.head.sent.search.clone().expect("a search update");
+    assert!(update.open, "{update:?}");
+    assert_eq!(update.query, "fox");
+    assert_eq!(update.current_key, Some(format!("s:{seq}")));
+}
+
+#[test]
+fn a_session_hit_opens_without_a_search() {
+    let mut rig = Rig::new();
+    let foxes = SessionId::new();
+    rig.log_in(
+        foxes,
+        vec![EventKind::SessionCreated {
+            workdir: "/srv/foxes".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        }],
+    );
+    open_search(&mut rig, None);
+    rig.intent(GuiIntent::GlobalSearchTyped {
+        query: "foxes".into(),
+    });
+    let found = the_search(rig.wait(SEARCH_AFTER));
+    searched(&mut rig, vec![found]);
+
+    let (count, rows) = search_page(&rig);
+    assert_eq!(count.as_deref(), Some("1 match"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind_label, "Session");
+    let key = rows[0].key.clone();
+    rig.intent(GuiIntent::GlobalSearchOpen { key });
+    rig.results();
+    rig.view();
+
+    assert!(
+        matches!(sent_screen(&rig), ScreenView::Session { .. }),
+        "the session shows"
+    );
+    let update = rig.head.sent.search.clone().expect("a search update");
+    assert!(!update.open, "{update:?}");
+}
