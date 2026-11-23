@@ -579,6 +579,12 @@ WHERE json_extract(event, '$.kind.type') = 'safety_rule_set'
         WHERE json_extract(event, '$.kind.type') = 'safety_rule_set'
         GROUP BY json_extract(event, '$.kind.words'));
 "#),
+    // `ServerFacts::screen_enabled`. A replica migrated from before reads
+    // "off" until the next `hello` rewrites the row.
+    Sql(r#"
+ALTER TABLE server_facts ADD COLUMN screen_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK (screen_enabled IN (0, 1));
+"#),
 ];
 
 /// Rewrites the stored server addresses to their canonical form
@@ -966,6 +972,8 @@ pub struct Settings {
 pub struct ServerFacts {
     /// Whether the server runs shell commands.
     pub shell_enabled: bool,
+    /// Whether the server drives screens (`[screen] enabled`).
+    pub screen_enabled: bool,
     /// Whether the server allows bypass mode.
     pub bypass_allowed: bool,
     /// When the agent's login expires; `None` when none was reported.
@@ -981,6 +989,7 @@ impl ServerFacts {
     pub fn of(hello: &HelloResponse) -> Self {
         ServerFacts {
             shell_enabled: hello.shell,
+            screen_enabled: hello.screen,
             bypass_allowed: hello.bypass,
             login_expires: hello.login_expires,
             agent_login_offered: hello.agent_login_offered,
@@ -2961,7 +2970,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT shell_enabled, bypass_allowed, login_expires, agent_login_offered,
-                    agent_logged_out
+                    agent_logged_out, screen_enabled
                  FROM server_facts WHERE id = 1",
                 [],
                 |row| {
@@ -2971,6 +2980,7 @@ impl Store {
                         login_expires: opt_time_col(row, 2)?,
                         agent_login_offered: row.get(3)?,
                         agent_logged_out: row.get(4)?,
+                        screen_enabled: row.get(5)?,
                     })
                 },
             )
@@ -3035,19 +3045,21 @@ impl Store {
     pub fn set_server_facts(&self, facts: &ServerFacts) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO server_facts (id, shell_enabled, bypass_allowed, login_expires,
-                 agent_login_offered, agent_logged_out)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                 agent_login_offered, agent_logged_out, screen_enabled)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (id) DO UPDATE SET shell_enabled = excluded.shell_enabled,
                  bypass_allowed = excluded.bypass_allowed,
                  login_expires = excluded.login_expires,
                  agent_login_offered = excluded.agent_login_offered,
-                 agent_logged_out = excluded.agent_logged_out",
+                 agent_logged_out = excluded.agent_logged_out,
+                 screen_enabled = excluded.screen_enabled",
             params![
                 facts.shell_enabled,
                 facts.bypass_allowed,
                 facts.login_expires.map(|at| at.to_rfc3339()),
                 facts.agent_login_offered,
                 facts.agent_logged_out,
+                facts.screen_enabled,
             ],
         )?;
         Ok(())

@@ -525,12 +525,13 @@ mod tests {
         let conn = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
         conn.execute_batch(
             "DROP TABLE safety_rules;
+             ALTER TABLE server_facts DROP COLUMN screen_enabled;
              ALTER TABLE sessions DROP COLUMN safety_check;
              ALTER TABLE sessions DROP COLUMN worktree_removed;
              ALTER TABLE sessions DROP COLUMN worktree;",
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 9)
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 10)
             .unwrap();
         drop(conn);
         legacy::write(dir.path(), legacy::DIR, &creds);

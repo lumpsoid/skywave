@@ -1071,7 +1071,7 @@ logs) an event that no longer decodes rather than failing.
   `usage_limits` keeps the latest answer to the usage limits read.
   `server_facts` keeps what the last `hello` said of the server
   (`ServerFacts`, `Settings::server`): whether it runs shell commands,
-  whether it allows bypass mode, when its agent's login expires
+  whether it drives screens, whether it allows bypass mode, when its agent's login expires
   (`login_expires`), whether a device may log the agent in
   (`agent_login_offered`) and whether the agent is logged out
   (`agent_logged_out`). One row, replaced whole by each `hello` and
