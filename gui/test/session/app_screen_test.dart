@@ -18,6 +18,7 @@ AppScreenUpdate screenUpdate({
   List<AppScreenRow> requests = const [],
   List<AppScreenDevice> devices = const [],
   String? device,
+  int typed = 0,
 }) => AppScreenUpdate(
   sessionId: 's1',
   open: true,
@@ -25,6 +26,7 @@ AppScreenUpdate screenUpdate({
   device: device,
   capture: capture,
   requests: requests,
+  typed: typed,
 );
 
 AppScreenRow screenRow(
@@ -64,6 +66,12 @@ Future<void> pumpScreen(
 
 IconButton iconButton(WidgetTester tester, String key) =>
     tester.widget<IconButton>(find.byKey(Key(key)));
+
+/// What the app screen's text field holds.
+String _fieldText(WidgetTester tester) => tester
+    .widget<TextField>(find.byKey(const Key('app-screen-text')))
+    .controller!
+    .text;
 
 void main() {
   test('the holder keeps the last update', () {
@@ -155,6 +163,73 @@ void main() {
     expect(iconButton(tester, 'app-screen-home').onPressed, isNull);
     expect(iconButton(tester, 'app-screen-recents').onPressed, isNull);
     expect(sent, isEmpty);
+  });
+
+  testWidgets('typed text stays until the hub says it was queued', (
+    tester,
+  ) async {
+    final holder = AppScreenHolder()
+      ..apply(screenUpdate(capture: phoneCapture));
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'hello');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+
+    final text = sent.single as GuiIntentAppScreenText;
+    expect(text.text, 'hello');
+    expect(text.captureId, 'c1');
+    expect(_fieldText(tester), 'hello');
+
+    // The hub queued it: the count moved, and the field clears.
+    holder.apply(screenUpdate(capture: phoneCapture, typed: 1));
+    await tester.pump();
+    expect(_fieldText(tester), '');
+
+    // Text edited after the send is the user's: a count that moves while the
+    // field holds other text keeps it.
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'a');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'ab');
+    holder.apply(screenUpdate(capture: phoneCapture, typed: 2));
+    await tester.pump();
+    expect(_fieldText(tester), 'ab');
+  });
+
+  testWidgets('a second send of waiting text waits for it', (tester) async {
+    final holder = AppScreenHolder()
+      ..apply(screenUpdate(capture: phoneCapture));
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'hello');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+
+    // The second press types nothing: the first is still waiting.
+    expect(sent, hasLength(1));
+    expect((sent.single as GuiIntentAppScreenText).captureId, 'c1');
+
+    // A new capture is a new aim: the waiting text goes to it.
+    const next = AppScreenCapture(
+      captureId: 'c2',
+      path: '/nonexistent/skywave-screen.png',
+      width: 1080,
+      height: 2400,
+    );
+    holder.apply(screenUpdate(capture: next));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+
+    expect(sent, hasLength(2));
+    final retry = sent.last as GuiIntentAppScreenText;
+    expect(retry.captureId, 'c2');
+    expect(retry.text, 'hello');
   });
 
   testWidgets('stale requests show in the error colour', (tester) async {

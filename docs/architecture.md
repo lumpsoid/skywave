@@ -1424,9 +1424,12 @@ logs) an event that no longer decodes rather than failing.
   session deleted here are skipped. Only logged commands are in it, never
   the outbox's. Nothing is stored for it.
 - **App screen** (D65): `Action::Screen` queues a `CommandKind::Screen`
-  through the outbox, discardable while it is refused or unsent. Only the
-  server's `ScreenStale` at accept decides a stale input, so it never
-  expires. `SessionView::app_screen` (`AppScreenView`) folds
+  through the outbox, discardable while it is refused or unsent. A capture is
+  not queued while a capture of the same device (a full one, for a full
+  capture) is still unsent or unanswered in this device's outbox, so repeated
+  presses offline run once. Only the server's `ScreenStale` at accept decides
+  a stale input, so it never expires. `SessionView::app_screen`
+  (`AppScreenView`) folds
   `ScreenRequested` and `ScreenDone`: the devices are the newest `Devices`
   listing, and each device's latest capture is its last `Done { Image }`
   (`Unchanged` keeps it). `ScreenDone::pruned` becomes `Deleted` blob fates,
