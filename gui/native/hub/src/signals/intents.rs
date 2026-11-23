@@ -520,6 +520,10 @@ pub enum ActionIntent {
     OpenSession {
         session_id: String,
     },
+    /// Open the search page, over `session_id`'s session only, or every session.
+    OpenSearch {
+        session_id: Option<String>,
+    },
     /// The session's workdir screen, at its changes; it reads them.
     OpenWorkdir {
         session_id: String,

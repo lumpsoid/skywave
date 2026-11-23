@@ -3388,3 +3388,32 @@ fn search_stops_at_its_hit_limit() {
     assert_eq!(found.hits.len(), SEARCH_HITS_MAX);
     assert!(found.more);
 }
+
+#[test]
+fn search_opens_scoped_and_back_returns_to_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, _requests, sid) = core_with_session(dir.path());
+    core.dispatch(Action::OpenSearch(Some(sid))).unwrap();
+    let view = core.view();
+    let Screen::Search(search) = &view.screen else {
+        panic!("expected the search page, got {:?}", view.screen);
+    };
+    assert_eq!(search.scope.as_ref().map(|scope| scope.id), Some(sid));
+    assert!(view.can_go_back);
+    core.dispatch(Action::Back).unwrap();
+    assert!(matches!(core.view().screen, Screen::Session(_)));
+}
+
+#[test]
+fn search_over_every_session_goes_back_to_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, _requests, _sid) = core_with_session(dir.path());
+    core.dispatch(Action::OpenSearch(None)).unwrap();
+    let view = core.view();
+    let Screen::Search(search) = &view.screen else {
+        panic!("expected the search page, got {:?}", view.screen);
+    };
+    assert!(search.scope.is_none());
+    core.dispatch(Action::Back).unwrap();
+    assert!(matches!(core.view().screen, Screen::SessionList(_)));
+}

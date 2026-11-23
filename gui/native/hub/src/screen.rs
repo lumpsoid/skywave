@@ -129,6 +129,14 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
         Screen::Worktrees(view) => worktrees_view(view),
+        Screen::Search(view) => ScreenView::Search {
+            scope_id: view.scope.as_ref().map(|s| s.id.0.to_string()),
+            scope_title: view.scope.as_ref().map(|s| clean_line(&s.title)),
+            query: String::new(),
+            count_label: None,
+            partial_label: None,
+            rows: Vec::new(),
+        },
         Screen::Approvals(view) => approvals_view(view),
         Screen::UsageLimits(view) => ScreenView::UsageLimits {
             limits: limits_view(view, ui.wall_ms),

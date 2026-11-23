@@ -172,6 +172,12 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::OpenSession { session_id } => {
             Action::OpenSession(id("session", &session_id)?)
         }
+        ActionIntent::OpenSearch { session_id } => Action::OpenSearch(
+            session_id
+                .as_deref()
+                .map(|text| id("session", text))
+                .transpose()?,
+        ),
         ActionIntent::OpenWorkdir { session_id } => Action::OpenWorkdir {
             session_id: id("session", &session_id)?,
         },

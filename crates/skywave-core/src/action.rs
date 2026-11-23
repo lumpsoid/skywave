@@ -419,6 +419,10 @@ pub enum Action {
         session_id: SessionId,
     },
     OpenSession(SessionId),
+    /// Open the search page ([`Screen::Search`](crate::Screen::Search)) over
+    /// every session (`None`) or over one session's only. A no-op without a
+    /// paired device, or for a session this device does not know.
+    OpenSearch(Option<SessionId>),
     /// Open the session of the next approval in
     /// [`Attention::approvals`](crate::Attention::approvals) outside the
     /// open session: the oldest, or, when the open session has one, the

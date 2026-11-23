@@ -55,11 +55,11 @@ pub use screen::{
     LimitsView, ListKindView, LoginFlowState, ModeOption, ModelOption, NotificationsView, PairForm,
     PairingState, PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView,
     RenamePrompt, RepairNotice, RuleOption, SafetyCheckView, SafetyRuleRow, ScheduleRow,
-    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, ShellPromptView, SnippetView,
-    StopHeadings, StorageGroupingView, StorageKindView, StorageRowView, StorageSessionView,
-    StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow, UsageGroupingView,
-    UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView, WorktreeSessionView,
-    WorktreeView,
+    ScreenUpdate, ScreenView, SearchRowView, SessionRowView, SessionScreen, ShellPromptView,
+    SnippetView, StopHeadings, StorageGroupingView, StorageKindView, StorageRowView,
+    StorageSessionView, StorageTotalView, SubagentHeaderView, SubagentRowView, TaskRow,
+    UsageGroupingView, UsageRowView, UsageSpanView, WorktreeRemoveView, WorktreeRepoView,
+    WorktreeSessionView, WorktreeView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};

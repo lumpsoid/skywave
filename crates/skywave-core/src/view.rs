@@ -608,6 +608,9 @@ pub enum Screen {
     /// Every approval this device can answer, from every session, oldest
     /// first ([`Route::Approvals`](crate::Route::Approvals)).
     Approvals(ApprovalsView),
+    /// The search page: hits from every session, or from one session's only
+    /// ([`Action::OpenSearch`](crate::Action::OpenSearch)).
+    Search(SearchView),
 }
 
 /// The page choosing which lines of a blob's content to keep
@@ -1155,6 +1158,21 @@ pub struct WorktreeSession {
     pub worktree_removed: bool,
     /// The latest `RemoveWorktree` for this session, until its effect is in the replica.
     pub removal: Option<Outgoing>,
+}
+
+/// The search page ([`Screen::Search`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchView {
+    /// The one session searched; `None` searches every session, and also
+    /// when the session the page was opened from is gone.
+    pub scope: Option<SearchScope>,
+}
+
+/// The session a search page is scoped to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchScope {
+    pub id: SessionId,
+    pub title: String,
 }
 
 /// The usage limits of the account the server's agent runs as
