@@ -39,6 +39,9 @@ cargo test --workspace
 (cd gui && flutter analyze && flutter test)   # only when gui/ changed
 ```
 
+- The full gate runs on CI. `ci.yml` has no push trigger for work branches:
+  after `agent-ci` pushes, start the run with `gh workflow run CI --ref <branch>`.
+
 - Run `rinf gen` in `gui/` after changing `gui/native/hub/src/signals`. The
   Dart bindings it generates are not committed.
 - Wire snapshots: `UPDATE_SNAPSHOTS=1 cargo test -p skywave-proto --test wire`
