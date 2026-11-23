@@ -319,6 +319,9 @@ class _TextEntryState extends State<_TextEntry> {
   /// The text sent and not yet queued, or null.
   String? _sent;
 
+  /// The capture the waiting text was sent to, or null with [_sent].
+  String? _sentAim;
+
   @override
   void dispose() {
     _controller.dispose();
@@ -332,11 +335,18 @@ class _TextEntryState extends State<_TextEntry> {
     if (widget.typed != oldWidget.typed && _controller.text == _sent) {
       _controller.clear();
       _sent = null;
+      _sentAim = null;
     }
   }
 
   void _type(String captureId) {
+    // The same text is already waiting for this capture: a second press must
+    // not type it twice.
+    if (_sent != null && _controller.text == _sent && captureId == _sentAim) {
+      return;
+    }
     _sent = _controller.text;
+    _sentAim = captureId;
     widget.send(
       GuiIntentAppScreenText(
         sessionId: widget.sessionId,

@@ -198,6 +198,40 @@ void main() {
     expect(_fieldText(tester), 'ab');
   });
 
+  testWidgets('a second send of waiting text waits for it', (tester) async {
+    final holder = AppScreenHolder()
+      ..apply(screenUpdate(capture: phoneCapture));
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'hello');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+
+    // The second press types nothing: the first is still waiting.
+    expect(sent, hasLength(1));
+    expect((sent.single as GuiIntentAppScreenText).captureId, 'c1');
+
+    // A new capture is a new aim: the waiting text goes to it.
+    const next = AppScreenCapture(
+      captureId: 'c2',
+      path: '/nonexistent/skywave-screen.png',
+      width: 1080,
+      height: 2400,
+    );
+    holder.apply(screenUpdate(capture: next));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+
+    expect(sent, hasLength(2));
+    final retry = sent.last as GuiIntentAppScreenText;
+    expect(retry.captureId, 'c2');
+    expect(retry.text, 'hello');
+  });
+
   testWidgets('stale requests show in the error colour', (tester) async {
     final holder = AppScreenHolder()
       ..apply(
