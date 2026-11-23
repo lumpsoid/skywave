@@ -6885,6 +6885,96 @@ fn a_failed_screen_text_is_answered_not_queued() {
 }
 
 #[test]
+fn an_older_text_answer_does_not_replace_the_newest() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, _) = log_capture(&mut rig);
+    // Send 1 is dispatched; its result stays in `rig.done` for now.
+    rig.intent(GuiIntent::AppScreenText {
+        session_id: session.clone(),
+        capture_id: capture.0.to_string(),
+        text: "a".into(),
+        seq: 1,
+    });
+    // Send 2 is refused for its stale aim: its answer is not queued.
+    let outs = rig.intent(GuiIntent::AppScreenText {
+        session_id: session,
+        capture_id: CommandId::new().0.to_string(),
+        text: "b".into(),
+        seq: 2,
+    });
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 2,
+            queued: false
+        }),
+        "{outs:?}"
+    );
+    // Send 1's result arrives now: it is not the newest send's answer.
+    let results = rig.results();
+    assert!(
+        app_screens(&results)
+            .iter()
+            .all(|u| u.text_result.map(|r| r.seq) != Some(1)),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn a_new_text_send_clears_the_last_answer() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    let (capture, _) = log_capture(&mut rig);
+    let send = |seq| GuiIntent::AppScreenText {
+        session_id: session.clone(),
+        capture_id: capture.0.to_string(),
+        text: "hi".into(),
+        seq,
+    };
+    rig.intent(send(4));
+    rig.results();
+    // The new send waits for its own answer: the last one is gone.
+    let outs = rig.intent(send(5));
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        None,
+        "{outs:?}"
+    );
+    let results = rig.results();
+    assert_eq!(
+        app_screens(&results).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 5,
+            queued: true
+        }),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn a_malformed_text_aim_is_answered_not_queued() {
+    let mut rig = Rig::new();
+    let session = rig.session.0.to_string();
+    log_capture(&mut rig);
+    let outs = rig.intent(GuiIntent::AppScreenText {
+        session_id: session,
+        capture_id: "nope".into(),
+        text: "hi".into(),
+        seq: 6,
+    });
+    assert_eq!(errors(&outs).len(), 1, "{outs:?}");
+    assert_eq!(
+        app_screens(&outs).last().unwrap().text_result,
+        Some(AppScreenTextResult {
+            seq: 6,
+            queued: false
+        }),
+        "{outs:?}"
+    );
+}
+
+#[test]
 fn a_refused_screen_request_is_dismissed() {
     let mut rig = Rig::new();
     let session = rig.session.0.to_string();

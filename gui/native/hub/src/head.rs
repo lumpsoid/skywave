@@ -372,10 +372,13 @@ pub struct Head {
     pending: HashMap<Tag, Purpose>,
     /// Bumped for every value the hub writes into a Dart field.
     revs: u32,
-    /// The answer to the latest typed text of the app screen. Kept here, not
-    /// in a session's head: the GUI's number for a send is unique while the
-    /// app runs, so an answer is never mistaken for another send's.
+    /// The answer to the newest typed text of the app screen; `None` while it
+    /// waits. Kept here, not in a session's head: the GUI's number for a send
+    /// is unique while the app runs, so an answer is never mistaken for
+    /// another send's.
     app_screen_text: Option<AppScreenTextResult>,
+    /// The number of the newest typed text; only its answer is kept.
+    app_screen_text_seq: Option<u32>,
     form: PairForm,
     create: Option<CreateUi>,
     create_tag: Option<Tag>,
@@ -659,10 +662,14 @@ impl Head {
                 }
             }
             Purpose::ScreenText(seq) => {
-                self.app_screen_text = Some(AppScreenTextResult {
-                    seq,
-                    queued: done.result.is_ok(),
-                });
+                // Only the newest send's answer counts; an older one's
+                // result arriving late must not replace it.
+                if self.app_screen_text_seq == Some(seq) {
+                    self.app_screen_text = Some(AppScreenTextResult {
+                        seq,
+                        queued: done.result.is_ok(),
+                    });
+                }
             }
             Purpose::Draft => {
                 if done.result.is_err()
@@ -1029,6 +1036,10 @@ impl Head {
             } => {
                 let input = Input::Text(text);
                 let purpose = Purpose::ScreenText(seq);
+                // A new send waits for its own answer; an older one's no
+                // longer counts.
+                self.app_screen_text_seq = Some(seq);
+                self.app_screen_text = None;
                 let dispatched =
                     self.app_screen_input(&session_id, &capture_id, input, purpose, clock, out);
                 // Not queued: the GUI may send the same text again.

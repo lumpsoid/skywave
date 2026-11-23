@@ -313,6 +313,53 @@ void main() {
     expect(_fieldText(tester), '');
   });
 
+  testWidgets("an older send's failure leaves the newer send waiting", (
+    tester,
+  ) async {
+    final holder = AppScreenHolder()
+      ..apply(screenUpdate(capture: phoneCapture));
+    final sent = <GuiIntent>[];
+    await pumpScreen(tester, holder, sent);
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'a');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    final seqA = (sent.last as GuiIntentAppScreenText).seq;
+
+    await tester.enterText(find.byKey(const Key('app-screen-text')), 'b');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(2));
+    final seqB = (sent.last as GuiIntentAppScreenText).seq;
+
+    // The first send's refusal is stale: 'b' still waits, so a press adds
+    // nothing.
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seqA, queued: false),
+      ),
+    );
+    await tester.pump();
+    expect(_fieldText(tester), 'b');
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(2));
+
+    // The second send's refusal lets 'b' go out again.
+    holder.apply(
+      screenUpdate(
+        capture: phoneCapture,
+        textResult: AppScreenTextResult(seq: seqB, queued: false),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('app-screen-send')));
+    await tester.pump();
+    expect(sent, hasLength(3));
+    expect((sent.last as GuiIntentAppScreenText).text, 'b');
+  });
+
   testWidgets('stale requests show in the error colour', (tester) async {
     final holder = AppScreenHolder()
       ..apply(
