@@ -1,7 +1,9 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/approvals/approvals_page.dart';
 import 'package:skywave_gui/boot/startup_page.dart';
+import 'package:skywave_gui/link/link_banner.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
 import 'package:skywave_gui/screen/screen_holder.dart';
 import 'package:skywave_gui/screen/repair_page.dart';
@@ -336,5 +338,77 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(NotificationsPage), findsNothing);
     expect(find.byType(SettingsPage), findsOneWidget);
+  });
+
+  testWidgets('Escape is Back where Rust says it goes somewhere', (
+    tester,
+  ) async {
+    final holders = fakeHolders();
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LinkShortcuts(
+          send: sent.add,
+          child: ScreenNavigator(holders: holders, send: sent.add),
+        ),
+      ),
+    );
+    holders.screen.apply(settingsScreen(canGoBack: true));
+    await tester.pumpAndSettle();
+
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pump();
+    expect(sent, [const GuiIntentAct(action: ActionIntentBack())]);
+  });
+
+  testWidgets('Escape does nothing where back would leave the app', (
+    tester,
+  ) async {
+    final holders = fakeHolders();
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LinkShortcuts(
+          send: sent.add,
+          child: ScreenNavigator(holders: holders, send: sent.add),
+        ),
+      ),
+    );
+    holders.screen.apply(settingsScreen(canGoBack: false));
+    await tester.pumpAndSettle();
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(sent, isEmpty);
+    expect(find.byType(SettingsPage), findsOneWidget);
+  });
+
+  testWidgets('Escape closes the notifications page and sends nothing', (
+    tester,
+  ) async {
+    final holders = fakeHolders();
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LinkShortcuts(
+          send: sent.add,
+          child: ScreenNavigator(holders: holders, send: sent.add),
+        ),
+      ),
+    );
+    holders.screen.apply(settingsScreen());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('notifications')));
+    await tester.pumpAndSettle();
+    expect(find.byType(NotificationsPage), findsOneWidget);
+
+    sent.clear();
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(holders.notificationsOpen.value, isFalse);
+    expect(find.byType(NotificationsPage), findsNothing);
+    expect(find.byType(SettingsPage), findsOneWidget);
+    expect(sent, isEmpty);
   });
 }

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
@@ -183,7 +185,8 @@ class LinkBanner extends StatelessWidget {
 /// Desktop shortcuts that work on every screen, as in the TUI: Ctrl+R
 /// retries the link now, Ctrl+G opens the next approval elsewhere. Rust
 /// ignores either when it does not apply. In the shell composer Ctrl+R opens
-/// the history picker instead (D53).
+/// the history picker instead (D53). Escape is system back (ScreenNavigator's
+/// PopScope), but never leaves the app.
 class LinkShortcuts extends StatelessWidget {
   const LinkShortcuts({required this.send, required this.child, super.key});
 
@@ -198,6 +201,8 @@ class LinkShortcuts extends StatelessWidget {
             send.act(const ActionIntentRetryNow()),
         const SingleActivator(LogicalKeyboardKey.keyG, control: true): () =>
             send.act(const ActionIntentOpenNextApproval()),
+        const SingleActivator(LogicalKeyboardKey.escape): () =>
+            unawaited(Navigator.maybePop(context)),
       },
       child: Focus(autofocus: true, child: child),
     );
