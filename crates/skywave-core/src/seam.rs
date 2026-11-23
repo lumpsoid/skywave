@@ -139,6 +139,10 @@ pub enum Request {
         path: String,
         replace: Option<ContentHash>,
     },
+    /// Cancel push `req` unless its write is sent already.
+    CancelPush {
+        req: u64,
+    },
     /// Ask the server for its agent's usage limits, for the usage limits
     /// page, within [`USAGE_LIMITS_TIMEOUT`](crate::USAGE_LIMITS_TIMEOUT).
     /// The engine answers with [`Seam::usage_limits_answered`], naming

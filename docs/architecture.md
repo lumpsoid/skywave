@@ -1504,7 +1504,11 @@ no longer decodes rather than failing.
   `Done(PushOutcome)`); a push the server answers `Exists` is
   `Done(Written(Exists { sha256, size }))`, the hash the GUI's Replace… resends
   with. A download's answer is stored like a read's; a push is held in
-  memory only.
+  memory only. `Action::CancelWorkdirPush` stops a push until its write is
+  sent: the engine then answers `Done(Cancelled)`, nothing written, and the
+  server keeps what was uploaded, so pushing again resumes. Once the write is
+  sent the push ends as the server answers; the model marks nothing cancelled
+  before the engine says so.
 - **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
   the sessions they ran in; heads total them with `skywave_present::usage`
   by local day, session, workdir or model. A turn with no cost is unpriced,

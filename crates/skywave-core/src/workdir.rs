@@ -166,6 +166,9 @@ pub enum PushOutcome {
     UploadRefused(UploadResult),
     /// The server's answer to the write.
     Written(WriteFileResult),
+    /// Cancelled by the user before its write was sent: nothing was
+    /// written. The server keeps what was uploaded: pushing again resumes.
+    Cancelled,
 }
 
 /// The model's workdir reads: the latest stored answer per ask, as the
@@ -374,6 +377,14 @@ impl Workdirs {
             Ok(outcome) => PushState::Done(outcome),
             Err(error) => PushState::Failed(error.to_string()),
         };
+    }
+
+    /// The request of the push into `path` of `session`, while it is pushing.
+    pub(crate) fn pushing_req(&self, session: SessionId, path: &str) -> Option<u64> {
+        self.pushes
+            .get(&(session, path.to_owned()))
+            .filter(|push| push.state == PushState::Pushing)
+            .map(|push| push.req)
     }
 
     /// `session`'s pushes, sorted by path.

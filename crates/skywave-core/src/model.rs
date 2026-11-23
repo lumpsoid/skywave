@@ -1391,6 +1391,11 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::CancelWorkdirPush { session_id, path } => self
+                .workdirs
+                .pushing_req(session_id, &path)
+                .map(|req| vec![Effect::Request(Request::CancelPush { req })])
+                .unwrap_or_default(),
             Action::DownloadBlob(id) => match self.blobs.get(&id).map(|b| &b.status) {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
@@ -16381,6 +16386,49 @@ mod tests {
                 .find(|p| p.path == "offline.md")
                 .expect("listed");
             assert_eq!(entry.state, PushState::Failed(not_connected()));
+        }
+
+        #[test]
+        fn workdir_a_push_cancels_only_while_pushing() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let push = |session: SessionId, path: &str| Action::PushWorkdirFile {
+                session_id: session,
+                source: PathBuf::from("/home/me/notes.md"),
+                path: path.into(),
+                replace: None,
+            };
+            let cancel = |session: SessionId, path: &str| Action::CancelWorkdirPush {
+                session_id: session,
+                path: path.into(),
+            };
+
+            // Nothing to cancel before a push.
+            assert!(f.dispatch(cancel(id, "docs/notes.md")).is_empty());
+
+            // Cancelling asks the engine to stop the push; it still shows as
+            // pushing until the engine answers.
+            let (req, _) = push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_eq!(
+                requests(f.dispatch(cancel(id, "docs/notes.md"))),
+                [Request::CancelPush { req }]
+            );
+            assert_eq!(view(&f).pushes[0].state, PushState::Pushing);
+
+            // The engine's answer ends the push; cancelling it again is a no-op.
+            f.model
+                .workdir_pushed(req, id, "docs/notes.md".into(), Ok(PushOutcome::Cancelled));
+            assert_eq!(
+                view(&f).pushes[0].state,
+                PushState::Done(PushOutcome::Cancelled)
+            );
+            assert!(f.dispatch(cancel(id, "docs/notes.md")).is_empty());
+
+            // A cancelled push does not block its path: pushing again asks.
+            push_asked(f.dispatch(push(id, "docs/notes.md")));
+            assert_eq!(view(&f).pushes[0].state, PushState::Pushing);
         }
 
         #[test]

@@ -487,6 +487,14 @@ pub enum Action {
         path: String,
         replace: Option<ContentHash>,
     },
+    /// Cancel the push into the session's workdir `path` while it uploads.
+    /// Stopped before its write is sent, it ends `PushOutcome::Cancelled`
+    /// (nothing written; pushing again resumes the upload); once the write is
+    /// sent it ends as it ends. A no-op unless it is pushing.
+    CancelWorkdirPush {
+        session_id: SessionId,
+        path: String,
+    },
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
     /// Stop blob's download, asked for or under way, keeping what it got: it

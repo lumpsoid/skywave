@@ -116,7 +116,7 @@
 //! server they started for, which refuses their writes from then on, until
 //! the `Connect` that follows restarts them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
 use std::path::Path;
@@ -130,7 +130,7 @@ use skywave_proto::{
     Command, CommandKind, CommandResult, ContentHash, EventsQuery, Seq, SessionId, UploadResult,
     WriteFileRequest, WriteFileResult,
 };
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::address::ServerAddress;
@@ -354,6 +354,9 @@ pub(crate) struct Engine {
     /// downloader's and the side transport. A new one per link start, so a
     /// link to another server never inherits the last one's run.
     run: ExpectedRun,
+    /// The cancel of each push in flight, by its request; one whose task
+    /// ended is pruned at the next push.
+    pushes: HashMap<u64, oneshot::Sender<()>>,
 }
 
 impl Engine {
@@ -382,6 +385,7 @@ impl Engine {
             blobs: Arc::new(BlobQueue::restore(&seam)),
             side: None,
             run: ExpectedRun::default(),
+            pushes: HashMap::new(),
         }
     }
 
@@ -612,12 +616,26 @@ impl Engine {
                     answer_push(&seam, req, session, path, Err(not_connected()));
                     return;
                 };
+                let (cancel, cancelled) = oneshot::channel();
+                self.pushes.retain(|_, cancel| !cancel.is_closed());
+                self.pushes.insert(req, cancel);
                 self.seam.spawn("a workdir push", async move {
-                    let result =
-                        push_workdir_file(&*transport, &source, session, path.clone(), replace)
-                            .await;
+                    let result = push_workdir_file(
+                        &*transport,
+                        &source,
+                        session,
+                        path.clone(),
+                        replace,
+                        cancelled,
+                    )
+                    .await;
                     answer_push(&seam, req, session, path, result);
                 });
+            }
+            Request::CancelPush { req } => {
+                if let Some(cancel) = self.pushes.remove(&req) {
+                    let _ = cancel.send(());
+                }
             }
             Request::CountLines { req, path } => {
                 let seam = self.seam.clone();
@@ -1494,46 +1512,68 @@ async fn write_one(
 /// file changed in between fails as the server's hash mismatch). A HEAD, then,
 /// unless the server holds the bytes, a PUT, then the write at `path`. A file
 /// that is missing, unreadable or over [`PUSH_MAX_BYTES`] is refused without an
-/// upload. A transport error is returned to the caller.
+/// upload. A transport error is returned to the caller. A cancel sent on
+/// `cancelled` before the write is sent stops the push as
+/// [`PushOutcome::Cancelled`]; once the write is sent, a cancel no longer counts.
 pub(crate) async fn push_workdir_file(
     transport: &dyn Transport,
     source: &Path,
     session: SessionId,
     path: String,
     replace: Option<ContentHash>,
+    cancelled: oneshot::Receiver<()>,
 ) -> Result<PushOutcome, TransportError> {
-    match tokio::fs::metadata(source).await {
-        Ok(meta) if meta.len() > PUSH_MAX_BYTES => {
-            tracing::warn!("workdir push file is over the upload limit");
-            return Ok(PushOutcome::UploadRefused(UploadResult::TooLarge));
+    let staged = async {
+        match tokio::fs::metadata(source).await {
+            Ok(meta) if meta.len() > PUSH_MAX_BYTES => {
+                tracing::warn!("workdir push file is over the upload limit");
+                return Ok(Err(PushOutcome::UploadRefused(UploadResult::TooLarge)));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "workdir push file cannot be read");
+                return Ok(Err(PushOutcome::Unreadable {
+                    reason: error.to_string(),
+                }));
+            }
         }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(%error, "workdir push file cannot be read");
-            return Ok(PushOutcome::Unreadable {
-                reason: error.to_string(),
-            });
+        let (sha, len) = match hash_file(source).await {
+            Ok(hashed) => hashed,
+            Err(error) => {
+                tracing::warn!(%error, "workdir push file cannot be read");
+                return Ok(Err(PushOutcome::Unreadable {
+                    reason: error.to_string(),
+                }));
+            }
+        };
+        if let StagedUpload::Missing { held } = transport.attachment_staged(sha).await? {
+            let file = UploadFile {
+                path: source.to_path_buf(),
+                len,
+            };
+            let answer = upload_resuming(transport, sha, file, held).await?;
+            if !matches!(answer, UploadResult::Stored { .. }) {
+                return Ok(Err(PushOutcome::UploadRefused(answer)));
+            }
         }
-    }
-    let (sha, len) = match hash_file(source).await {
-        Ok(hashed) => hashed,
-        Err(error) => {
-            tracing::warn!(%error, "workdir push file cannot be read");
-            return Ok(PushOutcome::Unreadable {
-                reason: error.to_string(),
-            });
+        Ok::<_, TransportError>(Ok(sha))
+    };
+    // A dropped sender is no cancel: only a sent one stops the push.
+    let cancel = async {
+        if cancelled.await.is_err() {
+            std::future::pending::<()>().await;
         }
     };
-    if let StagedUpload::Missing { held } = transport.attachment_staged(sha).await? {
-        let file = UploadFile {
-            path: source.to_path_buf(),
-            len,
-        };
-        let answer = upload_resuming(transport, sha, file, held).await?;
-        if !matches!(answer, UploadResult::Stored { .. }) {
-            return Ok(PushOutcome::UploadRefused(answer));
-        }
-    }
+    let sha = tokio::select! {
+        biased;
+        () = cancel => return Ok(PushOutcome::Cancelled),
+        staged = staged => match staged? {
+            Ok(sha) => sha,
+            Err(outcome) => return Ok(outcome),
+        },
+    };
+    // From here the write is sent: the server may write the file, so a
+    // cancel no longer counts.
     let request = WriteFileRequest {
         session,
         path,
@@ -3468,6 +3508,12 @@ mod tests {
         path
     }
 
+    /// A push that is never cancelled: its sender is dropped at once, which
+    /// is no cancel.
+    fn never_cancelled() -> oneshot::Receiver<()> {
+        oneshot::channel().1
+    }
+
     /// Writes `bytes` where the outbox looks for the image they hash to.
     fn put_file(dir: &std::path::Path, bytes: &[u8]) -> ContentHash {
         let sha256 = ContentHash::of(bytes);
@@ -4452,9 +4498,16 @@ mod tests {
         let sha = ContentHash::of(b"device bytes");
         server.partials.lock().unwrap().insert(sha, 3);
 
-        let outcome = push_workdir_file(&server, &source, session, "docs/a.txt".into(), None)
-            .await
-            .unwrap();
+        let outcome = push_workdir_file(
+            &server,
+            &source,
+            session,
+            "docs/a.txt".into(),
+            None,
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             server.calls(),
@@ -4480,9 +4533,16 @@ mod tests {
         let session = SessionId::new();
         let sha = ContentHash::of(b"device bytes");
 
-        let outcome = push_workdir_file(&server, &source, session, "docs/a.txt".into(), None)
-            .await
-            .unwrap();
+        let outcome = push_workdir_file(
+            &server,
+            &source,
+            session,
+            "docs/a.txt".into(),
+            None,
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             server.calls(),
@@ -4514,6 +4574,36 @@ mod tests {
         );
     }
 
+    /// A push cancelled before its write is sent writes nothing: the server
+    /// is never asked for the write, and the push says it was cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn push_cancelled_before_its_write_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_file(dir.path(), b"device bytes");
+        let server = StagingServer::new();
+        let sha = ContentHash::of(b"device bytes");
+        let (cancel, cancelled) = oneshot::channel();
+        cancel.send(()).unwrap();
+
+        let outcome = push_workdir_file(
+            &server,
+            &source,
+            SessionId::new(),
+            "docs/a.txt".into(),
+            None,
+            cancelled,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, PushOutcome::Cancelled);
+        assert!(
+            !server.calls().contains(&write_call(sha)),
+            "{:?}",
+            server.calls()
+        );
+    }
+
     /// A file is hashed whole by a streaming read, across more than one chunk.
     #[tokio::test]
     async fn hash_file_hashes_the_whole_file_by_a_streaming_read() {
@@ -4539,9 +4629,16 @@ mod tests {
         let server = StagingServer::new();
         let session = SessionId::new();
 
-        push_workdir_file(&server, &source, session, "big.bin".into(), None)
-            .await
-            .unwrap();
+        push_workdir_file(
+            &server,
+            &source,
+            session,
+            "big.bin".into(),
+            None,
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             server.uploads.lock().unwrap().clone(),
@@ -4567,9 +4664,16 @@ mod tests {
         let session = SessionId::new();
         let old = ContentHash::of(b"old");
 
-        push_workdir_file(&server, &source, session, "a.txt".into(), Some(old))
-            .await
-            .unwrap();
+        push_workdir_file(
+            &server,
+            &source,
+            session,
+            "a.txt".into(),
+            Some(old),
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(server.calls(), [head_call(sha), write_call(sha)]);
         let writes = server.writes.lock().unwrap().clone();
@@ -4591,9 +4695,16 @@ mod tests {
         let server = StagingServer::new();
         let missing = dir.path().join("gone.bin");
 
-        let outcome = push_workdir_file(&server, &missing, SessionId::new(), "a".into(), None)
-            .await
-            .unwrap();
+        let outcome = push_workdir_file(
+            &server,
+            &missing,
+            SessionId::new(),
+            "a".into(),
+            None,
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(outcome, PushOutcome::Unreadable { .. }),
@@ -4611,9 +4722,16 @@ mod tests {
         file.set_len(PUSH_MAX_BYTES + 1).unwrap();
         let server = StagingServer::new();
 
-        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
-            .await
-            .unwrap();
+        let outcome = push_workdir_file(
+            &server,
+            &source,
+            SessionId::new(),
+            "a".into(),
+            None,
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, PushOutcome::UploadRefused(UploadResult::TooLarge));
         assert!(server.calls().is_empty(), "{:?}", server.calls());
@@ -4630,9 +4748,16 @@ mod tests {
             ..StagingServer::new()
         };
 
-        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
-            .await
-            .unwrap();
+        let outcome = push_workdir_file(
+            &server,
+            &source,
+            SessionId::new(),
+            "a".into(),
+            None,
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(server.calls(), [head_call(sha), put_call(sha)]);
         assert_eq!(outcome, PushOutcome::UploadRefused(UploadResult::DiskLow));
@@ -4653,9 +4778,16 @@ mod tests {
             ..StagingServer::new()
         };
 
-        let outcome = push_workdir_file(&server, &source, SessionId::new(), "a".into(), None)
-            .await
-            .unwrap();
+        let outcome = push_workdir_file(
+            &server,
+            &source,
+            SessionId::new(),
+            "a".into(),
+            None,
+            never_cancelled(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, PushOutcome::Written(answer));
     }

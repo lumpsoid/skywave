@@ -429,6 +429,13 @@ fn push_row(push: &WorkdirPush) -> WorkdirPushRow {
         PushState::Done(PushOutcome::UploadRefused(
             UploadResult::Stored { .. } | UploadResult::OffsetMismatch { .. },
         )) => ("Push failed".to_owned(), false, false, None, true),
+        PushState::Done(PushOutcome::Cancelled) => (
+            "Cancelled before writing: nothing written. Retry resumes the upload.".to_owned(),
+            false,
+            false,
+            None,
+            true,
+        ),
         PushState::Done(PushOutcome::Written(WriteFileResult::Written { size, .. })) => (
             format!("Written \u{b7} {}", bytes(*size)),
             false,
