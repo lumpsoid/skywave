@@ -246,6 +246,17 @@ impl Workdirs {
         self.pending.remove(ask);
     }
 
+    /// The user cancelled `ask` while it was in flight: an answer to it
+    /// is stale now, and it shows as failed, `cancelled`; a stored answer
+    /// stays. False if it was not in flight.
+    pub(crate) fn cancel(&mut self, ask: &WorkdirAsk) -> bool {
+        if self.pending.remove(ask).is_none() {
+            return false;
+        }
+        self.failed.insert(ask.clone(), "cancelled".to_owned());
+        true
+    }
+
     /// The session left the replica: everything read of it goes.
     pub(crate) fn forget(&mut self, session: SessionId) {
         self.stored.retain(|ask, _| ask.session() != session);

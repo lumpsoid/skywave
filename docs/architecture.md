@@ -1490,6 +1490,7 @@ no longer decodes rather than failing.
   screen (`Model::want_blob`). An action while that download is in flight
   asks nothing. `WorkdirView.downloads` lists the session's downloads that are
   stored, in flight or failed, each with its `fetch`, `result` and `blob`.
+  `Action::CancelWorkdirDownload` drops a download still asking the server (it shows as failed, `cancelled`; its late answer is stale) or stops its blob as `StopBlobDownload` does, keeping what it got.
   `Action::PushWorkdirFile { session_id, source, path, replace }` makes a
   `Request::PushWorkdirFile`, which the engine's `push_workdir_file` carries
   out: it hashes the device file where it is (not copied into the data dir)

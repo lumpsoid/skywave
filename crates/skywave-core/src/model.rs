@@ -1356,6 +1356,25 @@ impl Model {
                     .into_iter()
                     .collect()
             }
+            Action::CancelWorkdirDownload { session_id, path } => {
+                let ask = WorkdirAsk::Download {
+                    session: session_id,
+                    path,
+                };
+                if self.workdirs.cancel(&ask) {
+                    return Vec::new();
+                }
+                match self.workdirs.stored.get(&ask) {
+                    Some(WorkdirAnswer::File(FileResult::File {
+                        content: FileBody::Blob(blob),
+                        ..
+                    })) => {
+                        let id = blob.id;
+                        self.stop_blob(id)
+                    }
+                    _ => Vec::new(),
+                }
+            }
             Action::PushWorkdirFile {
                 session_id,
                 source,
@@ -16513,6 +16532,54 @@ mod tests {
                 panic!("expected the diff");
             };
             assert_eq!(shown.state, BlobState::Requested { size: 10 });
+        }
+
+        #[test]
+        fn workdir_a_download_cancelled_while_asked_or_downloading_stops() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let download = || Action::DownloadWorkdirFile {
+                session_id: id,
+                path: "big.bin".into(),
+            };
+            let cancel = || Action::CancelWorkdirDownload {
+                session_id: id,
+                path: "big.bin".into(),
+            };
+
+            // Asked, and in flight: the cancel drops the ask, which shows as
+            // failed, and the late answer is stale.
+            let (req, ask) = asked(f.dispatch(download()));
+            assert!(f.dispatch(cancel()).is_empty());
+            assert_eq!(
+                view(&f).downloads[0].fetch,
+                WorkdirFetch::Failed("cancelled".into())
+            );
+            assert!(!f.model.workdir_awaited(req, &ask));
+            // Nothing in flight any more: a second cancel does nothing.
+            assert!(f.dispatch(cancel()).is_empty());
+
+            // Asked afresh and answered with a blob: the content downloads.
+            let (req, ask) = asked(f.dispatch(download()));
+            let big = blob(4);
+            assert_eq!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("big.bin", FileBody::Blob(big.clone()))
+                ),
+                vec![Request::DownloadBlob(big.id)]
+            );
+            // Downloading: the cancel stops it, and the blob shows as not
+            // downloaded.
+            assert_eq!(requests(f.dispatch(cancel())), [Request::StopBlob(big.id)]);
+            assert_eq!(
+                view(&f).downloads[0].blob.as_ref().map(|b| &b.state),
+                Some(&BlobState::NotDownloaded { size: 4 })
+            );
         }
 
         #[test]

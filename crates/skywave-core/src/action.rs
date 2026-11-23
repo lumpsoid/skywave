@@ -466,6 +466,15 @@ pub enum Action {
         session_id: SessionId,
         path: String,
     },
+    /// Cancel a download of the session's workdir file
+    /// ([`Action::DownloadWorkdirFile`]): while the server is asked, the ask
+    /// is dropped and shows as failed, `cancelled`; while its content
+    /// downloads, that stops as [`Action::StopBlobDownload`] does, keeping
+    /// what it got. A no-op otherwise.
+    CancelWorkdirDownload {
+        session_id: SessionId,
+        path: String,
+    },
     /// Push a device file into the session's workdir at `path`: it is read,
     /// uploaded unless the server holds it, and written there. `replace` is the
     /// sha256 of the file now at `path` (from a `WriteFileResult::Exists`), when
