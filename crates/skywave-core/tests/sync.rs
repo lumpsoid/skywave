@@ -52,14 +52,27 @@ async fn an_unpaired_device_is_unpaired_until_it_pairs() {
     client.dispatch(Action::RetryNow);
     assert_eq!(client.core.view().link, Link::Unpaired);
 
-    let links = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = links.clone();
+    let (sink, mut links) = tokio::sync::watch::channel(Vec::new());
+    let watched = links.clone();
     client
         .core
-        .subscribe(move |view| sink.lock().unwrap().push(view.link));
+        .subscribe(move |view| sink.send_modify(|links| links.push(view.link)));
+    // The first snapshot comes on the delivery thread; pairing before it
+    // arrives could let a newer one overtake it.
+    tokio::time::timeout(SOON, links.wait_for(|links| !links.is_empty()))
+        .await
+        .expect("the sink's first snapshot")
+        .unwrap();
     daemon.pair(&client, &proxy.address()).await;
 
-    let links = links.lock().unwrap().clone();
+    let links = tokio::time::timeout(
+        SOON,
+        links.wait_for(|links| matches!(links.last(), Some(Link::Online { .. }))),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the sink never saw online: {:?}", watched.borrow()))
+    .unwrap()
+    .clone();
     assert_eq!(links.first(), Some(&Link::Unpaired));
     let paired = links
         .iter()
