@@ -1,4 +1,5 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/link/link_status.dart';
@@ -134,9 +135,18 @@ class _ServerAddressesPageState extends State<ServerAddressesPage> {
                         key: Key('forget-address-$address'),
                         icon: const Icon(Icons.close),
                         tooltip: 'Forget this address',
-                        onPressed: () => send.act(
-                          ActionIntentForgetServerAddress(address: address),
-                        ),
+                        onPressed: () async {
+                          final yes = await confirmIrreversible(
+                            context,
+                            question: 'Forget $address?',
+                            action: 'Forget',
+                          );
+                          if (yes) {
+                            send.act(
+                              ActionIntentForgetServerAddress(address: address),
+                            );
+                          }
+                        },
                       ),
                     ),
                   if (widget.screen.others.isEmpty)
