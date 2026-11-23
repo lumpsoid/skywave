@@ -1277,7 +1277,8 @@ plain text.
   of the event; nothing is stored or sent differently.
 - **Search shows raw text.** Search ranges point into the raw text; a row or
   section with matches shows that text marked rather than mapping ranges
-  through the parse. Search is to be reworked; this costs nothing to drop.
+  through the parse. The search page is that rework (D66); its snippets are
+  raw text too.
 - **Nothing fetched, few links.** Images show as their alt text. Only `http`,
   `https` and `mailto` links (with nothing cleaning would change) are
   tappable, and open only after a dialog shows the whole URL: link text may
@@ -1895,3 +1896,28 @@ replica, say).
 
 **Deferred:** an iOS simulator backend (needs `skywaved` on macOS) and a
 low-fps live mode for good links.
+
+## D66. One search page, over every session or one
+
+A session's search and the search over every session are one page with a
+scope. `Action::OpenSearch(scope)` opens it (`Screen::Search`, the core owns
+the page); `Core::search(text, scope)` finds the hits. The hub holds the
+query and the newest results, as a head-side state, the way it holds the
+timeline search. A hit opens its session at the item, and the in-place
+search marks the matches there, so the results only lead into a session.
+
+- **One system for both scopes.** What is searched, the cap, the order and
+  the partial note are the same whichever scope is open, so they cannot
+  drift apart.
+- **The lock per session.** Each session's timeline is built under the state
+  lock, one session at a time. Matching and reading downloaded outputs happen
+  outside it. A long search takes the lock in pieces, so sync is not stalled
+  for its whole length.
+- **Bounded.** At most 200 item hits (`search::SEARCH_HITS_MAX`), with `more`
+  when the search stopped there. Session hits come first, items newest first.
+  Only the main timeline's logged items are searched: not subagent items and
+  not pending ones.
+- **The hub owns the clock.** The search runs 250 ms after typing pauses.
+  Present's policies never read the clock, so the wait lives in the hub.
+- **GUI only for now.** The TUI keeps its `/` search and has inert arms for
+  the page. It gets the page when someone needs it.

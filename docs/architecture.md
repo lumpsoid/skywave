@@ -988,7 +988,8 @@ D9. The server owns a CA; every device holds a certificate it signed.
 ## Client core
 
 `skywave-core`. `Core::open(data_dir)`, `dispatch(Action)`,
-`subscribe(ViewState)`, on its own tokio runtime. The state machine
+`subscribe(ViewState)` and `search(text, scope)` (blocking, see **Search page**
+below), on its own tokio runtime. The state machine
 (`Model`) does no I/O: the network tasks reach it through `core.seam()`,
 receiving `Request`s and reporting results, and every report is persisted,
 then pushed as a new `ViewState`.
@@ -1642,6 +1643,19 @@ no longer decodes rather than failing.
   raw: the input's blob state and this device's answer are read at view time.
   An answered approval leaves the list at once (`can_answer`). The TUI's
   screen only counts them.
+- **Search page** (`Action::OpenSearch(scope)`, `Screen::Search(SearchView)`,
+  D66): not a `Route`. The scope is every session (`None`) or one session
+  (`SearchScope`); an id the replica does not hold opens nothing, and a scope
+  that has since gone searches every session. `Core::search(text, scope)`
+  finds the hits. Each session's timeline is built under the state lock, one
+  session at a time; matching and reading downloaded outputs happen outside
+  it, so sync is not stalled by a long search. One hit per item, from the main
+  timeline's `Logged` items only (no subagent items, no pending ones); a
+  session hit when its title or workdir matches. At most
+  `search::SEARCH_HITS_MAX` (200) item hits, and `more` says the search stopped
+  there. Session hits come first, items newest first. Back returns to the
+  scoped session, else the session list. The TUI has inert arms for the
+  screen and keeps its own `/` search.
 - **Agent login** (`ViewState::login_expires`, on every screen): Settings
   always say when the agent's login expires, once paired
   (`skywave_present::login::expiry_label`: `expires in 12 days ·
@@ -2011,8 +2025,8 @@ skywave-core                 all logic, sync, replica
   leaves Settings. Back closes it without leaving Settings.
 - **Escape** (GUI): Escape is system back (`Back`, or closing the
   notifications page) wherever a page can go back; it never leaves the app,
-  and the session page's own Esc (closing search, leaving the composer)
-  comes first.
+  and the session page's own Esc (closing the timeline's search bar, leaving
+  the composer) comes first.
 - **Approve and deny** (GUI): on the session page Ctrl+Shift+A approves and
   Ctrl+Shift+D denies the approval on screen (with none, Ctrl+Shift+D
   declines the question); the buttons' tooltips name them. A held key
@@ -2035,3 +2049,23 @@ skywave-core                 all logic, sync, replica
   (the field keeps focus), newest row at the bottom as in fzf, matched chars
   highlighted. Up/Down and Ctrl-P/N move while it is open, Enter and Tab
   accept, Esc closes.
+- **Search page** (D66). The hub's `GlobalSearch`
+  (`gui/native/hub/src/global_search.rs`) holds the page's query, scope and
+  newest answer. A search runs 250 ms after typing pauses (`SEARCH_AFTER`), off
+  the hub task (`Out::SearchSessions`, `Core::search` in `spawn_blocking`,
+  then `Head::on_searched`); only the newest answer is kept (`asked`). It runs
+  again when the page opens or its scope changes. Hits travel in `ScreenUpdate`
+  (`ScreenView::Search`, a `SearchRowView` each), not in `SearchUpdate`, which
+  is the timeline's own search. A row is the snippet with its marks, the kind,
+  the session and the time: `skywave_present::search_hits` words the kind, cuts
+  the snippet round the first match and counts the hits, and
+  `policy::partial_label` says what could not be searched. Opening a hit
+  (`GuiIntent::GlobalSearchOpen { key }`) opens its session and, once the
+  timeline is loaded, starts `TimelineSearch` with the query at that item.
+  `SearchPage` (`gui/lib/search/search_page.dart`) opens from the session list
+  (search button, Ctrl+F) over every session, and from a session (its search
+  button, Ctrl+F, a quick action) scoped to it. The scope's `In: <title>` chip,
+  when deleted, widens the search to every session. A session's search bar is
+  read-only: it shows the query and count, steps with its buttons and the
+  timeline's `n`/`N`, and Esc closes it. Tapping its query reopens the scoped
+  page. When the bar opens, focus goes to the timeline.
