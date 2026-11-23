@@ -8575,7 +8575,22 @@ fn fox_data(rig: &mut Rig) {
         text: "a fox elsewhere".into(),
         attachments: Vec::new(),
     };
-    rig.log_in(other, vec![created, prompt]);
+    // The server logs a session's creation and every message with the id of
+    // the command that made it; a message without one has no entry to show.
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let events = [created, prompt]
+        .into_iter()
+        .map(|kind| Event {
+            session_id: other,
+            at,
+            command_id: kind.logged_by_command().then(CommandId::new),
+            context: skywave_proto::ContextId::first_of(other),
+            kind,
+        })
+        .collect();
+    let from = Seq(rig.seam.cursor().unwrap().0 + 1);
+    rig.seam.apply_events(&EventBatch { from, events }).unwrap();
+    rig.view();
 }
 
 /// Opens the search page, scoped to `session_id` when given.
