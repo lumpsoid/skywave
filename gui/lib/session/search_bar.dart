@@ -4,17 +4,17 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The search through the timeline, while the hub has one open: the
-/// query (each edit is `SearchTyped`), how many matches and where, and
-/// steps through them. Enter jumps to the nearest match at or above the
-/// newest row in view; ↑/↓ (or n/N on the timeline) step older and newer;
-/// Esc closes it.
+/// The search through the timeline, while the hub has one open: how many
+/// matches and where, and steps through them. ↑/↓ (or n/N on the timeline)
+/// step older and newer; Esc closes it. The query is edited on the search
+/// page: tapping it opens that page.
 class SessionSearchBar extends StatefulWidget {
   const SessionSearchBar({
     required this.search,
     required this.send,
     required this.newestVisibleKey,
     required this.onStepped,
+    required this.onEdit,
     this.focusNode,
     super.key,
   });
@@ -27,6 +27,10 @@ class SessionSearchBar extends StatefulWidget {
 
   /// After Enter: hand the keyboard to the timeline, for n/N.
   final VoidCallback onStepped;
+
+  /// Tapped: opens the search page, scoped to this session, to edit the
+  /// query.
+  final VoidCallback onEdit;
   final FocusNode? focusNode;
 
   @override
@@ -35,6 +39,14 @@ class SessionSearchBar extends StatefulWidget {
 
 class _SessionSearchBarState extends State<SessionSearchBar> {
   late final _field = TextEditingController(text: widget.search.query);
+
+  @override
+  void didUpdateWidget(SessionSearchBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_field.text != widget.search.query) {
+      _field.text = widget.search.query;
+    }
+  }
 
   @override
   void dispose() {
@@ -92,17 +104,13 @@ class _SessionSearchBarState extends State<SessionSearchBar> {
                       controller: _field,
                       focusNode: widget.focusNode,
                       autofocus: true,
+                      readOnly: true,
                       textInputAction: TextInputAction.search,
-                      onChanged: (query) =>
-                          widget.send(GuiIntentSearchTyped(query: query)),
-                      onSubmitted: (_) {
-                        _step(null);
-                        widget.onStepped();
-                      },
+                      onTap: widget.onEdit,
                       decoration: const InputDecoration(
                         isDense: true,
                         prefixIcon: Icon(Icons.search),
-                        hintText: 'Search this session',
+                        hintText: 'Search',
                         border: InputBorder.none,
                       ),
                     ),

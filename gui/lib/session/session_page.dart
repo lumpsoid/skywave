@@ -288,14 +288,9 @@ class _SessionPageState extends State<SessionPage> {
     );
   }
 
-  void _openSearch() {
-    final search = _search.search;
-    if (search != null && search.open) {
-      _searchFocus.requestFocus();
-    } else {
-      widget.send(GuiIntentSearchTyped(query: search?.query ?? ''));
-    }
-  }
+  /// Opens the search page, scoped to this session.
+  void _openSearch() =>
+      widget.send.act(ActionIntentOpenSearch(sessionId: _screen.sessionId));
 
   /// Reveals the call an approval gates, expanded.
   void _showCall(String key) {
@@ -718,6 +713,7 @@ class _SessionPageState extends State<SessionPage> {
                           _timelineView.currentState?.newestVisibleKey(),
                       onStepped: () =>
                           _timelineView.currentState?.focusNode.requestFocus(),
+                      onEdit: _openSearch,
                     );
                   },
                 ),
