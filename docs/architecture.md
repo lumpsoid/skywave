@@ -1473,8 +1473,8 @@ logs) an event that no longer decodes rather than failing.
   replaces a stored answer; any other answer is stored, and the model learns the blobs it
   registered and purged in the same update. Back walks file → its
   directory, diff → changes, directory → its parent, and the changes, the
-  commits or the workdir root → the session; a session deleted here falls back to the
-  archived list, or to the all list when that was the list last shown.
+  commits or the workdir root → the session; a session deleted here falls back
+  to the list last shown, the one back from the session returns to.
 - **Workdir downloads and pushes** (D54, D56). `Action::DownloadWorkdirFile`
   asks for one file as a `WorkdirAsk::Download`, stored under its own kind so
   it never replaces a file view's answer; the stored `WorkdirAnswer::File`
