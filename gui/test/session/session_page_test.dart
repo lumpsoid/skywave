@@ -2198,6 +2198,9 @@ void main() {
 
     await openMore(screenEnabled: true);
     expect(find.text('App screen'), findsOneWidget);
+    // The More sheet scrolls and the item is its last entry.
+    await tester.ensureVisible(find.text('App screen'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('App screen'));
     await tester.pumpAndSettle();
     expect(sent.whereType<GuiIntentAppScreenToggle>(), [
