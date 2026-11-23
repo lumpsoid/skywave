@@ -35,7 +35,7 @@ SessionRowView sessionRow(
   approvalsLabel: '1 approval pending',
   hasDraft: true,
   costLabel: r'$1.27',
-  lastActivityLabel: '2026-10-31 14:02 UTC',
+  lastActivityLabel: '5 min ago',
   lastActivityMs: 0,
   renameLabel: 'queued',
   deletable: deletable,
@@ -88,7 +88,7 @@ void main() {
       '3',
       '1 approval pending',
       'draft',
-      r'$1.27 · 2026-10-31 14:02 UTC',
+      r'$1.27 · 5 min ago',
       'Active',
       'Archived',
       'New session',
@@ -575,7 +575,7 @@ void main() {
         label:
             r'title a, rename queued, 3 unread, needs approval, '
             r'1 approval pending, draft saved, /srv/proj-a, $1.27, '
-            'last active 2026-10-31 14:02 UTC',
+            'last active 5 min ago',
         isButton: true,
         isFocusable: true,
         hasEnabledState: true,
@@ -616,7 +616,7 @@ void main() {
         label:
             r'title a, rename queued, archived, 3 unread, needs approval, '
             r'1 approval pending, draft saved, /srv/proj-a, $1.27, '
-            'last active 2026-10-31 14:02 UTC',
+            'last active 5 min ago',
         isButton: true,
         isFocusable: true,
         hasEnabledState: true,
@@ -674,7 +674,7 @@ void main() {
     );
     expect(
       find.bySemanticsLabel(
-        'broken, agent error: crashed, last active 2026-10-31 14:02 UTC',
+        'broken, agent error: crashed, last active 5 min ago',
       ),
       findsOneWidget,
     );
@@ -741,7 +741,7 @@ void main() {
         '3',
         '1 approval pending',
         'draft',
-        r'$1.27 · 2026-10-31 14:02 UTC',
+        r'$1.27 · 5 min ago',
       ]) {
         expect(find.text(text), findsOneWidget, reason: text);
       }

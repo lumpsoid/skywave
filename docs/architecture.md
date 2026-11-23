@@ -1035,8 +1035,9 @@ the old settings this build reads, in one transaction), checks that it
 loads, removes the old WAL files and renames it over `core.db`, so a crash
 leaves either the old database or the whole new one. The TUI names `--reset-replica` and exits; the GUI's
 boot failure (`BootFailed.unreadable`) offers "Reset local data", which
-sends `Boot` with `reset_replica`. Deleting a session locally skips (and
-logs) an event that no longer decodes rather than failing.
+asks first (unsent messages are lost) and then sends `Boot` with
+`reset_replica`. Deleting a session locally skips (and logs) an event that
+no longer decodes rather than failing.
 
 - **Replica** (SQLite, `core.db`): the replicated `events`, projections
   folded in the transaction that stores them (`sessions`, and `turns`, each
@@ -1082,7 +1083,10 @@ logs) an event that no longer decodes rather than failing.
   one). Only a message someone writes moves a session up. The agent's
   replies, tool calls, approvals and state changes do not, so a row does
   not jump while it is being read. `last_seq` and `last_activity` still
-  follow every activity event, for read marks and the row's time. The GUI
+  follow every activity event, for read marks and the row's time. The row
+  shows that time as `5 min ago` for the last day, then as the local date
+  and minute (`skywave_present::format::activity_label`); the GUI hub wakes
+  once a minute while the list shows, so the ages advance. The GUI
   groups the list by repo (the key is under **Worktrees** below) unless the
   user picked the plain layout, a per-device preference
   (`GuiIntent::SetPlainList`): a group sits where its newest row does, and
@@ -1595,9 +1599,9 @@ logs) an event that no longer decodes rather than failing.
   `Screen::ServerAddresses(ServerAddressesView)`): the address in use and
   the server's other addresses (see Pairing), from the replica's settings.
   `SetServerAddress` connects to a typed or listed one and
-  `ForgetServerAddress` drops one. Back returns to the settings. The GUI
-  opens it from the settings' server tile; the TUI changes the address
-  from its settings (`a`) and never opens it.
+  `ForgetServerAddress` drops one (the GUI asks first). Back returns to the
+  settings. The GUI opens it from the settings' server tile; the TUI changes
+  the address from its settings (`a`) and never opens it.
 - **Usage limits page** (`Route::UsageLimits`): the replica keeps the
   latest answer (`usage_limits`, one row, cleared with the replica), so
   the page reads offline with the time the agent reported it. Opening it
@@ -1993,6 +1997,10 @@ skywave-core                 all logic, sync, replica
   Flutter-local, a page in `ScreenNavigator`'s pages list, opened by the
   Settings tile through `Holders.notificationsOpen` and closed when the screen
   leaves Settings. Back closes it without leaving Settings.
+- **Escape** (GUI): Escape is system back (`Back`, or closing the
+  notifications page) wherever a page can go back; it never leaves the app,
+  and the session page's own Esc (closing search, leaving the composer)
+  comes first.
 - **Platforms:** Linux and Android verified; macOS, iOS and Windows
   scaffolded only; no web (D26).
 - **Shell history picker** (D53). The hub owns its state. In shell mode
