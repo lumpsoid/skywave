@@ -8,6 +8,7 @@ import 'package:skywave_gui/link/link_banner.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
 import 'package:skywave_gui/pairing/qr_scan.dart';
 import 'package:skywave_gui/screen/repair_page.dart';
+import 'package:skywave_gui/search/search_page.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/session/info_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
@@ -205,6 +206,11 @@ class ScreenNavigator extends StatelessWidget {
         ScreenViewCrop(:final crop) => CropPage(
           screen: crop,
           lines: holders.cropLines,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        final ScreenViewSearch screen => SearchPage(
+          screen: screen,
           canGoBack: update.canGoBack,
           send: send,
         ),

@@ -1,4 +1,5 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
 import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
@@ -31,113 +32,133 @@ class SessionListPage extends StatelessWidget {
     final entries = screen.plain
         ? [for (final row in screen.rows) _RowEntry(row)]
         : _groupEntries(screen.rows);
+    void openSearch() =>
+        send.act(const ActionIntentOpenSearch(sessionId: null));
     return Stack(
       children: [
-        Scaffold(
-          appBar: AppBar(
-            leading: backButton(
-              canGoBack: canGoBack,
-              onBack: () => send.act(const ActionIntentBack()),
-            ),
-            toolbarHeight: LinkTitle.toolbarHeight(context),
-            flexibleSpace: const LinkProgress(),
-            title: LinkTitle(title: Text(screen.title), send: send),
-            actions: [
-              ApprovalsButton(send: send),
-              IconButton(
-                tooltip: 'Usage',
-                icon: const Icon(Icons.bar_chart),
-                onPressed: () => send.act(
-                  const ActionIntentNavigate(route: RouteView.usage),
+        CallbackShortcuts(
+          bindings: {
+            const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+                openSearch,
+          },
+          child: Focus(
+            autofocus: true,
+            child: Scaffold(
+              appBar: AppBar(
+                leading: backButton(
+                  canGoBack: canGoBack,
+                  onBack: () => send.act(const ActionIntentBack()),
                 ),
-              ),
-              IconButton(
-                tooltip: 'Server storage',
-                icon: const Icon(Icons.storage),
-                onPressed: () => send.act(
-                  const ActionIntentNavigate(route: RouteView.storage),
-                ),
-              ),
-              IconButton(
-                tooltip: 'Worktrees',
-                icon: const Icon(Icons.account_tree_outlined),
-                onPressed: () => send.act(
-                  const ActionIntentNavigate(route: RouteView.worktrees),
-                ),
-              ),
-              IconButton(
-                tooltip: 'Settings',
-                icon: const Icon(Icons.settings),
-                onPressed: () => send.act(
-                  const ActionIntentNavigate(route: RouteView.settings),
-                ),
-              ),
-            ],
-          ),
-          floatingActionButton: active
-              ? FloatingActionButton.extended(
-                  onPressed: () => send(const GuiIntentCreateOpen()),
-                  icon: const Icon(Icons.add),
-                  label: const Text('New session'),
-                )
-              : null,
-          body: ReadableWidth(
-            child: CustomScrollView(
-              slivers: [
-                SliverToBoxAdapter(
-                  child: _ScopeBar(screen: screen, send: send),
-                ),
-                if (screen.creating.isNotEmpty) ...[
-                  const SliverToBoxAdapter(child: _Header('Creating')),
-                  SliverList.list(
-                    children: [
-                      for (final creating in screen.creating)
-                        _CreatingRow(
-                          key: ValueKey(creating.commandId),
-                          creating: creating,
-                          dismissable: creating.commandId == screen.dismissable,
-                          send: send,
-                        ),
-                    ],
+                toolbarHeight: LinkTitle.toolbarHeight(context),
+                flexibleSpace: const LinkProgress(),
+                title: LinkTitle(title: Text(screen.title), send: send),
+                actions: [
+                  IconButton(
+                    tooltip: 'Search (Ctrl+F)',
+                    icon: const Icon(Icons.search),
+                    onPressed: openSearch,
                   ),
-                  const SliverToBoxAdapter(child: Divider()),
+                  ApprovalsButton(send: send),
+                  IconButton(
+                    tooltip: 'Usage',
+                    icon: const Icon(Icons.bar_chart),
+                    onPressed: () => send.act(
+                      const ActionIntentNavigate(route: RouteView.usage),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Server storage',
+                    icon: const Icon(Icons.storage),
+                    onPressed: () => send.act(
+                      const ActionIntentNavigate(route: RouteView.storage),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Worktrees',
+                    icon: const Icon(Icons.account_tree_outlined),
+                    onPressed: () => send.act(
+                      const ActionIntentNavigate(route: RouteView.worktrees),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Settings',
+                    icon: const Icon(Icons.settings),
+                    onPressed: () => send.act(
+                      const ActionIntentNavigate(route: RouteView.settings),
+                    ),
+                  ),
                 ],
-                if (screen.emptyLabel case final empty?)
-                  SliverToBoxAdapter(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Text(
-                        empty,
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+              floatingActionButton: active
+                  ? FloatingActionButton.extended(
+                      onPressed: () => send(const GuiIntentCreateOpen()),
+                      icon: const Icon(Icons.add),
+                      label: const Text('New session'),
+                    )
+                  : null,
+              body: ReadableWidth(
+                child: CustomScrollView(
+                  slivers: [
+                    SliverToBoxAdapter(
+                      child: _ScopeBar(screen: screen, send: send),
+                    ),
+                    if (screen.creating.isNotEmpty) ...[
+                      const SliverToBoxAdapter(child: _Header('Creating')),
+                      SliverList.list(
+                        children: [
+                          for (final creating in screen.creating)
+                            _CreatingRow(
+                              key: ValueKey(creating.commandId),
+                              creating: creating,
+                              dismissable:
+                                  creating.commandId == screen.dismissable,
+                              send: send,
+                            ),
+                        ],
+                      ),
+                      const SliverToBoxAdapter(child: Divider()),
+                    ],
+                    if (screen.emptyLabel case final empty?)
+                      SliverToBoxAdapter(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Text(
+                            empty,
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.bodyLarge
+                                ?.copyWith(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant,
+                                ),
+                          ),
                         ),
                       ),
+                    SliverList.separated(
+                      itemCount: entries.length,
+                      // A divider only between two rows; a header has none.
+                      separatorBuilder: (_, i) =>
+                          entries[i] is _RowEntry && entries[i + 1] is _RowEntry
+                          ? const Divider(height: 1)
+                          : const SizedBox.shrink(),
+                      itemBuilder: (context, i) => switch (entries[i]) {
+                        _GroupEntry(:final row) => _Header(
+                          row.groupName,
+                          key: ValueKey('group:${row.group}'),
+                        ),
+                        _RowEntry(:final row) => SessionRow(
+                          key: ValueKey(row.sessionId),
+                          row: row,
+                          send: send,
+                          markArchived: screen.kind == ListKindView.all,
+                        ),
+                      },
                     ),
-                  ),
-                SliverList.separated(
-                  itemCount: entries.length,
-                  // A divider only between two rows; a header has none.
-                  separatorBuilder: (_, i) =>
-                      entries[i] is _RowEntry && entries[i + 1] is _RowEntry
-                      ? const Divider(height: 1)
-                      : const SizedBox.shrink(),
-                  itemBuilder: (context, i) => switch (entries[i]) {
-                    _GroupEntry(:final row) => _Header(
-                      row.groupName,
-                      key: ValueKey('group:${row.group}'),
-                    ),
-                    _RowEntry(:final row) => SessionRow(
-                      key: ValueKey(row.sessionId),
-                      row: row,
-                      send: send,
-                      markArchived: screen.kind == ListKindView.all,
-                    ),
-                  },
+                    // Room for the floating button over the last row.
+                    const SliverToBoxAdapter(child: SizedBox(height: 88)),
+                  ],
                 ),
-                // Room for the floating button over the last row.
-                const SliverToBoxAdapter(child: SizedBox(height: 88)),
-              ],
+              ),
             ),
           ),
         ),
