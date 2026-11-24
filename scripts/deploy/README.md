@@ -10,11 +10,26 @@ you build on.
 ## Before the first deploy
 
 On this machine, install `cargo-zigbuild` and `zig`, and add the Rust targets
-for the devices you deploy to:
+for the devices you deploy to. `setup-build.sh` does all three, as you and
+without sudo:
 
 ```sh
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+scripts/deploy/setup-build.sh
+scripts/deploy/setup-build.sh --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
 ```
+
+- `zig`: unless one is already on `PATH`, it installs the latest stable release
+  from ziglang.org, checks its SHA-256 against the release index, unpacks it
+  into `~/.local/opt` and links `~/.local/bin/zig` to it. `--zig <version>`
+  installs that version even if a zig is already installed, which also
+  upgrades one the script installed before.
+- `cargo-zigbuild`: `cargo install --locked cargo-zigbuild`, unless it is
+  installed already.
+- Rust targets: `rustup target add` for each `--target`. Without `--target`,
+  only the musl target for this machine's CPU, which is what `--local`
+  needs.
+
+Running it again only does what is missing.
 
 On the device, once:
 
