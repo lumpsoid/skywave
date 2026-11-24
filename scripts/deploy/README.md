@@ -4,7 +4,8 @@
 device's CPU, copies it and the systemd user unit over ssh, and runs
 `install.sh` on the device. The device runs the server as a user service, as
 you, so the agent finds your `claude` login. Run the script on your own
-machine, from anywhere in the repo.
+machine, from anywhere in the repo. With `--local` the device is the machine
+you build on.
 
 ## Before the first deploy
 
@@ -72,6 +73,22 @@ Flags:
 - `--build-only`: build, print the path of the binary and stop. With
   `--target` it needs no host, so `scripts/deploy/deploy.sh --build-only
   --target x86_64-unknown-linux-musl` builds without touching a device.
+- `--local`: deploy to this machine instead of an ssh host. See below.
+
+## Deploy to this machine
+
+When the machine that builds `skywaved` also runs it:
+
+```sh
+scripts/deploy/deploy.sh --local
+```
+
+It works like an ssh deploy without ssh: it reads the CPU from the local
+`uname -m`, copies the binary and unit into your own `~/.local/bin` and
+`~/.config/systemd/user`, and runs `install.sh` here. `--now` and `--target`
+work the same way. The one-time setup in "Before the first deploy" still
+applies, both the build tools and the device steps. Afterwards, run
+`~/.local/bin/skywaved status` and `journalctl --user -u skywaved` directly.
 
 ## Pair
 

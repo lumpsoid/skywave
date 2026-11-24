@@ -155,7 +155,8 @@ ls target/release/skywaved target/release/skywave-tui
 ```
 
 The app's build steps are in [`gui/README.md`](gui/README.md). To build for a
-server reached over ssh and install it there as a service, see
+server reached over ssh (or this machine, with `--local`) and install it
+there as a service, see
 [`scripts/deploy/README.md`](scripts/deploy/README.md).
 
 ### 1. Start the server
@@ -378,7 +379,8 @@ stops it.
 systemd user unit that runs `~/.local/bin/skywaved`; its header says how to
 install it. It runs as you, so the agent finds your `claude` login.
 [`scripts/deploy/deploy.sh`](scripts/deploy/README.md) builds, installs and
-(re)starts it on a server reached over ssh. By hand, put the binary in place
+(re)starts it on a server reached over ssh, or on this machine with
+`--local`. By hand, put the binary in place
 with `install -m 755 target/release/skywaved ~/.local/bin/`, creating that
 directory with `mkdir -p` first if needed, and follow the unit's header.
 Before `systemctl --user stop`, which loses running work, run

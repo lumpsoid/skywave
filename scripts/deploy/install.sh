@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs on the device, from deploy.sh: installs the skywaved binary and unit it
 # uploaded, then starts it or picks up the new binary.
-#   usage: sh -s -- now|after-work < install.sh
+#   usage: sh -s -- now|after-work < install.sh   (over ssh)
+#          sh install.sh now|after-work            (deploy.sh --local)
 set -eu
 
 case "${1:-}" in
