@@ -735,6 +735,38 @@ impl Drop for SlowLink {
     }
 }
 
+/// How long a [`LateLink`] holds a connection: longer than [`SHORT`], well
+/// under [`SOON`].
+const LATE: Duration = Duration::from_secs(3);
+
+/// A relay that accepts at once but forwards nothing, either way, for
+/// `delay`: a connect that takes long to complete, like a first rendezvous
+/// with a Tor onion service.
+struct LateLink {
+    port: u16,
+}
+
+impl LateLink {
+    async fn start(upstream: u16, delay: Duration) -> LateLink {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let Ok(mut outbound) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await
+                    else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+        LateLink { port }
+    }
+}
+
 /// A session with `messages` user messages of `len` random letters and
 /// digits each: an events body of about `messages * len` bytes that
 /// compresses (D45) only to some three quarters of that.
@@ -910,6 +942,59 @@ async fn a_stalled_events_body_times_out() {
         "{:?}",
         started.elapsed()
     );
+}
+
+/// A connect slower than the request timeout but within the connect timeout
+/// still gets the whole request timeout once it is open, for `hello` and for
+/// an events long-poll.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_connect_leaves_the_request_its_whole_deadline() {
+    let fx = Fixture::start().await;
+    let identity = paired_identity(&fx).await;
+    let late = LateLink::start(fx.port, LATE).await;
+    let addr: ServerAddress = format!("127.0.0.1:{}", late.port).parse().unwrap();
+
+    let slow = TransportConfig {
+        connect_timeout: SOON,
+        request_timeout: SHORT,
+        ..TransportConfig::default()
+    };
+    let transport =
+        HttpsTransport::new(&addr, &identity, slow.clone(), ExpectedRun::default()).unwrap();
+    transport.hello(None).await.unwrap();
+
+    // A new transport, so the events long-poll connects afresh.
+    let transport = HttpsTransport::new(&addr, &identity, slow, ExpectedRun::default()).unwrap();
+    transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: Some(0),
+            limit: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// The positive control: the same slow connect fails once it outlasts the
+/// connect timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_slower_than_the_connect_timeout_times_out() {
+    let fx = Fixture::start().await;
+    let identity = paired_identity(&fx).await;
+    let late = LateLink::start(fx.port, LATE).await;
+    let addr: ServerAddress = format!("127.0.0.1:{}", late.port).parse().unwrap();
+
+    let impatient = TransportConfig {
+        connect_timeout: SHORT,
+        request_timeout: SOON,
+        ..TransportConfig::default()
+    };
+    let transport =
+        HttpsTransport::new(&addr, &identity, impatient, ExpectedRun::default()).unwrap();
+    let started = std::time::Instant::now();
+    let err = transport.hello(None).await.unwrap_err();
+    assert_eq!(err, TransportError::Timeout);
+    assert!(started.elapsed() < LATE, "{:?}", started.elapsed());
 }
 
 /// A transport that cannot read workdirs answers `NotFound`, as a server
