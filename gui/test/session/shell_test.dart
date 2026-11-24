@@ -406,7 +406,16 @@ void main() {
       ..apply(
         ShellUpdateSnapshot(
           sessionId: 's1',
-          runs: [shellRun('r1', 'cargo test')],
+          runs: [
+            shellRun('r1', 'cargo test'),
+            shellRun(
+              'r2',
+              'ls -la',
+              state: ShellRunKind.succeeded,
+              stateLabel: 'exit 0',
+              canStop: false,
+            ),
+          ],
         ),
       );
     await pumpSession(
@@ -443,5 +452,15 @@ void main() {
     await tester.tap(find.text('Cancel'));
     await tester.pumpAndSettle();
     expect(sent.whereType<GuiIntentSaveShellCommand>(), hasLength(2));
+
+    // A finished run saves too: the button is there in every state.
+    await tester.tap(find.byKey(const Key('shell-save-r2')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    final finished = sent.whereType<GuiIntentSaveShellCommand>().last;
+    expect(finished.command, 'ls -la');
+    expect(finished.name, '');
+    expect(sent.whereType<GuiIntentSaveShellCommand>(), hasLength(3));
   });
 }

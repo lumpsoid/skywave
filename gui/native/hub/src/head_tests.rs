@@ -6398,6 +6398,7 @@ fn a_shell_command_saves_as_a_shell_snippet_and_blank_is_ignored() {
         o,
         Out::Effect(PlatformEffect::Notice { .. })
     )));
+    assert!(rig.actions.is_empty(), "{:?}", rig.kinds());
 
     // Saved from agent mode, the command's text is kept as a shell command.
     let outs = rig.intent(GuiIntent::SaveShellCommand {
@@ -6414,6 +6415,12 @@ fn a_shell_command_saves_as_a_shell_snippet_and_blank_is_ignored() {
     )));
     rig.results();
     rig.view();
+    let agent_snippets = rig.open_session().snippets;
+    assert!(
+        !agent_snippets.iter().any(|s| s.label == "tests"),
+        "not among the agent prompts: {:?}",
+        agent_snippets.iter().map(|s| s.label.as_str()).collect::<Vec<_>>()
+    );
     rig.switch_to_shell();
     let snippets = rig.open_session().snippets;
     assert!(
