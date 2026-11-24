@@ -378,6 +378,12 @@ stops it.
 [`contrib/systemd/skywaved.service`](contrib/systemd/skywaved.service) is a
 systemd user unit that runs `~/.local/bin/skywaved`; its header says how to
 install it. It runs as you, so the agent finds your `claude` login.
+It sets no environment of its own: it gets the systemd user manager's, so
+put your `PATH` in `~/.config/environment.d/*.conf`, e.g.
+`PATH=$HOME/.local/bin:$PATH`, or set `agent.command` to the absolute
+path of `claude`. Override anything else with
+`systemctl --user edit skywaved`: a deploy replaces the unit but never that
+drop-in.
 [`scripts/deploy/deploy.sh`](scripts/deploy/README.md) builds, installs and
 (re)starts it on a server reached over ssh, or on this machine with
 `--local`. By hand, put the binary in place

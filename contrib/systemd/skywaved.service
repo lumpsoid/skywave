@@ -9,6 +9,13 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now skywaved
 #   loginctl enable-linger "$USER"   # keep it running while you are logged out
+#
+# The unit sets no environment: the service gets the user manager's, which
+# reads ~/.config/environment.d/*.conf. Put PATH there, so the agent and the
+# shell runner find `claude`, cargo and the rest. Change anything else with
+# `systemctl --user edit skywaved`: that drop-in
+# (~/.config/systemd/user/skywaved.service.d/override.conf) is yours, and a
+# deploy, which replaces only this file, leaves it alone.
 
 [Unit]
 Description=Skywave server daemon
@@ -21,9 +28,6 @@ ExecReload=/bin/kill -HUP $MAINPID
 # serve again in the same process.
 Restart=on-failure
 RestartSec=5s
-# A user manager's PATH may lack where `claude` is installed; or set
-# `agent.command` to its absolute path.
-Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
