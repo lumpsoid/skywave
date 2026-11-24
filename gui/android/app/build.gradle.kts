@@ -74,7 +74,7 @@ flutter {
 }
 
 dependencies {
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     // D20: QR scanning without Play Services; ZXing core and its own camera handling.
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     // StayConnectedService: ServiceCompat, NotificationCompat. Plugins pull
