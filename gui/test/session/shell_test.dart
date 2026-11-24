@@ -393,4 +393,55 @@ void main() {
     await tester.pumpAndSettle();
     expect(sent.whereType<GuiIntentInsertSnippet>().single.snippetId, 'n1');
   });
+
+  testWidgets("a run's command saves as a saved command, named or not", (
+    tester,
+  ) async {
+    // A phone: the save button is there at every width.
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final sent = <GuiIntent>[];
+    final shell = ShellHolder()
+      ..apply(
+        ShellUpdateSnapshot(
+          sessionId: 's1',
+          runs: [shellRun('r1', 'cargo test')],
+        ),
+      );
+    await pumpSession(
+      tester,
+      screen: screenWith(composer: shellComposer()),
+      timeline: timelineOf('hello'),
+      shell: shell,
+      sent: sent,
+    );
+    await tester.tap(find.byKey(const Key('shell-save-r1')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('snippet-name-field')),
+      'tests',
+    );
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    final named = sent.whereType<GuiIntentSaveShellCommand>().single;
+    expect(named.command, 'cargo test');
+    expect(named.name, 'tests');
+
+    // Saved with no name: the dialog's blank name goes through as ''.
+    await tester.tap(find.byKey(const Key('shell-save-r1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    final unnamed = sent.whereType<GuiIntentSaveShellCommand>().last;
+    expect(unnamed.command, 'cargo test');
+    expect(unnamed.name, '');
+
+    // Cancelled: nothing more is sent.
+    await tester.tap(find.byKey(const Key('shell-save-r1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(sent.whereType<GuiIntentSaveShellCommand>(), hasLength(2));
+  });
 }
