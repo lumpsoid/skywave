@@ -4,6 +4,7 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/shell_holder.dart';
 import 'package:skywave_gui/session/shell_output.dart';
+import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/session/timeline_view.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -78,8 +79,8 @@ class ShellView extends StatelessWidget {
 }
 
 /// One run: its command and condition, how it stands, its output's tail,
-/// and what can be done with it. "Show all" opens its whole output in the
-/// app ([showShellOutput]).
+/// and what can be done with it, its command saved from the bookmark
+/// button. "Show all" opens its whole output in the app ([showShellOutput]).
 class ShellRunTile extends StatelessWidget {
   const ShellRunTile({
     required this.sessionId,
@@ -133,6 +134,23 @@ class ShellRunTile extends StatelessWidget {
                   const SizedBox(width: 8),
                   StateBadge(label: condition, color: colors.warning),
                 ],
+                IconButton(
+                  key: Key('shell-save-${run.key}'),
+                  tooltip: 'Save this command',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () async {
+                    final name = await askSnippetName(context);
+                    if (name != null) {
+                      send(
+                        GuiIntentSaveShellCommand(
+                          command: run.command,
+                          name: name,
+                        ),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.bookmark_add_outlined),
+                ),
                 if (run.canStop)
                   IconButton(
                     tooltip: 'Stop this run',

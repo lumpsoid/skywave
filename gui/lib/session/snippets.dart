@@ -147,7 +147,8 @@ class _SnippetSheet extends StatelessWidget {
                   child: Text(
                     shell
                         ? 'No saved commands yet. Save what you are writing '
-                              'from here.'
+                              "from here, or a run's command with its bookmark "
+                              'button.'
                         : 'No snippets yet. Save a message you sent from its '
                               'menu, or what you are writing from here.',
                     style: theme.textTheme.bodyMedium?.copyWith(
