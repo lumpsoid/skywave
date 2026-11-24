@@ -6394,10 +6394,11 @@ fn a_shell_command_saves_as_a_shell_snippet_and_blank_is_ignored() {
         command: "   ".into(),
         name: String::new(),
     });
-    assert!(!outs.iter().any(|o| matches!(
-        o,
-        Out::Effect(PlatformEffect::Notice { .. })
-    )));
+    assert!(
+        !outs
+            .iter()
+            .any(|o| matches!(o, Out::Effect(PlatformEffect::Notice { .. })))
+    );
     assert!(rig.actions.is_empty(), "{:?}", rig.kinds());
 
     // Saved from agent mode, the command's text is kept as a shell command.
@@ -6419,14 +6420,20 @@ fn a_shell_command_saves_as_a_shell_snippet_and_blank_is_ignored() {
     assert!(
         !agent_snippets.iter().any(|s| s.label == "tests"),
         "not among the agent prompts: {:?}",
-        agent_snippets.iter().map(|s| s.label.as_str()).collect::<Vec<_>>()
+        agent_snippets
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect::<Vec<_>>()
     );
     rig.switch_to_shell();
     let snippets = rig.open_session().snippets;
     assert!(
         snippets.iter().any(|s| s.label == "tests"),
         "listed among the shell commands: {:?}",
-        snippets.iter().map(|s| s.label.as_str()).collect::<Vec<_>>()
+        snippets
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
