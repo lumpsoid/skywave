@@ -70,14 +70,13 @@ pub struct TransportConfig {
     /// handshakes. Long enough for a first rendezvous with a Tor onion
     /// service. A request's own deadline starts once it has an open connection.
     pub connect_timeout: Duration,
-    /// A whole request; for blobs and event batches, the response head and
-    /// then each body chunk, so a slow link that keeps delivering bytes
-    /// never times out. An events long-poll's head gets its `wait` on top.
-    /// A command is timed by its upload instead: it fails once the socket
-    /// has taken none of it for this long, which, after the last byte,
-    /// bounds the wait for the response head; its reply body is then read
-    /// per chunk.
-    /// Counted from an open connection, never including the connect.
+    /// A whole request, counted from an open connection, never including the
+    /// connect; for blobs and event batches, the response head and then each
+    /// body chunk, so a slow link that keeps delivering bytes never times
+    /// out. An events long-poll's head gets its `wait` on top. A command is
+    /// timed by its upload instead: it fails once the socket has taken none
+    /// of it for this long, which, after the last byte, bounds the wait for
+    /// the response head; its reply body is then read per chunk.
     pub request_timeout: Duration,
     /// Idle connections kept for reuse.
     pub max_idle: usize,
@@ -734,8 +733,8 @@ impl Http {
         self.ended(exchange.await)
     }
 
-    /// Sends a request and waits up to the request timeout for the
-    /// response head, leaving the body to the caller.
+    /// Sends a request and waits up to the request timeout, from having an
+    /// open connection, for the response head, leaving the body to the caller.
     async fn request_head(
         &self,
         method: Method,
