@@ -1162,6 +1162,9 @@ impl Head {
                 let (text, kind) = (session.composer.text.clone(), session.mode);
                 self.save_snippet(name, text, kind, clock, out);
             }
+            GuiIntent::SaveShellCommand { command, name } => {
+                self.save_snippet(name, command, ComposerMode::Shell, clock, out);
+            }
             GuiIntent::InsertSnippet {
                 session_id,
                 snippet_id,

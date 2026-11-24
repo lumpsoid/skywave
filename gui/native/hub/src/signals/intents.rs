@@ -174,6 +174,12 @@ pub enum GuiIntent {
         session_id: String,
         name: String,
     },
+    /// Keep `command` (a shell run's, as it was sent) as a saved shell
+    /// command named `name`, blank for none.
+    SaveShellCommand {
+        command: String,
+        name: String,
+    },
     /// Put a snippet's text into the composer at its cursor, to edit or
     /// send; the snippet lists first.
     InsertSnippet {
