@@ -130,6 +130,11 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
   Elsewhere (desktop macOS and Windows) the send buffer, which can
   autotune to megabytes, counts as sent, so on an uplink too slow to
   drain it within 30 s a large command times out there and is resent.
+- **Connecting:** a new connection (name lookup, TCP, TLS and HTTP
+  handshakes) gets `connect_timeout` (30 s) of its own, long enough for a
+  first rendezvous with a Tor onion service. Every request deadline above
+  starts once the request has an open connection, so a slow connect never
+  eats into it.
 - **Dead connections:** the HTTPS transport keeps up to `max_idle` (4)
   connections for reuse. A NAT or network that drops a connection
   silently leaves it looking ready. So a request that times out or whose

@@ -66,7 +66,9 @@ use crate::workdir::{WORKDIR_TIMEOUT, WORKDIR_WRITE_TIMEOUT};
 /// Timeouts and pool size of an [`HttpsTransport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportConfig {
-    /// TCP connect plus TLS handshake.
+    /// Opening a new connection: name lookup, TCP connect, TLS and HTTP
+    /// handshakes. Long enough for a first rendezvous with a Tor onion
+    /// service. A request's own deadline starts once it has an open connection.
     pub connect_timeout: Duration,
     /// A whole request; for blobs and event batches, the response head and
     /// then each body chunk, so a slow link that keeps delivering bytes
@@ -75,6 +77,7 @@ pub struct TransportConfig {
     /// has taken none of it for this long, which, after the last byte,
     /// bounds the wait for the response head; its reply body is then read
     /// per chunk.
+    /// Counted from an open connection, never including the connect.
     pub request_timeout: Duration,
     /// Idle connections kept for reuse.
     pub max_idle: usize,
@@ -83,7 +86,7 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         TransportConfig {
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(30),
             max_idle: 4,
         }
@@ -493,6 +496,9 @@ struct Head {
     headers: HeaderMap,
     body: Incoming,
     conn: Conn,
+    /// When the request's deadline ends, counted from its open connection:
+    /// the body must arrive by then. `None` when the request has no deadline.
+    until: Option<tokio::time::Instant>,
 }
 
 /// A response read in full.
@@ -578,7 +584,9 @@ impl Http {
     }
 
     /// Sends a request and waits for the response head, timed by the
-    /// upload's progress when `stall` is set ([`Conn::send`]).
+    /// upload's progress when `stall` is set ([`Conn::send`]). When `deadline`
+    /// is set, the head must arrive within it, counted from the open
+    /// connection; the connect is timed by `connect_timeout` alone.
     async fn head(
         &self,
         method: Method,
@@ -586,6 +594,7 @@ impl Http {
         headers: &[(header::HeaderName, HeaderValue)],
         body: RequestBody,
         stall: Option<Duration>,
+        deadline: Option<Duration>,
     ) -> Result<Head, TransportError> {
         // A caller's own Content-Type replaces the JSON default; a second
         // one would be sent as well.
@@ -617,8 +626,9 @@ impl Http {
             Ok(req)
         };
         if let Some(mut conn) = self.take_idle() {
-            match conn.send(build()?, stall).await? {
-                Ok(resp) => return Ok(into_head(resp, conn)),
+            let until = deadline.map(|d| tokio::time::Instant::now() + d);
+            match by_deadline(until, conn.send(build()?, stall)).await?? {
+                Ok(resp) => return Ok(into_head(resp, conn, until)),
                 Err(e) if e.is_canceled() || e.is_closed() || e.is_incomplete_message() => {
                     // Stale pooled connection: try once on a fresh one.
                 }
@@ -626,11 +636,11 @@ impl Http {
             }
         }
         let mut conn = self.connect().await?;
-        let resp = conn
-            .send(build()?, stall)
-            .await?
+        let until = deadline.map(|d| tokio::time::Instant::now() + d);
+        let resp = by_deadline(until, conn.send(build()?, stall))
+            .await??
             .map_err(|e| TransportError::Io(e.to_string()))?;
-        Ok(into_head(resp, conn))
+        Ok(into_head(resp, conn, until))
     }
 
     /// Sends a request whose body may take long to upload, timed by its
@@ -648,14 +658,22 @@ impl Http {
     ) -> Result<Reply, TransportError> {
         let exchange = async {
             let head = self
-                .head(method, uri, headers, body, Some(self.request_timeout()))
+                .head(
+                    method,
+                    uri,
+                    headers,
+                    body,
+                    Some(self.request_timeout()),
+                    None,
+                )
                 .await?;
             self.read(head).await
         };
         self.ended(exchange.await)
     }
 
-    /// Sends a request and reads the whole response within `timeout`.
+    /// Sends a request and reads the whole response within `timeout` of
+    /// having an open connection.
     pub(crate) async fn request(
         &self,
         method: Method,
@@ -666,12 +684,17 @@ impl Http {
     ) -> Result<Reply, TransportError> {
         let exchange = async {
             let head = self
-                .head(method, uri, headers, RequestBody::Bytes(body), None)
+                .head(
+                    method,
+                    uri,
+                    headers,
+                    RequestBody::Bytes(body),
+                    None,
+                    Some(timeout),
+                )
                 .await?;
-            let body = head
-                .body
-                .collect()
-                .await
+            let body = by_deadline(head.until, head.body.collect())
+                .await?
                 .map_err(|e| TransportError::Io(e.to_string()))?
                 .to_bytes();
             self.put_idle(head.conn);
@@ -681,17 +704,13 @@ impl Http {
                 headers: head.headers,
             })
         };
-        let ended = tokio::time::timeout(timeout, exchange)
-            .await
-            .map_err(|_| TransportError::Timeout)
-            .flatten();
-        self.ended(ended)
+        self.ended(exchange.await)
     }
 
-    /// Sends a request, waits up to `head_timeout` for the response head,
-    /// then reads the body with each chunk due within the request timeout.
-    /// A slow link that keeps delivering bytes never times out; one that
-    /// stalls for a request timeout does.
+    /// Sends a request, waits up to `head_timeout`, from having an open
+    /// connection, for the response head, then reads the body with each chunk
+    /// due within the request timeout. A slow link that keeps delivering bytes
+    /// never times out; one that stalls for a request timeout does.
     async fn request_chunked(
         &self,
         method: Method,
@@ -700,12 +719,16 @@ impl Http {
         head_timeout: Duration,
     ) -> Result<Reply, TransportError> {
         let exchange = async {
-            let head = tokio::time::timeout(
-                head_timeout,
-                self.head(method, uri, headers, RequestBody::Bytes(Bytes::new()), None),
-            )
-            .await
-            .map_err(|_| TransportError::Timeout)??;
+            let head = self
+                .head(
+                    method,
+                    uri,
+                    headers,
+                    RequestBody::Bytes(Bytes::new()),
+                    None,
+                    Some(head_timeout),
+                )
+                .await?;
             self.read(head).await
         };
         self.ended(exchange.await)
@@ -719,13 +742,16 @@ impl Http {
         uri: &str,
         headers: &[(header::HeaderName, HeaderValue)],
     ) -> Result<Head, TransportError> {
-        let head = tokio::time::timeout(
-            self.request_timeout(),
-            self.head(method, uri, headers, RequestBody::Bytes(Bytes::new()), None),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)
-        .flatten();
+        let head = self
+            .head(
+                method,
+                uri,
+                headers,
+                RequestBody::Bytes(Bytes::new()),
+                None,
+                Some(self.request_timeout()),
+            )
+            .await;
         self.ended(head)
     }
 
@@ -753,13 +779,32 @@ impl Http {
     }
 }
 
-fn into_head(resp: hyper::Response<Incoming>, conn: Conn) -> Head {
+fn into_head(
+    resp: hyper::Response<Incoming>,
+    conn: Conn,
+    until: Option<tokio::time::Instant>,
+) -> Head {
     let (parts, body) = resp.into_parts();
     Head {
         status: parts.status,
         headers: parts.headers,
         body,
         conn,
+        until,
+    }
+}
+
+/// `future`, cut off with [`TransportError::Timeout`] at `until` when there
+/// is one.
+async fn by_deadline<T>(
+    until: Option<tokio::time::Instant>,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, TransportError> {
+    match until {
+        Some(until) => tokio::time::timeout_at(until, future)
+            .await
+            .map_err(|_| TransportError::Timeout),
+        None => Ok(future.await),
     }
 }
 
