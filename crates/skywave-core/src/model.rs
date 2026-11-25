@@ -14851,8 +14851,16 @@ mod tests {
             "server addresses",
             "settings",
         );
-        assert_back(&mut f, nav(Route::Usage), "usage", "active list");
-        assert_back(&mut f, nav(Route::Storage), "storage", "active list");
+        // Usage and storage opened from Settings go back to Settings, so they
+        // are opened from the session list here (see the test below).
+        let from_list = |route| {
+            move |f: &mut Fixture| {
+                f.dispatch(Action::Navigate(Route::SessionList));
+                f.dispatch(Action::Navigate(route));
+            }
+        };
+        assert_back(&mut f, from_list(Route::Usage), "usage", "active list");
+        assert_back(&mut f, from_list(Route::Storage), "storage", "active list");
         assert_back(&mut f, nav(Route::Worktrees), "worktrees", "active list");
         assert_back(&mut f, nav(Route::Approvals), "approvals", "active list");
         // Re-pairing a paired device can be cancelled.
