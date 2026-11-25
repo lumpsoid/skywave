@@ -9973,6 +9973,59 @@ mod tests {
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));
     }
 
+    #[test]
+    fn a_create_named_on_its_mode_request_opens_the_session() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Plan)));
+        f.dispatch(Action::SetDefaultSafetyCheck(true));
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let command = queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: "/srv/new".into(),
+                conversation: None,
+                worktree: None,
+                mode: Some(PermissionMode::Plan),
+                safety_check: true,
+            }
+        );
+
+        // As the server logs a create with a mode: the `SessionCreated` and
+        // the safety check name no command; the mode request, logged last,
+        // names the create.
+        let new = SessionId::new();
+        let me = f.me;
+        f.log_commands(
+            new,
+            vec![
+                (
+                    None,
+                    EventKind::SessionCreated {
+                        workdir: "/srv/new".into(),
+                        context_name: "start".into(),
+                        from: None,
+                        worktree: None,
+                    },
+                ),
+                (None, EventKind::SafetyCheckSet { on: true, by: me }),
+                (
+                    Some(command.id),
+                    EventKind::PermissionModeRequested {
+                        mode: PermissionMode::Plan,
+                        by: me,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(f.model.open_session(), Some(new));
+        assert_eq!(f.model.unloaded_session(), Some(new));
+    }
+
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {
         queued(&f.dispatch(Action::SendMessage {
             session_id,

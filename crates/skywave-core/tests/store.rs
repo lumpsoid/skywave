@@ -2396,6 +2396,44 @@ fn v43_opens_a_v42_replica_unchanged() {
     ));
 }
 
+/// A v43 device's queued `CreateSession` opens as v44 and reads back with no
+/// mode and the safety check off: v44 added `mode` and `safety_check` to
+/// `CreateSession`, which a v43 command never carried.
+#[test]
+fn v44_opens_a_v43_replica_with_its_outboxed_create_session() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let command_id = "01920000-0000-7000-8000-000000000011";
+    let v43 = format!(
+        r#"{{"id":"{command_id}","kind":{{"type":"create_session","workdir":"/srv/a","conversation":null,"worktree":null}}}}"#
+    );
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute(
+        "INSERT INTO outbox (command_id, command) VALUES (?1, ?2)",
+        rusqlite::params![command_id, v43],
+    )
+    .unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 43", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let outbox = store.outbox().unwrap();
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].status, OutboxStatus::Queued);
+    assert_eq!(
+        outbox[0].command.kind,
+        CommandKind::CreateSession {
+            workdir: "/srv/a".into(),
+            conversation: None,
+            worktree: None,
+            mode: None,
+            safety_check: false,
+        }
+    );
+}
+
 fn usage_limits_read() -> UsageLimitsResult {
     UsageLimitsResult::Read {
         at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
@@ -4150,6 +4188,27 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     );
     core.dispatch(Action::OpenSession(log.a)).unwrap();
     assert_eq!(shown(&core), (false, false), "no bypass, no shell");
+}
+
+/// The new-session defaults are this device's, as the blob policy is: pairing
+/// with another server keeps them, where the old server's facts go.
+#[test]
+fn new_session_defaults_survive_a_server_reset() {
+    let (_tmp, dir) = data_dir();
+    let ca = ca_pem();
+    let core = Core::open_detached(&dir).unwrap();
+    let seam = core.seam();
+    seam.pairing_succeeded(&addr("old.example:7443"), paired_with(&ca))
+        .unwrap();
+    let store = Store::open(&dir).unwrap();
+    store.set_default_mode(Some(PermissionMode::Plan)).unwrap();
+    store.set_default_safety_check(true).unwrap();
+
+    seam.pairing_succeeded(&addr("new.example:7443"), paired_with(&ca_pem()))
+        .unwrap();
+    let settings = store.settings().unwrap();
+    assert_eq!(settings.default_mode, Some(PermissionMode::Plan));
+    assert!(settings.default_safety_check);
 }
 
 fn requested(session_id: SessionId, minute: u32, id: ApprovalId) -> Event {
