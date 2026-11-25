@@ -489,6 +489,7 @@ impl EventLog {
                 workdir,
                 conversation,
                 worktree: None,
+                ..
             } => {
                 let workdir = match dirs::canonical_under_roots(self.roots(), workdir) {
                     Ok(workdir) => workdir,

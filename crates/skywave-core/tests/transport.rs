@@ -206,6 +206,8 @@ async fn pair_then_talk_to_the_server_until_revoked() {
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let accepted = transport.send_command(&create).await.unwrap();
@@ -791,6 +793,8 @@ async fn log_of(transport: &HttpsTransport, fx: &Fixture, texts: Vec<String>) ->
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let CommandResult::Accepted { mut seq } = transport.send_command(&create).await.unwrap() else {
@@ -1060,6 +1064,8 @@ async fn workdir_reads_reach_a_real_server() {
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let accepted = transport.send_command(&create).await.unwrap();
@@ -1184,6 +1190,8 @@ async fn workdir_download_reaches_a_real_server() {
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let accepted = transport.send_command(&create).await.unwrap();
@@ -1246,6 +1254,8 @@ async fn workdir_write_reaches_a_real_server() {
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let accepted = transport.send_command(&create).await.unwrap();

@@ -978,6 +978,8 @@ mod tests {
                     workdir: workdir.to_str().unwrap().to_owned(),
                     conversation: None,
                     worktree: None,
+                    mode: None,
+                    safety_check: false,
                 },
             };
             log.handle(&mut storage.db, DeviceId::new(), &create)
@@ -1104,6 +1106,8 @@ mod tests {
                     workdir: self.workdir.to_str().unwrap().to_owned(),
                     conversation: None,
                     worktree: None,
+                    mode: None,
+                    safety_check: false,
                 },
             };
             log.handle(&mut self.storage.db, DeviceId::new(), &create)

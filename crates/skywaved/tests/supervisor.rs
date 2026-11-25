@@ -138,6 +138,8 @@ impl Fixture {
                 workdir,
                 conversation,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             },
         };
         let seq = accepted(
@@ -468,6 +470,8 @@ impl Fixture {
                 workdir: workdir.to_str().unwrap().to_owned(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             },
         ));
         self.log
@@ -5684,6 +5688,8 @@ async fn a_low_disk_pauses_the_agent_refuses_new_work_and_still_interrupts_and_s
         workdir: f.root.join("project").to_str().unwrap().to_owned(),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     };
     assert_eq!(
         rejected(f.handle(DeviceId::new(), create)),

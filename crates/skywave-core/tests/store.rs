@@ -3114,6 +3114,8 @@ fn withdraw_anything_not_accepted() {
             workdir: "/etc".into(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let interrupt = Command {

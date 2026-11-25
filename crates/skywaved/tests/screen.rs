@@ -89,6 +89,8 @@ impl Fixture {
                 workdir: workdir.to_str().unwrap().to_owned(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             },
         ));
         self.log

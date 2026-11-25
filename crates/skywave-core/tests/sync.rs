@@ -1679,6 +1679,8 @@ fn create_on_server(daemon: &mut Daemon, device: skywave_core::DeviceId) {
             workdir: daemon.workdir(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let result = daemon

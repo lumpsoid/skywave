@@ -753,6 +753,8 @@ impl Model {
                         workdir: workdir.to_owned(),
                         conversation,
                         worktree,
+                        mode: None,
+                        safety_check: false,
                     },
                     Vec::new(),
                 );
@@ -778,6 +780,8 @@ impl Model {
                         workdir,
                         conversation: None,
                         worktree: None,
+                        mode: None,
+                        safety_check: false,
                     },
                     Vec::new(),
                 );
@@ -9744,6 +9748,8 @@ mod tests {
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }
         );
         assert_eq!(f.model.unloaded_session(), None);
@@ -9779,6 +9785,8 @@ mod tests {
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }
         );
         let new = SessionId::new();
@@ -10853,6 +10861,8 @@ mod tests {
             workdir: "/srv/a".into(),
             conversation: conversation.map(str::to_owned),
             worktree: None,
+            mode: None,
+            safety_check: false,
         };
         assert_eq!(create(&mut f, Some(" id ")), kind(Some("id")));
         assert_eq!(create(&mut f, Some("  ")), kind(None));
@@ -10876,6 +10886,8 @@ mod tests {
             workdir: "/srv/app".into(),
             conversation: None,
             worktree: worktree.map(str::to_owned),
+            mode: None,
+            safety_check: false,
         };
         assert_eq!(create(&mut f, Some("  feat/x ")), kind(Some("feat/x")));
         assert_eq!(create(&mut f, Some("   ")), kind(None));
@@ -14636,6 +14648,8 @@ mod tests {
                 workdir: workdir.into(),
                 conversation: Some(id.into()),
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }
         );
         assert_eq!(f.list_view().conversations, None);

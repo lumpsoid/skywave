@@ -232,7 +232,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`RejectReason::ScreenStale`] and [`RejectReason::BadScreenInput`].
 ///
 /// v43: `HelloResponse::screen` advertises `[screen] enabled`.
-pub const PROTOCOL_VERSION: u32 = 43;
+///
+/// v44: `mode` and `safety_check` on `CommandKind::CreateSession`: a new
+/// session's starting permission mode and safety check (D67).
+pub const PROTOCOL_VERSION: u32 = 44;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2370,6 +2373,13 @@ pub enum CommandKind {
         /// `workdir` itself.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree: Option<String>,
+        /// The permission mode the session's agent should start in (D67).
+        /// `None`: the agent's own. Not with `conversation`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<PermissionMode>,
+        /// Start with Skywave's safety check on (D59, D67).
+        #[serde(default)]
+        safety_check: bool,
     },
     /// Send `text` to the agent. `context` is the session's context the
     /// message was written in; the server refuses it as `ContextChanged`

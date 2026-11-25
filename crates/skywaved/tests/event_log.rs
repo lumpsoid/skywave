@@ -77,6 +77,8 @@ impl Fixture {
             workdir,
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }));
         let batch = self.log.read(&self.storage.db, Seq(seq.0 - 1), 1).unwrap();
         assert!(matches!(
@@ -410,6 +412,8 @@ fn each_accepted_command_logs_one_event_naming_it() {
             workdir,
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     );
     let seq = accepted(result);
@@ -474,6 +478,8 @@ fn each_accepted_command_logs_one_event_naming_it() {
             workdir: f.root.join("project").display().to_string(),
             conversation: Some(CONVERSATION.into()),
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let prepared = f.prepare_import(two_items());
@@ -579,6 +585,8 @@ fn concurrent_resends_of_one_command_append_once() {
             workdir,
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let device = DeviceId::new();
@@ -687,6 +695,8 @@ fn create_session_records_the_canonical_workdir() {
         workdir: workdir(&dotted),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     }));
     let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
     let canonical = workdir(&std::fs::canonicalize(f.root.join("project")).unwrap());
@@ -718,6 +728,8 @@ fn create_session_records_the_canonical_workdir() {
         workdir: workdir(&f.root),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     }));
 }
 
@@ -752,6 +764,8 @@ fn create_session_rejects_workdirs_outside_roots() {
                 workdir: dir.clone(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }),
             rejected(reason),
             "{dir}"
@@ -773,6 +787,8 @@ fn create_session_follows_symlinks_before_checking_roots() {
             workdir: workdir(&f.root.join("escape")),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
@@ -784,6 +800,8 @@ fn create_session_follows_symlinks_before_checking_roots() {
         workdir: workdir(&link_in),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     }));
 }
 
@@ -796,6 +814,8 @@ fn no_roots_allow_nothing() {
             workdir: workdir(&f.root.join("project")),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
@@ -810,6 +830,8 @@ fn adopt_kind(workdir: String, conversation: &str) -> CommandKind {
         workdir,
         conversation: Some(conversation.to_owned()),
         worktree: None,
+        mode: None,
+        safety_check: false,
     }
 }
 
@@ -1815,6 +1837,8 @@ impl OpenWork {
                 workdir: workdir(&f.root.join("project")),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             },
             CommandKind::SendMessage {
                 session_id: session,
@@ -3661,6 +3685,8 @@ async fn waiters_wake_on_append() {
                     workdir,
                     conversation: None,
                     worktree: None,
+                    mode: None,
+                    safety_check: false,
                 },
             };
             log.handle(&mut conn.db, DeviceId::new(), &command).unwrap()
@@ -3726,6 +3752,8 @@ impl Fixture {
             workdir: workdir(dir),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }));
         let session = self.all_events()[(seq.0 - 1) as usize].session_id;
         let first = ContextId::first_of(session);
