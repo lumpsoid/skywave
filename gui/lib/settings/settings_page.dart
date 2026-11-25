@@ -16,8 +16,9 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// device ([AgentLoginPanel] below it), and Re-pair. Also the
 /// Notifications tile, which opens its page ([NotificationsPage]); below
 /// Re-pair, the Usage and Storage tiles, which open those pages (back
-/// returns here); and the safety rules the person trusts, each with a
-/// remove button (D61). A paired
+/// returns here); the New sessions defaults, the permission mode and safety
+/// check a new session starts with; and the safety rules the person trusts,
+/// each with a remove button (D61). A paired
 /// server's tile opens its addresses ([ServerAddressesPage]), to reach it at
 /// another without
 /// re-pairing.
@@ -245,6 +246,25 @@ class SettingsPage extends StatelessWidget {
                 const ActionIntentNavigate(route: RouteView.storage),
               ),
             ),
+            const _Section('New sessions'),
+            ListTile(
+              key: const Key('default-mode'),
+              leading: const Icon(Icons.shield_outlined),
+              title: const Text('Permission mode'),
+              subtitle: Text(screen.defaultModeLabel),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => _pickDefaultMode(context, screen, send),
+            ),
+            SwitchListTile(
+              key: const Key('default-safety-check'),
+              title: const Text('Safety check'),
+              subtitle: const Text(
+                'Approve provably read-only shell commands in new sessions',
+              ),
+              value: screen.defaultSafetyCheck,
+              onChanged: (on) =>
+                  send.act(ActionIntentSetDefaultSafetyCheck(on: on)),
+            ),
             const _Section('Safety rules'),
             if (screen.safetyRules.isEmpty)
               Padding(
@@ -337,6 +357,126 @@ class ConnectionTile extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Lists the modes a new session can start in, the agent's own first; a
+/// pick sets the default for sessions started from now on. A mode that lets
+/// every tool run unasked is confirmed first. The dialog pops `option: null`
+/// for the agent's own, so a dismissed dialog (`null`) sends nothing.
+Future<void> _pickDefaultMode(
+  BuildContext context,
+  ScreenViewSettings screen,
+  SendIntent send,
+) async {
+  final picked = await showDialog<({ModeOption? option})>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Permission mode for new sessions'),
+      contentPadding: const EdgeInsets.fromLTRB(0, 16, 0, 0),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _defaultChoice(
+              context,
+              key: const Key('default-mode-none'),
+              label: "The agent's own",
+              detail: 'Whatever the agent starts in',
+              current: screen.defaultMode == null,
+              warn: false,
+              onTap: () => Navigator.of(context).pop((option: null)),
+            ),
+            for (final option in screen.defaultModes)
+              _defaultChoice(
+                context,
+                key: Key('default-mode-${option.mode.name}'),
+                label: option.label,
+                detail: option.detail,
+                current: screen.defaultMode == option.mode,
+                warn: option.needsConfirmation,
+                onTap: () => Navigator.of(context).pop((option: option)),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
+    ),
+  );
+  if (picked == null || !context.mounted) return;
+  final option = picked.option;
+  if (option != null &&
+      option.needsConfirmation &&
+      !await _confirmDefault(context, option)) {
+    return;
+  }
+  send.act(ActionIntentSetDefaultMode(mode: option?.mode));
+}
+
+/// One choice in the default picker, the current one checked. A mode that
+/// lets every tool run unasked is shown in the error colour, as the session
+/// picker shows it.
+ListTile _defaultChoice(
+  BuildContext context, {
+  required Key key,
+  required String label,
+  required String detail,
+  required bool current,
+  required bool warn,
+  required VoidCallback onTap,
+}) {
+  return ListTile(
+    key: key,
+    contentPadding: const EdgeInsets.symmetric(horizontal: 24),
+    selected: current,
+    leading: Icon(current ? Icons.check_circle : Icons.circle_outlined),
+    title: Text(
+      label,
+      style: warn
+          ? TextStyle(color: Theme.of(context).colorScheme.error)
+          : null,
+    ),
+    subtitle: Text(detail),
+    onTap: onTap,
+  );
+}
+
+/// Asks once more before a default mode that lets every tool run unasked.
+Future<bool> _confirmDefault(BuildContext context, ModeOption option) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) {
+      final scheme = Theme.of(context).colorScheme;
+      return AlertDialog(
+        icon: Icon(Icons.warning_amber_rounded, color: scheme.error),
+        title: Text('Start new sessions in ${option.label}?'),
+        content: Text(
+          '${option.label}: ${option.detail}. '
+          'Nothing the agent runs waits for an approval.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: scheme.error,
+              foregroundColor: scheme.onError,
+            ),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text('Start in ${option.label}'),
+          ),
+        ],
+      );
+    },
+  );
+  return confirmed ?? false;
 }
 
 class _Section extends StatelessWidget {
