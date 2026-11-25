@@ -1011,10 +1011,16 @@ fn settings_view(
         safety_rules: settings.safety_rules.iter().map(safety_rule_row).collect(),
         default_modes,
         default_mode: settings.default_mode.map(mode_view),
-        default_mode_label: settings.default_mode.map_or_else(
-            || "the agent's own".to_owned(),
-            |mode| mode_label(mode).to_owned(),
-        ),
+        default_mode_label: match settings.default_mode {
+            None => "the agent's own".to_owned(),
+            // The stored default stays bypass, but a new session starts in
+            // the agent's own mode while the server disallows it.
+            Some(PermissionMode::Bypass) if !settings.bypass_allowed => format!(
+                "{} (not allowed by this server: the agent's own)",
+                mode_label(PermissionMode::Bypass)
+            ),
+            Some(mode) => mode_label(mode).to_owned(),
+        },
         default_safety_check: settings.default_safety_check,
         version: skywave_version::VERSION.to_owned(),
     }
@@ -1682,6 +1688,83 @@ mod tests {
                         .iter()
                         .any(|option| option.mode == PermissionModeView::Bypass)
                 );
+            }
+            other => panic!("not settings: {other:?}"),
+        }
+    }
+
+    /// A bypass default the server disallows is said so, since new sessions
+    /// start in the agent's own mode; the default itself stays bypass.
+    #[test]
+    fn a_bypass_default_the_server_disallows_says_so() {
+        let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
+        let show = |settings: &SettingsView| {
+            let view = ViewState {
+                link: Link::Online { latency_ms: 1 },
+                queued: 0,
+                attention: Attention::default(),
+                screen: Screen::Settings(settings.clone()),
+                can_go_back: true,
+                snippets: Vec::new(),
+                shell_history: Default::default(),
+                login_expires: None,
+                agent_login_offered: false,
+                agent_logged_out: false,
+            };
+            settings_view(
+                settings,
+                &view,
+                None,
+                NotificationPrefs::ON,
+                now.timestamp_millis(),
+            )
+        };
+        let mut settings = SettingsView {
+            blob_policy: BlobPolicy::OnDemand,
+            default_mode: Some(PermissionMode::Bypass),
+            default_safety_check: false,
+            bypass_allowed: false,
+            blobs_disk_full: false,
+            server_address: None,
+            other_addresses: Vec::new(),
+            device_id: None,
+            server_fingerprint: None,
+            login: idle(false),
+            safety_rules: Vec::new(),
+        };
+        match show(&settings) {
+            ScreenView::Settings {
+                default_modes,
+                default_mode,
+                default_mode_label,
+                ..
+            } => {
+                assert_eq!(default_mode, Some(PermissionModeView::Bypass));
+                assert_eq!(
+                    default_mode_label,
+                    format!(
+                        "{} (not allowed by this server: the agent's own)",
+                        mode_label(PermissionMode::Bypass)
+                    )
+                );
+                assert!(default_modes.iter().all(|option| !option.current));
+            }
+            other => panic!("not settings: {other:?}"),
+        }
+        settings.bypass_allowed = true;
+        match show(&settings) {
+            ScreenView::Settings {
+                default_modes,
+                default_mode_label,
+                ..
+            } => {
+                assert_eq!(default_mode_label, mode_label(PermissionMode::Bypass));
+                let current: Vec<PermissionModeView> = default_modes
+                    .iter()
+                    .filter(|option| option.current)
+                    .map(|option| option.mode)
+                    .collect();
+                assert_eq!(current, vec![PermissionModeView::Bypass]);
             }
             other => panic!("not settings: {other:?}"),
         }

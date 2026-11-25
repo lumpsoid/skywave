@@ -119,7 +119,10 @@ pub enum ScreenView {
         default_modes: Vec<ModeOption>,
         /// This device's default, `None`: the agent's own.
         default_mode: Option<PermissionModeView>,
-        /// "the agent's own", or the default's label.
+        /// "the agent's own", or the default's label. A bypass default the
+        /// server disallows reads "bypass (not allowed by this server: the
+        /// agent's own)", since new sessions start in the agent's own mode;
+        /// `default_mode` still says bypass.
         default_mode_label: String,
         /// Whether new sessions start with the safety check on.
         default_safety_check: bool,
