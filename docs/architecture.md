@@ -193,9 +193,11 @@ every version.
   (`Event.command_id`), the last it appends, at the seq of its `Accepted`;
   a rejected one logs nothing. So the log acknowledges a command as its
   reply does (`MoveContext` also logs the new session's `SessionCreated`
-  first; an adopting `CreateSession` logs its `SessionCreated` and the
-  imported history first, and names itself on the `ImportFinished` after
-  them, D37). A `DeleteBlob`'s `BlobDeleted` and a `CropBlob`'s
+  first; a `CreateSession` logs its `SessionCreated`, then the session's
+  starting `SafetyCheckSet` and `PermissionModeRequested` when it asks for
+  them, the last naming it; an adopting `CreateSession` logs its
+  `SessionCreated`, its `SafetyCheckSet` if on, and the imported history
+  first, and names itself on the `ImportFinished` after them, D37). A `DeleteBlob`'s `BlobDeleted` and a `CropBlob`'s
   `BlobCropped` are stamped with the session and context of the event
   that referenced the blob, as an `ApprovalResolved` takes its approval's
   (D42).

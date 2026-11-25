@@ -4,11 +4,14 @@
 //!
 //! What each command appends, and the seq its `Accepted` names:
 //! - `CreateSession` → `SessionCreated` with the canonical workdir, a new
-//!   [`SessionId`] and a generated name for its first context; when it
-//!   adopts an outside conversation, that `SessionCreated` has `from` =
-//!   [`SessionOrigin::Agent`] with the checked id and names no command, and
-//!   is followed by an `Imported` for each item of the conversation's
-//!   history, then `ImportFinished` with the import's outcome;
+//!   [`SessionId`] and a generated name for its first context, then the
+//!   session's starting `SafetyCheckSet` (when `safety_check` is on) and
+//!   `PermissionModeRequested` (when it asks for a `mode`), the last of
+//!   those naming the command; when it adopts an outside conversation, that
+//!   `SessionCreated` has `from` = [`SessionOrigin::Agent`] with the checked
+//!   id and names no command, is followed by its `SafetyCheckSet` if on, and
+//!   then by an `Imported` for each item of the conversation's history, then
+//!   `ImportFinished` with the import's outcome;
 //! - `SendMessage` → `UserMessage`;
 //! - `ResolveApproval` → `ApprovalResolved`, echoing the granted `rule`;
 //! - `Interrupt` → `TurnInterrupted`;
@@ -34,8 +37,11 @@
 //! Each appends exactly one event naming the command
 //! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
 //! appends, and nothing else but the new session's `SessionCreated` a
-//! `MoveContext` logs before it, and an adopting `CreateSession`'s
-//! `SessionCreated` and `Imported`s before its `ImportFinished`. Every
+//! `MoveContext` logs before it, the `SessionCreated` and starting settings
+//! (`SafetyCheckSet`, `PermissionModeRequested`) a `CreateSession` logs
+//! before the one naming it, and an adopting `CreateSession`'s
+//! `SessionCreated`, `SafetyCheckSet` and `Imported`s before its
+//! `ImportFinished`. Every
 //! adopting create's own event is its `ImportFinished`, whatever the import's
 //! outcome. So the log acknowledges an accepted
 //! command as its `Accepted` does: a device whose reply was lost settles
@@ -74,10 +80,15 @@
 //! `BlobCropped` with the session and context of the event that referenced
 //! the blob; every other event with the session's current context.
 //!
-//! **CreateSession.** Refused, in this order: the workdir must canonicalise
-//! under a root (`WorkdirNotAllowed`, `WorkdirNotFound`); then a
-//! `conversation` must pass [`skywave_proto::check_conversation_id`], else
-//! `BadConversation`. That is a syntax check only, and the id is logged
+//! **CreateSession.** Refused, in this order: a `conversation` with a
+//! `worktree` or a `mode` is `BadConversation` (an adopted session starts in
+//! its agent's mode, and a mode request counts only when it names the
+//! command, which `ImportFinished` does); a `mode` of `Bypass` while the log
+//! does not allow it is `BypassDisabled`, as for `SetPermissionMode`. Then the
+//! workdir must canonicalise under a root (`WorkdirNotAllowed`,
+//! `WorkdirNotFound`); then a `conversation` must pass
+//! [`skywave_proto::check_conversation_id`], else `BadConversation`. That is a
+//! syntax check only, and the id is logged
 //! trimmed, never cut. Whether the agent has such a conversation in the
 //! workdir is not checked here: the agent settles it when the session
 //! first starts. Its history is imported before the transaction (D37): the
@@ -88,6 +99,10 @@
 //! import that found nothing, failed or timed out is an outcome of the
 //! `ImportFinished` (`NotFound`, `Failed`), never a refusal: the session is
 //! created all the same. A refused create logs nothing and leaves no blob.
+//! A session created with `safety_check` on logs `SafetyCheckSet { on: true }`
+//! after its `SessionCreated`, and one created with a `mode` a
+//! `PermissionModeRequested` after that: the supervisor starts the agent for
+//! the latter, as it does for a switch of a fresh session's mode.
 //!
 //! **SendMessage.** `ContextChanged` when its `context` is no longer the
 //! session's current one: the message was written for a conversation the
@@ -457,8 +472,25 @@ impl EventLog {
                 worktree: Some(_),
                 ..
             } => return Ok(Err(RejectReason::BadConversation)),
+            // An adopted session starts in its agent's mode: a mode request
+            // counts only when it names the command, and an adopting
+            // command names its `ImportFinished`, so the two cannot combine.
             CommandKind::CreateSession {
-                worktree: Some(_), ..
+                conversation: Some(_),
+                mode: Some(_),
+                ..
+            } => return Ok(Err(RejectReason::BadConversation)),
+            // As for `SetPermissionMode`: the server's own config refuses it
+            // before anything else is checked.
+            CommandKind::CreateSession {
+                mode: Some(PermissionMode::Bypass),
+                ..
+            } if !self.bypass_allowed() => return Ok(Err(RejectReason::BypassDisabled)),
+            CommandKind::CreateSession {
+                worktree: Some(_),
+                mode,
+                safety_check,
+                ..
             } => {
                 let (created, intent) = match prepared_worktree(self.roots(), prepared) {
                     Ok(made) => made,
@@ -483,13 +515,16 @@ impl EventLog {
                         branch: created.branch,
                     }),
                 };
+                let starting = starting_settings(*mode, *safety_check, device);
+                let kind = log_new_session(tx, session, context, kind, starting)?;
                 (session, context, kind)
             }
             CommandKind::CreateSession {
                 workdir,
                 conversation,
                 worktree: None,
-                ..
+                mode,
+                safety_check,
             } => {
                 let workdir = match dirs::canonical_under_roots(self.roots(), workdir) {
                     Ok(workdir) => workdir,
@@ -512,12 +547,19 @@ impl EventLog {
                     worktree: None,
                 };
                 if !adopting {
+                    let starting = starting_settings(*mode, *safety_check, device);
+                    let kind = log_new_session(tx, session, context, kind, starting)?;
                     (session, context, kind)
                 } else {
-                    // The session first, naming no command, then its
-                    // imported history; the command names itself on the
-                    // `ImportFinished` after it, the last event it appends.
+                    // The session first, naming no command, then its starting
+                    // safety check (a conversation names no mode, refused
+                    // above), then its imported history; the command names
+                    // itself on the `ImportFinished` after them, the last
+                    // event it appends.
                     event_log::append_in(tx, session, context, None, &kind)?;
+                    for starting in starting_settings(None, *safety_check, device) {
+                        event_log::append_in(tx, session, context, None, &starting)?;
+                    }
                     let outcome = match prepared {
                         Some(Preparation::Import(prepared))
                             if prepared.workdir() == Some(workdir.as_str()) =>
@@ -1065,6 +1107,44 @@ impl EventLog {
             &kind,
         )?))
     }
+}
+
+/// The settings a new session starts with, logged after its `SessionCreated`:
+/// its safety check when on, then its permission mode when asked for.
+fn starting_settings(
+    mode: Option<PermissionMode>,
+    safety_check: bool,
+    device: DeviceId,
+) -> Vec<EventKind> {
+    let mut settings = Vec::new();
+    if safety_check {
+        settings.push(EventKind::SafetyCheckSet {
+            on: true,
+            by: device,
+        });
+    }
+    if let Some(mode) = mode {
+        settings.push(EventKind::PermissionModeRequested { mode, by: device });
+    }
+    settings
+}
+
+/// Appends a new session's `created` event and then its `starting` settings,
+/// none naming the command but the last event, which is returned for the
+/// tail to name the command with.
+fn log_new_session(
+    tx: &Connection,
+    session: SessionId,
+    context: ContextId,
+    created: EventKind,
+    starting: Vec<EventKind>,
+) -> Result<EventKind> {
+    let mut last = created;
+    for kind in starting {
+        event_log::append_in(tx, session, context, None, &last)?;
+        last = kind;
+    }
+    Ok(last)
 }
 
 /// The worktree `prepare_worktree` made for a `CreateSession` naming one, with
