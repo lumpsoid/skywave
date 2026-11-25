@@ -8,6 +8,31 @@ migrates the stored data (see the README).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
+This release changes the wire protocol (v44): upgrade the server and every
+device together. The server and the app migrate their stored data on start.
+
+### Added
+
+- Settings → New sessions: choose the permission mode new sessions start in
+  and whether their safety check starts on. The defaults belong to the
+  device and are kept across a re-pair. Bypass is offered only where the
+  server allows it.
+- Save a shell run's command as a snippet from the bookmark button on its
+  tile, including runs that have finished.
+
+### Changed
+
+- Usage and Storage moved from the session list's app bar to Settings →
+  Usage and storage.
+
+### Fixed
+
+- The systemd unit no longer overrides `PATH`, so the server and its agents
+  get the user manager's environment (`environment.d`). Set anything else
+  with `systemctl --user edit skywaved`; that survives a deploy.
+
 ## [0.2.0] - 2026-11-24
 
 This release changes the wire protocol (v43): upgrade the server and every
