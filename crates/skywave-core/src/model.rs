@@ -151,8 +151,8 @@ enum Place {
     Settings,
     ServerAddresses,
     Pairing,
-    Usage,
-    Storage,
+    Usage(Up),
+    Storage(Up),
     Worktrees,
     Approvals,
     /// The usage limits page, opened from the session on screen, if any:
@@ -250,7 +250,17 @@ struct CropPage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CropFrom {
     Session(SessionId),
-    Storage,
+    /// The storage page, with where back from it goes.
+    Storage(Up),
+}
+
+/// Where back goes from a page opened from both the session list and
+/// Settings (usage, storage): the screen it was opened from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Up {
+    #[default]
+    SessionList,
+    Settings,
 }
 
 /// Where the count of the crop page's lines stands.
@@ -273,8 +283,8 @@ impl From<Route> for Place {
             Route::Settings => Place::Settings,
             Route::ServerAddresses => Place::ServerAddresses,
             Route::Pairing => Place::Pairing,
-            Route::Usage => Place::Usage,
-            Route::Storage => Place::Storage,
+            Route::Usage => Place::Usage(Up::default()),
+            Route::Storage => Place::Storage(Up::default()),
             Route::Worktrees => Place::Worktrees,
             Route::Approvals => Place::Approvals,
             Route::UsageLimits => Place::UsageLimits(None),
@@ -818,7 +828,7 @@ impl Model {
                 Vec::new()
             }
             Action::RefreshStorage => {
-                if self.device().is_none() || self.place != Place::Storage {
+                if self.device().is_none() || !matches!(self.place, Place::Storage(_)) {
                     return Vec::new();
                 }
                 let online = self.online();
@@ -829,7 +839,7 @@ impl Model {
                     .collect()
             }
             Action::ReclaimServerSpace => {
-                if self.device().is_none() || self.place != Place::Storage {
+                if self.device().is_none() || !matches!(self.place, Place::Storage(_)) {
                     return Vec::new();
                 }
                 let online = self.online();
@@ -840,7 +850,7 @@ impl Model {
                     .collect()
             }
             Action::ReclaimDeviceSpace => {
-                if self.place != Place::Storage {
+                if !matches!(self.place, Place::Storage(_)) {
                     return Vec::new();
                 }
                 self.storage
@@ -1461,7 +1471,7 @@ impl Model {
                     return Vec::new();
                 }
                 let from = match &self.place {
-                    Place::Storage => CropFrom::Storage,
+                    Place::Storage(up) => CropFrom::Storage(*up),
                     Place::Session { id, .. } => CropFrom::Session(*id),
                     // Reopened over itself, it keeps where back goes.
                     Place::Crop(page) => page.from,
@@ -1518,8 +1528,20 @@ impl Model {
             },
             Action::Navigate(route) => {
                 let from = self.open_session();
+                // Back from the crop page keeps where back from storage goes.
+                let up = match &self.place {
+                    Place::Settings => Up::Settings,
+                    Place::Usage(up) | Place::Storage(up) => *up,
+                    Place::Crop(page) => match page.from {
+                        CropFrom::Storage(up) => up,
+                        CropFrom::Session(_) => Up::SessionList,
+                    },
+                    _ => Up::SessionList,
+                };
                 let place = match route {
                     Route::UsageLimits => Place::UsageLimits(from),
+                    Route::Usage => Place::Usage(up),
+                    Route::Storage => Place::Storage(up),
                     route => route.into(),
                 };
                 self.place = place;
@@ -1534,7 +1556,7 @@ impl Model {
                 }
                 let online = self.online();
                 let asked: Vec<Request> = match self.place {
-                    Place::Storage => self.storage.open(online),
+                    Place::Storage(_) => self.storage.open(online),
                     Place::Worktrees => self.worktrees.open(online).into_iter().collect(),
                     Place::UsageLimits(_) => self.usage_limits.open(online).into_iter().collect(),
                     _ => Vec::new(),
@@ -1616,11 +1638,13 @@ impl Model {
             | Place::All
             | Place::Settings
             | Place::Pairing
-            | Place::Usage
-            | Place::Storage
+            | Place::Usage(Up::SessionList)
+            | Place::Storage(Up::SessionList)
             | Place::Worktrees
             | Place::Approvals => Route::SessionList,
-            Place::ServerAddresses => Route::Settings,
+            Place::ServerAddresses | Place::Usage(Up::Settings) | Place::Storage(Up::Settings) => {
+                Route::Settings
+            }
             Place::UsageLimits(from) => {
                 return Some(match from.filter(|id| self.summary(*id).is_some()) {
                     Some(id) => Action::OpenSession(id),
@@ -1666,7 +1690,7 @@ impl Model {
                     CropFrom::Session(id) if self.summary(id).is_some() => Action::OpenSession(id),
                     CropFrom::Session(_) => Action::Navigate(Route::SessionList),
                     // Asked again: the crop may have changed it.
-                    CropFrom::Storage => Action::Navigate(Route::Storage),
+                    CropFrom::Storage(_) => Action::Navigate(Route::Storage),
                 });
             }
         };
@@ -2736,7 +2760,7 @@ impl Model {
         let online = self.online();
         let paired = self.device().is_some();
         match self.place {
-            Place::Storage if frees && paired => self.storage.refresh(online),
+            Place::Storage(_) if frees && paired => self.storage.refresh(online),
             Place::Worktrees if removes && paired => {
                 self.worktrees.refresh(online).into_iter().collect()
             }
@@ -3240,8 +3264,8 @@ impl Model {
             }
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived, None)),
             Place::All => Screen::SessionList(self.session_list(ListKind::All, None)),
-            Place::Usage => Screen::Usage(self.usage_view()),
-            Place::Storage => Screen::Storage(self.storage_view()),
+            Place::Usage(_) => Screen::Usage(self.usage_view()),
+            Place::Storage(_) => Screen::Storage(self.storage_view()),
             Place::Worktrees => Screen::Worktrees(self.worktrees_view()),
             Place::Approvals => Screen::Approvals(self.approvals_view()),
             Place::UsageLimits(_) => Screen::UsageLimits(self.usage_limits.view()),
@@ -14691,6 +14715,33 @@ mod tests {
             "archived session",
             "active list",
         );
+    }
+
+    #[test]
+    fn back_from_usage_and_storage_returns_to_settings_where_opened_there() {
+        let mut f = Fixture::paired();
+        let session = f.session("/srv/a");
+        let from_settings = |route| {
+            move |f: &mut Fixture| {
+                f.dispatch(Action::Navigate(Route::Settings));
+                f.dispatch(Action::Navigate(route));
+            }
+        };
+        assert_back(&mut f, from_settings(Route::Usage), "usage", "settings");
+        assert_back(&mut f, from_settings(Route::Storage), "storage", "settings");
+
+        // Through the crop page and back, storage still returns to Settings.
+        from_settings(Route::Storage)(&mut f);
+        f.dispatch(Action::OpenCrop {
+            blob: BlobId::new(),
+            session,
+            holds: BlobUse::ToolOutput,
+            title: "Bash ls".into(),
+        });
+        assert_eq!(shown(&f.model.view()), "crop");
+        // Back to storage asks for its reports again.
+        f.dispatch(Action::Back);
+        assert_back(&mut f, |_| {}, "storage", "settings");
     }
 
     #[test]
