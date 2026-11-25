@@ -112,6 +112,20 @@ pub enum ScreenView {
         /// with a change of this device still on its way; in the core's
         /// order.
         safety_rules: Vec<SafetyRuleRow>,
+        /// The modes a new session can start in, as the session's mode picker
+        /// offers them (bypass only where the server allows it); `current` marks
+        /// this device's default, `pending` is always false. The agent's own mode
+        /// (no default) is not in the list: it is `default_mode: None`.
+        default_modes: Vec<ModeOption>,
+        /// This device's default, `None`: the agent's own.
+        default_mode: Option<PermissionModeView>,
+        /// "the agent's own", or the default's label. A bypass default the
+        /// server disallows reads "bypass (not allowed by this server: the
+        /// agent's own)", since new sessions start in the agent's own mode;
+        /// `default_mode` still says bypass.
+        default_mode_label: String,
+        /// Whether new sessions start with the safety check on.
+        default_safety_check: bool,
         /// This build's version and commit, `0.1.0 (2391c1d)`.
         version: String,
     },

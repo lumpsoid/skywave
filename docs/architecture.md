@@ -193,9 +193,11 @@ every version.
   (`Event.command_id`), the last it appends, at the seq of its `Accepted`;
   a rejected one logs nothing. So the log acknowledges a command as its
   reply does (`MoveContext` also logs the new session's `SessionCreated`
-  first; an adopting `CreateSession` logs its `SessionCreated` and the
-  imported history first, and names itself on the `ImportFinished` after
-  them, D37). A `DeleteBlob`'s `BlobDeleted` and a `CropBlob`'s
+  first; a `CreateSession` logs its `SessionCreated`, then the session's
+  starting `SafetyCheckSet` and `PermissionModeRequested` when it asks for
+  them, the last naming it; an adopting `CreateSession` logs its
+  `SessionCreated`, its `SafetyCheckSet` if on, and the imported history
+  first, and names itself on the `ImportFinished` after them, D37). A `DeleteBlob`'s `BlobDeleted` and a `CropBlob`'s
   `BlobCropped` are stamped with the session and context of the event
   that referenced the blob, as an `ApprovalResolved` takes its approval's
   (D42).
@@ -429,8 +431,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
   request prepares waits for it; one after it is answered from the stored
   result. Imported items are records: never delivered to the agent, never
   open calls.
-- **Worktrees** (D52): `CreateSession { workdir, conversation, worktree }`
-  with a branch name in `worktree` makes a git worktree of the workdir's
+- **Worktrees** (D52): a `CreateSession` with a branch name in `worktree`
+  makes a git worktree of the workdir's
   repository on that new branch, at `<parent>/<repo>.worktrees/<dir>` beside
   the repository, where `<dir>` is the branch with each `/` as `-` (`feat/x`
   is `feat-x`), starting at the workdir's `HEAD`. The session runs at the
@@ -1048,7 +1050,8 @@ no longer decodes rather than failing.
 - **Replica** (SQLite, `core.db`): the replicated `events`, projections
   folded in the transaction that stores them (`sessions`, and `turns`, each
   `TurnUsage` by seq for the usage screen), the `outbox`, the `cursor`,
-  `blobs`, `settings`, and what is this device's alone (D5: drafts per
+  `blobs`, `settings` (among them this device's defaults for new sessions,
+  D67), and what is this device's alone (D5: drafts per
   session and composer mode, composer modes, snippets, read marks, local
   deletes, alerted approvals). A schema migration backfills a new
   projection from the stored events. `draft_attachments` keeps a session's
@@ -1466,7 +1469,9 @@ no longer decodes rather than failing.
   deleted here, already pulled). Only the latest request's answer is kept;
   offline (or with the server unreachable) it is `Unavailable(Offline)`,
   at once when the link is down, and nothing is asked later. Continuing is
-  `CreateSession { workdir, conversation, worktree }` (no worktree), which ends the picker, as do `EndConversations` and leaving the list.
+  `CreateSession { workdir, conversation, worktree }` (no worktree; the core
+  adds this device's new-session defaults, D67), which ends the picker, as
+  do `EndConversations` and leaving the list.
   Nothing is stored: the listing goes stale at once.
 - **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
   changes; `ShowWorkdir` switches between the changes, one file's diff (a
@@ -2036,6 +2041,12 @@ skywave-core                 all logic, sync, replica
   Flutter-local, a page in `ScreenNavigator`'s pages list, opened by the
   Settings tile through `Holders.notificationsOpen` and closed when the screen
   leaves Settings. Back closes it without leaving Settings.
+- **Settings → New sessions** (`gui/lib/settings/settings_page.dart`): the
+  permission mode the device's new sessions start in (a dialog listing the
+  agent's own first, then the modes the server offers, bypass confirmed
+  first) and the safety check switch. They send `SetDefaultMode` and
+  `SetDefaultSafetyCheck`; the core keeps them in its `settings` table and
+  shows them back on the settings view (D67). The TUI has no UI for them yet.
 - **Escape** (GUI): Escape is system back (`Back`, or closing the
   notifications page) wherever a page can go back; it never leaves the app,
   and the session page's own Esc (closing the timeline's search bar, leaving

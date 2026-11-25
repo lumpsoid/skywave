@@ -138,6 +138,8 @@ impl Fixture {
                 workdir,
                 conversation,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             },
         };
         let seq = accepted(
@@ -460,21 +462,40 @@ impl Fixture {
 
     /// Creates another session, with a workdir of its own; its id.
     fn create_session(&mut self) -> SessionId {
+        self.create_session_with(None, false).0
+    }
+
+    /// Creates another session, with a workdir of its own, asking for `mode`
+    /// and the safety check as given; its id and the create's command id.
+    fn create_session_with(
+        &mut self,
+        mode: Option<PermissionMode>,
+        safety_check: bool,
+    ) -> (SessionId, CommandId) {
         let workdir = self.root.join("other");
         std::fs::create_dir_all(&workdir).unwrap();
-        let seq = accepted(self.handle(
-            DeviceId::new(),
-            CommandKind::CreateSession {
+        let command = Command {
+            id: CommandId::new(),
+            kind: CommandKind::CreateSession {
                 workdir: workdir.to_str().unwrap().to_owned(),
                 conversation: None,
                 worktree: None,
+                mode,
+                safety_check,
             },
-        ));
-        self.log
+        };
+        let seq = accepted(
+            self.log
+                .handle(&mut self.storage.db, DeviceId::new(), &command)
+                .unwrap(),
+        );
+        let session = self
+            .log
             .read(&self.storage.db, Seq(seq.0 - 1), 1)
             .unwrap()
             .events[0]
-            .session_id
+            .session_id;
+        (session, command.id)
     }
 
     /// The session's first context, the one it was created with.
@@ -807,6 +828,72 @@ async fn the_safety_check_approves_a_read_only_command() {
     let supervisor = f.start(&agent).await;
 
     f.set_safety_check(true);
+    f.send("read notes");
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+
+    assert!(kinds.contains(&EventKind::SafetyCheckApproved {
+        call: None,
+        tool: "shell".into(),
+        summary: "cat notes.txt".into(),
+        reason: "read-only: cat".into(),
+        shell: Some("cat notes.txt".into()),
+    }));
+    assert!(!kinds.iter().any(is_approval_requested));
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "ran".into(),
+        full: None,
+    }));
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("read notes"),
+            FakeInput::Answer("r".into(), Decision::Approve, None),
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_session_created_with_a_mode_starts_its_agent_in_it() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+
+    let (session, create) = f.create_session_with(Some(PermissionMode::Plan), false);
+    f.session_id = session;
+    let kinds = f.wait_count("mode answer", 1, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds),
+        [EventKind::PermissionModeChanged {
+            mode: PermissionMode::Plan,
+            answers: Some(create),
+        }]
+    );
+    // Started in the mode, with no message and no turn.
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            FakeInput::SetPermissionMode(PermissionMode::Plan),
+        ]
+    );
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| *k == state(SessionState::AgentWorking))
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_session_created_with_the_safety_check_approves_a_read_only_command() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(shell_script("cat notes.txt"));
+    let supervisor = f.start(&agent).await;
+
+    f.session_id = f.create_session_with(None, true).0;
     f.send("read notes");
     let kinds = f.wait_count("idle", 1, is_idle).await;
 
@@ -5684,6 +5771,8 @@ async fn a_low_disk_pauses_the_agent_refuses_new_work_and_still_interrupts_and_s
         workdir: f.root.join("project").to_str().unwrap().to_owned(),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     };
     assert_eq!(
         rejected(f.handle(DeviceId::new(), create)),

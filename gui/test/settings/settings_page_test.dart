@@ -42,6 +42,9 @@ void main() {
               shell: true,
             ),
             safetyRules: [],
+            defaultModes: [],
+            defaultModeLabel: "the agent's own",
+            defaultSafetyCheck: false,
             version: '0.1.0 (abc1234)',
           ),
           link: LinkHolder(),
@@ -92,6 +95,10 @@ void main() {
     String? serverAddresses,
     bool? stayConnected,
     List<SafetyRuleRow> safetyRules = const [],
+    List<ModeOption> defaultModes = const [],
+    PermissionModeView? defaultMode,
+    String defaultModeLabel = "the agent's own",
+    bool defaultSafetyCheck = false,
     NotificationsView notifications = const NotificationsView(
       all: true,
       approvals: true,
@@ -112,6 +119,10 @@ void main() {
         stayConnected: stayConnected,
         notifications: notifications,
         safetyRules: safetyRules,
+        defaultModes: defaultModes,
+        defaultMode: defaultMode,
+        defaultModeLabel: defaultModeLabel,
+        defaultSafetyCheck: defaultSafetyCheck,
         version: '0.1.0 (abc1234)',
       ),
       link: LinkHolder(),
@@ -478,5 +489,132 @@ void main() {
     expect(find.text("The server's identity changed."), findsOneWidget);
     await tester.tap(find.text('Try again'));
     expect(sent, [const GuiIntentAct(action: ActionIntentRetryNow())]);
+  });
+
+  testWidgets('the mode default tile shows its label', (tester) async {
+    await tester.pumpWidget(settings([], defaultModeLabel: 'Plan'));
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('default-mode')),
+      200,
+      scrollable: pageScrollable(),
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('default-mode')),
+        matching: find.text('Plan'),
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('the safety check default switch sends the change', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(settings(sent));
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('default-safety-check')),
+      200,
+      scrollable: pageScrollable(),
+    );
+    await tester.ensureVisible(find.byKey(const Key('default-safety-check')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('default-safety-check')));
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentSetDefaultSafetyCheck(on: true)),
+    ]);
+  });
+
+  testWidgets('the mode default picker sends the picked mode', (tester) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      settings(
+        sent,
+        defaultModes: const [
+          ModeOption(
+            mode: PermissionModeView.ask,
+            label: 'Ask',
+            detail: 'Asks before each tool runs',
+            needsConfirmation: false,
+            current: false,
+            pending: false,
+          ),
+          ModeOption(
+            mode: PermissionModeView.plan,
+            label: 'Plan',
+            detail: 'Plans without running tools',
+            needsConfirmation: false,
+            current: false,
+            pending: false,
+          ),
+        ],
+      ),
+    );
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('default-mode')),
+      200,
+      scrollable: pageScrollable(),
+    );
+    await tester.ensureVisible(find.byKey(const Key('default-mode')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('default-mode')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('default-mode-plan')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('default-mode')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('default-mode-none')));
+    await tester.pumpAndSettle();
+
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentSetDefaultMode(mode: PermissionModeView.plan),
+      ),
+      const GuiIntentAct(action: ActionIntentSetDefaultMode(mode: null)),
+    ]);
+  });
+
+  testWidgets('a bypass default asks first', (tester) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      settings(
+        sent,
+        defaultModes: const [
+          ModeOption(
+            mode: PermissionModeView.bypass,
+            label: 'Bypass',
+            detail: 'Every tool runs unasked',
+            needsConfirmation: true,
+            current: false,
+            pending: false,
+          ),
+        ],
+      ),
+    );
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('default-mode')),
+      200,
+      scrollable: pageScrollable(),
+    );
+    await tester.ensureVisible(find.byKey(const Key('default-mode')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('default-mode')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('default-mode-bypass')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Start new sessions in Bypass?'), findsOneWidget);
+    expect(sent, isEmpty);
+
+    await tester.tap(find.text('Start in Bypass'));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentSetDefaultMode(mode: PermissionModeView.bypass),
+      ),
+    ]);
   });
 }

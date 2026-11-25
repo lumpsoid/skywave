@@ -901,6 +901,7 @@ back from a timed-out import); subagent lines, thinking, attachments and
 per-turn usage of imported turns; event blob GC (as D36).
 
 ## D38. Bypass mode only where the operator accepted the risk
+**Amended by D67:** a device's default can start a new session in bypass, as a mode switch right after launch; the launch itself still never starts in bypass.
 Bypass (`PermissionMode::Bypass`: every tool runs, nothing asks) can be
 chosen from a head only when the server's operator set `[agent]
 allow_bypass = true` in `skywaved.toml` (protocol v17). It is off by
@@ -1565,6 +1566,7 @@ N` (absent = 0 = restart) and appends; any other N answers
 
 ## D59. Skywave's safety check approves provably read-only shell commands (v38)
 **Amended by D61:** user-written rules approve commands beside the read-only proof, as trust rather than proof.
+**Amended by D67:** a device can make its new sessions start with the check on.
 A session that opts in lets `skywaved` answer some approvals itself: a
 shell command it can prove read-only and confined to the session's
 workdir is approved without a prompt, and the log says the safety check
@@ -1921,3 +1923,50 @@ search marks the matches there, so the results only lead into a session.
   Present's policies never read the clock, so the wait lives in the hub.
 - **GUI only for now.** The TUI keeps its `/` search and has inert arms for
   the page. It gets the page when someone needs it.
+
+## D67. A device's defaults for new sessions (v44)
+
+A person who always wants a new session to start in plan mode, or with the
+safety check on (D59), should not have to set it each time. The defaults
+belong to the device that the person set them on, and every session that
+device creates starts with them.
+
+**Decided:**
+- Two defaults, the permission mode (`default_mode`: one of the modes the
+  server offers, or the agent's own) and the safety check
+  (`default_safety_check`). The core keeps them per device in its
+  `settings` table (`SetDefaultMode`, `SetDefaultSafetyCheck`). A replica
+  reset keeps them, as it keeps every setting.
+- A bypass default counts only where the server allows bypass (D38). The
+  core sends no mode where it does not, so the create is not refused, and
+  the stored default stays bypass: it applies once the server allows it.
+- The core sends both on every `CreateSession` and `CreateSessionLike`
+  (`CommandKind::CreateSession { mode, safety_check }`, wire v44). A create
+  that adopts an outside conversation sends no mode, since the server
+  refuses one.
+- The server refuses a bypass `mode` unless `[agent] allow_bypass` is set
+  (`BypassDisabled`), and a `mode` with an adopted `conversation`
+  (`BadConversation`). Both are refused before anything is logged, as any
+  rejected command.
+- The create logs its starting events in order: `SessionCreated`, then
+  `SafetyCheckSet { on: true }` if the check starts on, then
+  `PermissionModeRequested` if a mode was given, the last of them naming
+  the command. An adopting create logs its `SafetyCheckSet` right after
+  its `SessionCreated`, before the imported history.
+- A mode starts the agent at once, as a mode switch on a fresh session
+  always did. Bypass still never starts a launch (D38): the agent is
+  launched with the opt-in and switched. Without a mode the agent starts
+  on the first message, as before.
+- Settings → New sessions sets both: a permission-mode picker (the agent's
+  own first, then the offered modes, bypass confirmed first) and a
+  safety-check switch.
+
+**Rejected:**
+- A server-wide switch: D59 rejected it, "Trust is per session and its
+  workdir". A default on one device is still a choice the person made for
+  the sessions of that device.
+- Defaults synced through the server. That needs a server-side setting, its
+  own events and sync, and the person asked for this device's setting.
+
+**Deferred:** the TUI's way to set both defaults. The core and the wire
+already carry them.

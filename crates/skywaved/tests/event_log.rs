@@ -77,6 +77,8 @@ impl Fixture {
             workdir,
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }));
         let batch = self.log.read(&self.storage.db, Seq(seq.0 - 1), 1).unwrap();
         assert!(matches!(
@@ -410,6 +412,8 @@ fn each_accepted_command_logs_one_event_naming_it() {
             workdir,
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     );
     let seq = accepted(result);
@@ -474,6 +478,8 @@ fn each_accepted_command_logs_one_event_naming_it() {
             workdir: f.root.join("project").display().to_string(),
             conversation: Some(CONVERSATION.into()),
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let prepared = f.prepare_import(two_items());
@@ -579,6 +585,8 @@ fn concurrent_resends_of_one_command_append_once() {
             workdir,
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
     };
     let device = DeviceId::new();
@@ -687,6 +695,8 @@ fn create_session_records_the_canonical_workdir() {
         workdir: workdir(&dotted),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     }));
     let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
     let canonical = workdir(&std::fs::canonicalize(f.root.join("project")).unwrap());
@@ -718,7 +728,138 @@ fn create_session_records_the_canonical_workdir() {
         workdir: workdir(&f.root),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     }));
+}
+
+#[test]
+fn a_created_session_logs_its_starting_safety_check_and_mode() {
+    let mut f = Fixture::new();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: workdir(&f.root.join("project")),
+            conversation: None,
+            worktree: None,
+            mode: Some(PermissionMode::Plan),
+            safety_check: true,
+        },
+    };
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
+    let [created, safety, mode] = &batch.events[..] else {
+        panic!("expected three events: {:#?}", batch.events);
+    };
+    assert!(matches!(
+        created.kind,
+        EventKind::SessionCreated {
+            from: None,
+            worktree: None,
+            ..
+        }
+    ));
+    assert_eq!(created.command_id, None);
+    assert_eq!(
+        safety.kind,
+        EventKind::SafetyCheckSet {
+            on: true,
+            by: device,
+        }
+    );
+    assert_eq!(safety.command_id, None);
+    assert_eq!(
+        mode.kind,
+        EventKind::PermissionModeRequested {
+            mode: PermissionMode::Plan,
+            by: device,
+        }
+    );
+    assert_eq!(mode.command_id, Some(command.id));
+    assert_eq!(batch.last(), Some(seq));
+    assert_eq!(f.log.head(), seq);
+    let session = created.session_id;
+    assert!(safety.session_id == session && mode.session_id == session);
+    assert!(f.log.safety_check_on(&f.storage.db, session).unwrap());
+}
+
+#[test]
+fn a_created_session_with_only_the_safety_check_names_it() {
+    let mut f = Fixture::new();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: workdir(&f.root.join("project")),
+            conversation: None,
+            worktree: None,
+            mode: None,
+            safety_check: true,
+        },
+    };
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
+    let [created, safety] = &batch.events[..] else {
+        panic!("expected two events: {:#?}", batch.events);
+    };
+    assert!(matches!(created.kind, EventKind::SessionCreated { .. }));
+    assert_eq!(created.command_id, None);
+    assert_eq!(
+        safety.kind,
+        EventKind::SafetyCheckSet {
+            on: true,
+            by: device,
+        }
+    );
+    assert_eq!(safety.command_id, Some(command.id));
+    assert_eq!(batch.last(), Some(seq));
+    assert!(
+        f.log
+            .safety_check_on(&f.storage.db, created.session_id)
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_created_session_in_bypass_is_refused_unless_the_server_allows_it() {
+    let mut f = Fixture::new();
+    assert!(!f.log.bypass_allowed(), "off by default");
+    let project = workdir(&f.root.join("project"));
+    let create = |mode| CommandKind::CreateSession {
+        workdir: project.clone(),
+        conversation: None,
+        worktree: None,
+        mode,
+        safety_check: false,
+    };
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(create(Some(PermissionMode::Bypass))),
+        rejected(RejectReason::BypassDisabled)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+    assert!(f.all_events().is_empty(), "no session was logged");
+
+    f.log = f.log.clone().with_bypass(true);
+    accepted(f.handle(create(Some(PermissionMode::Bypass))));
+}
+
+#[test]
+fn an_adopting_create_session_cannot_ask_for_a_mode() {
+    let mut f = Fixture::new();
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(CommandKind::CreateSession {
+            workdir: workdir(&f.root.join("project")),
+            conversation: Some(CONVERSATION.into()),
+            worktree: None,
+            mode: Some(PermissionMode::Plan),
+            safety_check: false,
+        }),
+        rejected(RejectReason::BadConversation)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
 }
 
 #[test]
@@ -752,6 +893,8 @@ fn create_session_rejects_workdirs_outside_roots() {
                 workdir: dir.clone(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }),
             rejected(reason),
             "{dir}"
@@ -773,6 +916,8 @@ fn create_session_follows_symlinks_before_checking_roots() {
             workdir: workdir(&f.root.join("escape")),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
@@ -784,6 +929,8 @@ fn create_session_follows_symlinks_before_checking_roots() {
         workdir: workdir(&link_in),
         conversation: None,
         worktree: None,
+        mode: None,
+        safety_check: false,
     }));
 }
 
@@ -796,6 +943,8 @@ fn no_roots_allow_nothing() {
             workdir: workdir(&f.root.join("project")),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
@@ -810,6 +959,8 @@ fn adopt_kind(workdir: String, conversation: &str) -> CommandKind {
         workdir,
         conversation: Some(conversation.to_owned()),
         worktree: None,
+        mode: None,
+        safety_check: false,
     }
 }
 
@@ -1815,6 +1966,8 @@ impl OpenWork {
                 workdir: workdir(&f.root.join("project")),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             },
             CommandKind::SendMessage {
                 session_id: session,
@@ -3661,6 +3814,8 @@ async fn waiters_wake_on_append() {
                     workdir,
                     conversation: None,
                     worktree: None,
+                    mode: None,
+                    safety_check: false,
                 },
             };
             log.handle(&mut conn.db, DeviceId::new(), &command).unwrap()
@@ -3726,6 +3881,8 @@ impl Fixture {
             workdir: workdir(dir),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         }));
         let session = self.all_events()[(seq.0 - 1) as usize].session_id;
         let first = ContextId::first_of(session);

@@ -2338,6 +2338,13 @@ pub struct ServerAddressesView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsView {
     pub blob_policy: BlobPolicy,
+    /// The permission mode this device's new sessions start in; `None`: the
+    /// agent's own.
+    pub default_mode: Option<PermissionMode>,
+    /// Whether this device's new sessions start with the safety check on.
+    pub default_safety_check: bool,
+    /// Whether the server allows bypass, so it can be offered as a default.
+    pub bypass_allowed: bool,
     /// Blob downloads, `Eager` ones included, are paused because this
     /// device's disk is full ([`Pause::DiskFull`]).
     pub blobs_disk_full: bool,

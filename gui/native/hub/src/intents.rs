@@ -247,6 +247,8 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             BlobPolicyChoice::Eager => BlobPolicy::Eager,
             BlobPolicyChoice::OnDemand => BlobPolicy::OnDemand,
         }),
+        ActionIntent::SetDefaultMode { mode } => Action::SetDefaultMode(mode.map(permission_mode)),
+        ActionIntent::SetDefaultSafetyCheck { on } => Action::SetDefaultSafetyCheck(on),
         ActionIntent::RetryNow => Action::RetryNow,
         ActionIntent::ResetReplica => Action::ResetReplica,
         ActionIntent::RefreshStorage => Action::RefreshStorage,
@@ -407,6 +409,24 @@ mod tests {
                 on: false,
             }),
             Err("not a session id: \"nope\"".to_owned())
+        );
+    }
+
+    #[test]
+    fn set_default_mode_and_safety_check_map() {
+        assert_eq!(
+            action(ActionIntent::SetDefaultMode {
+                mode: Some(PermissionModeView::AcceptEdits),
+            }),
+            Ok(Action::SetDefaultMode(Some(PermissionMode::AcceptEdits)))
+        );
+        assert_eq!(
+            action(ActionIntent::SetDefaultMode { mode: None }),
+            Ok(Action::SetDefaultMode(None))
+        );
+        assert_eq!(
+            action(ActionIntent::SetDefaultSafetyCheck { on: true }),
+            Ok(Action::SetDefaultSafetyCheck(true))
         );
     }
 

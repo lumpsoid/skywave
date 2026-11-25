@@ -160,6 +160,8 @@ impl Fixture {
                 workdir: workdir.to_owned(),
                 conversation: conversation.map(str::to_owned),
                 worktree: None,
+                mode: None,
+                safety_check: false,
             },
         }
     }

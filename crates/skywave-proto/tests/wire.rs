@@ -1035,16 +1035,29 @@ fn all_command_kinds() -> Vec<CommandKind> {
             workdir: "/srv/code/skywave".into(),
             conversation: None,
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
         CommandKind::CreateSession {
             workdir: "/srv/code/skywave".into(),
             conversation: Some("9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into()),
             worktree: None,
+            mode: None,
+            safety_check: false,
         },
         CommandKind::CreateSession {
             workdir: "/srv/code/skywave".into(),
             conversation: None,
             worktree: Some("feat/login".into()),
+            mode: None,
+            safety_check: false,
+        },
+        CommandKind::CreateSession {
+            workdir: "/srv/code/skywave".into(),
+            conversation: None,
+            worktree: None,
+            mode: Some(PermissionMode::Plan),
+            safety_check: true,
         },
         CommandKind::SendMessage {
             session_id: session(),
@@ -1804,6 +1817,25 @@ fn v7_model_choice_decodes_without_efforts() {
     assert_eq!(models[0].efforts, vec![Effort::Low, Effort::XHigh]);
 }
 
+/// A `CreateSession` stored before v44 has no `mode` or `safety_check`: it
+/// starts in the agent's own mode, with the safety check off.
+#[test]
+fn v43_create_session_decodes_without_mode_or_safety_check() {
+    let command: CommandKind =
+        serde_json::from_str(r#"{"type":"create_session","workdir":"/w","conversation":null}"#)
+            .unwrap();
+    assert_eq!(
+        command,
+        CommandKind::CreateSession {
+            workdir: "/w".into(),
+            conversation: None,
+            worktree: None,
+            mode: None,
+            safety_check: false,
+        }
+    );
+}
+
 /// A `SessionCreated` stored before v10 has no `from`: it created a session
 /// of its own, logged by its `CreateSession`.
 #[test]
@@ -2261,8 +2293,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v43() {
-    assert_eq!(PROTOCOL_VERSION, 43);
+fn protocol_is_v44() {
+    assert_eq!(PROTOCOL_VERSION, 44);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

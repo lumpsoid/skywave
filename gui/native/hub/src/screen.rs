@@ -960,6 +960,17 @@ fn settings_view(
     wall_ms: i64,
 ) -> ScreenView {
     let now = DateTime::from_timestamp_millis(wall_ms).unwrap_or_default();
+    let default_modes: Vec<ModeOption> = offered_modes(settings.bypass_allowed)
+        .into_iter()
+        .map(|mode| ModeOption {
+            mode: mode_view(mode),
+            label: mode_label(mode).to_owned(),
+            detail: mode_detail(mode).to_owned(),
+            needs_confirmation: mode_needs_confirmation(mode),
+            current: settings.default_mode == Some(mode),
+            pending: false,
+        })
+        .collect();
     let (blob_policy, blob_policy_label) = match settings.blob_policy {
         BlobPolicy::Eager => (
             BlobPolicyView::Eager,
@@ -998,6 +1009,19 @@ fn settings_view(
             shell: notifications.shell,
         },
         safety_rules: settings.safety_rules.iter().map(safety_rule_row).collect(),
+        default_modes,
+        default_mode: settings.default_mode.map(mode_view),
+        default_mode_label: match settings.default_mode {
+            None => "the agent's own".to_owned(),
+            // The stored default stays bypass, but a new session starts in
+            // the agent's own mode while the server disallows it.
+            Some(PermissionMode::Bypass) if !settings.bypass_allowed => format!(
+                "{} (not allowed by this server: the agent's own)",
+                mode_label(PermissionMode::Bypass)
+            ),
+            Some(mode) => mode_label(mode).to_owned(),
+        },
+        default_safety_check: settings.default_safety_check,
         version: skywave_version::VERSION.to_owned(),
     }
 }
@@ -1437,6 +1461,9 @@ mod tests {
         let settings = |device_id, login_expires| {
             let settings = SettingsView {
                 blob_policy: BlobPolicy::OnDemand,
+                default_mode: None,
+                default_safety_check: false,
+                bypass_allowed: false,
                 blobs_disk_full: false,
                 server_address: None,
                 other_addresses: Vec::new(),
@@ -1502,6 +1529,9 @@ mod tests {
         };
         let settings = SettingsView {
             blob_policy: BlobPolicy::OnDemand,
+            default_mode: None,
+            default_safety_check: false,
+            bypass_allowed: false,
             blobs_disk_full: false,
             server_address: None,
             other_addresses: Vec::new(),
@@ -1577,10 +1607,176 @@ mod tests {
         }
     }
 
+    /// Settings show this device's new-session defaults, and the modes a new
+    /// session can start in: bypass only where the server allows it.
+    #[test]
+    fn settings_offer_the_new_session_defaults() {
+        let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
+        let show = |settings: &SettingsView| {
+            let view = ViewState {
+                link: Link::Online { latency_ms: 1 },
+                queued: 0,
+                attention: Attention::default(),
+                screen: Screen::Settings(settings.clone()),
+                can_go_back: true,
+                snippets: Vec::new(),
+                shell_history: Default::default(),
+                login_expires: None,
+                agent_login_offered: false,
+                agent_logged_out: false,
+            };
+            settings_view(
+                settings,
+                &view,
+                None,
+                NotificationPrefs::ON,
+                now.timestamp_millis(),
+            )
+        };
+        let mut settings = SettingsView {
+            blob_policy: BlobPolicy::OnDemand,
+            default_mode: Some(PermissionMode::Plan),
+            default_safety_check: true,
+            bypass_allowed: false,
+            blobs_disk_full: false,
+            server_address: None,
+            other_addresses: Vec::new(),
+            device_id: None,
+            server_fingerprint: None,
+            login: idle(false),
+            safety_rules: Vec::new(),
+        };
+        match show(&settings) {
+            ScreenView::Settings {
+                default_modes,
+                default_mode,
+                default_mode_label,
+                default_safety_check,
+                ..
+            } => {
+                assert_eq!(default_mode, Some(PermissionModeView::Plan));
+                assert_eq!(default_mode_label, mode_label(PermissionMode::Plan));
+                assert!(default_safety_check);
+                assert!(
+                    default_modes
+                        .iter()
+                        .all(|option| option.mode != PermissionModeView::Bypass)
+                );
+                let current: Vec<PermissionModeView> = default_modes
+                    .iter()
+                    .filter(|option| option.current)
+                    .map(|option| option.mode)
+                    .collect();
+                assert_eq!(current, vec![PermissionModeView::Plan]);
+            }
+            other => panic!("not settings: {other:?}"),
+        }
+        settings.default_mode = None;
+        settings.bypass_allowed = true;
+        match show(&settings) {
+            ScreenView::Settings {
+                default_modes,
+                default_mode,
+                default_mode_label,
+                ..
+            } => {
+                assert_eq!(default_mode, None);
+                assert_eq!(default_mode_label, "the agent's own");
+                assert!(default_modes.iter().all(|option| !option.current));
+                assert!(
+                    default_modes
+                        .iter()
+                        .any(|option| option.mode == PermissionModeView::Bypass)
+                );
+            }
+            other => panic!("not settings: {other:?}"),
+        }
+    }
+
+    /// A bypass default the server disallows is said so, since new sessions
+    /// start in the agent's own mode; the default itself stays bypass.
+    #[test]
+    fn a_bypass_default_the_server_disallows_says_so() {
+        let now = DateTime::from_timestamp(1_794_000_000, 0).unwrap();
+        let show = |settings: &SettingsView| {
+            let view = ViewState {
+                link: Link::Online { latency_ms: 1 },
+                queued: 0,
+                attention: Attention::default(),
+                screen: Screen::Settings(settings.clone()),
+                can_go_back: true,
+                snippets: Vec::new(),
+                shell_history: Default::default(),
+                login_expires: None,
+                agent_login_offered: false,
+                agent_logged_out: false,
+            };
+            settings_view(
+                settings,
+                &view,
+                None,
+                NotificationPrefs::ON,
+                now.timestamp_millis(),
+            )
+        };
+        let mut settings = SettingsView {
+            blob_policy: BlobPolicy::OnDemand,
+            default_mode: Some(PermissionMode::Bypass),
+            default_safety_check: false,
+            bypass_allowed: false,
+            blobs_disk_full: false,
+            server_address: None,
+            other_addresses: Vec::new(),
+            device_id: None,
+            server_fingerprint: None,
+            login: idle(false),
+            safety_rules: Vec::new(),
+        };
+        match show(&settings) {
+            ScreenView::Settings {
+                default_modes,
+                default_mode,
+                default_mode_label,
+                ..
+            } => {
+                assert_eq!(default_mode, Some(PermissionModeView::Bypass));
+                assert_eq!(
+                    default_mode_label,
+                    format!(
+                        "{} (not allowed by this server: the agent's own)",
+                        mode_label(PermissionMode::Bypass)
+                    )
+                );
+                assert!(default_modes.iter().all(|option| !option.current));
+            }
+            other => panic!("not settings: {other:?}"),
+        }
+        settings.bypass_allowed = true;
+        match show(&settings) {
+            ScreenView::Settings {
+                default_modes,
+                default_mode_label,
+                ..
+            } => {
+                assert_eq!(default_mode_label, mode_label(PermissionMode::Bypass));
+                let current: Vec<PermissionModeView> = default_modes
+                    .iter()
+                    .filter(|option| option.current)
+                    .map(|option| option.mode)
+                    .collect();
+                assert_eq!(current, vec![PermissionModeView::Bypass]);
+            }
+            other => panic!("not settings: {other:?}"),
+        }
+    }
+
     /// The settings' login tile, for `login`, paired or not.
     fn login_tile(login: LoginView, paired: bool) -> Option<AgentLoginView> {
         let settings = SettingsView {
             blob_policy: BlobPolicy::OnDemand,
+            default_mode: None,
+            default_safety_check: false,
+            bypass_allowed: false,
             blobs_disk_full: false,
             server_address: None,
             other_addresses: Vec::new(),

@@ -855,6 +855,7 @@ async fn prepare_worktree(
         workdir,
         conversation: None,
         worktree: Some(branch),
+        ..
     } = &command.kind
     else {
         return Ok(None);

@@ -842,6 +842,8 @@ impl State {
             let done = match effect {
                 Effect::Enqueue(command, files) => self.store.enqueue(&command, &files),
                 Effect::SaveBlobPolicy(policy) => self.store.set_blob_policy(policy),
+                Effect::SaveDefaultMode(mode) => self.store.set_default_mode(mode),
+                Effect::SaveDefaultSafetyCheck(on) => self.store.set_default_safety_check(on),
                 Effect::SaveServerAddresses(addresses) => {
                     // The pairing record, not the store.
                     if let Err(err) = self.save_addresses(data_dir, addresses) {

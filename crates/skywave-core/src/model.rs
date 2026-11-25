@@ -14,8 +14,8 @@ use skywave_proto::limits::{ATTACHMENTS_MAX, ATTACHMENTS_MAX_TOTAL_BYTES};
 use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ContentHash, ConversationsResult,
     DeviceInfo, DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem,
-    LoginFinishResult, LoginStartResult, QuestionAnswer, RejectReason, RepoListing, RuleSuggestion,
-    SafetyJudgment, ScreenAction, ScreenOutcome, ScreenShot, SessionOrigin,
+    LoginFinishResult, LoginStartResult, PermissionMode, QuestionAnswer, RejectReason, RepoListing,
+    RuleSuggestion, SafetyJudgment, ScreenAction, ScreenOutcome, ScreenShot, SessionOrigin,
     SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult, WorktreeList, answers_fit,
 };
 
@@ -71,6 +71,10 @@ pub(crate) enum Effect {
     /// session's draft files it was written from, in order).
     Enqueue(Command, Vec<AttachedFile>),
     SaveBlobPolicy(BlobPolicy),
+    /// Keep the permission mode new sessions start in; `None` deletes it.
+    SaveDefaultMode(Option<PermissionMode>),
+    /// Keep whether new sessions start with the safety check on.
+    SaveDefaultSafetyCheck(bool),
     /// Store the pairing's addresses as these, after a switch or a forget.
     SaveServerAddresses(ServerAddresses),
     /// Keep the session's draft in that mode; `None` deletes it.
@@ -747,12 +751,19 @@ impl Model {
                     .map(str::trim)
                     .filter(|w| !w.is_empty())
                     .map(str::to_owned);
+                // The server refuses a mode with an adopted conversation.
+                let mode = match conversation {
+                    Some(_) => None,
+                    None => self.new_session_mode(),
+                };
                 let at = self.opening_from();
                 let effects = self.enqueue(
                     CommandKind::CreateSession {
                         workdir: workdir.to_owned(),
                         conversation,
                         worktree,
+                        mode,
+                        safety_check: self.settings.default_safety_check,
                     },
                     Vec::new(),
                 );
@@ -778,6 +789,8 @@ impl Model {
                         workdir,
                         conversation: None,
                         worktree: None,
+                        mode: self.new_session_mode(),
+                        safety_check: self.settings.default_safety_check,
                     },
                     Vec::new(),
                 );
@@ -1504,6 +1517,20 @@ impl Model {
                     Effect::SaveBlobPolicy(policy),
                     Effect::Request(Request::BlobPolicyChanged(policy)),
                 ]
+            }
+            Action::SetDefaultMode(mode) => {
+                if self.settings.default_mode == mode {
+                    return Vec::new();
+                }
+                self.settings.default_mode = mode;
+                vec![Effect::SaveDefaultMode(mode)]
+            }
+            Action::SetDefaultSafetyCheck(on) => {
+                if self.settings.default_safety_check == on {
+                    return Vec::new();
+                }
+                self.settings.default_safety_check = on;
+                vec![Effect::SaveDefaultSafetyCheck(on)]
             }
             Action::RetryNow => match self.link() {
                 Link::Reconnecting { .. } => vec![Effect::Request(Request::RetryNow)],
@@ -3234,6 +3261,9 @@ impl Model {
             Place::Pairing => Screen::Pairing(self.pairing_view()),
             Place::Settings => Screen::Settings(SettingsView {
                 blob_policy: self.settings.blob_policy,
+                default_mode: self.settings.default_mode,
+                default_safety_check: self.settings.default_safety_check,
+                bypass_allowed: self.settings.server.bypass_allowed,
                 blobs_disk_full: self.blobs_disk_full,
                 server_address: self.paired.as_ref().map(|p| p.addresses.current().clone()),
                 other_addresses: self
@@ -4396,6 +4426,14 @@ impl Model {
         }
         rows.retain(|row| row.on || row.pending.is_some());
         rows
+    }
+
+    /// The mode a new session starts in: this device's default, except bypass
+    /// where the server does not allow it (it would refuse the create).
+    fn new_session_mode(&self) -> Option<PermissionMode> {
+        self.settings
+            .default_mode
+            .filter(|mode| *mode != PermissionMode::Bypass || self.settings.server.bypass_allowed)
     }
 
     /// The session's safety check switch still on its way in front: this
@@ -9682,6 +9720,108 @@ mod tests {
     }
 
     #[test]
+    fn new_session_defaults_are_saved_shown_and_sent_on_create() {
+        let mut f = Fixture::paired();
+        assert_eq!(
+            f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Plan))),
+            vec![Effect::SaveDefaultMode(Some(PermissionMode::Plan))]
+        );
+        assert!(
+            f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Plan)))
+                .is_empty()
+        );
+        assert_eq!(
+            f.dispatch(Action::SetDefaultSafetyCheck(true)),
+            vec![Effect::SaveDefaultSafetyCheck(true)]
+        );
+
+        f.dispatch(Action::Navigate(Route::Settings));
+        match f.model.view().screen {
+            Screen::Settings(view) => {
+                assert_eq!(view.default_mode, Some(PermissionMode::Plan));
+                assert!(view.default_safety_check);
+            }
+            other => panic!("expected settings, got {other:?}"),
+        }
+        f.dispatch(Action::Navigate(Route::SessionList));
+
+        let command = queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/a".into(),
+            worktree: None,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: "/srv/a".into(),
+                conversation: None,
+                worktree: None,
+                mode: Some(PermissionMode::Plan),
+                safety_check: true,
+            }
+        );
+
+        // The server refuses a mode with an adopted conversation.
+        let command = queued(&f.dispatch(Action::CreateSession {
+            conversation: Some("abc".into()),
+            workdir: "/srv/a".into(),
+            worktree: None,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: "/srv/a".into(),
+                conversation: Some("abc".into()),
+                worktree: None,
+                mode: None,
+                safety_check: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_bypass_default_is_sent_only_where_the_server_allows_it() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Bypass)));
+        let mode_sent = |f: &mut Fixture| match queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/a".into(),
+            worktree: None,
+        }))
+        .kind
+        {
+            CommandKind::CreateSession { mode, .. } => mode,
+            other => panic!("expected a create, got {other:?}"),
+        };
+        assert_eq!(mode_sent(&mut f), None);
+        f.model.server_facts(ServerFacts {
+            bypass_allowed: true,
+            ..Default::default()
+        });
+        assert_eq!(mode_sent(&mut f), Some(PermissionMode::Bypass));
+    }
+
+    #[test]
+    fn a_session_created_like_another_starts_with_the_defaults() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/a");
+        f.dispatch(Action::SetDefaultMode(Some(PermissionMode::AcceptEdits)));
+        f.dispatch(Action::SetDefaultSafetyCheck(true));
+        f.open(old);
+        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: "/srv/a".into(),
+                conversation: None,
+                worktree: None,
+                mode: Some(PermissionMode::AcceptEdits),
+                safety_check: true,
+            }
+        );
+    }
+
+    #[test]
     fn created_session_is_pending_until_it_reaches_the_replica() {
         let mut f = Fixture::paired();
         let old = f.session("/srv/old");
@@ -9744,6 +9884,8 @@ mod tests {
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }
         );
         assert_eq!(f.model.unloaded_session(), None);
@@ -9779,6 +9921,8 @@ mod tests {
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }
         );
         let new = SessionId::new();
@@ -9827,6 +9971,59 @@ mod tests {
         f.dispatch(Action::Navigate(Route::Settings));
         f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));
+    }
+
+    #[test]
+    fn a_create_named_on_its_mode_request_opens_the_session() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Plan)));
+        f.dispatch(Action::SetDefaultSafetyCheck(true));
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let command = queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: "/srv/new".into(),
+                conversation: None,
+                worktree: None,
+                mode: Some(PermissionMode::Plan),
+                safety_check: true,
+            }
+        );
+
+        // As the server logs a create with a mode: the `SessionCreated` and
+        // the safety check name no command; the mode request, logged last,
+        // names the create.
+        let new = SessionId::new();
+        let me = f.me;
+        f.log_commands(
+            new,
+            vec![
+                (
+                    None,
+                    EventKind::SessionCreated {
+                        workdir: "/srv/new".into(),
+                        context_name: "start".into(),
+                        from: None,
+                        worktree: None,
+                    },
+                ),
+                (None, EventKind::SafetyCheckSet { on: true, by: me }),
+                (
+                    Some(command.id),
+                    EventKind::PermissionModeRequested {
+                        mode: PermissionMode::Plan,
+                        by: me,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(f.model.open_session(), Some(new));
+        assert_eq!(f.model.unloaded_session(), Some(new));
     }
 
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {
@@ -10853,6 +11050,8 @@ mod tests {
             workdir: "/srv/a".into(),
             conversation: conversation.map(str::to_owned),
             worktree: None,
+            mode: None,
+            safety_check: false,
         };
         assert_eq!(create(&mut f, Some(" id ")), kind(Some("id")));
         assert_eq!(create(&mut f, Some("  ")), kind(None));
@@ -10876,6 +11075,8 @@ mod tests {
             workdir: "/srv/app".into(),
             conversation: None,
             worktree: worktree.map(str::to_owned),
+            mode: None,
+            safety_check: false,
         };
         assert_eq!(create(&mut f, Some("  feat/x ")), kind(Some("feat/x")));
         assert_eq!(create(&mut f, Some("   ")), kind(None));
@@ -14636,6 +14837,8 @@ mod tests {
                 workdir: workdir.into(),
                 conversation: Some(id.into()),
                 worktree: None,
+                mode: None,
+                safety_check: false,
             }
         );
         assert_eq!(f.list_view().conversations, None);
@@ -14701,8 +14904,16 @@ mod tests {
             "server addresses",
             "settings",
         );
-        assert_back(&mut f, nav(Route::Usage), "usage", "active list");
-        assert_back(&mut f, nav(Route::Storage), "storage", "active list");
+        // Usage and storage opened from Settings go back to Settings, so they
+        // are opened from the session list here (see the test below).
+        let from_list = |route| {
+            move |f: &mut Fixture| {
+                f.dispatch(Action::Navigate(Route::SessionList));
+                f.dispatch(Action::Navigate(route));
+            }
+        };
+        assert_back(&mut f, from_list(Route::Usage), "usage", "active list");
+        assert_back(&mut f, from_list(Route::Storage), "storage", "active list");
         assert_back(&mut f, nav(Route::Worktrees), "worktrees", "active list");
         assert_back(&mut f, nav(Route::Approvals), "approvals", "active list");
         // Re-pairing a paired device can be cancelled.
