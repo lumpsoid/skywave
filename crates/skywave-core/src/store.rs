@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
     ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, HelloResponse, ImageType, LogId,
-    LogRun, MIGRATED_SINCE, ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
-    UsageLimitsResult,
+    LogRun, MIGRATED_SINCE, ModelChoice, PROTOCOL_VERSION, PermissionMode, RunId, RunsSince, Seq,
+    SessionId, UsageLimitsResult,
 };
 use uuid::Uuid;
 
@@ -964,6 +964,12 @@ pub enum BlobPolicy {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Settings {
     pub blob_policy: BlobPolicy,
+    /// The permission mode this device's new sessions start in; `None`: the
+    /// agent's own (D67).
+    pub default_mode: Option<PermissionMode>,
+    /// Whether this device's new sessions start with the safety check on
+    /// (D67).
+    pub default_safety_check: bool,
     /// What the server's last `hello` said of itself
     /// ([`Store::set_server_facts`]); the default until one did, and again
     /// once the replica is cleared.
@@ -1024,6 +1030,33 @@ impl Settings {
                 "on_demand" => BlobPolicy::OnDemand,
                 _ => {
                     return Err(bad_value(1, Type::Text, format!("blob policy {value:?}")).into());
+                }
+            }
+        }
+        if key == KEY_DEFAULT_MODE {
+            self.default_mode = match value.as_str() {
+                "ask" => Some(PermissionMode::Ask),
+                "accept_edits" => Some(PermissionMode::AcceptEdits),
+                "plan" => Some(PermissionMode::Plan),
+                "auto" => Some(PermissionMode::Auto),
+                "dont_ask" => Some(PermissionMode::DontAsk),
+                "bypass" => Some(PermissionMode::Bypass),
+                _ => {
+                    return Err(bad_value(1, Type::Text, format!("default mode {value:?}")).into());
+                }
+            }
+        }
+        if key == KEY_DEFAULT_SAFETY_CHECK {
+            self.default_safety_check = match value.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => {
+                    return Err(bad_value(
+                        1,
+                        Type::Text,
+                        format!("default safety check {value:?}"),
+                    )
+                    .into());
                 }
             }
         }
@@ -3004,6 +3037,26 @@ impl Store {
         self.put_setting(KEY_BLOB_POLICY, Some(value))
     }
 
+    /// Keeps the permission mode new sessions start in; `None` deletes the
+    /// row, the agent's own.
+    pub fn set_default_mode(&self, mode: Option<PermissionMode>) -> Result<(), StoreError> {
+        let value = mode.map(|mode| match mode {
+            PermissionMode::Ask => "ask",
+            PermissionMode::AcceptEdits => "accept_edits",
+            PermissionMode::Plan => "plan",
+            PermissionMode::Auto => "auto",
+            PermissionMode::DontAsk => "dont_ask",
+            PermissionMode::Bypass => "bypass",
+        });
+        self.put_setting(KEY_DEFAULT_MODE, value)
+    }
+
+    /// Keeps whether new sessions start with the safety check on.
+    pub fn set_default_safety_check(&self, on: bool) -> Result<(), StoreError> {
+        let value = if on { "on" } else { "off" };
+        self.put_setting(KEY_DEFAULT_SAFETY_CHECK, Some(value))
+    }
+
     /// The server addresses an older build kept among the settings, before
     /// they moved into the pairing ([`Pairing`](crate::Pairing)); `None`
     /// without a current address that parses. Read leniently, as only the
@@ -3097,6 +3150,8 @@ fn other_addresses_json(addresses: &[ServerAddress]) -> Option<String> {
 }
 
 const KEY_BLOB_POLICY: &str = "blob_policy";
+const KEY_DEFAULT_MODE: &str = "default_mode";
+const KEY_DEFAULT_SAFETY_CHECK: &str = "default_safety_check";
 /// Where an older build kept the current server address, before it moved
 /// into the pairing ([`Store::legacy_server_addresses`]).
 const KEY_SERVER_ADDRESS: &str = "server_address";

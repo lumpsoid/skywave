@@ -1437,6 +1437,9 @@ mod tests {
         let settings = |device_id, login_expires| {
             let settings = SettingsView {
                 blob_policy: BlobPolicy::OnDemand,
+                default_mode: None,
+                default_safety_check: false,
+                bypass_allowed: false,
                 blobs_disk_full: false,
                 server_address: None,
                 other_addresses: Vec::new(),
@@ -1502,6 +1505,9 @@ mod tests {
         };
         let settings = SettingsView {
             blob_policy: BlobPolicy::OnDemand,
+            default_mode: None,
+            default_safety_check: false,
+            bypass_allowed: false,
             blobs_disk_full: false,
             server_address: None,
             other_addresses: Vec::new(),
@@ -1581,6 +1587,9 @@ mod tests {
     fn login_tile(login: LoginView, paired: bool) -> Option<AgentLoginView> {
         let settings = SettingsView {
             blob_policy: BlobPolicy::OnDemand,
+            default_mode: None,
+            default_safety_check: false,
+            bypass_allowed: false,
             blobs_disk_full: false,
             server_address: None,
             other_addresses: Vec::new(),

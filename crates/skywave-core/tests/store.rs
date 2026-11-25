@@ -21,8 +21,8 @@ use skywave_proto::{
     ChangesResult, Command, CommandId, CommandKind, CommandResult, Commit, CommitLog, ContentHash,
     ContextId, Decision, DeviceId, DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody,
     FileChange, FileResult, Full, ImageType, ImportOutcome, ImportedItem, LimitSeverity,
-    LimitWindow, LineSpan, LogResult, RejectReason, Schedule, ScheduleId, Seq, SessionId,
-    SessionOrigin, SessionState, TaskId, TaskKind, ToolResult, TurnUsage, UsageLimit,
+    LimitWindow, LineSpan, LogResult, PermissionMode, RejectReason, Schedule, ScheduleId, Seq,
+    SessionId, SessionOrigin, SessionState, TaskId, TaskKind, ToolResult, TurnUsage, UsageLimit,
     UsageLimitsResult, Worktree,
 };
 
@@ -170,9 +170,29 @@ fn fresh_store_is_empty_with_defaults() {
         snapshot.settings,
         Settings {
             blob_policy: BlobPolicy::OnDemand,
+            default_mode: None,
+            default_safety_check: false,
             server: ServerFacts::default(),
         }
     );
+}
+
+#[test]
+fn new_session_defaults_round_trip() {
+    let (_tmp, dir) = data_dir();
+    {
+        let store = Store::open(&dir).unwrap();
+        store
+            .set_default_mode(Some(PermissionMode::DontAsk))
+            .unwrap();
+        store.set_default_safety_check(true).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    let settings = store.settings().unwrap();
+    assert_eq!(settings.default_mode, Some(PermissionMode::DontAsk));
+    assert!(settings.default_safety_check);
+    store.set_default_mode(None).unwrap();
+    assert_eq!(store.settings().unwrap().default_mode, None);
 }
 
 #[test]
@@ -4097,6 +4117,8 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
         after.settings,
         Settings {
             blob_policy: BlobPolicy::Eager,
+            default_mode: None,
+            default_safety_check: false,
             server: ServerFacts::default(),
         },
         "the blob policy is this device's; everything the old server's hello \

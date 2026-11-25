@@ -536,6 +536,11 @@ pub enum Action {
     /// The crop page's selection, stored as given. A no-op elsewhere.
     SetCropKeep(Vec<LineSpan>),
     SetBlobPolicy(BlobPolicy),
+    /// The permission mode this device's new sessions start in; `None`: the
+    /// agent's own.
+    SetDefaultMode(Option<PermissionMode>),
+    /// Whether this device's new sessions start with the safety check on.
+    SetDefaultSafetyCheck(bool),
     /// While the link is `Reconnecting`, skip the rest of the wait and
     /// reconnect now. The attempt count and `offline_since` carry on.
     /// After a rejection a server-side fix may clear
