@@ -611,6 +611,14 @@ pub enum ActionIntent {
     SetBlobPolicy {
         policy: BlobPolicyChoice,
     },
+    /// The permission mode this device's new sessions start in; `None`: the agent's own.
+    SetDefaultMode {
+        mode: Option<PermissionModeView>,
+    },
+    /// Whether this device's new sessions start with the safety check on.
+    SetDefaultSafetyCheck {
+        on: bool,
+    },
     RetryNow,
     /// Ask the server for its storage report again (the storage screen).
     RefreshStorage,
