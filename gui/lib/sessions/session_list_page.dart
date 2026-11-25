@@ -55,20 +55,6 @@ class SessionListPage extends StatelessWidget {
                 ),
                 ApprovalsButton(send: send),
                 IconButton(
-                  tooltip: 'Usage',
-                  icon: const Icon(Icons.bar_chart),
-                  onPressed: () => send.act(
-                    const ActionIntentNavigate(route: RouteView.usage),
-                  ),
-                ),
-                IconButton(
-                  tooltip: 'Server storage',
-                  icon: const Icon(Icons.storage),
-                  onPressed: () => send.act(
-                    const ActionIntentNavigate(route: RouteView.storage),
-                  ),
-                ),
-                IconButton(
                   tooltip: 'Worktrees',
                   icon: const Icon(Icons.account_tree_outlined),
                   onPressed: () => send.act(

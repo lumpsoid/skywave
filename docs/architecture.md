@@ -1520,7 +1520,10 @@ no longer decodes rather than failing.
   the sessions they ran in; heads total them with `skywave_present::usage`
   by local day, session, workdir or model. A turn with no cost is unpriced,
   never $0. Archived sessions count; a session deleted from this device took
-  its turns with it, and the screen says so.
+  its turns with it, and the screen says so. The TUI opens it with `u` from
+  the session list; the GUI from Settings. Back from it, as from the
+  storage screen, returns to where it was opened: Settings or the session
+  list.
 - **Context fill and subagent figures** (D46): two separate numbers, never
   added. The session's `SessionUsage::context` is the newest `TurnUsage`'s
   `context_tokens` of `context_window`, set at each turn's end; a turn that
@@ -1535,7 +1538,8 @@ no longer decodes rather than failing.
   4.3s · ctx 12k`): its own context at its end, not what it spent. A
   stopped subagent has none.
 
-- **Storage screen** (`Route::Storage`): opening it asks
+- **Storage screen** (`Route::Storage`; the TUI's `S` on the session list,
+  the GUI's Settings): opening it asks
   `GET /v1/storage` on the side transport within `STORAGE_TIMEOUT` (12 s,
   above the server's 10 s), and `RefreshStorage` asks again, as does this
   device's own `DeleteBlob` or `CropBlob` settling accepted while the

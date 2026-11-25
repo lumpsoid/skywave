@@ -13,9 +13,11 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// paired as, the link to it with its round trip, the fingerprint to
 /// compare with what `skywaved` prints, when the agent's login on the
 /// server expires, with Log in where the server offers a login from a
-/// device ([AgentLoginPanel] below it), and Re-pair. Below it, the
-/// Notifications tile, which opens its page ([NotificationsPage]), and the
-/// safety rules the person trusts, each with a remove button (D61). A paired
+/// device ([AgentLoginPanel] below it), and Re-pair. Also the
+/// Notifications tile, which opens its page ([NotificationsPage]); below
+/// Re-pair, the Usage and Storage tiles, which open those pages (back
+/// returns here); and the safety rules the person trusts, each with a
+/// remove button (D61). A paired
 /// server's tile opens its addresses ([ServerAddressesPage]), to reach it at
 /// another without
 /// re-pairing.
@@ -221,6 +223,26 @@ class SettingsPage extends StatelessWidget {
                   },
                   label: const Text('Re-pair'),
                 ),
+              ),
+            ),
+            const _Section('Usage and storage'),
+            ListTile(
+              key: const Key('usage'),
+              leading: const Icon(Icons.bar_chart),
+              title: const Text('Usage'),
+              subtitle: const Text('Cost and tokens across sessions'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () =>
+                  send.act(const ActionIntentNavigate(route: RouteView.usage)),
+            ),
+            ListTile(
+              key: const Key('storage'),
+              leading: const Icon(Icons.storage),
+              title: const Text('Storage'),
+              subtitle: const Text("What the server's data takes on its disk"),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => send.act(
+                const ActionIntentNavigate(route: RouteView.storage),
               ),
             ),
             const _Section('Safety rules'),

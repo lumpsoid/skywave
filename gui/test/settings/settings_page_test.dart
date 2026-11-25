@@ -228,6 +228,27 @@ void main() {
     ]);
   });
 
+  testWidgets('the usage and storage tiles open their pages', (tester) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(settings(sent));
+    for (final key in ['usage', 'storage']) {
+      await tester.scrollUntilVisible(
+        find.byKey(Key(key)),
+        200,
+        scrollable: pageScrollable(),
+      );
+      await tester.ensureVisible(find.byKey(Key(key)));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(Key(key)));
+    }
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentNavigate(route: RouteView.usage)),
+      const GuiIntentAct(
+        action: ActionIntentNavigate(route: RouteView.storage),
+      ),
+    ]);
+  });
+
   testWidgets('an unpaired device has no address to change', (tester) async {
     await tester.pumpWidget(settings([]));
     expect(find.byKey(const Key('server-addresses')), findsNothing);
@@ -303,6 +324,8 @@ void main() {
       200,
       scrollable: pageScrollable(),
     );
+    await tester.ensureVisible(find.byKey(const Key('dismiss-safety-rule-0')));
+    await tester.pumpAndSettle();
     expect(find.byKey(const Key('remove-safety-rule-0')), findsNothing);
 
     await tester.tap(find.byKey(const Key('dismiss-safety-rule-0')));
