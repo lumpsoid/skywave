@@ -2217,6 +2217,36 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_on_its_way_reads_as_what_it_asks_for() {
+        assert_eq!(
+            pending_change_line(&PendingChange::NewContext {
+                name: "velvet walrus".into()
+            }),
+            "New context · velvet walrus"
+        );
+        assert_eq!(
+            pending_change_line(&PendingChange::SwitchContext {
+                name: "start".into()
+            }),
+            "Back to start"
+        );
+        assert_eq!(
+            pending_change_line(&PendingChange::SwitchContext {
+                name: String::new()
+            }),
+            "Back to an earlier context"
+        );
+        assert_eq!(
+            pending_change_line(&PendingChange::Setting(AgentSetting::Mode(
+                PermissionMode::Plan
+            ))),
+            "mode → plan"
+        );
+        assert_eq!(change_state_label(None), "waiting for the agent");
+        assert_eq!(change_state_label(Some(&Outgoing::Queued)), "queued");
+    }
+
+    #[test]
     fn a_bad_conversation_id_is_named() {
         assert_eq!(
             reject_reason(RejectReason::BadConversation),

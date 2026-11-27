@@ -8084,6 +8084,225 @@ mod tests {
         assert_eq!(f.list_view_after_back().sessions[0].id, sid);
     }
 
+    /// The switches on their way in the open session's timeline, as
+    /// (command, change, delivery).
+    fn changes(f: &Fixture) -> Vec<(CommandId, PendingChange, Option<Outgoing>)> {
+        f.session_view()
+            .timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                TimelineItem::Change {
+                    command_id,
+                    change,
+                    outgoing,
+                } => Some((command_id, change, outgoing)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mode_switch_is_a_row_until_the_agent_answers_it() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log(
+            sid,
+            vec![EventKind::PermissionModeChanged {
+                mode: PermissionMode::Ask,
+                answers: None,
+            }],
+        );
+        f.open(sid);
+
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        let plan = PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan));
+        assert_eq!(
+            changes(&f),
+            [(command.id, plan.clone(), Some(Outgoing::Queued))]
+        );
+
+        // Logged: only the agent's answer is awaited.
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::PermissionModeRequested {
+                    mode: PermissionMode::Plan,
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        assert_eq!(changes(&f), [(command.id, plan, None)]);
+
+        f.log(
+            sid,
+            vec![EventKind::PermissionModeChanged {
+                mode: PermissionMode::Plan,
+                answers: Some(command.id),
+            }],
+        );
+        assert!(changes(&f).is_empty());
+        assert!(f.session_view().timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::Logged {
+                entry: Entry::AgentSetting {
+                    setting: AgentSetting::Mode(PermissionMode::Plan),
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_refused_mode_switch_stays_a_row_with_its_failure() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::TurnRunning,
+            },
+            Utc::now(),
+        );
+        assert_eq!(
+            changes(&f),
+            [(
+                command.id,
+                PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan)),
+                Some(Outgoing::Failed(FailReason::Rejected(
+                    RejectReason::TurnRunning
+                ))),
+            )]
+        );
+    }
+
+    #[test]
+    fn a_clear_is_a_row_until_its_divider_is_in_the_replica() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        let CommandKind::ClearContext { context, name, .. } = clear.kind.clone() else {
+            panic!("expected a clear, got {clear:?}");
+        };
+        assert_eq!(
+            changes(&f),
+            [(
+                clear.id,
+                PendingChange::NewContext { name: name.clone() },
+                Some(Outgoing::Queued),
+            )]
+        );
+
+        let me = f.me;
+        f.log_stamped(sid, vec![(Some(clear.id), context, started(&name, me))]);
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(clear.id, CommandResult::Accepted { seq }, Utc::now());
+        assert!(changes(&f).is_empty());
+        assert!(f.session_view().timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::Logged {
+                entry: Entry::ContextStarted { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_switch_is_a_row_named_for_its_context_until_pulled() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let first = ContextId::first_of(sid);
+        let later = ContextId::new();
+        f.log_in(sid, later, vec![started("velvet walrus", DeviceId::new())]);
+        f.open(sid);
+        let switch = queued(&f.dispatch(Action::SwitchContext {
+            session_id: sid,
+            context: first,
+        }));
+        let back = PendingChange::SwitchContext {
+            name: "start".into(),
+        };
+        assert_eq!(
+            changes(&f),
+            [(switch.id, back.clone(), Some(Outgoing::Queued))]
+        );
+
+        f.model.command_sending(switch.id, Utc::now());
+        f.model.command_result(
+            switch.id,
+            CommandResult::Accepted { seq: Seq(3) },
+            Utc::now(),
+        );
+        assert_eq!(
+            changes(&f),
+            [(switch.id, back, Some(Outgoing::Accepted(Seq(3))))]
+        );
+
+        f.log_stamped(
+            sid,
+            vec![(
+                Some(switch.id),
+                first,
+                EventKind::ContextSwitched { by: f.me },
+            )],
+        );
+        assert!(changes(&f).is_empty());
+    }
+
+    #[test]
+    fn pending_messages_and_switches_keep_the_order_they_were_asked_in() {
+        use skywave_proto::PermissionMode;
+        // The kinds of the open session's pending items, in timeline order.
+        let kinds = |f: &Fixture| -> Vec<&'static str> {
+            f.session_view()
+                .timeline
+                .iter()
+                .filter_map(|item| match item {
+                    TimelineItem::Pending { .. } => Some("pending"),
+                    TimelineItem::Change { .. } => Some("change"),
+                    TimelineItem::Logged { .. } => None,
+                })
+                .collect()
+        };
+
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        });
+        send(&mut f, sid, "hi");
+        assert_eq!(kinds(&f), ["change", "pending"]);
+
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        send(&mut f, sid, "hi");
+        f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        });
+        assert_eq!(kinds(&f), ["pending", "change"]);
+    }
+
     #[test]
     fn a_refused_model_keeps_the_old_one_and_offered_models_reach_every_session() {
         let mut f = Fixture::paired();
