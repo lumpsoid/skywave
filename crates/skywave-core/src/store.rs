@@ -1186,7 +1186,10 @@ impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
     /// message, shell run, screen action, session creation, context move,
     /// blob delete or crop, or safety rule change the server has not
-    /// answered, or refused.
+    /// answered, or refused; a context clear or switch, or a mode, model or
+    /// effort switch, only once refused or undeliverable, since messages
+    /// queued after one on its way were written for what it changes.
+    ///
     /// One already sent may have reached the server, and withdrawing cannot
     /// stop it there; it only stops the resends, so a command whose request
     /// keeps failing no longer holds back every later one. If the server took
@@ -1204,11 +1207,27 @@ impl OutboxEntry {
                 | CommandKind::CropBlob { .. }
                 | CommandKind::SetSafetyRule { .. }
         );
-        kind && match &self.status {
-            OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
-            OutboxStatus::Undeliverable | OutboxStatus::AttachmentRefused(_) => true,
-            OutboxStatus::Queued | OutboxStatus::Sending => true,
-        }
+        let switch = matches!(
+            self.command.kind,
+            CommandKind::ClearContext { .. }
+                | CommandKind::SwitchContext { .. }
+                | CommandKind::SetPermissionMode { .. }
+                | CommandKind::SetModel { .. }
+                | CommandKind::SetEffort { .. }
+        );
+        let failed = matches!(
+            &self.status,
+            OutboxStatus::Done(CommandResult::Rejected { .. })
+                | OutboxStatus::Undeliverable
+                | OutboxStatus::AttachmentRefused(_)
+        );
+        (kind
+            && match &self.status {
+                OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
+                OutboxStatus::Undeliverable | OutboxStatus::AttachmentRefused(_) => true,
+                OutboxStatus::Queued | OutboxStatus::Sending => true,
+            })
+            || (switch && failed)
     }
 }
 

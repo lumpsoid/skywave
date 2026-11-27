@@ -1026,6 +1026,7 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
                     command_id: c,
                     change: PendingChange::NewContext { name: shown },
                     outgoing: Some(Outgoing::Queued),
+                    discardable: false,
                 },
                 TimelineItem::Pending { command_id: m, .. },
             ] if *c == clear && *m == message && *shown == name

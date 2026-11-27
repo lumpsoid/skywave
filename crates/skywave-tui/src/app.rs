@@ -31,8 +31,8 @@ use skywave_present::policy::{
 };
 use skywave_present::question::QuestionDraft;
 use skywave_present::sections::{
-    Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
-    selectable, starts_turn, wanted_blob,
+    Content, ItemKey, call_content, discardable, editable, find, gated_item, main_content,
+    sections, selectable, starts_turn, wanted_blob,
 };
 use skywave_present::storage::{Grouping as StorageGrouping, row_target, rows as storage_rows};
 use skywave_present::usage::{Grouping, Span};
@@ -2856,7 +2856,7 @@ impl App {
                 // Only what the core marks discardable; anything else (it
                 // may have reached the server) is left alone.
                 KeyCode::Char('e') => {
-                    discardable(view, session.shown.selected).map(|(id, _)| Action::EditQueued(id))
+                    editable(view, session.shown.selected).map(Action::EditQueued)
                 }
                 KeyCode::Delete if discardable(view, session.shown.selected).is_some() => {
                     discardable(view, session.shown.selected).map(|(id, _)| Action::Discard(id))

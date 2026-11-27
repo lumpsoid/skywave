@@ -6139,6 +6139,40 @@ fn edit_and_cancel_a_queued_message() {
 }
 
 #[test]
+fn a_refused_mode_switch_is_dismissed_with_del() {
+    let (mut h, id, me) = open_session();
+    hello_with(&mut h, me, false, true);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('p'));
+    h.key(KeyCode::Down);
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetPermissionMode {
+            session_id: id,
+            mode: PermissionMode::AcceptEdits,
+        })
+    );
+    let command = last_command(&h);
+    h.seam
+        .command_result(
+            command,
+            &CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+        )
+        .unwrap();
+    h.sync();
+
+    // The refused switch is a row of its own. It cannot be edited back into
+    // the draft, so `e` dispatches nothing; Delete dismisses it.
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(command)));
+    assert!(footer(&h).starts_with("Del dismiss"), "{}", footer(&h));
+    assert_eq!(h.key(KeyCode::Char('e')), None);
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(command)));
+}
+
+#[test]
 fn dismiss_refused_creation() {
     let mut h = Harness::paired();
     for workdir in ["/etc", "/srv/new"] {

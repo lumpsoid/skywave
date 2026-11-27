@@ -37,10 +37,14 @@ impl ItemKey {
 }
 
 /// Messages (any device's, logged or pending), tool items and agent messages
-/// can be selected, imported ones too; tool items expand.
+/// can be selected, imported ones too; tool items expand; a switch only once
+/// it can be dismissed.
 pub fn selectable(item: &TimelineItem) -> Option<ItemKey> {
     match item {
         TimelineItem::Pending { .. }
+        | TimelineItem::Change {
+            discardable: true, ..
+        }
         | TimelineItem::Logged {
             entry:
                 Entry::UserMessage { .. }
@@ -79,8 +83,8 @@ pub fn find(view: &SessionView, key: ItemKey) -> Option<usize> {
     })
 }
 
-/// The pending message `selected` names, with its delivery state, if the
-/// core marks it discardable: what a head may edit or take back.
+/// The pending message or switch `selected` names, with its delivery state,
+/// if the core marks it discardable: what a head may take back.
 pub fn discardable(view: &SessionView, selected: Option<ItemKey>) -> Option<(CommandId, Outgoing)> {
     let Some(ItemKey::Pending(id)) = selected else {
         return None;
@@ -91,7 +95,30 @@ pub fn discardable(view: &SessionView, selected: Option<ItemKey>) -> Option<(Com
             outgoing,
             discardable: true,
             ..
+        }
+        | TimelineItem::Change {
+            command_id,
+            outgoing: Some(outgoing),
+            discardable: true,
+            ..
         } if *command_id == id => Some((id, *outgoing)),
+        _ => None,
+    })
+}
+
+/// The pending message `selected` names, if the core lets
+/// [`Action::EditQueued`](skywave_core::Action::EditQueued) take it back
+/// into the draft; a switch never goes back.
+pub fn editable(view: &SessionView, selected: Option<ItemKey>) -> Option<CommandId> {
+    let Some(ItemKey::Pending(id)) = selected else {
+        return None;
+    };
+    view.timeline.iter().find_map(|item| match item {
+        TimelineItem::Pending {
+            command_id,
+            discardable: true,
+            ..
+        } if *command_id == id => Some(id),
         _ => None,
     })
 }

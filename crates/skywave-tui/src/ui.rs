@@ -44,7 +44,7 @@ use skywave_present::format::{
 };
 use skywave_present::link::{self, RepairNotice};
 use skywave_present::login;
-use skywave_present::sections::{discardable, wanted_blob};
+use skywave_present::sections::{discardable, editable, wanted_blob};
 use skywave_present::text::clean;
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable};
@@ -974,6 +974,9 @@ fn footer_keys(app: &App) -> &'static str {
                 "Enter run · Ctrl-O condition · Ctrl-P/N history · Ctrl-X stop · Ctrl-T agent · Esc runs · F1 help"
             }
             Some((view, ui, Focus::Timeline)) => match discardable(view, ui.shown.selected) {
+                Some((_, Outgoing::Failed(_))) if editable(view, ui.shown.selected).is_none() => {
+                    "Del dismiss · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                }
                 Some((_, Outgoing::Failed(_))) => {
                     "e edit · Del dismiss · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
@@ -1284,7 +1287,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("e", "edit your never-sent or refused message"),
                     key(
                         "Del",
-                        "cancel your never-sent message, or dismiss a refused one",
+                        "cancel your never-sent message, or dismiss a refused one or a failed switch",
                     ),
                     key(
                         "",

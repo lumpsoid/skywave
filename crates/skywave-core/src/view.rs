@@ -1916,6 +1916,9 @@ pub enum TimelineItem {
         /// The command's delivery; `None` once it is in the log and only the
         /// agent's answer is awaited (a setting switch).
         outgoing: Option<Outgoing>,
+        /// [`Action::Discard`](crate::Action::Discard) dismisses it: the server
+        /// refused it, or it could not be delivered.
+        discardable: bool,
     },
 }
 

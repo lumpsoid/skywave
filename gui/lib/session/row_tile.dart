@@ -123,69 +123,82 @@ class RowTile extends StatelessWidget {
     }
   }
 
-  List<(String, IconData, GuiIntent)> _menuItems() => [
-    if (row.selectable)
-      (
-        row.tool == null ? 'Copy' : 'Copy output',
-        Icons.copy,
-        GuiIntentCopy(key: row.key, what: CopyWhat.main),
-      ),
-    if (row.kind == RowKind.userMessage || row.kind == RowKind.pendingMessage)
-      (
-        'Save as snippet',
-        Icons.bookmark_add_outlined,
-        GuiIntentSaveSnippet(key: row.key, name: ''),
-      ),
-    if (row.tool != null)
-      (
-        'Copy call',
-        Icons.data_object,
-        GuiIntentCopy(key: row.key, what: CopyWhat.call),
-      ),
-    if (row.tool?.feedback case final feedback?)
-      (
-        'Safety feedback…',
-        Icons.flag_outlined,
-        GuiIntentAct(
-          action: ActionIntentSafetyCheckFeedback(
-            sessionId: sessionId,
-            call: feedback.call,
-            judgment: feedback.judgment,
+  List<(String, IconData, GuiIntent)> _menuItems() {
+    // A switch has no message to edit: it can only be dismissed.
+    final notice =
+        row.kind == RowKind.contextDivider || row.kind == RowKind.agentSetting;
+    return [
+      if (row.selectable && !notice)
+        (
+          row.tool == null ? 'Copy' : 'Copy output',
+          Icons.copy,
+          GuiIntentCopy(key: row.key, what: CopyWhat.main),
+        ),
+      if (row.kind == RowKind.userMessage || row.kind == RowKind.pendingMessage)
+        (
+          'Save as snippet',
+          Icons.bookmark_add_outlined,
+          GuiIntentSaveSnippet(key: row.key, name: ''),
+        ),
+      if (row.tool != null)
+        (
+          'Copy call',
+          Icons.data_object,
+          GuiIntentCopy(key: row.key, what: CopyWhat.call),
+        ),
+      if (row.tool?.feedback case final feedback?)
+        (
+          'Safety feedback…',
+          Icons.flag_outlined,
+          GuiIntentAct(
+            action: ActionIntentSafetyCheckFeedback(
+              sessionId: sessionId,
+              call: feedback.call,
+              judgment: feedback.judgment,
+            ),
           ),
         ),
-      ),
-    if (row.tool?.ruleCandidates case final candidates?
-        when candidates.isNotEmpty)
-      (
-        'Trust command…',
-        Icons.verified_user_outlined,
-        GuiIntentAct(
-          action: ActionIntentSetSafetyRule(
-            sessionId: sessionId,
-            words: const [],
-            on: true,
+      if (row.tool?.ruleCandidates case final candidates?
+          when candidates.isNotEmpty)
+        (
+          'Trust command…',
+          Icons.verified_user_outlined,
+          GuiIntentAct(
+            action: ActionIntentSetSafetyRule(
+              sessionId: sessionId,
+              words: const [],
+              on: true,
+            ),
           ),
         ),
-      ),
-    if (row.expandable && !row.expanded) ...[
-      ('Expand', Icons.unfold_more, GuiIntentExpandItem(key: row.key)),
-      ('Download', Icons.download, GuiIntentDownloadItem(key: row.key)),
-    ],
-    if (row.expandable && row.expanded)
-      ('Collapse', Icons.unfold_less, GuiIntentCollapseItem(key: row.key)),
-    if (row.discardable && row.commandId != null) ...[
-      (
-        'Edit queued',
-        Icons.edit,
-        GuiIntentAct(action: ActionIntentEditQueued(commandId: row.commandId!)),
-      ),
-      (
-        'Discard',
-        Icons.delete_outline,
-        GuiIntentAct(action: ActionIntentDiscard(commandId: row.commandId!)),
-      ),
-    ],
-  ];
+      if (row.expandable && !row.expanded) ...[
+        ('Expand', Icons.unfold_more, GuiIntentExpandItem(key: row.key)),
+        ('Download', Icons.download, GuiIntentDownloadItem(key: row.key)),
+      ],
+      if (row.expandable && row.expanded)
+        ('Collapse', Icons.unfold_less, GuiIntentCollapseItem(key: row.key)),
+      if (row.discardable && row.commandId != null && !notice) ...[
+        (
+          'Edit queued',
+          Icons.edit,
+          GuiIntentAct(
+            action: ActionIntentEditQueued(commandId: row.commandId!),
+          ),
+        ),
+        (
+          'Discard',
+          Icons.delete_outline,
+          GuiIntentAct(action: ActionIntentDiscard(commandId: row.commandId!)),
+        ),
+      ],
+      if (row.discardable && row.commandId != null && notice)
+        (
+          'Dismiss',
+          Icons.close,
+          GuiIntentAct(action: ActionIntentDiscard(commandId: row.commandId!)),
+        ),
+    ];
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -225,6 +238,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.interrupted || RowKind.stopped => _Notice(
         row: row,
+        send: send,
         icon: row.kind == RowKind.stopped
             ? Icons.power_settings_new
             : Icons.pan_tool_outlined,
@@ -234,6 +248,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.renamed => _Notice(
         row: row,
+        send: send,
         icon: Icons.drive_file_rename_outline,
         color: colors.muted,
         hit: hit,
@@ -241,6 +256,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.agentSetting => _Notice(
         row: row,
+        send: send,
         icon: row.outgoing != null ? Icons.hourglass_top : Icons.tune,
         color: colors.muted,
         hit: hit,
@@ -248,6 +264,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.settingRefused => _Notice(
         row: row,
+        send: send,
         icon: Icons.error_outline,
         color: colors.warning,
         hit: hit,
@@ -255,6 +272,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.agentVersion => _Notice(
         row: row,
+        send: send,
         icon: Icons.warning_amber_outlined,
         color: colors.warning,
         hit: hit,
@@ -262,6 +280,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.archived => _Notice(
         row: row,
+        send: send,
         icon: Icons.inventory_2_outlined,
         color: colors.muted,
         hit: hit,
@@ -269,6 +288,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.contextDivider => _Notice(
         row: row,
+        send: send,
         icon: row.outgoing != null ? Icons.hourglass_top : Icons.alt_route,
         color: colors.muted,
         hit: hit,
@@ -276,6 +296,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.turnUsage => _Notice(
         row: row,
+        send: send,
         icon: Icons.timer_outlined,
         color: colors.muted,
         hit: hit,
@@ -995,6 +1016,7 @@ class _ToolCard extends StatelessWidget {
 class _Notice extends StatelessWidget {
   const _Notice({
     required this.row,
+    required this.send,
     required this.icon,
     required this.color,
     required this.hit,
@@ -1003,6 +1025,7 @@ class _Notice extends StatelessWidget {
   });
 
   final TimelineRow row;
+  final SendIntent send;
   final IconData icon;
   final Color color;
   final SearchHit? hit;
@@ -1035,6 +1058,15 @@ class _Notice extends StatelessWidget {
           StateBadge(
             label: outgoing.label,
             color: SkyColors.of(context).outgoing(outgoing.state),
+          ),
+        ],
+        // A failed switch can be dismissed; it has no message to edit.
+        if (row.discardable && row.commandId != null) ...[
+          const SizedBox(width: 6),
+          _LinkButton(
+            label: 'Dismiss',
+            onPressed: () =>
+                send.act(ActionIntentDiscard(commandId: row.commandId!)),
           ),
         ],
       ],

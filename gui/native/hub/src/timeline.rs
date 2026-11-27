@@ -279,6 +279,7 @@ fn row(
             command_id,
             change,
             outgoing,
+            discardable,
         } => {
             let kind = match change {
                 PendingChange::NewContext { .. } | PendingChange::SwitchContext { .. } => {
@@ -289,6 +290,7 @@ fn row(
             set(&mut row, kind, clean_line(&pending_change_line(change)));
             row.own = true;
             row.command_id = Some(command_id.0.to_string());
+            row.discardable = *discardable;
             row.outgoing = Some(match outgoing {
                 Some(outgoing) => outgoing_view(outgoing),
                 None => OutgoingView {
@@ -1421,11 +1423,13 @@ mod tests {
                     name: "velvet walrus".into(),
                 },
                 outgoing: Some(Outgoing::Sending),
+                discardable: false,
             },
             TimelineItem::Change {
                 command_id: mode,
                 change: PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan)),
                 outgoing: None,
+                discardable: false,
             },
         ]);
         let got: Vec<_> = rows
@@ -1465,6 +1469,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_switch_row_can_be_discarded() {
+        let clear = CommandId::new();
+        let rows = rows_of(vec![TimelineItem::Change {
+            command_id: clear,
+            change: PendingChange::NewContext {
+                name: "velvet walrus".into(),
+            },
+            outgoing: Some(Outgoing::Failed(FailReason::Undeliverable)),
+            discardable: true,
+        }]);
+        assert_eq!(rows.rows.len(), 1);
+        let row = &rows.rows[0];
+        assert!(row.discardable, "{}", row.key);
+        assert_eq!(row.command_id, Some(clear.0.to_string()), "{}", row.key);
+    }
+
+    #[test]
     fn a_logged_divider_takes_the_place_of_its_switch_on_its_way() {
         let clear = CommandId::new();
         let old = rows_of(vec![TimelineItem::Change {
@@ -1473,6 +1494,7 @@ mod tests {
                 name: "velvet walrus".into(),
             },
             outgoing: Some(Outgoing::Sending),
+            discardable: false,
         }]);
         let new = rows_of(vec![TimelineItem::Logged {
             parent: None,

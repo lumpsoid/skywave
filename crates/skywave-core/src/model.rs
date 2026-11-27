@@ -2051,7 +2051,8 @@ impl Model {
     /// likewise into the shell draft, which takes the run's `when`. A
     /// command answered meanwhile is no longer discardable here: nothing
     /// happens. The sender hears of it, so it stops waiting to resend this
-    /// one and moves on.
+    /// one and moves on. Dismissing a failed switch also takes the earlier
+    /// failed ones of its kind with it.
     fn withdraw(&mut self, id: CommandId, edit: bool) -> Vec<Effect> {
         let Some(index) = self
             .outbox
@@ -2095,16 +2096,46 @@ impl Model {
             ),
             _ if edit => return Vec::new(),
             _ => {
-                self.outbox.remove(index);
-                return vec![
-                    Effect::Withdraw {
-                        id,
+                let kind = &self.outbox[index].command.kind;
+                let mut ids = Vec::new();
+                if matches!(
+                    kind,
+                    CommandKind::ClearContext { .. }
+                        | CommandKind::SwitchContext { .. }
+                        | CommandKind::SetPermissionMode { .. }
+                        | CommandKind::SetModel { .. }
+                        | CommandKind::SetEffort { .. }
+                ) {
+                    // The timeline shows only the newest command of a kind, so
+                    // an earlier failed one would take the dismissed row's place.
+                    let session = command_session(kind);
+                    ids.extend(
+                        self.outbox[..index]
+                            .iter()
+                            .filter(|e| {
+                                std::mem::discriminant(&e.command.kind)
+                                    == std::mem::discriminant(kind)
+                                    && command_session(&e.command.kind) == session
+                                    && e.discardable()
+                            })
+                            .map(|e| e.command.id),
+                    );
+                }
+                // The dismissed one goes last: a partial failure then leaves
+                // the newest row, not an older one.
+                ids.push(id);
+                self.outbox.retain(|e| !ids.contains(&e.command.id));
+                let mut effects: Vec<Effect> = ids
+                    .into_iter()
+                    .map(|withdrawn| Effect::Withdraw {
+                        id: withdrawn,
                         draft: None,
                         images: None,
                         files: None,
-                    },
-                    Effect::Request(Request::OutboxChanged),
-                ];
+                    })
+                    .collect();
+                effects.push(Effect::Request(Request::OutboxChanged));
+                return effects;
             }
         };
         // A blank message adds no lines in front of the draft's text.
@@ -4496,21 +4527,30 @@ impl Model {
                         e.command.id,
                         e.command.kind.clone(),
                         Outgoing::from(&e.status),
+                        e.discardable(),
                     )
                 })
-                .filter(|(_, _, outgoing)| !self.in_replica(*outgoing))
+                .filter(|(_, _, outgoing, _)| !self.in_replica(*outgoing))
         };
-        let mut changes: Vec<(CommandId, PendingChange, Option<Outgoing>)> = Vec::new();
-        if let Some((command_id, CommandKind::ClearContext { name, .. }, outgoing)) = newest(
-            &|kind| matches!(kind, CommandKind::ClearContext { session_id, .. } if *session_id == id),
-        ) {
+        let mut changes: Vec<(CommandId, PendingChange, Option<Outgoing>, bool)> = Vec::new();
+        if let Some((command_id, CommandKind::ClearContext { name, .. }, outgoing, discardable)) =
+            newest(
+                &|kind| matches!(kind, CommandKind::ClearContext { session_id, .. } if *session_id == id),
+            )
+        {
             changes.push((
                 command_id,
                 PendingChange::NewContext { name },
                 Some(outgoing),
+                discardable,
             ));
         }
-        if let Some((command_id, CommandKind::SwitchContext { context, .. }, outgoing)) = newest(
+        if let Some((
+            command_id,
+            CommandKind::SwitchContext { context, .. },
+            outgoing,
+            discardable,
+        )) = newest(
             &|kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
         ) {
             let name = contexts
@@ -4522,13 +4562,24 @@ impl Model {
                 command_id,
                 PendingChange::SwitchContext { name },
                 Some(outgoing),
+                discardable,
             ));
         }
-        if let Some((command_id, CommandKind::SetPermissionMode { mode, .. }, outgoing)) = newest(
+        if let Some((
+            command_id,
+            CommandKind::SetPermissionMode { mode, .. },
+            outgoing,
+            discardable,
+        )) = newest(
             &|kind| matches!(kind, CommandKind::SetPermissionMode { session_id, .. } if *session_id == id),
         ) {
             let setting = AgentSetting::Mode(mode);
-            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+            changes.push((
+                command_id,
+                PendingChange::Setting(setting),
+                Some(outgoing),
+                discardable,
+            ));
         } else if let Some(r) = summary
             .agent
             .mode
@@ -4537,13 +4588,20 @@ impl Model {
             .filter(|r| self.device() == Some(r.by))
         {
             let setting = AgentSetting::Mode(r.value);
-            changes.push((r.command, PendingChange::Setting(setting), None));
+            changes.push((r.command, PendingChange::Setting(setting), None, false));
         }
-        if let Some((command_id, CommandKind::SetModel { model, .. }, outgoing)) = newest(
-            &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
-        ) {
+        if let Some((command_id, CommandKind::SetModel { model, .. }, outgoing, discardable)) =
+            newest(
+                &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
+            )
+        {
             let setting = AgentSetting::Model(model);
-            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+            changes.push((
+                command_id,
+                PendingChange::Setting(setting),
+                Some(outgoing),
+                discardable,
+            ));
         } else if let Some(r) = summary
             .agent
             .model
@@ -4552,13 +4610,20 @@ impl Model {
             .filter(|r| self.device() == Some(r.by))
         {
             let setting = AgentSetting::Model(r.value.clone());
-            changes.push((r.command, PendingChange::Setting(setting), None));
+            changes.push((r.command, PendingChange::Setting(setting), None, false));
         }
-        if let Some((command_id, CommandKind::SetEffort { effort, .. }, outgoing)) = newest(
-            &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
-        ) {
+        if let Some((command_id, CommandKind::SetEffort { effort, .. }, outgoing, discardable)) =
+            newest(
+                &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
+            )
+        {
             let setting = AgentSetting::Effort(Some(effort));
-            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+            changes.push((
+                command_id,
+                PendingChange::Setting(setting),
+                Some(outgoing),
+                discardable,
+            ));
         } else if let Some(r) = summary
             .agent
             .effort
@@ -4566,16 +4631,19 @@ impl Model {
             .filter(|r| self.device() == Some(r.by))
         {
             let setting = AgentSetting::Effort(Some(r.value));
-            changes.push((r.command, PendingChange::Setting(setting), None));
+            changes.push((r.command, PendingChange::Setting(setting), None, false));
         }
-        changes.sort_by_key(|(command_id, _, _)| *command_id);
+        changes.sort_by_key(|(command_id, _, _, _)| *command_id);
         changes
             .into_iter()
-            .map(|(command_id, change, outgoing)| TimelineItem::Change {
-                command_id,
-                change,
-                outgoing,
-            })
+            .map(
+                |(command_id, change, outgoing, discardable)| TimelineItem::Change {
+                    command_id,
+                    change,
+                    outgoing,
+                    discardable,
+                },
+            )
             .collect()
     }
 
@@ -8112,6 +8180,7 @@ mod tests {
                     command_id,
                     change,
                     outgoing,
+                    ..
                 } => Some((command_id, change, outgoing)),
                 _ => None,
             })
@@ -8206,6 +8275,136 @@ mod tests {
                 ))),
             )]
         );
+    }
+
+    #[test]
+    fn a_refused_mode_switch_is_dismissed_and_its_row_goes() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::TurnRunning,
+            },
+            Utc::now(),
+        );
+        assert!(f.session_view().timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::Change {
+                discardable: true,
+                ..
+            }
+        )));
+        let effects = f.dispatch(Action::Discard(command.id));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Withdraw { id, .. } if *id == command.id))
+        );
+        assert!(changes(&f).is_empty());
+    }
+
+    #[test]
+    fn a_mode_switch_on_its_way_is_not_dismissed() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        assert!(f.dispatch(Action::Discard(command.id)).is_empty());
+        let rows = changes(&f);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, command.id);
+    }
+
+    #[test]
+    fn dismissing_a_failed_clear_takes_the_earlier_failed_one_with_it() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let first = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        f.model.command_undeliverable(first.id, Utc::now());
+        let second = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        f.model.command_result(
+            second.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextExists,
+            },
+            Utc::now(),
+        );
+        let rows = changes(&f);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, second.id);
+        let effects = f.dispatch(Action::Discard(second.id));
+        for gone in [first.id, second.id] {
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Withdraw { id, .. } if *id == gone))
+            );
+        }
+        assert!(changes(&f).is_empty());
+        assert_eq!(f.session_view().clear, None);
+    }
+
+    #[test]
+    fn dismissing_a_failed_clear_leaves_other_kinds_and_sessions() {
+        let mut f = Fixture::paired();
+        let a = f.session("/srv/a");
+        let b = f.session("/srv/b");
+        f.open(b);
+        let other_clear = queued(&f.dispatch(Action::ClearContext { session_id: b }));
+        f.model.command_result(
+            other_clear.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextExists,
+            },
+            Utc::now(),
+        );
+        f.open(a);
+        let model = queued(&f.dispatch(Action::SetModel {
+            session_id: a,
+            model: "opus".into(),
+        }));
+        f.model.command_result(
+            model.id,
+            CommandResult::Rejected {
+                reason: RejectReason::TurnRunning,
+            },
+            Utc::now(),
+        );
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: a }));
+        f.model.command_result(
+            clear.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextExists,
+            },
+            Utc::now(),
+        );
+        let effects = f.dispatch(Action::Discard(clear.id));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Withdraw {
+                    id: clear.id,
+                    draft: None,
+                    images: None,
+                    files: None,
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        let left: Vec<CommandId> = f.model.outbox.iter().map(|e| e.command.id).collect();
+        assert_eq!(left, [other_clear.id, model.id]);
     }
 
     #[test]

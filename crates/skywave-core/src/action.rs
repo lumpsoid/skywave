@@ -241,8 +241,10 @@ pub enum Action {
     DeleteSnippet(SnippetId),
     /// Take back one of this device's messages, shell runs, screen actions
     /// or session creations that the server never saw, or dismiss one it
-    /// refused. Only items shown as `discardable` can be; anything else is a
-    /// no-op.
+    /// refused; or dismiss a context clear or switch, or a mode, model or
+    /// effort switch, it refused or could not deliver (with the earlier
+    /// failed ones of its kind). Only items shown as `discardable` can be;
+    /// anything else is a no-op.
     Discard(CommandId),
     /// Take back a `discardable` message into its session's draft, ahead of
     /// what the draft held, its images ahead of the draft's, to edit and send
