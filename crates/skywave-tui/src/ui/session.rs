@@ -31,7 +31,10 @@ use skywave_present::text::clean;
 use super::timeline::{
     approval_state, detail_lines, glyph, head_lines, preview_lines, rule_index, title_spans, wrap,
 };
-use super::{outgoing_badge, rename_badge, render_prompt, rule_text, shown_title, state_badge};
+use super::{
+    outgoing_badge, pending_session_line, rename_badge, render_prompt, rule_text, shown_title,
+    state_badge,
+};
 use crate::app::{App, Focus, Geometry, Picker, SessionUi, StopKind};
 
 /// Most composer rows on screen; longer drafts scroll.
@@ -111,6 +114,17 @@ pub(super) fn render(
         Constraint::Length(composer_height),
     ])
     .areas(inner);
+
+    // A creating session's create takes the timeline's top row.
+    let timeline = match &session.creating {
+        Some(pending) => {
+            let [line, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(timeline);
+            frame.render_widget(Paragraph::new(pending_session_line(pending)), line);
+            rest
+        }
+        None => timeline,
+    };
 
     // The timeline first: the status line reads the scroll state its
     // layout settles. Writing shell commands, the runs stand in for it.

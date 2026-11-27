@@ -47,7 +47,9 @@ use skywave_present::login;
 use skywave_present::sections::{discardable, editable, wanted_blob};
 use skywave_present::text::clean;
 
-use crate::app::{App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable};
+use crate::app::{
+    App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable, refused_create,
+};
 use crate::notify;
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
@@ -839,6 +841,18 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
             .into();
     }
     let keys = footer_keys(app);
+    // A refused create: `R` and Del are the session's keys in either pane,
+    // unless a picker or a prompt has the keys.
+    let refused = !app.ui().help
+        && app.ui().prompt.is_none()
+        && app
+            .session()
+            .is_some_and(|(view, ui)| ui.picker.is_none() && refused_create(view).is_some());
+    let keys: Cow<'static, str> = if refused {
+        format!("R recreate · Del dismiss · {keys}").into()
+    } else {
+        keys.into()
+    };
     // `d` says how much it would fetch.
     if !app.ui().help
         && let Some((view, ui)) = app.session()
@@ -884,6 +898,11 @@ fn footer_keys(app: &App) -> &'static str {
                 .is_some_and(|p| matches!(p.kind, PromptKind::Rename(_))) =>
         {
             "Enter rename (empty: default title) · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
+        // The only prompt on a session but the rename: the recreate of its
+        // refused create.
+        Screen::Session(_) if app.ui().prompt.is_some() => {
+            "Enter recreate · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(_)
             if app

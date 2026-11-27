@@ -14,9 +14,9 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
     Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
-    Entry, Link, ListKind, PairUri, PairingView, Question, Route, RunWhen, Screen, Seq,
-    ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
-    TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Entry, Link, ListKind, Outgoing, PairUri, PairingView, PendingSession, Question, Route,
+    RunWhen, Screen, Seq, ServerAddress, SessionId, SessionListView, SessionRow, SessionView,
+    ShellRun, ShellRunState, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::blob_actions::{entry_target, run_target};
 use skywave_present::format::{
@@ -171,7 +171,7 @@ pub enum PromptKind {
 }
 
 /// A one-line prompt over the session list or a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Prompt {
     pub kind: PromptKind,
     pub text: String,
@@ -185,6 +185,8 @@ pub struct Prompt {
     /// the prompt asks for the conversation id; `None` while it still asks
     /// for the workdir.
     workdir: Option<String>,
+    /// Recreating this refused session: Enter sends `RecreateSession`.
+    recreate: Option<PendingSession>,
 }
 
 impl Prompt {
@@ -195,6 +197,7 @@ impl Prompt {
             submitted: false,
             picker: WorkdirPicker::new(),
             workdir: None,
+            recreate: None,
         }
     }
 
@@ -221,16 +224,28 @@ impl Prompt {
     }
 
     /// Whether the prompt still belongs on `screen`: a new-session prompt
-    /// on the session list, a rename there or on its session, an address
-    /// on settings.
+    /// on the session list, a rename there or on its session, the recreate
+    /// of a refused session on its page, an address on settings.
     fn fits(&self, screen: &Screen) -> bool {
         match (self.kind, screen) {
             (PromptKind::ServerAddress, screen) => matches!(screen, Screen::Settings(_)),
             (_, Screen::SessionList(_)) => true,
             (PromptKind::Rename(id), Screen::Session(view)) => view.id == id,
+            (PromptKind::Create, Screen::Session(view)) => self
+                .recreate
+                .as_ref()
+                .is_some_and(|pending| pending.session_id == view.id),
             _ => false,
         }
     }
+}
+
+/// The session's create, when the server refused it: `R` asks for it again
+/// and Del takes it back.
+pub(crate) fn refused_create(view: &SessionView) -> Option<&PendingSession> {
+    view.creating
+        .as_ref()
+        .filter(|pending| matches!(pending.outgoing, Outgoing::Failed(_)))
 }
 
 /// Where keys go on the session view.
@@ -2472,6 +2487,14 @@ impl App {
                     return create.picker.cancel(completing);
                 }
                 create.submitted = true;
+                if let Some(pending) = &create.recreate {
+                    return Some(Action::RecreateSession {
+                        session_id: pending.session_id,
+                        workdir: create.text.clone(),
+                        conversation: pending.conversation.clone(),
+                        worktree: pending.worktree.clone(),
+                    });
+                }
                 return Some(Action::CreateSession {
                     conversation: None,
                     workdir: create.text.clone(),
@@ -2649,6 +2672,24 @@ impl App {
                     Focus::Timeline => Focus::Composer,
                 };
                 return None;
+            }
+            // A refused create: `R` asks for it again, Del takes it back
+            // with its messages. Ahead of the focus's keys, so either pane
+            // has them, and the rename `R` below does not get them. Del
+            // keeps the timeline's own when an item there is discardable.
+            KeyCode::Char('R') if refused_create(view).is_some() => {
+                let pending = refused_create(view)?.clone();
+                let mut prompt = Prompt::new(PromptKind::Create, pending.workdir.clone());
+                let action = prompt.picker.start(&pending.workdir);
+                prompt.recreate = Some(pending);
+                self.ui.prompt = Some(prompt);
+                return Some(action);
+            }
+            KeyCode::Delete
+                if refused_create(view).is_some()
+                    && discardable(view, session.shown.selected).is_none() =>
+            {
+                return refused_create(view).map(|pending| Action::Discard(pending.command_id));
             }
             _ => {}
         }

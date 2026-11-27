@@ -1265,6 +1265,98 @@ fn refused_creations_say_why() {
 }
 
 #[test]
+fn a_new_session_opens_at_once_and_takes_a_message() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('n'));
+    h.type_workdir("/srv/new");
+    assert!(matches!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession { .. })
+    ));
+    assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+    // The page opens now, as a creating session, not the list.
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+    let id = session_view(&h).id;
+    let screen = h.screen();
+    assert_contains(&line_with(&screen, "waits for the server"), "/srv/new");
+
+    // Messages go to the creating session, as to any other.
+    h.type_text("hello");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SendMessage {
+            session_id: id,
+            text: "hello".into(),
+        })
+    );
+}
+
+#[test]
+fn a_refused_create_offers_recreate_and_dismiss() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('n'));
+    h.type_workdir("/srv/new");
+    assert!(matches!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession { .. })
+    ));
+    let id = session_view(&h).id;
+    let command = last_command(&h);
+    h.seam.command_sending(command).unwrap();
+    h.seam
+        .command_result(
+            command,
+            &CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotFound,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_contains(&line_with(&h.screen(), "[failed]"), "/srv/new");
+    assert_contains(&h.screen(), "R recreate · Del dismiss");
+
+    // `R` opens the new-session prompt with the workdir; Enter asks again.
+    assert_eq!(
+        h.key(KeyCode::Char('R')),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/new".into()
+        })
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "New session");
+    assert_contains(&screen, "> /srv/new");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::RecreateSession {
+            session_id: id,
+            workdir: "/srv/new".into(),
+            conversation: None,
+            worktree: None,
+        })
+    );
+    assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+
+    // Refused again: Del, with nothing selected, takes the create back.
+    let command = last_command(&h);
+    h.seam.command_sending(command).unwrap();
+    h.seam
+        .command_result(
+            command,
+            &CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotFound,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_contains(&h.screen(), "R recreate · Del dismiss");
+    let create = session_view(&h)
+        .creating
+        .expect("the create is refused")
+        .command_id;
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(create)));
+}
+
+#[test]
 fn esc_cancels_the_new_session_prompt() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('n'));
