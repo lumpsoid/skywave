@@ -1471,6 +1471,7 @@ fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_time
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir.to_str().unwrap().to_owned(),
             conversation: None,
             worktree: None,

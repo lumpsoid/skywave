@@ -759,6 +759,7 @@ impl Model {
                 let at = self.opening_from();
                 let effects = self.enqueue(
                     CommandKind::CreateSession {
+                        session_id: SessionId::new(),
                         workdir: workdir.to_owned(),
                         conversation,
                         worktree,
@@ -786,6 +787,7 @@ impl Model {
                 };
                 let effects = self.enqueue(
                     CommandKind::CreateSession {
+                        session_id: SessionId::new(),
                         workdir,
                         conversation: None,
                         worktree: None,
@@ -6342,6 +6344,14 @@ mod tests {
         }
     }
 
+    /// The session id a queued create names.
+    fn created_id(command: &Command) -> SessionId {
+        match &command.kind {
+            CommandKind::CreateSession { session_id, .. } => *session_id,
+            other => panic!("not a create: {other:?}"),
+        }
+    }
+
     #[test]
     fn unpaired_shows_pairing_and_tracks_progress() {
         let mut model = Model::new(empty_snapshot(), None);
@@ -10498,6 +10508,7 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10515,6 +10526,7 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: Some("abc".into()),
                 worktree: None,
@@ -10557,6 +10569,7 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10626,6 +10639,7 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10663,6 +10677,7 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10732,6 +10747,7 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/new".into(),
                 conversation: None,
                 worktree: None,
@@ -11783,48 +11799,58 @@ mod tests {
     #[test]
     fn a_created_session_sends_its_trimmed_conversation_unchecked() {
         let mut f = Fixture::paired();
+        // The id is minted per create, so each expected kind takes the one sent.
         let create = |f: &mut Fixture, conversation: Option<&str>| {
-            queued(&f.dispatch(Action::CreateSession {
+            let command = queued(&f.dispatch(Action::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: conversation.map(str::to_owned),
                 worktree: None,
-            }))
-            .kind
+            }));
+            (created_id(&command), command.kind)
         };
-        let kind = |conversation: Option<&str>| CommandKind::CreateSession {
+        let kind = |session_id, conversation: Option<&str>| CommandKind::CreateSession {
+            session_id,
             workdir: "/srv/a".into(),
             conversation: conversation.map(str::to_owned),
             worktree: None,
             mode: None,
             safety_check: false,
         };
-        assert_eq!(create(&mut f, Some(" id ")), kind(Some("id")));
-        assert_eq!(create(&mut f, Some("  ")), kind(None));
-        assert_eq!(create(&mut f, None), kind(None));
+        let (id, sent) = create(&mut f, Some(" id "));
+        assert_eq!(sent, kind(id, Some("id")));
+        let (id, sent) = create(&mut f, Some("  "));
+        assert_eq!(sent, kind(id, None));
+        let (id, sent) = create(&mut f, None);
+        assert_eq!(sent, kind(id, None));
         // Not an id the agent could have: still sent, the server decides.
-        assert_eq!(create(&mut f, Some("../x y")), kind(Some("../x y")));
+        let (id, sent) = create(&mut f, Some("../x y"));
+        assert_eq!(sent, kind(id, Some("../x y")));
     }
 
     #[test]
     fn creating_a_session_asks_for_a_trimmed_worktree() {
         let mut f = Fixture::paired();
+        // The id is minted per create, so each expected kind takes the one sent.
         let create = |f: &mut Fixture, worktree: Option<&str>| {
-            queued(&f.dispatch(Action::CreateSession {
+            let command = queued(&f.dispatch(Action::CreateSession {
                 workdir: "/srv/app".into(),
                 conversation: None,
                 worktree: worktree.map(str::to_owned),
-            }))
-            .kind
+            }));
+            (created_id(&command), command.kind)
         };
-        let kind = |worktree: Option<&str>| CommandKind::CreateSession {
+        let kind = |session_id, worktree: Option<&str>| CommandKind::CreateSession {
+            session_id,
             workdir: "/srv/app".into(),
             conversation: None,
             worktree: worktree.map(str::to_owned),
             mode: None,
             safety_check: false,
         };
-        assert_eq!(create(&mut f, Some("  feat/x ")), kind(Some("feat/x")));
-        assert_eq!(create(&mut f, Some("   ")), kind(None));
+        let (id, sent) = create(&mut f, Some("  feat/x "));
+        assert_eq!(sent, kind(id, Some("feat/x")));
+        let (id, sent) = create(&mut f, Some("   "));
+        assert_eq!(sent, kind(id, None));
     }
 
     #[test]
@@ -15579,6 +15605,7 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: workdir.into(),
                 conversation: Some(id.into()),
                 worktree: None,

@@ -23,7 +23,7 @@ use skywave_core::{
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, Event, EventBatch,
-    EventKind, EventsQuery, HelloResponse, RejectReason, Seq, SessionState,
+    EventKind, EventsQuery, HelloResponse, RejectReason, Seq, SessionId, SessionState,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, seed};
 use skywaved::agent::fake::{FakeAgent, FakeScript, Gate, Step};
@@ -1692,6 +1692,7 @@ fn create_on_server(daemon: &mut Daemon, device: skywave_core::DeviceId) {
     let command = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: daemon.workdir(),
             conversation: None,
             worktree: None,

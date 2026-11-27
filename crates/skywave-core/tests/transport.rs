@@ -203,6 +203,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
@@ -790,6 +791,7 @@ async fn log_of(transport: &HttpsTransport, fx: &Fixture, texts: Vec<String>) ->
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
@@ -1061,6 +1063,7 @@ async fn workdir_reads_reach_a_real_server() {
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
@@ -1187,6 +1190,7 @@ async fn workdir_download_reaches_a_real_server() {
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,
@@ -1251,6 +1255,7 @@ async fn workdir_write_reaches_a_real_server() {
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: fx.workdir(),
             conversation: None,
             worktree: None,

@@ -2422,9 +2422,14 @@ fn v44_opens_a_v43_replica_with_its_outboxed_create_session() {
     let outbox = store.outbox().unwrap();
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].status, OutboxStatus::Queued);
+    // v45 mints the id the create names; the rest is what v44 wrote.
+    let CommandKind::CreateSession { session_id, .. } = &outbox[0].command.kind else {
+        panic!("not a create: {:?}", outbox[0].command.kind);
+    };
     assert_eq!(
         outbox[0].command.kind,
         CommandKind::CreateSession {
+            session_id: *session_id,
             workdir: "/srv/a".into(),
             conversation: None,
             worktree: None,
@@ -2432,6 +2437,78 @@ fn v44_opens_a_v43_replica_with_its_outboxed_create_session() {
             safety_check: false,
         }
     );
+}
+
+/// A v44 device's queued `CreateSession` opens as v45 under the id its logged
+/// create carries, so the device opens the session the server made; one
+/// nothing logged yet gets a fresh id. v45 added `session_id` to
+/// `CreateSession`, which a v44 command never carried.
+#[test]
+fn v45_opens_a_v44_replica_with_its_outboxed_creates() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let logged_id = CommandId::new();
+    let unlogged_id = CommandId::new();
+    let session = SessionId::new();
+    let create = |id: CommandId, workdir: &str| {
+        serde_json::json!({
+            "id": id.0,
+            "kind": {
+                "type": "create_session",
+                "workdir": workdir,
+                "conversation": null,
+                "worktree": null,
+                "mode": null,
+                "safety_check": false,
+            },
+        })
+        .to_string()
+    };
+    let logged = Event {
+        session_id: session,
+        at: Utc.with_ymd_and_hms(2026, 10, 29, 9, 0, 0).unwrap(),
+        command_id: Some(logged_id),
+        context: ContextId::first_of(session),
+        kind: EventKind::SessionCreated {
+            workdir: "/srv/a".into(),
+            context_name: "start".into(),
+            from: None,
+            worktree: None,
+        },
+    };
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    for (id, workdir) in [(logged_id, "/srv/a"), (unlogged_id, "/srv/b")] {
+        conn.execute(
+            "INSERT INTO outbox (command_id, command) VALUES (?1, ?2)",
+            rusqlite::params![id.0.to_string(), create(id, workdir)],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO events (seq, session_id, event) VALUES (1, ?1, ?2)",
+        rusqlite::params![
+            session.0.to_string(),
+            serde_json::to_string(&logged).unwrap()
+        ],
+    )
+    .unwrap();
+    conn.execute("UPDATE protocol_stamp SET version = 44", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let outbox = store.outbox().unwrap();
+    let queued_session = |id: CommandId| match outbox
+        .iter()
+        .find(|entry| entry.command.id == id)
+        .map(|entry| &entry.command.kind)
+    {
+        Some(CommandKind::CreateSession { session_id, .. }) => *session_id,
+        other => panic!("not a queued create: {other:?}"),
+    };
+    assert_eq!(queued_session(logged_id), session);
+    assert_ne!(queued_session(unlogged_id), session);
 }
 
 fn usage_limits_read() -> UsageLimitsResult {
@@ -3169,6 +3246,7 @@ fn withdraw_anything_not_accepted() {
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: "/etc".into(),
             conversation: None,
             worktree: None,
