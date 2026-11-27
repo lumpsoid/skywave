@@ -128,7 +128,7 @@ class RowTile extends StatelessWidget {
     final notice =
         row.kind == RowKind.contextDivider || row.kind == RowKind.agentSetting;
     return [
-      if (row.selectable)
+      if (row.selectable && !notice)
         (
           row.tool == null ? 'Copy' : 'Copy output',
           Icons.copy,

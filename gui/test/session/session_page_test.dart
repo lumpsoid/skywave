@@ -231,6 +231,21 @@ void main() {
       sent.last,
       const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c3')),
     );
+
+    // The row's menu offers Dismiss alone: no Copy, no Edit or Discard.
+    sent.clear();
+    await tester.longPress(find.text('mode → plan', findRichText: true));
+    await tester.pumpAndSettle();
+    // The inline link and the menu's entry both show.
+    expect(find.text('Dismiss'), findsNWidgets(2));
+    expect(find.text('Copy'), findsNothing);
+    expect(find.text('Edit queued'), findsNothing);
+    expect(find.text('Discard'), findsNothing);
+    await tester.tap(find.text('Dismiss').last);
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c3')),
+    ]);
   });
 
   testWidgets('collapsed calls step back from the messages', (tester) async {
