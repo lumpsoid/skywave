@@ -28,7 +28,7 @@ use skywave_present::format::{
     blob_size, bytes, change_state_label, context_moved_line, context_started_line,
     context_switched_line, decision_label, delivery_label, dollars, download_state, fail_reason,
     import_finished_line, moved_from_line, outgoing_label, pending_change_line, seconds,
-    subagent_status, took_label, turn_time,
+    session_created_line, subagent_status, took_label, turn_time,
 };
 use skywave_present::policy::in_conversation;
 use skywave_present::sections::{
@@ -601,6 +601,9 @@ impl Layout<'_> {
             }
             Entry::Adopted { conversation } => {
                 return context_divider(lead, &adopted_line(conversation));
+            }
+            Entry::Created { workdir } => {
+                return context_divider(lead, &session_created_line(workdir));
             }
             // The outside conversation's user wrote it, not a device.
             Entry::Imported {

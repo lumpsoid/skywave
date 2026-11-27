@@ -2037,6 +2037,9 @@ pub enum Entry {
     /// that conversation follows as [`Entry::Imported`] items, then one
     /// [`Entry::ImportFinished`]; the session's own entries come after.
     Adopted { conversation: String },
+    /// The session was created in `workdir` (a fresh one: a move or an
+    /// adoption has its own entry).
+    Created { workdir: String },
     /// One item of an adopted conversation's history, as the agent kept it
     /// outside Skywave: a record, never unread news and never running.
     /// `at` is when the agent recorded it, or when the server logged it if

@@ -843,6 +843,11 @@ pub fn adopted_line(conversation: &str) -> String {
     format!("Continues agent conversation {conversation} from outside Skywave")
 }
 
+/// The row a fresh session starts with: `Session created · /srv/x`.
+pub fn session_created_line(workdir: &str) -> String {
+    format!("Session created · {workdir}")
+}
+
 /// What a head marks a row of imported history with: it happened outside
 /// Skywave, before the session adopted the conversation.
 pub const IMPORTED_MARK: &str = "imported";
@@ -2088,6 +2093,11 @@ mod tests {
         ] {
             assert_eq!(dollars(usd), text, "{usd}");
         }
+    }
+
+    #[test]
+    fn a_created_session_names_its_workdir() {
+        assert_eq!(session_created_line("/srv/x"), "Session created · /srv/x");
     }
 
     #[test]

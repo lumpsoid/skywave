@@ -22,7 +22,7 @@ use skywave_present::format::{
     bytes, change_state_label, context_moved_line, context_started_line, context_switched_line,
     decision_label, delivery_label, dollars, download_state, fail_reason, import_finished_line,
     moved_from_line, outgoing_label, pending_change_line, safety_approval_label, seconds,
-    subagent_status, took_label, turn_time,
+    session_created_line, subagent_status, took_label, turn_time,
 };
 use skywave_present::markdown as md;
 use skywave_present::sections::{
@@ -368,6 +368,11 @@ fn row(
             &mut row,
             RowKind::ContextDivider,
             clean_line(&adopted_line(conversation)),
+        ),
+        Entry::Created { workdir } => set(
+            &mut row,
+            RowKind::Created,
+            clean_line(&session_created_line(workdir)),
         ),
         Entry::Imported { entry: item, .. } => {
             row.mark = Some(IMPORTED_MARK.to_owned());

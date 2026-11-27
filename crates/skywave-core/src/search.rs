@@ -330,6 +330,7 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         | Entry::ContextMoved { name, .. }
         | Entry::MovedFrom { name, .. } => vec![name],
         Entry::Adopted { conversation } => vec![conversation],
+        Entry::Created { workdir } => vec![workdir],
         Entry::AgentSetting {
             setting, refused, ..
         } => {

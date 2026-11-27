@@ -149,6 +149,8 @@ pub enum RowKind {
     Interrupted,
     Stopped,
     Renamed,
+    /// A fresh session's first row: where it was created.
+    Created,
     Archived,
     /// A context was cleared or an earlier one made current again: what
     /// follows went to that context.

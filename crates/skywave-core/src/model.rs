@@ -5310,12 +5310,15 @@ impl Model {
                     refused: Some(reason.clone()),
                 }),
                 EventKind::SessionCreated {
-                    context_name, from, ..
+                    workdir,
+                    context_name,
+                    from,
+                    ..
                 } => {
                     names.insert(event.context, context_name);
                     current = Some(event.context);
                     // Shown in the header, but for where a moved context
-                    // came from.
+                    // came from, and where a fresh session was created.
                     match from {
                         Some(SessionOrigin::Context(from)) => Some(Entry::MovedFrom {
                             from: self.session_ref(from.session),
@@ -5324,7 +5327,9 @@ impl Model {
                         Some(SessionOrigin::Agent { conversation }) => Some(Entry::Adopted {
                             conversation: conversation.clone(),
                         }),
-                        None => None,
+                        None => Some(Entry::Created {
+                            workdir: workdir.clone(),
+                        }),
                     }
                 }
                 EventKind::ContextStarted { by, name } => {
