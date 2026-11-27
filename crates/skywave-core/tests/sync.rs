@@ -1078,12 +1078,16 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
         other => panic!("expected the message, got {other:?}"),
     };
     let view = client
-        .open_session(session, |s| s.timeline.len() == 2)
+        .open_session(session, |s| s.timeline.len() == 3)
         .await;
     assert!(
         matches!(
             &view.timeline[..],
             [
+                TimelineItem::Logged {
+                    entry: Entry::Created { .. },
+                    ..
+                },
                 TimelineItem::Change {
                     command_id: c,
                     change: PendingChange::NewContext { name: shown },
@@ -1093,7 +1097,7 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
                 TimelineItem::Pending { command_id: m, .. },
             ] if *c == clear && *m == message && *shown == name
         ),
-        "the clear's row, then the message queued after it: {:?}",
+        "where it was created, the clear's row, then the message queued after it: {:?}",
         view.timeline
     );
     assert_eq!(view.context, cleared);
