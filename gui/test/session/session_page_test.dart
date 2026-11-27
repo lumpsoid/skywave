@@ -200,6 +200,39 @@ void main() {
     expect(find.byIcon(Icons.tune), findsNothing);
   });
 
+  testWidgets('a failed switch can be dismissed, not edited', (tester) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        'p:c3',
+        RowKind.agentSetting,
+        'mode → plan',
+        own: true,
+        discardable: true,
+        commandId: 'c3',
+        outgoing: const OutgoingView(
+          state: OutgoingState.failed,
+          label: 'refused',
+        ),
+      ),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+
+    expect(find.text('Edit'), findsNothing);
+    expect(find.text('Discard'), findsNothing);
+    await tester.tap(find.text('Dismiss'));
+    expect(
+      sent.last,
+      const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c3')),
+    );
+  });
+
   testWidgets('collapsed calls step back from the messages', (tester) async {
     tall(tester);
     final timeline = holding([
