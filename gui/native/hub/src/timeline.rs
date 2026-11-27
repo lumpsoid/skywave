@@ -175,7 +175,7 @@ pub fn rows(
                     at.format("%H:%M").to_string()
                 })
             }
-            TimelineItem::Pending { .. } => None,
+            TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
         };
         let key = ItemKey::of(item);
         let open = matches!(key, ItemKey::Logged(seq) if expanded.contains(&seq));
@@ -274,6 +274,7 @@ fn row(
             ..
         }
         | TimelineItem::Logged { at, entry, .. } => (at, entry),
+        TimelineItem::Change { .. } => return row,
     };
     row.at_ms = Some(at.timestamp_millis());
     match entry {

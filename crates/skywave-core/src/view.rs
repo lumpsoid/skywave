@@ -1481,7 +1481,7 @@ impl SessionView {
                     ..
                 }
                 | TimelineItem::Pending { text, .. } => text.as_str(),
-                TimelineItem::Logged { .. } => continue,
+                TimelineItem::Logged { .. } | TimelineItem::Change { .. } => continue,
             };
             if prompts.last() != Some(&text) {
                 prompts.push(text);
@@ -1793,6 +1793,20 @@ pub enum AgentSetting {
     Effort(Option<Effort>),
 }
 
+/// What a context or agent setting switch on its way asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingChange {
+    /// A clear: a new, empty context with this name.
+    NewContext {
+        name: String,
+    },
+    /// Back to an earlier context, named as the log names it (empty if unknown).
+    SwitchContext {
+        name: String,
+    },
+    Setting(AgentSetting),
+}
+
 /// What a session's composer writes on this device: a message to the agent
 /// or a shell command for the server. Never synced (D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -1892,6 +1906,15 @@ pub enum TimelineItem {
         /// the server never saw it, or refused it.
         discardable: bool,
         delivery: Option<Delivery>,
+    },
+    /// A context clear or switch, or a mode, model or effort switch, that this
+    /// device asked for and the log does not show done yet.
+    Change {
+        command_id: CommandId,
+        change: PendingChange,
+        /// The command's delivery; `None` once it is in the log and only the
+        /// agent's answer is awaited (a setting switch).
+        outgoing: Option<Outgoing>,
     },
 }
 

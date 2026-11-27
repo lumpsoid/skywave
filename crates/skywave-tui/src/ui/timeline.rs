@@ -380,7 +380,7 @@ impl Layout<'_> {
                 let this = at.timestamp().div_euclid(60);
                 minute.replace(this) != Some(this)
             }
-            TimelineItem::Pending { .. } => false,
+            TimelineItem::Pending { .. } | TimelineItem::Change { .. } => false,
         };
         Flags {
             above,
@@ -439,6 +439,7 @@ impl Layout<'_> {
             TimelineItem::Pending { text, outgoing, .. } => {
                 self.message(lead, you(Some(outgoing)), Color::Blue, text, mark)
             }
+            TimelineItem::Change { .. } => Vec::new(),
             // Dimmed: it happened outside Skywave.
             TimelineItem::Logged {
                 entry: entry @ Entry::Imported { .. },

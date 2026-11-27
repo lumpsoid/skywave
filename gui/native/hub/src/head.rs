@@ -1299,7 +1299,7 @@ impl Head {
                                 .chain(message_image_blobs(entry))
                                 .find(|b| b.id == id)
                                 .map(|b| b.state.clone()),
-                            TimelineItem::Pending { .. } => None,
+                            TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
                         })
                     }),
                 };
@@ -2379,7 +2379,7 @@ fn prompt(item: &TimelineItem) -> Option<&str> {
             entry: Entry::UserMessage { text, .. },
             ..
         } => Some(text),
-        TimelineItem::Logged { .. } => None,
+        TimelineItem::Logged { .. } | TimelineItem::Change { .. } => None,
     }
 }
 

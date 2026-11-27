@@ -49,16 +49,16 @@ use crate::view::{
     DeviceRef, DeviceStorage, DiffBody, Draft, Entry, ErrorInfo, FailReason, FeedbackSent,
     FileBody, FileChange, FileResult, FullView, IdleAlert, ImportedEntry, LineSpan, Link,
     LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
-    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
-    PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER,
-    SafetyFeedbackView, SafetyRuleView, Screen, ScreenRequest, ScreenRequestState, SearchScope,
-    SearchView, Seq, ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef,
-    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun,
-    ShellRunState, ShellView, Snippet, SnippetId, StorageReport, StorageSession, StorageView,
-    SubagentHeader, SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome,
-    ToolView, UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState,
-    WaitingApproval, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView,
-    WorktreeSession, WorktreesView,
+    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingChange,
+    PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
+    SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, ScreenRequest,
+    ScreenRequestState, SearchScope, SearchView, Seq, ServerAddressesView, SessionId,
+    SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
+    SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
+    SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader, SubagentStatus,
+    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WaitingApproval, WorkdirBody,
+    WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -3871,9 +3871,23 @@ impl Model {
                 TimelineItem::Logged { context, .. } | TimelineItem::Pending { context, .. } => {
                     *context == viewing
                 }
+                TimelineItem::Change { .. } => true,
             });
         }
         let contexts = self.contexts(id, events, context);
+        if subagent.is_none() {
+            timeline.extend(self.pending_changes(summary, &contexts));
+            // Pending messages and switches in the order they were asked for.
+            let start = timeline
+                .iter()
+                .rposition(|item| matches!(item, TimelineItem::Logged { .. }))
+                .map_or(0, |at| at + 1);
+            timeline[start..].sort_by_key(|item| match item {
+                TimelineItem::Pending { command_id, .. }
+                | TimelineItem::Change { command_id, .. } => Some(*command_id),
+                TimelineItem::Logged { .. } => None,
+            });
+        }
         let can_clear = contexts.iter().any(|c| c.current && c.messages > 0);
         let contexts = contexts
             .into_iter()
@@ -4460,6 +4474,92 @@ impl Model {
             .find(|e| kind(&e.command.kind))
             .map(|e| Outgoing::from(&e.status))
             .filter(|outgoing| !self.in_replica(*outgoing))
+    }
+
+    /// The session's switches on their way, as timeline items, oldest first:
+    /// this device's newest clear and switch of the context until their
+    /// effect is in the replica, and each mode, model and effort switch while
+    /// the header shows it waiting.
+    fn pending_changes(
+        &self,
+        summary: &SessionSummary,
+        contexts: &[ContextView],
+    ) -> Vec<TimelineItem> {
+        let id = summary.id;
+        let newest = |is: &dyn Fn(&CommandKind) -> bool| {
+            self.outbox
+                .iter()
+                .rev()
+                .find(|e| is(&e.command.kind))
+                .map(|e| {
+                    (
+                        e.command.id,
+                        e.command.kind.clone(),
+                        Outgoing::from(&e.status),
+                    )
+                })
+                .filter(|(_, _, outgoing)| !self.in_replica(*outgoing))
+        };
+        let mut changes: Vec<(CommandId, PendingChange, Option<Outgoing>)> = Vec::new();
+        if let Some((command_id, CommandKind::ClearContext { name, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::ClearContext { session_id, .. } if *session_id == id),
+        ) {
+            changes.push((
+                command_id,
+                PendingChange::NewContext { name },
+                Some(outgoing),
+            ));
+        }
+        if let Some((command_id, CommandKind::SwitchContext { context, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
+        ) {
+            let name = contexts
+                .iter()
+                .find(|c| c.id == context)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            changes.push((
+                command_id,
+                PendingChange::SwitchContext { name },
+                Some(outgoing),
+            ));
+        }
+        if let Some((command_id, CommandKind::SetPermissionMode { mode, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SetPermissionMode { session_id, .. } if *session_id == id),
+        ) {
+            let setting = AgentSetting::Mode(mode);
+            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+        } else if let Some(r) = &summary.agent.mode.requested {
+            let setting = AgentSetting::Mode(r.value);
+            changes.push((r.command, PendingChange::Setting(setting), None));
+        }
+        if let Some((command_id, CommandKind::SetModel { model, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
+        ) {
+            let setting = AgentSetting::Model(model);
+            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+        } else if let Some(r) = &summary.agent.model.requested {
+            let setting = AgentSetting::Model(r.value.clone());
+            changes.push((r.command, PendingChange::Setting(setting), None));
+        }
+        if let Some((command_id, CommandKind::SetEffort { effort, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
+        ) {
+            let setting = AgentSetting::Effort(Some(effort));
+            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+        } else if let Some(r) = summary.agent.effort.requested_effort() {
+            let setting = AgentSetting::Effort(Some(r.value));
+            changes.push((r.command, PendingChange::Setting(setting), None));
+        }
+        changes.sort_by_key(|(command_id, _, _)| *command_id);
+        changes
+            .into_iter()
+            .map(|(command_id, change, outgoing)| TimelineItem::Change {
+                command_id,
+                change,
+                outgoing,
+            })
+            .collect()
     }
 
     /// Where a message sent to the session now goes: the context this
@@ -5655,7 +5755,7 @@ impl ToolIndex {
         let &(item, _) = self.calls.get(&call?)?;
         match items.get(item)? {
             TimelineItem::Logged { parent, .. } => *parent,
-            TimelineItem::Pending { .. } => None,
+            TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
         }
     }
 
@@ -6437,6 +6537,7 @@ mod tests {
             .map(|item| match item {
                 TimelineItem::Logged { entry, .. } => entry,
                 TimelineItem::Pending { .. } => panic!("message shown twice: {item:?}"),
+                TimelineItem::Change { .. } => panic!("unexpected switch on its way: {item:?}"),
             })
             .collect();
         assert_eq!(
@@ -10042,7 +10143,7 @@ mod tests {
                 TimelineItem::Pending {
                     text, discardable, ..
                 } => Some((text, discardable)),
-                TimelineItem::Logged { .. } => None,
+                TimelineItem::Logged { .. } | TimelineItem::Change { .. } => None,
             })
             .collect()
     }
@@ -10935,7 +11036,7 @@ mod tests {
             .into_iter()
             .find_map(|item| match item {
                 TimelineItem::Pending { files, .. } => Some(files),
-                TimelineItem::Logged { .. } => None,
+                TimelineItem::Logged { .. } | TimelineItem::Change { .. } => None,
             });
         assert_eq!(
             files,
@@ -11840,7 +11941,7 @@ mod tests {
             .into_iter()
             .filter_map(|item| match item {
                 TimelineItem::Logged { entry, .. } => Some(entry),
-                TimelineItem::Pending { .. } => None,
+                TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
             })
             .collect()
     }
@@ -15056,7 +15157,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 TimelineItem::Pending { context, text, .. } => Some((text.as_str(), *context)),
-                TimelineItem::Logged { .. } => None,
+                TimelineItem::Logged { .. } | TimelineItem::Change { .. } => None,
             })
             .collect();
         assert_eq!(pending, [("hello", first), ("fresh", context)]);
@@ -15285,6 +15386,7 @@ mod tests {
                         other => format!("{other:?}"),
                     },
                     TimelineItem::Pending { text, .. } => format!("pending {text}"),
+                    TimelineItem::Change { .. } => panic!("unexpected switch on its way"),
                 })
                 .collect()
         };
@@ -15308,6 +15410,7 @@ mod tests {
                 .map(|item| match item {
                     TimelineItem::Logged { context, .. }
                     | TimelineItem::Pending { context, .. } => *context,
+                    TimelineItem::Change { .. } => panic!("unexpected switch on its way"),
                 })
                 .collect();
         assert_eq!(stamps, [a, b, b, a, b, a, a]);

@@ -31,6 +31,7 @@ impl ItemKey {
         match item {
             TimelineItem::Logged { seq, .. } => ItemKey::Logged(*seq),
             TimelineItem::Pending { command_id, .. } => ItemKey::Pending(*command_id),
+            TimelineItem::Change { command_id, .. } => ItemKey::Pending(*command_id),
         }
     }
 }
