@@ -1186,15 +1186,15 @@ impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
     /// message, shell run, screen action, session creation, context move,
     /// blob delete or crop, or safety rule change the server has not
-    /// answered, or refused.
+    /// answered, or refused; a context clear or switch, or a mode, model or
+    /// effort switch, only once refused or undeliverable, since messages
+    /// queued after one on its way were written for what it changes.
+    ///
     /// One already sent may have reached the server, and withdrawing cannot
     /// stop it there; it only stops the resends, so a command whose request
     /// keeps failing no longer holds back every later one. If the server took
     /// it, its event shows it in the log like any other, and its answer, if
     /// one still comes, settles nothing.
-    /// A context clear or switch, or a mode, model or effort switch, only once
-    /// refused or undeliverable: on its way, messages after it were written for
-    /// what it changes.
     pub fn discardable(&self) -> bool {
         let kind = matches!(
             self.command.kind,

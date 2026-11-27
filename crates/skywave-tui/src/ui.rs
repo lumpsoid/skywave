@@ -1287,7 +1287,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("e", "edit your never-sent or refused message"),
                     key(
                         "Del",
-                        "cancel your never-sent message, or dismiss a refused one",
+                        "cancel your never-sent message, or dismiss a refused one or a failed switch",
                     ),
                     key(
                         "",

@@ -2097,7 +2097,7 @@ impl Model {
             _ if edit => return Vec::new(),
             _ => {
                 let kind = &self.outbox[index].command.kind;
-                let mut ids = vec![id];
+                let mut ids = Vec::new();
                 if matches!(
                     kind,
                     CommandKind::ClearContext { .. }
@@ -2121,6 +2121,9 @@ impl Model {
                             .map(|e| e.command.id),
                     );
                 }
+                // The dismissed one goes last: a partial failure then leaves
+                // the newest row, not an older one.
+                ids.push(id);
                 self.outbox.retain(|e| !ids.contains(&e.command.id));
                 let mut effects: Vec<Effect> = ids
                     .into_iter()
@@ -8351,6 +8354,57 @@ mod tests {
         }
         assert!(changes(&f).is_empty());
         assert_eq!(f.session_view().clear, None);
+    }
+
+    #[test]
+    fn dismissing_a_failed_clear_leaves_other_kinds_and_sessions() {
+        let mut f = Fixture::paired();
+        let a = f.session("/srv/a");
+        let b = f.session("/srv/b");
+        f.open(b);
+        let other_clear = queued(&f.dispatch(Action::ClearContext { session_id: b }));
+        f.model.command_result(
+            other_clear.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextExists,
+            },
+            Utc::now(),
+        );
+        f.open(a);
+        let model = queued(&f.dispatch(Action::SetModel {
+            session_id: a,
+            model: "opus".into(),
+        }));
+        f.model.command_result(
+            model.id,
+            CommandResult::Rejected {
+                reason: RejectReason::TurnRunning,
+            },
+            Utc::now(),
+        );
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: a }));
+        f.model.command_result(
+            clear.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextExists,
+            },
+            Utc::now(),
+        );
+        let effects = f.dispatch(Action::Discard(clear.id));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Withdraw {
+                    id: clear.id,
+                    draft: None,
+                    images: None,
+                    files: None,
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        let left: Vec<CommandId> = f.model.outbox.iter().map(|e| e.command.id).collect();
+        assert_eq!(left, [other_clear.id, model.id]);
     }
 
     #[test]
