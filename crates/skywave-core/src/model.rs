@@ -742,34 +742,10 @@ impl Model {
                 // No local id check: dispatch has no failure channel, and a
                 // silent drop would lose what the user typed. The server's
                 // `BadConversation` shows as a failed pending session.
-                let conversation = conversation
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|c| !c.is_empty())
-                    .map(str::to_owned);
-                let worktree = worktree
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|w| !w.is_empty())
-                    .map(str::to_owned);
-                // The server refuses a mode with an adopted conversation.
-                let mode = match conversation {
-                    Some(_) => None,
-                    None => self.new_session_mode(),
-                };
                 let at = self.opening_from();
                 let session_id = SessionId::new();
-                let mut effects = self.enqueue(
-                    CommandKind::CreateSession {
-                        session_id,
-                        workdir: workdir.to_owned(),
-                        conversation,
-                        worktree,
-                        mode,
-                        safety_check: self.settings.default_safety_check,
-                    },
-                    Vec::new(),
-                );
+                let kind = self.create_command(session_id, workdir, conversation, worktree);
+                let mut effects = self.enqueue(kind, Vec::new());
                 // Open the new session now, as a creating one: it takes
                 // messages before the server logs it.
                 if at.is_some() && !effects.is_empty() {
@@ -806,6 +782,67 @@ impl Model {
                     self.place = Place::session(session_id);
                     effects.push(Effect::LoadSession(session_id));
                 }
+                effects
+            }
+            Action::RecreateSession {
+                session_id,
+                workdir,
+                conversation,
+                worktree,
+            } => {
+                let workdir = workdir.trim();
+                // Commands need a paired device, as `enqueue` needs one.
+                if workdir.is_empty() || self.device().is_none() {
+                    return Vec::new();
+                }
+                let refused = self.outbox.iter().any(|e| {
+                    matches!(
+                        &e.command.kind,
+                        CommandKind::CreateSession { session_id: id, .. } if *id == session_id
+                    ) && matches!(Outgoing::from(&e.status), Outgoing::Failed(_))
+                        && e.discardable()
+                });
+                if !refused {
+                    return Vec::new();
+                }
+                let kind = self.create_command(session_id, workdir, conversation, worktree);
+                // The refused create and the messages queued for its session
+                // leave the outbox. The messages come back behind the new
+                // create, in their outbox order.
+                let (gone, kept): (Vec<OutboxEntry>, Vec<OutboxEntry>) =
+                    std::mem::take(&mut self.outbox).into_iter().partition(|e| {
+                        match &e.command.kind {
+                            CommandKind::CreateSession { session_id: id, .. } => *id == session_id,
+                            CommandKind::SendMessage { session_id: id, .. } => {
+                                *id == session_id && e.discardable()
+                            }
+                            _ => false,
+                        }
+                    });
+                self.outbox = kept;
+                let mut effects = Vec::new();
+                let mut messages = Vec::new();
+                for entry in gone {
+                    effects.push(Effect::Withdraw {
+                        id: entry.command.id,
+                        draft: None,
+                        images: None,
+                        files: None,
+                    });
+                    if matches!(entry.command.kind, CommandKind::SendMessage { .. }) {
+                        let files: Vec<AttachedFile> =
+                            entry.files.into_iter().map(|held| held.file).collect();
+                        messages.push((entry.command.kind, files));
+                    }
+                }
+                let mut queued = self.enqueue(kind, Vec::new());
+                for (message, files) in messages {
+                    queued.extend(self.enqueue(message, files));
+                }
+                // Each enqueue ends with an outbox wake-up; one is enough.
+                queued.retain(|effect| !matches!(effect, Effect::Request(Request::OutboxChanged)));
+                effects.extend(queued);
+                effects.push(Effect::Request(Request::OutboxChanged));
                 effects
             }
             Action::CompleteWorkdir { input } => {
@@ -1870,6 +1907,41 @@ impl Model {
             code,
             fingerprint,
         })]
+    }
+
+    /// The create command of session `session_id` in `workdir` (trimmed by
+    /// the caller). A blank `conversation` or `worktree` is none. The mode is
+    /// the device's default, but none with an adopted conversation: the
+    /// server refuses a mode with one.
+    fn create_command(
+        &self,
+        session_id: SessionId,
+        workdir: &str,
+        conversation: Option<String>,
+        worktree: Option<String>,
+    ) -> CommandKind {
+        let conversation = conversation
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
+        let worktree = worktree
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned);
+        let mode = match conversation {
+            Some(_) => None,
+            None => self.new_session_mode(),
+        };
+        CommandKind::CreateSession {
+            session_id,
+            workdir: workdir.to_owned(),
+            conversation,
+            worktree,
+            mode,
+            safety_check: self.settings.default_safety_check,
+        }
     }
 
     /// Queues a command under a fresh UUIDv7 id, carrying `files`, which the
@@ -11018,6 +11090,100 @@ mod tests {
             ]
         );
         assert!(f.list_view().creating.is_empty());
+    }
+
+    #[test]
+    fn recreating_a_refused_session_requeues_its_messages_behind_it() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let create = queued(&effects[..2]);
+        let id = created_id(&create);
+        let one = send(&mut f, id, "one");
+        let two = send(&mut f, id, "two");
+        f.model.command_sending(create.id, Utc::now());
+        f.model.command_result(
+            create.id,
+            CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotFound,
+            },
+            Utc::now(),
+        );
+        f.model.command_sending(one.id, Utc::now());
+        f.model.command_result(
+            one.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+
+        let effects = f.dispatch(Action::RecreateSession {
+            session_id: id,
+            workdir: "/srv/fixed".into(),
+            conversation: None,
+            worktree: None,
+        });
+        let withdraw = |command_id: CommandId| Effect::Withdraw {
+            id: command_id,
+            draft: None,
+            images: None,
+            files: None,
+        };
+        // The refused create and its messages go, then the new create and
+        // the messages again, behind it, with one outbox wake-up at the end.
+        assert_eq!(effects.len(), 7);
+        assert_eq!(
+            effects[..3],
+            [withdraw(create.id), withdraw(one.id), withdraw(two.id)]
+        );
+        assert_eq!(effects[6], Effect::Request(Request::OutboxChanged));
+        let requeued: Vec<Command> = effects[3..]
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Enqueue(command, _) => Some(command.clone()),
+                _ => None,
+            })
+            .collect();
+        let [again, one_again, two_again]: [Command; 3] = requeued.try_into().unwrap();
+        assert!(matches!(
+            &again.kind,
+            CommandKind::CreateSession { session_id, workdir, .. }
+                if *session_id == id && workdir == "/srv/fixed"
+        ));
+        assert_ne!(one_again.id, one.id);
+        assert_eq!(one_again.kind, one.kind);
+        assert_ne!(two_again.id, two.id);
+        assert_eq!(two_again.kind, two.kind);
+        assert_eq!(
+            f.session_view().creating.map(|page| page.outgoing),
+            Some(Outgoing::Queued)
+        );
+    }
+
+    #[test]
+    fn recreate_does_nothing_unless_the_create_was_refused() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let id = created_id(&queued(&effects[..2]));
+        assert!(
+            f.dispatch(Action::RecreateSession {
+                session_id: id,
+                workdir: "/srv/fixed".into(),
+                conversation: None,
+                worktree: None,
+            })
+            .is_empty()
+        );
     }
 
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {

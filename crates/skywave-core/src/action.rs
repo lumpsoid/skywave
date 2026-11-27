@@ -60,6 +60,15 @@ pub enum Action {
     /// session list, and open it at once, as a creating session (see
     /// [`Action::CreateSession`]).
     CreateSessionLike(SessionId),
+    /// Ask again for a session the server refused, under the same id, and
+    /// send its refused or still queued messages again behind it, in order.
+    /// Does nothing unless the session's create was refused.
+    RecreateSession {
+        session_id: SessionId,
+        workdir: String,
+        conversation: Option<String>,
+        worktree: Option<String>,
+    },
     /// Complete `input` as a workdir: the session list's
     /// [`completion`](crate::SessionListView::completion) shows the
     /// candidates. Heads send it on Tab and on every edit while the
