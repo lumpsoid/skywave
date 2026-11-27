@@ -57,6 +57,7 @@ impl Fixture {
             workdir: workdir.clone(),
         };
         let seq = accepted(fixture.handle(CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir.to_str().unwrap().to_owned(),
             conversation: None,
             worktree: None,

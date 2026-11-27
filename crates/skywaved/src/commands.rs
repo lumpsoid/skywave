@@ -486,7 +486,15 @@ impl EventLog {
                 mode: Some(PermissionMode::Bypass),
                 ..
             } if !self.bypass_allowed() => return Ok(Err(RejectReason::BypassDisabled)),
+            // The id is the session's row key, and a deleted session keeps its
+            // row, so an id already taken is refused before anything is made.
+            CommandKind::CreateSession { session_id, .. }
+                if event_log::session_id_taken_in(tx, *session_id)? =>
+            {
+                return Ok(Err(RejectReason::SessionExists));
+            }
             CommandKind::CreateSession {
+                session_id,
                 worktree: Some(_),
                 mode,
                 safety_check,
@@ -504,7 +512,7 @@ impl EventLog {
                     &intent.branch,
                     &intent.attempt,
                 )?;
-                let session = SessionId::new();
+                let session = *session_id;
                 let context = ContextId::first_of(session);
                 let kind = EventKind::SessionCreated {
                     workdir: created.path,
@@ -520,6 +528,7 @@ impl EventLog {
                 (session, context, kind)
             }
             CommandKind::CreateSession {
+                session_id,
                 workdir,
                 conversation,
                 worktree: None,
@@ -537,7 +546,7 @@ impl EventLog {
                     }),
                     Some(None) => return Ok(Err(RejectReason::BadConversation)),
                 };
-                let session = SessionId::new();
+                let session = *session_id;
                 let context = ContextId::first_of(session);
                 let adopting = from.is_some();
                 let kind = EventKind::SessionCreated {

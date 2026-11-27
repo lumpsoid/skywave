@@ -210,6 +210,7 @@ impl Fixture {
         Command {
             id: CommandId::new(),
             kind: CommandKind::CreateSession {
+                session_id: SessionId::new(),
                 workdir: self.root.join("project").display().to_string(),
                 conversation: None,
                 worktree: None,
@@ -810,6 +811,7 @@ async fn create_session_adopts_a_conversation_by_its_id() {
     let adopt = |conversation: &str| Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: f.root.join("project").display().to_string(),
             conversation: Some(conversation.to_owned()),
             worktree: None,
@@ -879,6 +881,7 @@ fn worktree_command(f: &Fixture, branch: &str) -> Command {
     Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: f.root.join("project").display().to_string(),
             conversation: None,
             worktree: Some(branch.into()),
@@ -1002,6 +1005,7 @@ async fn create_session_refuses_a_worktree_with_a_conversation() {
     let adopting = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: project.display().to_string(),
             conversation: Some("9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into()),
             worktree: Some("feat/x".into()),
@@ -1228,6 +1232,7 @@ async fn work_for_a_session_sharing_a_removed_worktree_is_refused() {
     let plain = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: dir.display().to_string(),
             conversation: None,
             worktree: None,
@@ -1271,6 +1276,7 @@ async fn a_recreated_worktree_lets_a_sharing_session_work_again() {
     let plain = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: dir.display().to_string(),
             conversation: None,
             worktree: None,
@@ -1627,6 +1633,7 @@ async fn a_worktree_is_not_removed_while_another_session_there_runs_a_turn() {
     let plain = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: dir.display().to_string(),
             conversation: None,
             worktree: None,

@@ -573,7 +573,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [
     v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27, v27_to_v28, v28_to_v29, v29_to_v30, v30_to_v31,
     v31_to_v32, v32_to_v33, v33_to_v34, v34_to_v35, v35_to_v36, v36_to_v37, v37_to_v38, v38_to_v39,
-    v39_to_v40, v40_to_v41, v41_to_v42, v42_to_v43, v43_to_v44,
+    v39_to_v40, v40_to_v41, v41_to_v42, v42_to_v43, v43_to_v44, v44_to_v45,
 ];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
@@ -727,6 +727,12 @@ fn v42_to_v43(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// v43 to v44: `mode` and `safety_check` on `CreateSession`; commands are not
 /// stored here, so nothing stored changes.
 fn v43_to_v44(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v44 to v45: `session_id` on `CreateSession` and `SessionExists`; commands
+/// are not stored here, so nothing stored changes.
+fn v44_to_v45(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -2364,6 +2370,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kind, v42);
+        assert_eq!(
+            deletion, None,
+            "the v27 column is NULL for a session it did not touch"
+        );
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::SafetyRuleSet { .. }
+        ));
+    }
+
+    /// A v43 database, at schema v27 (what v43 wrote), opens as v44: v44
+    /// added `session_id` to `CreateSession` and `SessionExists`, which
+    /// commands never store, so the event reads back unchanged.
+    #[test]
+    fn v44_reads_what_v43_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let session = "01920000-0000-7000-8000-000000000001";
+        let v43 = concat!(
+            r#"{"type":"safety_rule_set","words":["git","status"],"#,
+            r#""on":true,"by":"01920000-0000-7000-8000-000000000009"}"#
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..27] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 27).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 43)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, workdir) VALUES (?1, 'w')",
+                [session],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, ?1, 't', 'c', ?2)",
+                [session, v43],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let (kind, deletion): (String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT events.kind, sessions.deletion
+                 FROM events JOIN sessions ON sessions.id = events.session_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, v43);
         assert_eq!(
             deletion, None,
             "the v27 column is NULL for a session it did not touch"

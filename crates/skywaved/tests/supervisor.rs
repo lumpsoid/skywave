@@ -135,6 +135,7 @@ impl Fixture {
         let command = Command {
             id: CommandId::new(),
             kind: CommandKind::CreateSession {
+                session_id: SessionId::new(),
                 workdir,
                 conversation,
                 worktree: None,
@@ -477,6 +478,7 @@ impl Fixture {
         let command = Command {
             id: CommandId::new(),
             kind: CommandKind::CreateSession {
+                session_id: SessionId::new(),
                 workdir: workdir.to_str().unwrap().to_owned(),
                 conversation: None,
                 worktree: None,
@@ -5768,6 +5770,7 @@ async fn a_low_disk_pauses_the_agent_refuses_new_work_and_still_interrupts_and_s
         RejectReason::DiskLow
     );
     let create = CommandKind::CreateSession {
+        session_id: SessionId::new(),
         workdir: f.root.join("project").to_str().unwrap().to_owned(),
         conversation: None,
         worktree: None,
