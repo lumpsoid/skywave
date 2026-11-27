@@ -1908,7 +1908,8 @@ pub enum TimelineItem {
         delivery: Option<Delivery>,
     },
     /// A context clear or switch, or a mode, model or effort switch, that this
-    /// device asked for and the log does not show done yet.
+    /// device asked for and the log does not show done yet; shown only in the
+    /// current context's view.
     Change {
         command_id: CommandId,
         change: PendingChange,
