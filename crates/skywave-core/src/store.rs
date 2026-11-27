@@ -1192,6 +1192,9 @@ impl OutboxEntry {
     /// keeps failing no longer holds back every later one. If the server took
     /// it, its event shows it in the log like any other, and its answer, if
     /// one still comes, settles nothing.
+    /// A context clear or switch, or a mode, model or effort switch, only once
+    /// refused or undeliverable: on its way, messages after it were written for
+    /// what it changes.
     pub fn discardable(&self) -> bool {
         let kind = matches!(
             self.command.kind,
@@ -1204,11 +1207,27 @@ impl OutboxEntry {
                 | CommandKind::CropBlob { .. }
                 | CommandKind::SetSafetyRule { .. }
         );
-        kind && match &self.status {
-            OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
-            OutboxStatus::Undeliverable | OutboxStatus::AttachmentRefused(_) => true,
-            OutboxStatus::Queued | OutboxStatus::Sending => true,
-        }
+        let switch = matches!(
+            self.command.kind,
+            CommandKind::ClearContext { .. }
+                | CommandKind::SwitchContext { .. }
+                | CommandKind::SetPermissionMode { .. }
+                | CommandKind::SetModel { .. }
+                | CommandKind::SetEffort { .. }
+        );
+        let failed = matches!(
+            &self.status,
+            OutboxStatus::Done(CommandResult::Rejected { .. })
+                | OutboxStatus::Undeliverable
+                | OutboxStatus::AttachmentRefused(_)
+        );
+        (kind
+            && match &self.status {
+                OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
+                OutboxStatus::Undeliverable | OutboxStatus::AttachmentRefused(_) => true,
+                OutboxStatus::Queued | OutboxStatus::Sending => true,
+            })
+            || (switch && failed)
     }
 }
 

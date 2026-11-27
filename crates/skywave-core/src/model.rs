@@ -4496,21 +4496,30 @@ impl Model {
                         e.command.id,
                         e.command.kind.clone(),
                         Outgoing::from(&e.status),
+                        e.discardable(),
                     )
                 })
-                .filter(|(_, _, outgoing)| !self.in_replica(*outgoing))
+                .filter(|(_, _, outgoing, _)| !self.in_replica(*outgoing))
         };
-        let mut changes: Vec<(CommandId, PendingChange, Option<Outgoing>)> = Vec::new();
-        if let Some((command_id, CommandKind::ClearContext { name, .. }, outgoing)) = newest(
-            &|kind| matches!(kind, CommandKind::ClearContext { session_id, .. } if *session_id == id),
-        ) {
+        let mut changes: Vec<(CommandId, PendingChange, Option<Outgoing>, bool)> = Vec::new();
+        if let Some((command_id, CommandKind::ClearContext { name, .. }, outgoing, discardable)) =
+            newest(
+                &|kind| matches!(kind, CommandKind::ClearContext { session_id, .. } if *session_id == id),
+            )
+        {
             changes.push((
                 command_id,
                 PendingChange::NewContext { name },
                 Some(outgoing),
+                discardable,
             ));
         }
-        if let Some((command_id, CommandKind::SwitchContext { context, .. }, outgoing)) = newest(
+        if let Some((
+            command_id,
+            CommandKind::SwitchContext { context, .. },
+            outgoing,
+            discardable,
+        )) = newest(
             &|kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
         ) {
             let name = contexts
@@ -4522,13 +4531,24 @@ impl Model {
                 command_id,
                 PendingChange::SwitchContext { name },
                 Some(outgoing),
+                discardable,
             ));
         }
-        if let Some((command_id, CommandKind::SetPermissionMode { mode, .. }, outgoing)) = newest(
+        if let Some((
+            command_id,
+            CommandKind::SetPermissionMode { mode, .. },
+            outgoing,
+            discardable,
+        )) = newest(
             &|kind| matches!(kind, CommandKind::SetPermissionMode { session_id, .. } if *session_id == id),
         ) {
             let setting = AgentSetting::Mode(mode);
-            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+            changes.push((
+                command_id,
+                PendingChange::Setting(setting),
+                Some(outgoing),
+                discardable,
+            ));
         } else if let Some(r) = summary
             .agent
             .mode
@@ -4537,13 +4557,20 @@ impl Model {
             .filter(|r| self.device() == Some(r.by))
         {
             let setting = AgentSetting::Mode(r.value);
-            changes.push((r.command, PendingChange::Setting(setting), None));
+            changes.push((r.command, PendingChange::Setting(setting), None, false));
         }
-        if let Some((command_id, CommandKind::SetModel { model, .. }, outgoing)) = newest(
-            &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
-        ) {
+        if let Some((command_id, CommandKind::SetModel { model, .. }, outgoing, discardable)) =
+            newest(
+                &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
+            )
+        {
             let setting = AgentSetting::Model(model);
-            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+            changes.push((
+                command_id,
+                PendingChange::Setting(setting),
+                Some(outgoing),
+                discardable,
+            ));
         } else if let Some(r) = summary
             .agent
             .model
@@ -4552,13 +4579,20 @@ impl Model {
             .filter(|r| self.device() == Some(r.by))
         {
             let setting = AgentSetting::Model(r.value.clone());
-            changes.push((r.command, PendingChange::Setting(setting), None));
+            changes.push((r.command, PendingChange::Setting(setting), None, false));
         }
-        if let Some((command_id, CommandKind::SetEffort { effort, .. }, outgoing)) = newest(
-            &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
-        ) {
+        if let Some((command_id, CommandKind::SetEffort { effort, .. }, outgoing, discardable)) =
+            newest(
+                &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
+            )
+        {
             let setting = AgentSetting::Effort(Some(effort));
-            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+            changes.push((
+                command_id,
+                PendingChange::Setting(setting),
+                Some(outgoing),
+                discardable,
+            ));
         } else if let Some(r) = summary
             .agent
             .effort
@@ -4566,16 +4600,19 @@ impl Model {
             .filter(|r| self.device() == Some(r.by))
         {
             let setting = AgentSetting::Effort(Some(r.value));
-            changes.push((r.command, PendingChange::Setting(setting), None));
+            changes.push((r.command, PendingChange::Setting(setting), None, false));
         }
-        changes.sort_by_key(|(command_id, _, _)| *command_id);
+        changes.sort_by_key(|(command_id, _, _, _)| *command_id);
         changes
             .into_iter()
-            .map(|(command_id, change, outgoing)| TimelineItem::Change {
-                command_id,
-                change,
-                outgoing,
-            })
+            .map(
+                |(command_id, change, outgoing, discardable)| TimelineItem::Change {
+                    command_id,
+                    change,
+                    outgoing,
+                    discardable,
+                },
+            )
             .collect()
     }
 
@@ -8112,6 +8149,7 @@ mod tests {
                     command_id,
                     change,
                     outgoing,
+                    ..
                 } => Some((command_id, change, outgoing)),
                 _ => None,
             })
