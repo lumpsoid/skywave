@@ -48,16 +48,17 @@ pub enum Action {
     /// `worktree` is a new branch to create a git worktree on; the session
     /// runs in that worktree. `None` or blank: run in `workdir`.
     ///
-    /// Opens the session once its `SessionCreated` reaches the replica,
-    /// unless the user went elsewhere meanwhile.
+    /// Opens the new session at once, from a session list or a session's
+    /// page; it shows as creating, and takes messages, until its
+    /// `SessionCreated` reaches the replica.
     CreateSession {
         workdir: String,
         conversation: Option<String>,
         worktree: Option<String>,
     },
     /// Start a session in the session's workdir, from its page or from a
-    /// session list, and open it once its `SessionCreated` reaches the
-    /// replica, unless the user went elsewhere meanwhile.
+    /// session list, and open it at once, as a creating session (see
+    /// [`Action::CreateSession`]).
     CreateSessionLike(SessionId),
     /// Complete `input` as a workdir: the session list's
     /// [`completion`](crate::SessionListView::completion) shows the

@@ -1438,8 +1438,10 @@ mod tests {
     fn a_pending_adopting_creation_says_it_imports() {
         let pending = |conversation: Option<&str>, outgoing| PendingSession {
             command_id: CommandId::new(),
+            session_id: SessionId::new(),
             workdir: "/srv/app".into(),
             conversation: conversation.map(Into::into),
+            worktree: None,
             outgoing,
             discardable: false,
         };
@@ -2177,6 +2179,7 @@ mod tests {
             archived: false,
             workdir: None,
             state: SessionState::Idle,
+            creating: None,
             timeline: Vec::new(),
             contexts,
             context: walrus,

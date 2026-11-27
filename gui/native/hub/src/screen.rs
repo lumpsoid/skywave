@@ -1995,6 +1995,7 @@ mod tests {
             archived: false,
             workdir: None,
             state: SessionState::Idle,
+            creating: None,
             timeline: Vec::new(),
             pending_approval: None,
             pending_question: None,

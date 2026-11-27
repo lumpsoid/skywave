@@ -6,6 +6,7 @@
 //! the [`Core`](crate::Core) must carry out, persistence first. The
 //! [`ViewState`] is a pure function of the model.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -453,9 +454,9 @@ pub(crate) struct Model {
     /// This device's login of the server's agent: the flow, its URL and
     /// the code. In memory only, never stored.
     login: AgentLogin,
-    /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
-    /// new session is not in the replica yet: its command, and the screen
-    /// it was asked from, still on screen. In memory only.
+    /// A [`Action::MoveContext`] whose new session is not in the replica
+    /// yet: its command, and the screen it was asked from, still on screen.
+    /// In memory only.
     opening: Option<(CommandId, OpeningFrom)>,
     /// The server's devices by name, as stored.
     devices: HashMap<DeviceId, String>,
@@ -627,8 +628,8 @@ impl Model {
         }
     }
 
-    /// The session on screen when its events are not loaded: one
-    /// [`Model::apply_batch`] opened for a [`Action::CreateSessionLike`].
+    /// The session on screen when its events are not loaded: one a create
+    /// or a move opened, before its [`Effect::LoadSession`] is served.
     pub(crate) fn unloaded_session(&self) -> Option<SessionId> {
         match &self.place {
             Place::Session { id, open: None, .. } | Place::SessionInfo { id, open: None } => {
@@ -757,9 +758,10 @@ impl Model {
                     None => self.new_session_mode(),
                 };
                 let at = self.opening_from();
-                let effects = self.enqueue(
+                let session_id = SessionId::new();
+                let mut effects = self.enqueue(
                     CommandKind::CreateSession {
-                        session_id: SessionId::new(),
+                        session_id,
                         workdir: workdir.to_owned(),
                         conversation,
                         worktree,
@@ -768,26 +770,29 @@ impl Model {
                     },
                     Vec::new(),
                 );
-                // Like `CreateSessionLike`: open it once it is logged, unless the
-                // user went elsewhere meanwhile.
-                if let (Some(at), Some(Effect::Enqueue(command, _))) = (at, effects.first()) {
-                    self.opening = Some((command.id, at));
+                // Open the new session now, as a creating one: it takes
+                // messages before the server logs it.
+                if at.is_some() && !effects.is_empty() {
+                    self.place = Place::session(session_id);
+                    effects.push(Effect::LoadSession(session_id));
                 }
                 effects
             }
             Action::CreateSessionLike(from) => {
-                let Some(at) = self.opening_from().filter(|at| match at {
+                let opens_here = self.opening_from().is_some_and(|at| match at {
                     OpeningFrom::SessionList | OpeningFrom::Archived | OpeningFrom::All => true,
-                    OpeningFrom::Session(id) => *id == from,
-                }) else {
+                    OpeningFrom::Session(id) => id == from,
+                });
+                if !opens_here {
                     return Vec::new();
-                };
+                }
                 let Some(workdir) = self.summary(from).and_then(|s| s.workdir.clone()) else {
                     return Vec::new();
                 };
-                let effects = self.enqueue(
+                let session_id = SessionId::new();
+                let mut effects = self.enqueue(
                     CommandKind::CreateSession {
-                        session_id: SessionId::new(),
+                        session_id,
                         workdir,
                         conversation: None,
                         worktree: None,
@@ -796,8 +801,10 @@ impl Model {
                     },
                     Vec::new(),
                 );
-                if let Some(Effect::Enqueue(command, _)) = effects.first() {
-                    self.opening = Some((command.id, at));
+                // As `CreateSession`: opens now, as a creating session.
+                if !effects.is_empty() {
+                    self.place = Place::session(session_id);
+                    effects.push(Effect::LoadSession(session_id));
                 }
                 effects
             }
@@ -939,7 +946,7 @@ impl Model {
                 Vec::new()
             }
             Action::SendMessage { session_id, text } => {
-                let Some(summary) = self.summary(session_id) else {
+                let Some(summary) = self.session_or_creating(session_id) else {
                     return Vec::new();
                 };
                 // The draft's images and files are the message's attachments:
@@ -956,7 +963,7 @@ impl Model {
                 let text = with_file_lines(&text, &files);
                 // The message goes where this device's own clear or switch
                 // on its way leads, so it is not refused for that.
-                let context = self.target_context(summary);
+                let context = self.target_context(&summary);
                 let effects = self.enqueue(
                     CommandKind::SendMessage {
                         session_id,
@@ -1037,7 +1044,7 @@ impl Model {
                 when,
             } => self.save_draft((session_id, mode), text, cursor, when),
             Action::Attach { session_id, image } => {
-                if self.summary(session_id).is_none() {
+                if self.session_or_creating(session_id).is_none() {
                     return Vec::new();
                 }
                 let mut images = self.draft_images_of(session_id).to_vec();
@@ -1066,7 +1073,7 @@ impl Model {
                 vec![Effect::DetachFromDraft(session_id, sha256)]
             }
             Action::AttachFile { session_id, file } => {
-                if self.summary(session_id).is_none() || !plain_file_name(&file.name) {
+                if self.session_or_creating(session_id).is_none() || !plain_file_name(&file.name) {
                     return Vec::new();
                 }
                 let mut files = self.draft_files_of(session_id).to_vec();
@@ -1318,7 +1325,7 @@ impl Model {
                 self.enqueue(CommandKind::DeleteSession { session_id }, Vec::new())
             }
             Action::OpenSession(id) => {
-                if self.device().is_none() || self.summary(id).is_none() {
+                if self.device().is_none() || self.session_or_creating(id).is_none() {
                     return Vec::new();
                 }
                 self.place = Place::session(id);
@@ -1994,7 +2001,7 @@ impl Model {
         cursor: usize,
         when: RunWhen,
     ) -> Vec<Effect> {
-        if self.summary(key.0).is_none() {
+        if self.session_or_creating(key.0).is_none() {
             return Vec::new();
         }
         let when = match key.1 {
@@ -2054,7 +2061,8 @@ impl Model {
     /// command answered meanwhile is no longer discardable here: nothing
     /// happens. The sender hears of it, so it stops waiting to resend this
     /// one and moves on. Dismissing a failed switch also takes the earlier
-    /// failed ones of its kind with it.
+    /// failed ones of its kind with it. Taking back a create also takes back
+    /// the discardable messages queued for its session, and leaves its page.
     fn withdraw(&mut self, id: CommandId, edit: bool) -> Vec<Effect> {
         let Some(index) = self
             .outbox
@@ -2098,6 +2106,10 @@ impl Model {
             ),
             _ if edit => return Vec::new(),
             _ => {
+                let created = match &self.outbox[index].command.kind {
+                    CommandKind::CreateSession { session_id, .. } => Some(*session_id),
+                    _ => None,
+                };
                 let kind = &self.outbox[index].command.kind;
                 let mut ids = Vec::new();
                 if matches!(
@@ -2136,6 +2148,35 @@ impl Model {
                         files: None,
                     })
                     .collect();
+                // The session a refused create named never exists, so the
+                // messages queued for it go too, and its page with them.
+                if let Some(session_id) = created {
+                    let messages: Vec<CommandId> = self
+                        .outbox
+                        .iter()
+                        .filter(|e| {
+                            e.discardable()
+                                && matches!(
+                                    &e.command.kind,
+                                    CommandKind::SendMessage { session_id: queued, .. }
+                                        if *queued == session_id
+                                )
+                        })
+                        .map(|e| e.command.id)
+                        .collect();
+                    for message in messages {
+                        self.outbox.retain(|e| e.command.id != message);
+                        effects.push(Effect::Withdraw {
+                            id: message,
+                            draft: None,
+                            images: None,
+                            files: None,
+                        });
+                    }
+                    if self.loaded_session() == Some(session_id) {
+                        self.place = Place::SessionList(ListPage::default());
+                    }
+                }
                 effects.push(Effect::Request(Request::OutboxChanged));
                 return effects;
             }
@@ -3632,23 +3673,7 @@ impl Model {
         let creating = self
             .outbox
             .iter()
-            .filter_map(|e| match &e.command.kind {
-                CommandKind::CreateSession {
-                    workdir,
-                    conversation,
-                    ..
-                } => {
-                    let outgoing = Outgoing::from(&e.status);
-                    (!self.in_replica(outgoing)).then(|| PendingSession {
-                        command_id: e.command.id,
-                        workdir: workdir.clone(),
-                        conversation: conversation.clone(),
-                        outgoing,
-                        discardable: e.discardable(),
-                    })
-                }
-                _ => None,
-            })
+            .filter_map(|e| self.pending_session(e))
             .collect();
         let completion = page.and_then(|page| {
             page.completer
@@ -3800,7 +3825,7 @@ impl Model {
         open: Option<&OpenSession>,
         scope: Scope,
     ) -> Option<SessionView> {
-        let summary = self.summary(id)?;
+        let summary = self.session_or_creating(id)?;
         let events = open.map_or(&[][..], |open| open.events.as_slice());
         let (mut timeline, rules) = self.timeline(id, events);
         let pending_approval = summary.pending_approval().and_then(|approval| {
@@ -3850,7 +3875,7 @@ impl Model {
                 _ => None,
             })
         });
-        let state = session_state(summary);
+        let state = session_state(&summary);
         let interrupt = self
             .latest_outgoing(
                 |kind| matches!(kind, CommandKind::Interrupt { session_id } if *session_id == id),
@@ -3865,9 +3890,9 @@ impl Model {
         let switch = self.latest_outgoing(
             |kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
         );
-        let context = self.target_context(summary);
+        let context = self.target_context(&summary);
         let viewing = scope.context;
-        let title = self.title(summary);
+        let title = self.title(&summary);
         let subagent = scope
             .subagent
             .and_then(|call| subagent_header(&timeline, call));
@@ -3909,7 +3934,7 @@ impl Model {
         }
         let contexts = self.contexts(id, events, context);
         if subagent.is_none() && viewing.is_none_or(|v| v == context) {
-            timeline.extend(self.pending_changes(summary, &contexts));
+            timeline.extend(self.pending_changes(&summary, &contexts));
             // Pending messages and switches in the order they were asked for.
             let start = timeline
                 .iter()
@@ -3931,15 +3956,16 @@ impl Model {
             title: title.text,
             named: title.named,
             rename: title.rename,
-            archived: self.archived(summary),
+            archived: self.archived(&summary),
             workdir: summary.workdir.clone(),
             state,
+            creating: self.creating(id),
             timeline,
             pending_approval,
             pending_question,
             rules,
             usage: summary.usage.clone(),
-            agent: self.agent_view(summary),
+            agent: self.agent_view(&summary),
             safety_check: summary.safety_check,
             safety_check_change: self.safety_check_change(id),
             contexts,
@@ -3952,7 +3978,7 @@ impl Model {
             interrupt,
             stop,
             work: summary.work.clone(),
-            task_stops: self.task_stops(summary, events),
+            task_stops: self.task_stops(&summary, events),
             mode: self.composer_mode(id),
             draft: self.drafts.get(&(id, ComposerMode::Agent)).cloned(),
             draft_images: self.draft_images_of(id).to_vec(),
@@ -5559,6 +5585,62 @@ impl Model {
 
     fn summary(&self, id: SessionId) -> Option<&SessionSummary> {
         self.sessions.iter().find(|s| s.id == id)
+    }
+
+    /// The page of an outbox entry that is a create the replica does not
+    /// have yet, failed ones included; `None` for any other command.
+    fn pending_session(&self, e: &OutboxEntry) -> Option<PendingSession> {
+        let CommandKind::CreateSession {
+            session_id,
+            workdir,
+            conversation,
+            worktree,
+            ..
+        } = &e.command.kind
+        else {
+            return None;
+        };
+        let outgoing = Outgoing::from(&e.status);
+        (!self.in_replica(outgoing)).then(|| PendingSession {
+            command_id: e.command.id,
+            session_id: *session_id,
+            workdir: workdir.clone(),
+            conversation: conversation.clone(),
+            worktree: worktree.clone(),
+            outgoing,
+            discardable: e.discardable(),
+        })
+    }
+
+    /// The create of session `id` while the replica lacks the session: the
+    /// newest one this device queued for it.
+    fn creating(&self, id: SessionId) -> Option<PendingSession> {
+        if self.summary(id).is_some() {
+            return None;
+        }
+        self.outbox
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    &e.command.kind,
+                    CommandKind::CreateSession { session_id, .. } if *session_id == id
+                )
+            })
+            .and_then(|e| self.pending_session(e))
+    }
+
+    /// Session `id`'s summary, or while its create is pending, a stand-in
+    /// for it ([`SessionSummary::creating`]). What a message, a draft or an
+    /// attachment needs to find its session.
+    fn session_or_creating(&self, id: SessionId) -> Option<Cow<'_, SessionSummary>> {
+        match self.summary(id) {
+            Some(summary) => Some(Cow::Borrowed(summary)),
+            None => {
+                let pending = self.creating(id)?;
+                Some(Cow::Owned(SessionSummary::creating(id, pending.workdir)))
+            }
+        }
     }
 
     /// This device's latest delete or crop of `blob` until its effect is in
@@ -10500,11 +10582,13 @@ mod tests {
         }
         f.dispatch(Action::Navigate(Route::SessionList));
 
-        let command = queued(&f.dispatch(Action::CreateSession {
-            conversation: None,
-            workdir: "/srv/a".into(),
-            worktree: None,
-        }));
+        let command = queued(
+            &f.dispatch(Action::CreateSession {
+                conversation: None,
+                workdir: "/srv/a".into(),
+                worktree: None,
+            })[..2],
+        );
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
@@ -10518,11 +10602,13 @@ mod tests {
         );
 
         // The server refuses a mode with an adopted conversation.
-        let command = queued(&f.dispatch(Action::CreateSession {
-            conversation: Some("abc".into()),
-            workdir: "/srv/a".into(),
-            worktree: None,
-        }));
+        let command = queued(
+            &f.dispatch(Action::CreateSession {
+                conversation: Some("abc".into()),
+                workdir: "/srv/a".into(),
+                worktree: None,
+            })[..2],
+        );
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
@@ -10540,11 +10626,13 @@ mod tests {
     fn a_bypass_default_is_sent_only_where_the_server_allows_it() {
         let mut f = Fixture::paired();
         f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Bypass)));
-        let mode_sent = |f: &mut Fixture| match queued(&f.dispatch(Action::CreateSession {
-            conversation: None,
-            workdir: "/srv/a".into(),
-            worktree: None,
-        }))
+        let mode_sent = |f: &mut Fixture| match queued(
+            &f.dispatch(Action::CreateSession {
+                conversation: None,
+                workdir: "/srv/a".into(),
+                worktree: None,
+            })[..2],
+        )
         .kind
         {
             CommandKind::CreateSession { mode, .. } => mode,
@@ -10565,7 +10653,8 @@ mod tests {
         f.dispatch(Action::SetDefaultMode(Some(PermissionMode::AcceptEdits)));
         f.dispatch(Action::SetDefaultSafetyCheck(true));
         f.open(old);
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
@@ -10591,18 +10680,25 @@ mod tests {
             })
             .is_empty()
         );
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: " /srv/new ".into(),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
+        assert_eq!(effects.last(), Some(&Effect::LoadSession(new)));
+        // The new session opens at once: the list is read after leaving it.
+        f.dispatch(Action::Navigate(Route::SessionList));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
             creating(&f),
             vec![PendingSession {
                 command_id: command.id,
+                session_id: new,
                 workdir: "/srv/new".into(),
                 conversation: None,
+                worktree: None,
                 outgoing: Outgoing::Queued,
                 discardable: true,
             }]
@@ -10616,7 +10712,18 @@ mod tests {
         assert!(!creating(&f)[0].discardable, "accepted is final");
         assert!(f.dispatch(Action::Discard(command.id)).is_empty());
 
-        let new = f.session("/srv/new");
+        f.log_commands(
+            new,
+            vec![(
+                Some(command.id),
+                EventKind::SessionCreated {
+                    workdir: "/srv/new".into(),
+                    context_name: "start".into(),
+                    from: None,
+                    worktree: None,
+                },
+            )],
+        );
         let list = f.list_view();
         assert_eq!(list.creating, Vec::new());
         let ids: Vec<SessionId> = list.sessions.iter().map(|s| s.id).collect();
@@ -10625,7 +10732,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_created_like_another_opens_once_it_is_logged() {
+    fn a_session_created_like_another_opens_at_once() {
         let mut f = Fixture::paired();
         let old = f.session("/srv/a");
         let list = f.session("/srv/b");
@@ -10635,11 +10742,13 @@ mod tests {
         f.open(list);
         assert!(f.dispatch(Action::CreateSessionLike(old)).is_empty());
         f.open(old);
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
-                session_id: created_id(&command),
+                session_id: new,
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10647,13 +10756,19 @@ mod tests {
                 safety_check: false,
             }
         );
-        assert_eq!(f.model.unloaded_session(), None);
+        assert_eq!(effects.last(), Some(&Effect::LoadSession(new)));
+        assert_eq!(f.model.open_session(), Some(new));
+        let creating = f
+            .session_view()
+            .creating
+            .expect("the new session is creating");
+        assert_eq!(creating.outgoing, Outgoing::Queued);
 
         // Another device's session in the same place is not it.
         f.session("/srv/a");
-        assert_eq!(f.model.open_session(), Some(old));
+        assert_eq!(f.model.open_session(), Some(new));
 
-        let new = SessionId::new();
+        // Logged under the id it names: it stays open, no longer creating.
         let created = EventKind::SessionCreated {
             workdir: "/srv/a".into(),
             context_name: "start".into(),
@@ -10662,18 +10777,23 @@ mod tests {
         };
         f.log_commands(new, vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(new));
-        assert_eq!(f.model.unloaded_session(), Some(new));
+        assert_eq!(f.session_view().creating, None);
 
         // Gone elsewhere meanwhile: stays there.
         f.open(old);
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         f.open(list);
-        f.log_commands(SessionId::new(), vec![(Some(command.id), created.clone())]);
+        f.log_commands(
+            created_id(&command),
+            vec![(Some(command.id), created.clone())],
+        );
         assert_eq!(f.model.open_session(), Some(list));
 
         // From a row of the session list: opens it too.
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
@@ -10685,33 +10805,40 @@ mod tests {
                 safety_check: false,
             }
         );
-        let new = SessionId::new();
-        f.log_commands(new, vec![(Some(command.id), created.clone())]);
-        assert_eq!(f.model.open_session(), Some(new));
+        assert_eq!(f.model.open_session(), Some(created_id(&command)));
 
         // Left the list meanwhile: stays where it went.
         f.dispatch(Action::Navigate(Route::ArchivedSessions));
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         f.dispatch(Action::Navigate(Route::Settings));
-        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        f.log_commands(created_id(&command), vec![(Some(command.id), created)]);
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));
     }
 
     #[test]
-    fn a_session_created_from_the_dialog_opens_once_it_is_logged() {
+    fn a_session_created_from_the_dialog_opens_at_once() {
         let mut f = Fixture::paired();
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/new".into(),
             conversation: None,
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
+        assert_eq!(effects.last(), Some(&Effect::LoadSession(new)));
+        assert_eq!(f.model.open_session(), Some(new));
+        let creating = f
+            .session_view()
+            .creating
+            .expect("the new session is creating");
+        assert_eq!(creating.outgoing, Outgoing::Queued);
 
         // Another device's session in the same place is not it.
         f.session("/srv/new");
-        assert_eq!(f.model.open_session(), None);
+        assert_eq!(f.model.open_session(), Some(new));
 
-        let new = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/new".into(),
             context_name: "start".into(),
@@ -10723,13 +10850,14 @@ mod tests {
 
         // Gone elsewhere meanwhile: stays there.
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/new".into(),
             conversation: None,
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
         f.dispatch(Action::Navigate(Route::Settings));
-        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        f.log_commands(created_id(&command), vec![(Some(command.id), created)]);
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));
     }
 
@@ -10739,15 +10867,17 @@ mod tests {
         f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Plan)));
         f.dispatch(Action::SetDefaultSafetyCheck(true));
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/new".into(),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
-                session_id: created_id(&command),
+                session_id: new,
                 workdir: "/srv/new".into(),
                 conversation: None,
                 worktree: None,
@@ -10755,11 +10885,12 @@ mod tests {
                 safety_check: true,
             }
         );
+        // Open from the moment it is queued, as the server has not logged it.
+        assert_eq!(f.model.open_session(), Some(new));
 
         // As the server logs a create with a mode: the `SessionCreated` and
         // the safety check name no command; the mode request, logged last,
         // names the create.
-        let new = SessionId::new();
         let me = f.me;
         f.log_commands(
             new,
@@ -10785,6 +10916,108 @@ mod tests {
         );
         assert_eq!(f.model.open_session(), Some(new));
         assert_eq!(f.model.unloaded_session(), Some(new));
+    }
+
+    #[test]
+    fn a_creating_session_takes_messages_and_settles_when_logged() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let create = queued(&effects[..2]);
+        let id = created_id(&create);
+        let pending = |f: &Fixture| {
+            f.session_view()
+                .timeline
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::Pending { .. }))
+                .count()
+        };
+
+        // The page takes a message before the server has logged the session.
+        let message = queued(&f.dispatch(Action::SendMessage {
+            session_id: id,
+            text: "hi".into(),
+        }));
+        assert!(matches!(
+            &message.kind,
+            CommandKind::SendMessage { session_id, context, .. }
+                if *session_id == id && *context == ContextId::first_of(id)
+        ));
+        assert_eq!(pending(&f), 1);
+
+        // A rename needs the session in the replica: nothing is queued.
+        assert!(
+            f.dispatch(Action::RenameSession {
+                session_id: id,
+                name: "later".into(),
+            })
+            .is_empty()
+        );
+
+        // Logged: the page is no longer creating, and the message is still
+        // waiting for its turn in the log.
+        f.log_commands(
+            id,
+            vec![(
+                Some(create.id),
+                EventKind::SessionCreated {
+                    workdir: "/srv/new".into(),
+                    context_name: "start".into(),
+                    from: None,
+                    worktree: None,
+                },
+            )],
+        );
+        assert_eq!(f.session_view().creating, None);
+        assert_eq!(pending(&f), 1);
+    }
+
+    #[test]
+    fn dismissing_a_refused_creation_takes_its_messages_and_leaves_its_page() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let create = queued(&effects[..2]);
+        let id = created_id(&create);
+        let message = queued(&f.dispatch(Action::SendMessage {
+            session_id: id,
+            text: "hi".into(),
+        }));
+        f.model.command_sending(create.id, Utc::now());
+        f.model.command_result(
+            create.id,
+            CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotFound,
+            },
+            Utc::now(),
+        );
+        assert_eq!(
+            f.dispatch(Action::Discard(create.id)),
+            vec![
+                Effect::Withdraw {
+                    id: create.id,
+                    draft: None,
+                    images: None,
+                    files: None,
+                },
+                Effect::Withdraw {
+                    id: message.id,
+                    draft: None,
+                    images: None,
+                    files: None,
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        assert!(f.list_view().creating.is_empty());
     }
 
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {
@@ -11801,11 +12034,12 @@ mod tests {
         let mut f = Fixture::paired();
         // The id is minted per create, so each expected kind takes the one sent.
         let create = |f: &mut Fixture, conversation: Option<&str>| {
-            let command = queued(&f.dispatch(Action::CreateSession {
+            let effects = f.dispatch(Action::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: conversation.map(str::to_owned),
                 worktree: None,
-            }));
+            });
+            let command = queued(&effects[..2]);
             (created_id(&command), command.kind)
         };
         let kind = |session_id, conversation: Option<&str>| CommandKind::CreateSession {
@@ -11832,11 +12066,12 @@ mod tests {
         let mut f = Fixture::paired();
         // The id is minted per create, so each expected kind takes the one sent.
         let create = |f: &mut Fixture, worktree: Option<&str>| {
-            let command = queued(&f.dispatch(Action::CreateSession {
+            let effects = f.dispatch(Action::CreateSession {
                 workdir: "/srv/app".into(),
                 conversation: None,
                 worktree: worktree.map(str::to_owned),
-            }));
+            });
+            let command = queued(&effects[..2]);
             (created_id(&command), command.kind)
         };
         let kind = |session_id, worktree: Option<&str>| CommandKind::CreateSession {
@@ -11856,11 +12091,12 @@ mod tests {
     #[test]
     fn a_refused_conversation_is_a_discardable_failed_creation() {
         let mut f = Fixture::paired();
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("nope".into()),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
         f.model.command_sending(command.id, Utc::now());
         f.model.command_result(
             command.id,
@@ -11869,6 +12105,7 @@ mod tests {
             },
             Utc::now(),
         );
+        f.dispatch(Action::Navigate(Route::SessionList));
         let creating = f.list_view().creating;
         assert_eq!(creating.len(), 1);
         assert_eq!(creating[0].workdir, "/srv/a");
@@ -12311,18 +12548,23 @@ mod tests {
     #[test]
     fn an_adopting_creation_is_pending_with_its_conversation_until_its_import_is_in() {
         let mut f = Fixture::paired();
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("conv-1".into()),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let adopted = created_id(&command);
+        f.dispatch(Action::Navigate(Route::SessionList));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
             creating(&f),
             vec![PendingSession {
                 command_id: command.id,
+                session_id: adopted,
                 workdir: "/srv/a".into(),
                 conversation: Some("conv-1".into()),
+                worktree: None,
                 outgoing: Outgoing::Queued,
                 discardable: true,
             }]
@@ -12332,7 +12574,6 @@ mod tests {
 
         // A long import: the first pull brings the session and part of its
         // history, the command's `ImportFinished` comes in the next.
-        let adopted = SessionId::new();
         let first = ContextId::first_of(adopted);
         let items: Vec<_> = (0..600)
             .map(|i| {
@@ -12370,9 +12611,7 @@ mod tests {
         ));
         f.log_stamped(adopted, rest);
         assert_eq!(f.events.len() as u64, finished.0);
-        // Its import is in: the creation opens it, as the dialog asked.
-        assert_eq!(f.model.open_session(), Some(adopted));
-        f.dispatch(Action::Navigate(Route::SessionList));
+        // Its import is in: the list shows it, no longer creating.
         let list = f.list_view();
         assert_eq!(list.creating, Vec::new());
         assert!(!list.sessions[0].importing);
@@ -12384,16 +12623,19 @@ mod tests {
     #[test]
     fn discard_refused_creation_hides_row() {
         let mut f = Fixture::paired();
-        let refused = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/etc".into(),
             worktree: None,
-        }));
-        let waiting = queued(&f.dispatch(Action::CreateSession {
+        });
+        let refused = queued(&effects[..2]);
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/new".into(),
             worktree: None,
-        }));
+        });
+        let waiting = queued(&effects[..2]);
+        f.dispatch(Action::Navigate(Route::SessionList));
         f.model.command_sending(refused.id, Utc::now());
         f.model.command_sending(waiting.id, Utc::now());
         f.model.command_result(
@@ -14380,11 +14622,13 @@ mod tests {
         f.dispatch(Action::Navigate(Route::SessionList));
         assert!(complete(&mut f, "/srv/").is_some());
         // Creating the session ends the completion.
-        queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/x".into(),
             worktree: None,
-        }));
+        });
+        queued(&effects[..2]);
+        f.dispatch(Action::Navigate(Route::SessionList));
         assert_eq!(f.list_view().completion, None);
 
         // Leaving the list ends the completion; an answer asked before it
@@ -15597,11 +15841,12 @@ mod tests {
             .conversations_listed(req, conversations(vec![outside(id, workdir, None)], false));
         let pick = picker(&f).items.remove(0);
 
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: pick.workdir,
             conversation: Some(pick.id),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
@@ -15613,6 +15858,7 @@ mod tests {
                 safety_check: false,
             }
         );
+        f.dispatch(Action::Navigate(Route::SessionList));
         assert_eq!(f.list_view().conversations, None);
     }
 

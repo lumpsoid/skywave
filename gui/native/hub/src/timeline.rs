@@ -1161,6 +1161,7 @@ mod tests {
             archived: false,
             workdir: None,
             state: SessionState::Idle,
+            creating: None,
             timeline,
             pending_approval: None,
             pending_question: None,

@@ -1330,11 +1330,15 @@ pub struct UsageSession {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingSession {
     pub command_id: CommandId,
+    /// The session it creates: the device chose its id.
+    pub session_id: SessionId,
     pub workdir: String,
     /// The outside conversation it adopts, by the agent's own id: the
     /// server imports its history when the command arrives. `None`: a
     /// fresh conversation.
     pub conversation: Option<String>,
+    /// The worktree branch it asks for, if any.
+    pub worktree: Option<String>,
     pub outgoing: Outgoing,
     /// [`Action::Discard`](crate::Action::Discard) takes it back: the server
     /// never saw it, or refused it.
@@ -1355,6 +1359,9 @@ pub struct SessionView {
     pub archived: bool,
     pub workdir: Option<String>,
     pub state: SessionState,
+    /// Its create, while the server has not logged it (or refused it): the
+    /// page is open and takes messages already. `None` once it is logged.
+    pub creating: Option<PendingSession>,
     /// Log order; this device's messages not yet in the log come last.
     /// While [`viewing`](Self::viewing) a context, only that context's
     /// items, with no context dividers. Only the items of the agent shown:
@@ -2472,6 +2479,7 @@ mod tests {
             archived: false,
             workdir: None,
             state: SessionState::Idle,
+            creating: None,
             timeline: vec![
                 message(1, "first", true),
                 logged(
