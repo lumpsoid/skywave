@@ -8,6 +8,31 @@ migrates the stored data (see the README).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
+This release changes the wire protocol (v45): upgrade the server and every
+device together. The server and the app migrate their stored data on start.
+
+### Added
+
+- A new session opens at once, before the server has created it: write and
+  queue messages right away, and they go out once it exists. Its timeline
+  starts with where it was created. If the server refuses it, recreate it
+  with its queued messages, or dismiss it, which drops its messages and
+  drafts too.
+- A context clear or switch, or a mode, model or effort switch, shows in the
+  timeline while it is on its way, marked pending with its delivery state.
+- A refused or undeliverable context or setting switch can be dismissed:
+  Del in the terminal, Dismiss in the app. Earlier failed ones of the same
+  kind go with it.
+
+### Fixed
+
+- Only this device's switches show as on their way, and only in the context
+  being viewed.
+- Back leaves the page of a session that is still being created.
+- The server refuses a new session whose id is already a context's.
+
 ## [0.3.0] - 2026-11-25
 
 This release changes the wire protocol (v44): upgrade the server and every
