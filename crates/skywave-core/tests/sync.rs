@@ -18,8 +18,8 @@ use chrono::Utc;
 use skywave_core::{
     Action, ApprovalStatus, BlobDownload, BlobStatus, BoxFuture, Connector, Core, Decision,
     EngineConfig, Entry, FailReason, HttpsTransport, Link, LinkRejection, MAX_SERVER_ERRORS,
-    OutboxStatus, Outgoing, Route, Screen, SessionRow, TimelineItem, Transport, TransportError,
-    ViewState,
+    OutboxStatus, Outgoing, PendingChange, Route, Screen, SessionRow, TimelineItem, Transport,
+    TransportError, ViewState,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, Event, EventBatch,
@@ -1016,8 +1016,23 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
         other => panic!("expected the message, got {other:?}"),
     };
     let view = client
-        .open_session(session, |s| s.timeline.len() == 1)
+        .open_session(session, |s| s.timeline.len() == 2)
         .await;
+    assert!(
+        matches!(
+            &view.timeline[..],
+            [
+                TimelineItem::Change {
+                    command_id: c,
+                    change: PendingChange::NewContext { name: shown },
+                    outgoing: Some(Outgoing::Queued),
+                },
+                TimelineItem::Pending { command_id: m, .. },
+            ] if *c == clear && *m == message && *shown == name
+        ),
+        "the clear's row, then the message queued after it: {:?}",
+        view.timeline
+    );
     assert_eq!(view.context, cleared);
     assert_eq!(view.clear, Some(Outgoing::Queued));
 

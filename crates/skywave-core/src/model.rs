@@ -4478,8 +4478,8 @@ impl Model {
 
     /// The session's switches on their way, as timeline items, oldest first:
     /// this device's newest clear and switch of the context until their
-    /// effect is in the replica, and each mode, model and effort switch while
-    /// the header shows it waiting.
+    /// effect is in the replica, and each mode, model and effort switch of
+    /// this device's while it is on its way or its request is open.
     fn pending_changes(
         &self,
         summary: &SessionSummary,
