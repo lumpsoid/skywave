@@ -356,10 +356,11 @@ fn offline_send_is_persisted_first_and_appears_once() {
     let view = views.last();
     assert_eq!(view.queued, 1);
     let timeline = &session_view(&view).timeline;
-    let queued = delivery(&timeline[0]);
+    // Row 0 is the session's creation.
+    let queued = delivery(&timeline[1]);
     assert_eq!((queued.tries, queued.first_sent_at), (0, None));
     assert_eq!(
-        *timeline,
+        timeline[1..],
         vec![TimelineItem::Pending {
             command_id: command.id,
             context: ContextId::first_of(sid),
@@ -378,7 +379,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
     assert_eq!(pending.len(), 1);
     assert!(seam.command_sending(command.id).unwrap());
     assert!(matches!(
-        session_view(&views.last()).timeline[0],
+        session_view(&views.last()).timeline[1],
         TimelineItem::Pending {
             outgoing: Outgoing::Sending,
             ..
@@ -406,14 +407,14 @@ fn offline_send_is_persisted_first_and_appears_once() {
     assert_eq!(live.queued, 0);
     let timeline = &session_view(&live).timeline;
     // Sent once, answered after; all by this device's clock.
-    let done = delivery(&timeline[0]);
+    let done = delivery(&timeline[1]);
     let (Some(sent), Some(answered)) = (done.first_sent_at, done.answered_at) else {
         panic!("sent and answered: {done:?}");
     };
     assert_eq!(done.tries, 1);
     assert!(done.queued_at <= sent && sent <= answered);
     assert_eq!(
-        *timeline,
+        timeline[1..],
         vec![TimelineItem::Logged {
             parent: None,
             seq: Seq(2),
@@ -473,8 +474,8 @@ fn a_late_answer_leaves_an_undeliverable_command_failed() {
     seam.command_undeliverable(command).unwrap();
     let failed = Outgoing::Failed(FailReason::Undeliverable);
     let outgoing = |view: &ViewState| match &session_view(view).timeline[..] {
-        [TimelineItem::Pending { outgoing, .. }] => *outgoing,
-        other => panic!("one pending message: {other:?}"),
+        [_created, TimelineItem::Pending { outgoing, .. }] => *outgoing,
+        other => panic!("a creation, then one pending message: {other:?}"),
     };
     assert_eq!(outgoing(&core.view()), failed);
     assert_eq!(core.view().queued, 0, "given up on, not queued");
@@ -860,7 +861,7 @@ fn blob_progress_is_persisted_and_shown() {
     core.dispatch(Action::DownloadBlob(blob.id)).unwrap();
     assert_eq!(drain(&requests), vec![Request::DownloadBlob(blob.id)]);
 
-    let output_state = |core: &Core| match &session_view(&core.view()).timeline[0] {
+    let output_state = |core: &Core| match &session_view(&core.view()).timeline[1] {
         TimelineItem::Logged {
             entry:
                 Entry::ToolResult {

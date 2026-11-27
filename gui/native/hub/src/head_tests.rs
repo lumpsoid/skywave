@@ -414,6 +414,15 @@ fn the_conversation_picker_lists_and_continues_one() {
     );
     rig.results();
     rig.view();
+    // The create opened its page: back to the list, where the picker was.
+    // Back does nothing from a creating page, so navigate.
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
+    });
+    rig.results();
+    rig.view();
     assert_eq!(rig.conversations(), None, "taking one closes the picker");
     // The pending creation says it imports.
     let ScreenView::SessionList { creating, .. } = rig.list() else {
@@ -443,6 +452,15 @@ fn a_picked_conversation_closes_the_new_session_prompt() {
     assert!(create.is_some(), "the prompt stays under the picker");
     rig.intent(GuiIntent::ConversationPick {
         conversation_id: "aaa".into(),
+    });
+    rig.results();
+    rig.view();
+    // The create opened its page: back to the list, where the prompt was.
+    // Back does nothing from a creating page, so navigate.
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
     });
     rig.results();
     rig.view();
@@ -1806,7 +1824,8 @@ fn snippets_are_saved_from_rows_and_the_composer_and_inserted_at_the_cursor() {
     rig.submit();
     rig.results();
     rig.view();
-    let key = rig.head.sent.timeline.as_ref().unwrap().2[0].key.clone();
+    // Row 0 is the session's creation; row 1 is the message just sent.
+    let key = rig.head.sent.timeline.as_ref().unwrap().2[1].key.clone();
     let outs = rig.intent(GuiIntent::SaveSnippet {
         key,
         name: "tests".into(),
@@ -3099,16 +3118,24 @@ fn a_context_cleared_or_switched_is_a_divider_row() {
         .iter()
         .map(|row| (row.kind, row.text.clone(), row.selectable))
         .collect();
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(rows[0].0, RowKind::ContextDivider);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        (
+            RowKind::Created,
+            "Session created · /srv/work".to_owned(),
+            false
+        )
+    );
+    assert_eq!(rows[1].0, RowKind::ContextDivider);
     assert!(
-        rows[0]
+        rows[1]
             .1
             .starts_with("New context · velvet walrus · by device …"),
         "{rows:?}"
     );
     assert_eq!(
-        rows[1],
+        rows[2],
         (
             RowKind::ContextDivider,
             "Back to start · by you".to_owned(),
@@ -3167,11 +3194,18 @@ fn a_moved_context_is_a_divider_row() {
     };
     assert_eq!(
         rows(&rig),
-        [(
-            RowKind::ContextDivider,
-            "start went on in “forked” · by you".to_owned(),
-            false
-        )]
+        [
+            (
+                RowKind::Created,
+                "Session created · /srv/work".to_owned(),
+                false
+            ),
+            (
+                RowKind::ContextDivider,
+                "start went on in “forked” · by you".to_owned(),
+                false
+            ),
+        ]
     );
 
     rig.intent(GuiIntent::Act {
@@ -3217,7 +3251,10 @@ fn a_removed_worktree_is_an_archive_style_row() {
         .collect();
     assert_eq!(
         rows,
-        [(RowKind::Archived, "worktree removed by you".to_owned())]
+        [
+            (RowKind::Created, "Session created · /srv/work".to_owned()),
+            (RowKind::Archived, "worktree removed by you".to_owned()),
+        ]
     );
 }
 
@@ -3253,7 +3290,10 @@ fn a_written_file_is_a_notice() {
         .collect();
     assert_eq!(
         rows,
-        [(RowKind::Archived, "docs/a.txt written by you".to_owned())]
+        [
+            (RowKind::Created, "Session created · /srv/work".to_owned()),
+            (RowKind::Archived, "docs/a.txt written by you".to_owned()),
+        ]
     );
 }
 
@@ -5186,11 +5226,14 @@ fn conversation_only_leaves_tool_calls_out_of_the_rows_until_switched_off() {
         ),
     ]);
     let kinds = |rig: &Rig| rig.rows().iter().map(|row| row.kind).collect::<Vec<_>>();
-    assert_eq!(kinds(&rig), [RowKind::AgentMessage, RowKind::Tool]);
+    assert_eq!(
+        kinds(&rig),
+        [RowKind::Created, RowKind::AgentMessage, RowKind::Tool]
+    );
     assert!(!rig.open_session().conversation_only);
 
     rig.intent(GuiIntent::ToggleConversationOnly);
-    assert_eq!(kinds(&rig), [RowKind::AgentMessage]);
+    assert_eq!(kinds(&rig), [RowKind::Created, RowKind::AgentMessage]);
     assert!(rig.open_session().conversation_only);
     // A call logged while it is on stays out.
     rig.log(vec![a_call(
@@ -5200,12 +5243,17 @@ fn conversation_only_leaves_tool_calls_out_of_the_rows_until_switched_off() {
         skywave_proto::ToolKind::Shell,
         "make",
     )]);
-    assert_eq!(kinds(&rig), [RowKind::AgentMessage]);
+    assert_eq!(kinds(&rig), [RowKind::Created, RowKind::AgentMessage]);
 
     rig.intent(GuiIntent::ToggleConversationOnly);
     assert_eq!(
         kinds(&rig),
-        [RowKind::AgentMessage, RowKind::Tool, RowKind::Tool]
+        [
+            RowKind::Created,
+            RowKind::AgentMessage,
+            RowKind::Tool,
+            RowKind::Tool
+        ]
     );
     assert!(!rig.open_session().conversation_only);
 }
@@ -8943,11 +8991,17 @@ fn a_session_hit_opens_without_a_search() {
     let found = the_search(rig.wait(SEARCH_AFTER));
     searched(&mut rig, vec![found]);
 
+    // The session's creation entry holds "foxes" in its workdir too, so it is
+    // a hit of its own beside the session.
     let (count, rows) = search_page(&rig);
-    assert_eq!(count.as_deref(), Some("1 match"));
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].kind_label, "Session");
-    let key = rows[0].key.clone();
+    assert_eq!(count.as_deref(), Some("2 matches"));
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let sessions: Vec<_> = rows
+        .iter()
+        .filter(|row| row.kind_label == "Session")
+        .collect();
+    assert_eq!(sessions.len(), 1, "{rows:?}");
+    let key = sessions[0].key.clone();
     rig.intent(GuiIntent::GlobalSearchOpen { key });
     rig.results();
     rig.view();

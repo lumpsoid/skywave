@@ -584,7 +584,12 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         h.banner_at(t0 + TimeDelta::seconds(6)),
         "offline · server unreachable · 3 queued · retrying… (attempt 3)"
     );
-    // Local data still renders under the banner.
+    // Local data still renders under the banner; the creates opened their
+    // sessions' pages, so back to the list for the rows.
+    h.core
+        .dispatch(Action::Navigate(Route::SessionList))
+        .unwrap();
+    h.sync();
     assert_contains(&line_with(&h.screen(), "/srv/a"), "[queued]");
 
     // Ctrl-R asks the engine to stop waiting.
@@ -1202,6 +1207,11 @@ fn create_session_goes_from_queued_to_the_real_row() {
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
     assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+    // The create opened its session's page; back to the list to read its row.
+    h.core
+        .dispatch(Action::Navigate(Route::SessionList))
+        .unwrap();
+    h.sync();
     assert!(!h.app.typing());
     let command = last_command(&h);
 
@@ -1255,6 +1265,11 @@ fn refused_creations_say_why() {
         h.seam.command_sending(command).unwrap();
         h.seam
             .command_result(command, &CommandResult::Rejected { reason })
+            .unwrap();
+        h.sync();
+        // The create opened its session's page; back to the list to read the row.
+        h.core
+            .dispatch(Action::Navigate(Route::SessionList))
             .unwrap();
         h.sync();
         let row = line_with(&h.screen(), workdir);
@@ -1529,6 +1544,12 @@ fn pasting_an_outside_conversation_asks_the_workdir_then_the_id() {
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
     assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+    // The create opened its session's page; back to the list, where the
+    // prompt was.
+    h.core
+        .dispatch(Action::Navigate(Route::SessionList))
+        .unwrap();
+    h.sync();
     assert!(!h.app.typing());
 }
 
@@ -1642,6 +1663,11 @@ fn c_lists_the_servers_conversations_and_enter_continues_one() {
     assert!(h.app.conversation_picker().is_none(), "the core closes it");
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
 
+    // The pick opened the new session's page; back to the list for its row.
+    h.core
+        .dispatch(Action::Navigate(Route::SessionList))
+        .unwrap();
+    h.sync();
     // The pending creation says it imports.
     let command = last_command(&h);
     assert_contains(
@@ -2035,7 +2061,8 @@ fn blob(size: u64) -> (BlobId, BlobRef) {
 #[test]
 fn every_timeline_entry_renders_distinctly() {
     let (mut h, id, me) = open_session();
-    assert_contains(&h.screen(), "Nothing here yet.");
+    // A fresh session starts with its creation, so it is never empty.
+    assert_contains(&h.screen(), "── Session created · /srv/work ──");
     let other = DeviceId::new();
     let (_, output) = blob(10_000);
     pull(
@@ -5237,10 +5264,12 @@ fn select_the_write(h: &mut Harness) {
     h.key(KeyCode::Char('['));
     h.key(KeyCode::Char('['));
     let screen = h.screen();
+    // Line 3 is the separator that starts the turn, under the session's
+    // creation row above the screen.
     assert!(
         screen
             .lines()
-            .nth(3)
+            .nth(4)
             .unwrap()
             .starts_with("│> 12:01 ▌ you: add a hello binary"),
         "the turn is at the top, its message selected:\n{screen}"
@@ -6277,6 +6306,11 @@ fn dismiss_refused_creation() {
         h.key(KeyCode::Char('n'));
         h.app.on_paste(workdir);
         h.key(KeyCode::Enter);
+        // The create opened its session's page; back to the list for the rows.
+        h.core
+            .dispatch(Action::Navigate(Route::SessionList))
+            .unwrap();
+        h.sync();
     }
     let outbox = h.seam.pending_outbox().unwrap();
     let (refused, waiting) = (outbox[0].command.id, outbox[1].command.id);

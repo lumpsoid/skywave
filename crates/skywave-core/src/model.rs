@@ -6690,6 +6690,10 @@ mod tests {
         // Queued: the time comes from the command's UUIDv7 id.
         let queued_at = match &f.session_view().timeline[..] {
             [
+                TimelineItem::Logged {
+                    entry: Entry::Created { .. },
+                    ..
+                },
                 TimelineItem::Pending {
                     delivery: Some(delivery),
                     ..
@@ -6717,7 +6721,10 @@ mod tests {
             answered_at: None,
             tries: 0,
         };
-        assert_eq!(f.session_view().timeline, pending(Outgoing::Queued, fresh));
+        assert_eq!(
+            f.session_view().timeline[1..],
+            pending(Outgoing::Queued, fresh)
+        );
         assert_eq!(f.model.view().queued, 1);
 
         let sent = queued_at + TimeDelta::milliseconds(3200);
@@ -6728,7 +6735,7 @@ mod tests {
             ..fresh
         };
         assert_eq!(
-            f.session_view().timeline,
+            f.session_view().timeline[1..],
             pending(Outgoing::Sending, sending)
         );
 
@@ -6740,7 +6747,7 @@ mod tests {
             ..sending
         };
         assert_eq!(
-            f.session_view().timeline,
+            f.session_view().timeline[1..],
             pending(Outgoing::Sending, resent)
         );
 
@@ -6755,7 +6762,7 @@ mod tests {
             ..resent
         };
         assert_eq!(
-            f.session_view().timeline,
+            f.session_view().timeline[1..],
             pending(Outgoing::Accepted(Seq(2)), done)
         );
         assert_eq!(f.model.view().queued, 0);
@@ -6797,6 +6804,9 @@ mod tests {
         assert_eq!(
             entries,
             vec![
+                &Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 &Entry::UserMessage {
                     command_id: command.id,
                     text: "hello".into(),
@@ -6853,7 +6863,7 @@ mod tests {
         );
         let timeline = f.session_view().timeline;
         assert!(matches!(
-            &timeline[0],
+            &timeline[1],
             TimelineItem::Logged {
                 entry: Entry::UserMessage {
                     command_id,
@@ -6866,7 +6876,7 @@ mod tests {
             } if *command_id == phone
         ));
         assert!(matches!(
-            &timeline[1],
+            &timeline[2],
             TimelineItem::Pending {
                 command_id,
                 text,
@@ -6928,7 +6938,7 @@ mod tests {
                 answers: Vec::new(),
             })
         );
-        let Some(Entry::Tool(tool)) = entries(&f).into_iter().next() else {
+        let Some(Entry::Tool(tool)) = entries(&f).into_iter().nth(1) else {
             panic!("no tool entry");
         };
         let approval = tool.approval.unwrap();
@@ -7015,7 +7025,7 @@ mod tests {
         let view = f.session_view();
         assert_eq!(view.pending_question, None);
         assert_eq!(view.state, SessionState::Idle);
-        let Some(Entry::Tool(tool)) = entries(&f).into_iter().next() else {
+        let Some(Entry::Tool(tool)) = entries(&f).into_iter().nth(1) else {
             panic!("no tool entry");
         };
         assert!(matches!(
@@ -7057,14 +7067,19 @@ mod tests {
         f.open(sid);
         assert_eq!(
             entries(&f),
-            [Entry::Approval {
-                id: question,
-                tool: QUESTION_TOOL.into(),
-                summary: "Which bread?".into(),
-                input: None,
-                status: ApprovalStatus::Pending,
-                answer: None,
-            }]
+            [
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
+                Entry::Approval {
+                    id: question,
+                    tool: QUESTION_TOOL.into(),
+                    summary: "Which bread?".into(),
+                    input: None,
+                    status: ApprovalStatus::Pending,
+                    answer: None,
+                }
+            ]
         );
     }
 
@@ -9330,6 +9345,9 @@ mod tests {
         assert_eq!(
             entries,
             vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::Approval {
                     id: approval,
                     tool: "edit".into(),
@@ -9441,14 +9459,19 @@ mod tests {
         );
         assert_eq!(
             entries(&f),
-            vec![Entry::Renamed {
-                name: Some("flakytests".into()),
-                by: DeviceRef {
-                    id: f.me,
-                    name: None,
-                    me: true,
+            vec![
+                Entry::Created {
+                    workdir: "/srv/app".into(),
                 },
-            }]
+                Entry::Renamed {
+                    name: Some("flakytests".into()),
+                    by: DeviceRef {
+                        id: f.me,
+                        name: None,
+                        me: true,
+                    },
+                }
+            ]
         );
 
         // A blank name restores the default title.
@@ -9615,14 +9638,19 @@ mod tests {
         assert!(f.session_view().archived);
         assert_eq!(
             entries(&f),
-            vec![Entry::Archived {
-                archived: true,
-                by: DeviceRef {
-                    id: f.me,
-                    name: None,
-                    me: true,
+            vec![
+                Entry::Created {
+                    workdir: "/srv/old".into(),
                 },
-            }]
+                Entry::Archived {
+                    archived: true,
+                    by: DeviceRef {
+                        id: f.me,
+                        name: None,
+                        me: true,
+                    },
+                }
+            ]
         );
         f.open(new);
         assert!(!f.session_view().archived);
@@ -9744,13 +9772,18 @@ mod tests {
         f.open(old);
         assert_eq!(
             entries(&f),
-            vec![Entry::WorktreeRemoved {
-                by: DeviceRef {
-                    id: f.me,
-                    name: None,
-                    me: true,
+            vec![
+                Entry::Created {
+                    workdir: "/srv/old".into(),
                 },
-            }]
+                Entry::WorktreeRemoved {
+                    by: DeviceRef {
+                        id: f.me,
+                        name: None,
+                        me: true,
+                    },
+                }
+            ]
         );
     }
 
@@ -9787,6 +9820,9 @@ mod tests {
         assert_eq!(
             entries(&f),
             vec![
+                Entry::Created {
+                    workdir: "/srv/app".into(),
+                },
                 Entry::FileWritten {
                     path: "docs/a.txt".into(),
                     size: 1,
@@ -11398,7 +11434,13 @@ mod tests {
         }
         let command = send(&mut f, sid, "look");
         let pending_images = |f: &Fixture| match &f.session_view().timeline[..] {
-            [TimelineItem::Pending { images, .. }] => images.clone(),
+            [
+                TimelineItem::Logged {
+                    entry: Entry::Created { .. },
+                    ..
+                },
+                TimelineItem::Pending { images, .. },
+            ] => images.clone(),
             other => panic!("expected one pending message, got {other:?}"),
         };
         assert_eq!(pending_images(&f), vec![a.clone(), b.clone()]);
@@ -13064,7 +13106,7 @@ mod tests {
                 shell: None,
             }],
         );
-        assert_eq!(entries(&f).len(), 1, "no entry for an unlinked approval");
+        assert_eq!(entries(&f).len(), 2, "no entry for an unlinked approval");
         assert_eq!(tools(&f)[0].safety_check.as_deref(), Some("read-only: cat"));
     }
 
@@ -13317,7 +13359,7 @@ mod tests {
         assert!(row(&f, sid).last_activity > before.last_activity);
         f.open(sid);
         assert_eq!(
-            entries(&f)[0],
+            entries(&f)[1],
             Entry::AgentVersionUnconfirmed {
                 version: "2.2.0".into(),
                 confirmed: "2.1.310".into(),
@@ -13421,9 +13463,17 @@ mod tests {
             shell: None,
             outcome: ToolOutcome::Running { since: minute(2) },
         };
-        assert_eq!(entries(&f), vec![Entry::Tool(Box::new(waiting.clone()))]);
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
+                Entry::Tool(Box::new(waiting.clone())),
+            ]
+        );
         assert!(matches!(
-            view.timeline[0],
+            view.timeline[1],
             TimelineItem::Logged { seq: Seq(3), .. }
         ));
 
@@ -13473,7 +13523,15 @@ mod tests {
             },
             ..waiting
         };
-        assert_eq!(entries(&f), vec![Entry::Tool(Box::new(done))]);
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
+                Entry::Tool(Box::new(done)),
+            ]
+        );
         assert_eq!(f.session_view().pending_approval, None);
     }
 
@@ -13573,7 +13631,7 @@ mod tests {
             outcomes(&f),
             vec![(a, done("contents", 3)), (b, done("3 matches", 1))]
         );
-        assert_eq!(entries(&f).len(), 2);
+        assert_eq!(entries(&f).len(), 3);
     }
 
     #[test]
@@ -13599,7 +13657,7 @@ mod tests {
         );
         f.open(sid);
         let entries = entries(&f);
-        let [Entry::Tool(view)] = entries.as_slice() else {
+        let [Entry::Created { .. }, Entry::Tool(view)] = entries.as_slice() else {
             panic!("expected one tool item, got {entries:?}");
         };
         assert_eq!(
@@ -13669,6 +13727,9 @@ mod tests {
         assert_eq!(
             entries(&f),
             vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::Tool(Box::new(view.clone())),
                 Entry::AgentErrored {
                     message: "turn lost".into()
@@ -13744,7 +13805,7 @@ mod tests {
         // The control: a running call it does not name stays running.
         assert!(matches!(views[2].outcome, ToolOutcome::Running { .. }));
         assert_eq!(views.len(), 3, "it adds no item");
-        assert_eq!(entries(&f).len(), 3);
+        assert_eq!(entries(&f).len(), 4);
     }
 
     #[test]
@@ -13774,6 +13835,9 @@ mod tests {
         assert_eq!(
             entries(&f),
             vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::ToolCall {
                     name: "agent-tool".into(),
                     summary: "{\"command\":\"ls\"}".into(),
@@ -16482,6 +16546,7 @@ mod tests {
         assert_eq!(
             texts(&f),
             [
+                "Created { workdir: \"/srv/a\" }",
                 "a1",
                 "started velvet walrus by laptop",
                 "b1",
@@ -16501,7 +16566,7 @@ mod tests {
                     TimelineItem::Change { .. } => panic!("unexpected switch on its way"),
                 })
                 .collect();
-        assert_eq!(stamps, [a, b, b, a, b, a, a]);
+        assert_eq!(stamps, [a, a, b, b, a, b, a, a]);
 
         let view = |f: &mut Fixture, context| {
             f.dispatch(Action::ViewContext {
@@ -16527,10 +16592,14 @@ mod tests {
             (1, 0, 0)
         );
         view(&mut f, Some(a));
-        assert_eq!(texts(&f), ["a1", "a2", "pending a3"], "not B's end");
+        assert_eq!(
+            texts(&f),
+            ["Created { workdir: \"/srv/a\" }", "a1", "a2", "pending a3"],
+            "not B's end"
+        );
         assert_eq!((find(&f, "b1"), find(&f, "a1")), (0, 1));
         view(&mut f, None);
-        assert_eq!(texts(&f).len(), 7);
+        assert_eq!(texts(&f).len(), 8);
         assert_eq!(find(&f, "walrus"), 1, "the whole session's dividers");
 
         // Kept only while the session stays open.
@@ -16747,6 +16816,9 @@ mod tests {
         assert_eq!(
             dividers,
             [
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::ContextStarted {
                     name: fresh_name.clone(),
                     by: me.clone()
@@ -16790,12 +16862,13 @@ mod tests {
         });
         let texts: Vec<Entry> = entries(&f);
         assert!(
-            texts
-                .iter()
-                .all(|e| matches!(e, Entry::UserMessage { .. } | Entry::AgentMessage { .. })),
+            texts.iter().all(|e| matches!(
+                e,
+                Entry::Created { .. } | Entry::UserMessage { .. } | Entry::AgentMessage { .. }
+            )),
             "{texts:?}"
         );
-        assert_eq!(texts.len(), 3, "fix it, done, later");
+        assert_eq!(texts.len(), 4, "created, fix it, done, later");
     }
 
     #[test]
@@ -17069,7 +17142,15 @@ mod tests {
         let n = nested(&mut f);
         let view = f.session_view();
         assert_eq!(view.subagent, None);
-        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+        assert_eq!(
+            shown_items(&f),
+            [
+                "Created { workdir: \"/srv/a\" }",
+                "main says",
+                "outer",
+                "pwd"
+            ]
+        );
 
         f.dispatch(view_subagent(n.sid, Some(n.a)));
         assert_eq!(shown_items(&f), ["inner", "outer says"]);
@@ -17090,7 +17171,15 @@ mod tests {
         // Back to the main view.
         f.dispatch(view_subagent(n.sid, None));
         assert_eq!(f.session_view().subagent, None);
-        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+        assert_eq!(
+            shown_items(&f),
+            [
+                "Created { workdir: \"/srv/a\" }",
+                "main says",
+                "outer",
+                "pwd"
+            ]
+        );
     }
 
     #[test]
@@ -17137,7 +17226,15 @@ mod tests {
         f.dispatch(Action::Navigate(Route::Settings));
         f.open(n.sid);
         assert_eq!(shown(&f), None);
-        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+        assert_eq!(
+            shown_items(&f),
+            [
+                "Created { workdir: \"/srv/a\" }",
+                "main says",
+                "outer",
+                "pwd"
+            ]
+        );
     }
 
     #[test]

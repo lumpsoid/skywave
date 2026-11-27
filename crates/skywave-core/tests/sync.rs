@@ -517,10 +517,11 @@ async fn withdrawn_message_never_reaches_the_server() {
     }
     let ids: Vec<CommandId> = client.outbox()[1..].iter().map(|e| e.command.id).collect();
     let view = client
-        .open_session(session, |s| s.timeline.len() == 3)
+        .open_session(session, |s| s.timeline.len() == 4)
         .await;
+    // Row 0 is the session's creation; the rest are the three messages.
     assert!(
-        view.timeline.iter().all(|item| matches!(
+        view.timeline[1..].iter().all(|item| matches!(
             item,
             TimelineItem::Pending {
                 discardable: true,
@@ -533,7 +534,7 @@ async fn withdrawn_message_never_reaches_the_server() {
     client.dispatch(Action::Discard(ids[1]));
     client.dispatch(Action::EditQueued(ids[2]));
     let view = client
-        .open_session(session, |s| s.timeline.len() == 1)
+        .open_session(session, |s| s.timeline.len() == 2)
         .await;
     assert_eq!(view.draft.map(|d| d.text).as_deref(), Some("edit"));
     assert_eq!(client.core.view().queued, 1);
@@ -1081,7 +1082,7 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
         [(name.as_str(), 1, true)]
     );
     assert!(matches!(
-        &view.timeline[0],
+        &view.timeline[1],
         TimelineItem::Logged {
             entry: Entry::ContextStarted { name: shown, by },
             context,
