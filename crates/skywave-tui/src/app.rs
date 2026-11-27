@@ -2673,24 +2673,6 @@ impl App {
                 };
                 return None;
             }
-            // A refused create: `R` asks for it again, Del takes it back
-            // with its messages. Ahead of the focus's keys, so either pane
-            // has them, and the rename `R` below does not get them. Del
-            // keeps the timeline's own when an item there is discardable.
-            KeyCode::Char('R') if refused_create(view).is_some() => {
-                let pending = refused_create(view)?.clone();
-                let mut prompt = Prompt::new(PromptKind::Create, pending.workdir.clone());
-                let action = prompt.picker.start(&pending.workdir);
-                prompt.recreate = Some(pending);
-                self.ui.prompt = Some(prompt);
-                return Some(action);
-            }
-            KeyCode::Delete
-                if refused_create(view).is_some()
-                    && discardable(view, session.shown.selected).is_none() =>
-            {
-                return refused_create(view).map(|pending| Action::Discard(pending.command_id));
-            }
             _ => {}
         }
         match session.focus {
@@ -2902,6 +2884,11 @@ impl App {
                 KeyCode::Delete if discardable(view, session.shown.selected).is_some() => {
                     discardable(view, session.shown.selected).map(|(id, _)| Action::Discard(id))
                 }
+                // A refused create: Del takes it back with its messages.
+                // Behind the discardable item above, which keeps the key.
+                KeyCode::Delete if refused_create(view).is_some() => {
+                    refused_create(view).map(|pending| Action::Discard(pending.command_id))
+                }
                 // The selected call's output: delete, crop, or take back
                 // either. Shifted, as neither can be undone.
                 KeyCode::Char('D' | 'K') | KeyCode::Delete => {
@@ -2962,6 +2949,16 @@ impl App {
                 KeyCode::Char('C') => {
                     session.picker = Some(Picker::contexts(view));
                     None
+                }
+                // A refused create: `R` asks for it again. Ahead of the
+                // rename below, which it takes the key from.
+                KeyCode::Char('R') if refused_create(view).is_some() => {
+                    let pending = refused_create(view)?.clone();
+                    let mut prompt = Prompt::new(PromptKind::Create, pending.workdir.clone());
+                    let action = prompt.picker.start(&pending.workdir);
+                    prompt.recreate = Some(pending);
+                    self.ui.prompt = Some(prompt);
+                    Some(action)
                 }
                 KeyCode::Char('R') => {
                     let name = if view.named {

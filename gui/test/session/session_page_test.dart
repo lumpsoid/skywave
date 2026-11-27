@@ -274,6 +274,8 @@ void main() {
       timeline: timeline,
       sent: sent,
     );
+    // Laying out sends the following state; only the taps' intents count.
+    sent.clear();
     await tester.tap(find.byKey(const Key('recreate')));
     await tester.tap(find.byKey(const Key('dismiss-create')));
     expect(sent, [

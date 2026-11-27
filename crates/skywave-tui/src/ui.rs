@@ -841,13 +841,17 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
             .into();
     }
     let keys = footer_keys(app);
-    // A refused create: `R` and Del are the session's keys in either pane,
-    // unless a picker or a prompt has the keys.
+    // A refused create: `R` and Del are the timeline's keys, where a picker,
+    // a prompt, the run list or a rule pick does not have them.
     let refused = !app.ui().help
         && app.ui().prompt.is_none()
-        && app
-            .session()
-            .is_some_and(|(view, ui)| ui.picker.is_none() && refused_create(view).is_some());
+        && app.session().is_some_and(|(view, ui)| {
+            ui.picker.is_none()
+                && ui.focus == Focus::Timeline
+                && !ui.shell()
+                && ui.rule_pick(view).is_none()
+                && refused_create(view).is_some()
+        });
     let keys: Cow<'static, str> = if refused {
         format!("R recreate · Del dismiss · {keys}").into()
     } else {
@@ -872,7 +876,7 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
             .replacen("d download", &format!("d download ({})", bytes(size)), 1)
             .into();
     }
-    keys.into()
+    keys
 }
 
 fn footer_keys(app: &App) -> &'static str {

@@ -1313,6 +1313,12 @@ fn a_refused_create_offers_recreate_and_dismiss() {
         .unwrap();
     h.sync();
     assert_contains(&line_with(&h.screen(), "[failed]"), "/srv/new");
+
+    // The session opens on the composer, where a capital R is text.
+    h.type_text("R");
+    assert_eq!(h.app.composer().unwrap().text(), "R");
+    h.key_with(ctrl('u'));
+    h.key(KeyCode::Esc);
     assert_contains(&h.screen(), "R recreate · Del dismiss");
 
     // `R` opens the new-session prompt with the workdir; Enter asks again.
