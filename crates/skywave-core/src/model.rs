@@ -104,6 +104,9 @@ pub(crate) enum Effect {
         /// written with the rest; `None` leaves them as they are.
         files: Option<(SessionId, Vec<AttachedFile>)>,
     },
+    /// Take these commands out of the outbox, all or none, as one write: a
+    /// failed switch and the earlier failed ones of its kind.
+    WithdrawAll(Vec<CommandId>),
     /// Requeue a message refused for a file already in the workdir, replacing
     /// those files: each `(position, hash)` is the `replace` of that file
     /// ([`Store::requeue_replacing`](crate::Store::requeue_replacing)).
@@ -2178,54 +2181,45 @@ impl Model {
                 &[][..],
             ),
             _ if edit => return Vec::new(),
+            // The timeline shows only the newest command of a kind, so an
+            // earlier failed one would take the dismissed switch's place:
+            // they all go, in one write.
+            kind @ (CommandKind::ClearContext { .. }
+            | CommandKind::SwitchContext { .. }
+            | CommandKind::SetPermissionMode { .. }
+            | CommandKind::SetModel { .. }
+            | CommandKind::SetEffort { .. }) => {
+                let session = command_session(kind);
+                let mut ids: Vec<CommandId> = self.outbox[..index]
+                    .iter()
+                    .filter(|e| {
+                        std::mem::discriminant(&e.command.kind) == std::mem::discriminant(kind)
+                            && command_session(&e.command.kind) == session
+                            && e.discardable()
+                    })
+                    .map(|e| e.command.id)
+                    .collect();
+                ids.push(id);
+                self.outbox.retain(|e| !ids.contains(&e.command.id));
+                return vec![
+                    Effect::WithdrawAll(ids),
+                    Effect::Request(Request::OutboxChanged),
+                ];
+            }
             _ => {
                 let created = match &self.outbox[index].command.kind {
                     CommandKind::CreateSession { session_id, .. } => Some(*session_id),
                     _ => None,
                 };
-                let kind = &self.outbox[index].command.kind;
-                let mut ids = Vec::new();
-                if matches!(
-                    kind,
-                    CommandKind::ClearContext { .. }
-                        | CommandKind::SwitchContext { .. }
-                        | CommandKind::SetPermissionMode { .. }
-                        | CommandKind::SetModel { .. }
-                        | CommandKind::SetEffort { .. }
-                ) {
-                    // The timeline shows only the newest command of a kind, so
-                    // an earlier failed one would take the dismissed row's place.
-                    let session = command_session(kind);
-                    ids.extend(
-                        self.outbox[..index]
-                            .iter()
-                            .filter(|e| {
-                                std::mem::discriminant(&e.command.kind)
-                                    == std::mem::discriminant(kind)
-                                    && command_session(&e.command.kind) == session
-                                    && e.discardable()
-                            })
-                            .map(|e| e.command.id),
-                    );
-                }
-                // The dismissed one goes last: a partial failure then leaves
-                // the newest row, not an older one.
-                ids.push(id);
-                self.outbox.retain(|e| !ids.contains(&e.command.id));
-                let mut effects: Vec<Effect> = ids
-                    .into_iter()
-                    .map(|withdrawn| {
-                        // A create's withdrawal also empties its session's
-                        // draft images and files in the same write.
-                        let emptied = created.filter(|_| withdrawn == id);
-                        Effect::Withdraw {
-                            id: withdrawn,
-                            draft: None,
-                            images: emptied.map(|session| (session, Vec::new())),
-                            files: emptied.map(|session| (session, Vec::new())),
-                        }
-                    })
-                    .collect();
+                self.outbox.remove(index);
+                // A create's withdrawal also empties its session's draft
+                // images and files in the same write.
+                let mut effects = vec![Effect::Withdraw {
+                    id,
+                    draft: None,
+                    images: created.map(|session| (session, Vec::new())),
+                    files: created.map(|session| (session, Vec::new())),
+                }];
                 // The session a refused create named never exists, so the
                 // messages queued for it go too, and its page with them.
                 if let Some(session_id) = created {
@@ -8505,11 +8499,12 @@ mod tests {
                 ..
             }
         )));
-        let effects = f.dispatch(Action::Discard(command.id));
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Withdraw { id, .. } if *id == command.id))
+        assert_eq!(
+            f.dispatch(Action::Discard(command.id)),
+            [
+                Effect::WithdrawAll(vec![command.id]),
+                Effect::Request(Request::OutboxChanged),
+            ]
         );
         assert!(changes(&f).is_empty());
     }
@@ -8548,14 +8543,14 @@ mod tests {
         let rows = changes(&f);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, second.id);
-        let effects = f.dispatch(Action::Discard(second.id));
-        for gone in [first.id, second.id] {
-            assert!(
-                effects
-                    .iter()
-                    .any(|effect| matches!(effect, Effect::Withdraw { id, .. } if *id == gone))
-            );
-        }
+        // Both in one write, so neither can outlive the other.
+        assert_eq!(
+            f.dispatch(Action::Discard(second.id)),
+            [
+                Effect::WithdrawAll(vec![first.id, second.id]),
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
         assert!(changes(&f).is_empty());
         assert_eq!(f.session_view().clear, None);
     }
@@ -8598,12 +8593,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                Effect::Withdraw {
-                    id: clear.id,
-                    draft: None,
-                    images: None,
-                    files: None,
-                },
+                Effect::WithdrawAll(vec![clear.id]),
                 Effect::Request(Request::OutboxChanged),
             ]
         );

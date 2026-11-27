@@ -1188,8 +1188,9 @@ no longer decodes rather than failing.
   in the log like any other, and an answer that still comes settles
   nothing. A context clear or switch, or a mode, model or effort switch,
   can be dismissed once refused or undeliverable, not on its way;
-  dismissing one takes the earlier failed ones of its kind with it, since
-  the timeline shows only the newest. Reconnects back off
+  dismissing one takes the earlier failed ones of its kind with it, in
+  one store transaction (`Store::withdraw_all`), since the timeline shows
+  only the newest. Reconnects back off
   exponentially with jitter to 30 s. The attempt count starts over after a
   connection that made progress (a pull returned or the server settled a
   command); `hello` alone is not progress, so a server that answers it and
