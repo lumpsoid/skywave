@@ -349,6 +349,7 @@ fn rename_label(rename: Option<&Outgoing>) -> Option<String> {
 
 fn creating_view(pending: &PendingSession) -> CreatingView {
     CreatingView {
+        session_id: pending.session_id.0.to_string(),
         command_id: pending.command_id.0.to_string(),
         workdir: clean_line(&pending.workdir),
         outgoing: outgoing_view(&pending.outgoing),

@@ -1993,8 +1993,10 @@ names the new session itself, and its page opens before anything is sent.
   takes `SendMessage`, `SaveDraft`, `Attach` and `AttachFile`, and nothing
   else. A message sent meanwhile queues behind the create. The outbox is
   FIFO and the server serial, so the message lands after the session.
-- A refused create keeps its page. Dismissing it withdraws its queued
-  messages too and leaves the page. `Action::RecreateSession` asks again
+- A refused create keeps its page. Dismissing it, refused or still queued,
+  withdraws its queued messages too, drops the session's drafts, and leaves
+  the page. Back leaves a creating page as it does any other.
+  `Action::RecreateSession` asks again
   under the same id and re-queues its refused or queued messages behind the
   create, in their order.
 - A fresh session's timeline starts with `Entry::Created` ("Session created
@@ -2002,9 +2004,11 @@ names the new session itself, and its page opens before anything is sent.
 - The GUI draws a creating session with `AgentState::Creating` (the
   `pending.svg` icon) in its header and on its list row, not a spinner. A
   refused create has a row at the top of its page with Recreate and
-  Dismiss; Recreate opens the create dialog on the page, prefilled. The TUI
-  shows a creating line at the top of the page: `R` recreates, `Del`
-  dismisses.
+  Dismiss; Recreate opens the create dialog on the page, prefilled. A queued
+  create has Dismiss alone, and a creating row in the list reopens its page.
+  The TUI shows a creating line at the top of the page, and its keys work in
+  the timeline: `R` recreates a refused create, `Del` dismisses one that is
+  queued or refused.
 
 **Why:** a create that waits for the server's answer blocks the person on
 the network, and offline it cannot start at all. Writing at once keeps the

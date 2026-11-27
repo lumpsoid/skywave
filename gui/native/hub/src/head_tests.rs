@@ -5002,6 +5002,58 @@ fn recreate_opens_the_prompt_filled_and_sends_recreate_session() {
 }
 
 #[test]
+fn a_recreate_prompt_does_not_follow_to_the_list() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "abc-123".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    rig.results();
+    rig.view();
+    // The server refuses the create: the command never reached it.
+    let command = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { .. } => Some(entry.command.id),
+            _ => None,
+        })
+        .expect("the create is queued");
+    rig.seam.command_undeliverable(command).unwrap();
+    rig.view();
+
+    rig.intent(GuiIntent::RecreateOpen);
+    rig.results();
+    rig.view();
+    assert!(
+        matches!(sent_screen(&rig), ScreenView::Session { session } if session.create.is_some()),
+        "the recreate prompt opens on the refused session's page"
+    );
+
+    // Back to the list: the recreate prompt stays on its page only.
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::SessionList { create, .. } = rig.list() else {
+        unreachable!()
+    };
+    assert_eq!(
+        create, None,
+        "the recreate prompt does not follow to the list"
+    );
+}
+
+#[test]
 fn opening_the_prompt_lists_at_once() {
     let mut rig = Rig::new();
     open_create_prompt(&mut rig);

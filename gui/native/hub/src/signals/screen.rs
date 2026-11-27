@@ -606,6 +606,8 @@ pub struct SessionRowView {
 /// A session this device asked for, not in the replica yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct CreatingView {
+    /// The session it creates: a tap opens its page.
+    pub session_id: String,
     pub command_id: String,
     pub workdir: String,
     pub outgoing: OutgoingView,

@@ -284,6 +284,34 @@ void main() {
     ]);
   });
 
+  testWidgets('a queued creation offers Dismiss but not Recreate', (
+    tester,
+  ) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        'create:c8',
+        RowKind.creating,
+        'creating · /srv/typo',
+        outgoing: const OutgoingView(
+          state: OutgoingState.queued,
+          label: 'queued',
+        ),
+        discardable: true,
+        commandId: 'c8',
+      ),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+    expect(find.byKey(const Key('dismiss-create')), findsOneWidget);
+    expect(find.byKey(const Key('recreate')), findsNothing);
+  });
+
   testWidgets('collapsed calls step back from the messages', (tester) async {
     tall(tester);
     final timeline = holding([

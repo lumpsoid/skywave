@@ -224,11 +224,13 @@ impl Prompt {
     }
 
     /// Whether the prompt still belongs on `screen`: a new-session prompt
-    /// on the session list, a rename there or on its session, the recreate
-    /// of a refused session on its page, an address on settings.
+    /// on the session list (not a recreate), a rename there or on its
+    /// session, the recreate of a refused session on its page, an address
+    /// on settings.
     fn fits(&self, screen: &Screen) -> bool {
         match (self.kind, screen) {
             (PromptKind::ServerAddress, screen) => matches!(screen, Screen::Settings(_)),
+            (PromptKind::Create, Screen::SessionList(_)) if self.recreate.is_some() => false,
             (_, Screen::SessionList(_)) => true,
             (PromptKind::Rename(id), Screen::Session(view)) => view.id == id,
             (PromptKind::Create, Screen::Session(view)) => self
@@ -240,12 +242,17 @@ impl Prompt {
     }
 }
 
-/// The session's create, when the server refused it: `R` asks for it again
-/// and Del takes it back.
+/// The session's create, when the server refused it: `R` asks for it again.
 pub(crate) fn refused_create(view: &SessionView) -> Option<&PendingSession> {
     view.creating
         .as_ref()
         .filter(|pending| matches!(pending.outgoing, Outgoing::Failed(_)))
+}
+
+/// The session's create, while Del can take it back: the server never saw
+/// it, or refused it.
+pub(crate) fn discardable_create(view: &SessionView) -> Option<&PendingSession> {
+    view.creating.as_ref().filter(|pending| pending.discardable)
 }
 
 /// Where keys go on the session view.
@@ -2884,10 +2891,11 @@ impl App {
                 KeyCode::Delete if discardable(view, session.shown.selected).is_some() => {
                     discardable(view, session.shown.selected).map(|(id, _)| Action::Discard(id))
                 }
-                // A refused create: Del takes it back with its messages.
-                // Behind the discardable item above, which keeps the key.
-                KeyCode::Delete if refused_create(view).is_some() => {
-                    refused_create(view).map(|pending| Action::Discard(pending.command_id))
+                // A create the server never saw or refused: Del takes it back
+                // with its messages. Behind the discardable item above, which
+                // keeps the key.
+                KeyCode::Delete if discardable_create(view).is_some() => {
+                    discardable_create(view).map(|pending| Action::Discard(pending.command_id))
                 }
                 // The selected call's output: delete, crop, or take back
                 // either. Shifted, as neither can be undone.

@@ -582,7 +582,8 @@ impl Head {
         // A prompt goes with its screen; a recreate prompt stays on its
         // refused session's page.
         let keeps_prompt = match (&view.screen, &self.create) {
-            (Screen::SessionList(_), _) => true,
+            (Screen::SessionList(_), Some(create)) => create.recreate.is_none(),
+            (Screen::SessionList(_), None) => true,
             (Screen::Session(session), Some(create)) => Some(session.id) == create.recreate,
             _ => false,
         };

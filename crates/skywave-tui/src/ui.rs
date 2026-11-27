@@ -48,7 +48,8 @@ use skywave_present::sections::{discardable, editable, wanted_blob};
 use skywave_present::text::clean;
 
 use crate::app::{
-    App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable, refused_create,
+    App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, discardable_create, dismissable,
+    refused_create,
 };
 use crate::notify;
 
@@ -841,19 +842,27 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
             .into();
     }
     let keys = footer_keys(app);
-    // A refused create: `R` and Del are the timeline's keys, where a picker,
-    // a prompt, the run list or a rule pick does not have them.
-    let refused = !app.ui().help
+    // A create the server has not made: `R` and Del are the timeline's keys,
+    // where a picker, a prompt, the run list or a rule pick does not have them.
+    let timeline = !app.ui().help
         && app.ui().prompt.is_none()
         && app.session().is_some_and(|(view, ui)| {
             ui.picker.is_none()
                 && ui.focus == Focus::Timeline
                 && !ui.shell()
                 && ui.rule_pick(view).is_none()
-                && refused_create(view).is_some()
         });
+    let (refused, discardable) = match app.session() {
+        Some((view, _)) if timeline => (
+            refused_create(view).is_some(),
+            discardable_create(view).is_some(),
+        ),
+        _ => (false, false),
+    };
     let keys: Cow<'static, str> = if refused {
         format!("R recreate · Del dismiss · {keys}").into()
+    } else if discardable {
+        format!("Del dismiss · {keys}").into()
     } else {
         keys.into()
     };

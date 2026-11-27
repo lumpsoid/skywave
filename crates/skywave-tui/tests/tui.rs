@@ -29,7 +29,7 @@ use skywave_proto::{
     limits,
 };
 use skywave_tui::App;
-use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
+use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, PromptKind, READ_MARK_EVERY};
 use skywave_tui::clipboard::{self, Clip};
 use skywave_tui::ui;
 
@@ -1375,6 +1375,35 @@ fn a_refused_create_offers_recreate_and_dismiss() {
         .expect("the create is refused")
         .command_id;
     assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(create)));
+}
+
+#[test]
+fn a_queued_create_is_dismissed_from_the_timeline() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('n'));
+    h.type_workdir("/srv/typo");
+    assert!(matches!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession { .. })
+    ));
+    // Queued offline: the server has not seen it, so it can still go.
+    let create = session_view(&h)
+        .creating
+        .expect("the create is queued")
+        .command_id;
+    h.key_with(ctrl('u'));
+    h.key(KeyCode::Esc);
+    assert_contains(&h.screen(), "Del dismiss");
+    assert!(!h.screen().contains("R recreate"), "not refused");
+
+    // Del takes the queued create back.
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(create)));
+    // `R` offers no recreate for a create the server never refused.
+    h.key(KeyCode::Char('R'));
+    assert!(!matches!(
+        h.app.ui().prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::Create)
+    ));
 }
 
 #[test]

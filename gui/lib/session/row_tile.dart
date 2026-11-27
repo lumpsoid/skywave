@@ -1022,8 +1022,8 @@ class _ToolCard extends StatelessWidget {
 
 /// A session this device is creating: how its request stands, pending with
 /// the pending icon, refused with the error icon. A refused one that the hub
-/// still holds offers Recreate (its prompt reopens with the refused fields)
-/// and Dismiss.
+/// still holds offers Recreate (its prompt reopens with the refused fields);
+/// one the hub still holds, queued or refused, offers Dismiss.
 class _Creating extends StatelessWidget {
   const _Creating({
     required this.row,
@@ -1060,12 +1060,13 @@ class _Creating extends StatelessWidget {
             ),
           ),
         ),
-        if (failed && row.discardable && row.commandId != null) ...[
-          _LinkButton(
-            key: const Key('recreate'),
-            label: 'Recreate',
-            onPressed: () => send(const GuiIntentRecreateOpen()),
-          ),
+        if (row.discardable && row.commandId != null) ...[
+          if (failed)
+            _LinkButton(
+              key: const Key('recreate'),
+              label: 'Recreate',
+              onPressed: () => send(const GuiIntentRecreateOpen()),
+            ),
           _LinkButton(
             key: const Key('dismiss-create'),
             label: 'Dismiss',

@@ -470,6 +470,7 @@ void main() {
       list(
         creating: const [
           CreatingView(
+            sessionId: 's1',
             commandId: 'c1',
             workdir: '/srv/one',
             outgoing: OutgoingView(
@@ -480,6 +481,7 @@ void main() {
             discardable: true,
           ),
           CreatingView(
+            sessionId: 's2',
             commandId: 'c2',
             workdir: '/srv/two',
             outgoing: OutgoingView(
@@ -503,6 +505,31 @@ void main() {
     await tester.tap(find.text('Dismiss'));
     expect(sent, [
       const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c2')),
+    ]);
+  });
+
+  testWidgets('tapping a creating row opens its page', (tester) async {
+    await pump(
+      tester,
+      list(
+        creating: const [
+          CreatingView(
+            sessionId: 's7',
+            commandId: 'c7',
+            workdir: '/srv/seven',
+            outgoing: OutgoingView(
+              state: OutgoingState.queued,
+              label: 'queued',
+            ),
+            note: 'waits for the server',
+            discardable: true,
+          ),
+        ],
+      ),
+    );
+    await tester.tap(find.text('/srv/seven'));
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentOpenSession(sessionId: 's7')),
     ]);
   });
 

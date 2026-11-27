@@ -337,6 +337,8 @@ class _CreatingRow extends StatelessWidget {
               child: const Text('Dismiss'),
             )
           : null,
+      onTap: () =>
+          send.act(ActionIntentOpenSession(sessionId: creating.sessionId)),
     );
   }
 }
