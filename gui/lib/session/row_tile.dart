@@ -261,6 +261,13 @@ class RowTile extends StatelessWidget {
         hit: hit,
         mark: mark,
       ),
+      RowKind.creating => _Notice(
+        row: row,
+        icon: Icons.hourglass_top,
+        color: colors.muted,
+        hit: hit,
+        mark: mark,
+      ),
       RowKind.agentSetting => _Notice(
         row: row,
         send: send,

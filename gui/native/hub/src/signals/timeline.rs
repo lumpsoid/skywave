@@ -151,6 +151,8 @@ pub enum RowKind {
     Renamed,
     /// A fresh session's first row: where it was created.
     Created,
+    /// A creating session's first row: how its create stands.
+    Creating,
     Archived,
     /// A context was cleared or an earlier one made current again: what
     /// follows went to that context.

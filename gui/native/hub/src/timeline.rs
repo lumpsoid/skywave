@@ -13,8 +13,8 @@ use skywave_core::store::OutboxFile;
 use skywave_core::{
     Answer, ApprovalStatus, AttachmentRefusal, BlobId, BlobState, BlobView, BodyFormat, CallId,
     Decision, DeviceRef, Entry, FailReason, FullView, ImportedEntry, MessageImage, Outgoing,
-    PendingChange, QUESTION_TOOL, RuleSuggestion, SafetyJudgment, Seq, SessionId, SessionView,
-    TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
+    PendingChange, PendingSession, QUESTION_TOOL, RuleSuggestion, SafetyJudgment, Seq, SessionId,
+    SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
@@ -162,6 +162,10 @@ pub fn rows(
     let rule = rule_index(view);
     let mut minute: Option<String> = None;
     let mut out = Rows::default();
+    if let Some(pending) = &view.creating {
+        out.rows.push(creating_row(pending));
+        out.was.push(None);
+    }
     for (index, item) in view.timeline.iter().enumerate() {
         let time_label = match item {
             // Imported history shows when the agent recorded it.
@@ -194,6 +198,43 @@ pub fn rows(
         out.rows.push(row);
     }
     out
+}
+
+/// A creating session's first row: how its create stands. Its key is
+/// fixed: the session has no logged items yet, so no other key can clash.
+fn creating_row(pending: &PendingSession) -> TimelineRow {
+    let workdir = clean_line(&pending.workdir);
+    let text = match pending.outgoing {
+        Outgoing::Queued | Outgoing::Sending => format!("Creating session · {workdir}"),
+        Outgoing::Accepted(_) => format!("Created, syncing… · {workdir}"),
+        Outgoing::Failed(reason) => format!("Session not created · {}", fail_reason(reason)),
+    };
+    TimelineRow {
+        key: "creating".to_owned(),
+        kind: RowKind::Creating,
+        author: None,
+        own: false,
+        text,
+        markdown: Vec::new(),
+        mark: None,
+        time_label: None,
+        at_ms: None,
+        turn_start: false,
+        unread_rule: false,
+        selectable: false,
+        expandable: false,
+        expanded: false,
+        outgoing: Some(outgoing_view(&pending.outgoing)),
+        delivery_label: None,
+        discardable: pending.discardable,
+        command_id: Some(pending.command_id.0.to_string()),
+        tool: None,
+        sections: Vec::new(),
+        blob_target: None,
+        images: Vec::new(),
+        files: Vec::new(),
+        can_resend_replacing: false,
+    }
 }
 
 /// The timeline index the "new" rule goes above: the first logged item at

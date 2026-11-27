@@ -48,6 +48,7 @@ IconData toolIcon(ToolKindView kind) => switch (kind) {
 /// station with no sky.
 String agentIconAsset(AgentState state) => switch (state) {
   AgentState.idle => 'assets/status/idle.svg',
+  AgentState.creating => 'assets/status/idle.svg',
   AgentState.working => 'assets/status/working.svg',
   AgentState.awaitingApproval => 'assets/status/approval.svg',
   AgentState.errored => 'assets/status/error.svg',
@@ -134,6 +135,7 @@ class SkyColors {
   /// The agent's state: its label, badge and icon.
   Color agent(AgentState state) => switch (state) {
     AgentState.idle => muted,
+    AgentState.creating => warning,
     AgentState.working => working,
     AgentState.awaitingApproval => warning,
     AgentState.errored => scheme.error,

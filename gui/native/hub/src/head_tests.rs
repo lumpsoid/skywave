@@ -14,8 +14,9 @@ use skywave_proto::{
 use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
-    ActionIntent, ComposerFile, CreatePrompt, ListKindView, LoginFlowState, NotificationsView,
-    PastedCode, RouteView, RowKind, ScreenView, ShellPromptView, ToolState, WorktreeSessionView,
+    ActionIntent, AgentState, ComposerFile, CreatePrompt, ListKindView, LoginFlowState,
+    NotificationsView, PastedCode, RouteView, RowKind, ScreenView, ShellPromptView, ToolState,
+    WorktreeSessionView,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -4878,6 +4879,86 @@ fn accepting_a_candidate_leaves_the_conversation_alone() {
     rig.intent(GuiIntent::CompletionAccept);
     assert_eq!(queued_creations(&rig).len(), 1);
     assert_eq!(queued_creations(&rig)[0].1.as_deref(), Some("abc-123"));
+}
+
+#[test]
+fn a_creating_session_opens_at_once_with_its_creating_row() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    rig.results();
+    rig.view();
+    let ScreenView::Session { session } = sent_screen(&rig) else {
+        panic!("the new session's page opens at once");
+    };
+    assert_eq!(session.state, AgentState::Creating);
+    assert_eq!(rig.rows()[0].kind, RowKind::Creating);
+    assert!(rig.rows()[0].text.starts_with("Creating session · "));
+}
+
+#[test]
+fn recreate_opens_the_prompt_filled_and_sends_recreate_session() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "abc-123".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    rig.results();
+    rig.view();
+    // The server refuses the create: the command never reached it.
+    let (command, created) = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { session_id, .. } => Some((entry.command.id, session_id)),
+            _ => None,
+        })
+        .expect("the create is queued");
+    rig.seam.command_undeliverable(command).unwrap();
+    rig.view();
+
+    rig.intent(GuiIntent::RecreateOpen);
+    rig.results();
+    rig.view();
+    let ScreenView::Session { session } = sent_screen(&rig) else {
+        panic!("the refused session's page stays open");
+    };
+    let prompt = session
+        .create
+        .expect("the refused create's prompt opens on its page");
+    assert_eq!(prompt.input, "/srv/app");
+    assert_eq!(prompt.conversation, "abc-123");
+
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::RecreateSession {
+            session_id: created,
+            workdir: "/srv/app".into(),
+            conversation: Some("abc-123".into()),
+            worktree: Some(String::new()),
+        })
+    );
+    let queued: Vec<SessionId> = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { session_id, .. } => Some(session_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queued, [created]);
 }
 
 #[test]
