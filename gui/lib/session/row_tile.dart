@@ -241,7 +241,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.agentSetting => _Notice(
         row: row,
-        icon: Icons.tune,
+        icon: row.outgoing != null ? Icons.hourglass_top : Icons.tune,
         color: colors.muted,
         hit: hit,
         mark: mark,
@@ -269,7 +269,7 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.contextDivider => _Notice(
         row: row,
-        icon: Icons.alt_route,
+        icon: row.outgoing != null ? Icons.hourglass_top : Icons.alt_route,
         color: colors.muted,
         hit: hit,
         mark: mark,
@@ -394,6 +394,9 @@ double _opacity(TimelineRow row) => switch (row.kind) {
   RowKind.tool || RowKind.toolCall || RowKind.toolResult
       when !row.expanded && row.tool?.state != ToolState.needsApproval =>
     0.7,
+  // A switch on its way is not done yet: it steps back until the log has it.
+  RowKind.contextDivider ||
+  RowKind.agentSetting when row.outgoing != null => 0.6,
   _ => 1,
 };
 
@@ -1026,6 +1029,14 @@ class _Notice extends StatelessWidget {
             ),
           ),
         ),
+        // A context or setting switch on its way shows its delivery state.
+        if (row.outgoing case final outgoing?) ...[
+          const SizedBox(width: 6),
+          StateBadge(
+            label: outgoing.label,
+            color: SkyColors.of(context).outgoing(outgoing.state),
+          ),
+        ],
       ],
     );
   }
