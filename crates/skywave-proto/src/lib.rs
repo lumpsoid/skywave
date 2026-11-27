@@ -235,7 +235,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v44: `mode` and `safety_check` on `CommandKind::CreateSession`: a new
 /// session's starting permission mode and safety check (D67).
-pub const PROTOCOL_VERSION: u32 = 44;
+///
+/// v45: `CreateSession.session_id`, `RejectReason::SessionExists`.
+pub const PROTOCOL_VERSION: u32 = 45;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2363,6 +2365,10 @@ pub enum CommandKind {
     /// Start a session in `workdir`, which must lie under one of the
     /// server's configured roots (D14).
     CreateSession {
+        /// The new session's id, chosen by the device so it can address the
+        /// session (open it, queue messages to it) before the server answers.
+        /// The server refuses an id that is already a session (`SessionExists`).
+        session_id: SessionId,
         workdir: String,
         /// The agent's own id for a conversation it had outside Skywave, in
         /// `workdir`; the session's first context continues a copy of it.
@@ -2784,6 +2790,8 @@ pub enum RejectReason {
     /// `ClearContext.context` is already a context, of this session or
     /// another.
     ContextExists,
+    /// `CreateSession.session_id` is already a session's id, deleted ones included.
+    SessionExists,
     /// `SwitchContext.context` or `MoveContext.context` is not a context of
     /// the session.
     UnknownContext,

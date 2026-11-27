@@ -360,6 +360,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::BadAnswer => "that answer does not fit the question",
         RejectReason::UnknownModel => "no model named",
         RejectReason::ContextExists => "that context already exists",
+        RejectReason::SessionExists => "a session with this id already exists",
         RejectReason::UnknownContext => "the session has no such context",
         RejectReason::ContextChanged => "the session moved to another context first",
         RejectReason::ContextMoved => "that context was moved to a session of its own",
