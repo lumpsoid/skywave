@@ -793,6 +793,30 @@ fn a_create_naming_a_taken_session_id_is_refused() {
 }
 
 #[test]
+fn a_create_naming_another_sessions_context_is_refused() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let second = ContextId::new();
+    accepted(f.clear(session, second, "next"));
+    let head = f.log.head();
+    let result = f.handle(CommandKind::CreateSession {
+        session_id: SessionId(second.0),
+        workdir: workdir(&f.root.join("project")),
+        conversation: None,
+        worktree: None,
+        mode: None,
+        safety_check: false,
+    });
+    assert!(matches!(
+        result,
+        CommandResult::Rejected {
+            reason: RejectReason::SessionExists
+        }
+    ));
+    assert_eq!(f.log.head(), head, "a refused create logs nothing");
+}
+
+#[test]
 fn a_created_session_logs_its_starting_safety_check_and_mode() {
     let mut f = Fixture::new();
     let device = DeviceId::new();

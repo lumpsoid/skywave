@@ -2381,8 +2381,8 @@ mod tests {
     }
 
     /// A v43 database, at schema v27 (what v43 wrote), opens as v44: v44
-    /// added `session_id` to `CreateSession` and `SessionExists`, which
-    /// commands never store, so the event reads back unchanged.
+    /// added `mode` and `safety_check` on `CreateSession`, which commands
+    /// never store, so the event reads back unchanged.
     #[test]
     fn v44_reads_what_v43_wrote() {
         use skywave_proto::EventKind;
@@ -2430,6 +2430,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kind, v43);
+        assert_eq!(
+            deletion, None,
+            "the v27 column is NULL for a session it did not touch"
+        );
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::SafetyRuleSet { .. }
+        ));
+    }
+
+    /// A v44 database, at schema v27 (what v44 wrote), opens as v45: v45 added
+    /// `session_id` to `CreateSession` and `SessionExists`, which commands
+    /// never store, so the event reads back unchanged.
+    #[test]
+    fn v45_reads_what_v44_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let session = "01920000-0000-7000-8000-000000000001";
+        let v44 = concat!(
+            r#"{"type":"safety_rule_set","words":["git","status"],"#,
+            r#""on":true,"by":"01920000-0000-7000-8000-000000000009"}"#
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..27] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 27).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 44)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, workdir) VALUES (?1, 'w')",
+                [session],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, ?1, 't', 'c', ?2)",
+                [session, v44],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let (kind, deletion): (String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT events.kind, sessions.deletion
+                 FROM events JOIN sessions ON sessions.id = events.session_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, v44);
         assert_eq!(
             deletion, None,
             "the v27 column is NULL for a session it did not touch"
