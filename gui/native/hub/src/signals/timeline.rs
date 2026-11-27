@@ -75,7 +75,8 @@ pub struct TimelineRow {
     /// `ExpandItem` would show more (only logged items with sections).
     pub expandable: bool,
     pub expanded: bool,
-    /// Delivery state of this device's message.
+    /// Delivery state of this device's message, or of its context or setting
+    /// switch on its way.
     pub outgoing: Option<OutgoingView>,
     /// How this device's message went out: `queued 14:02:11 · sending,
     /// try 3`.
@@ -83,7 +84,7 @@ pub struct TimelineRow {
     /// `EditQueued` and `Discard` take this pending message back.
     pub discardable: bool,
     /// This device's pending message's command id, for `EditQueued` and
-    /// `Discard`; `None` for logged rows.
+    /// `Discard`, or its switch's on its way; `None` for logged rows.
     pub command_id: Option<String>,
     /// What a tool item (or a legacy call, result or approval) did.
     pub tool: Option<ToolFacts>,
@@ -151,10 +152,12 @@ pub enum RowKind {
     Archived,
     /// A context was cleared or an earlier one made current again: what
     /// follows went to that context.
+    /// With `outgoing` set, this device's clear or switch on its way.
     ContextDivider,
     AgentError,
     TurnUsage,
     /// The agent switched its mode or model.
+    /// With `outgoing` set, this device's switch on its way.
     AgentSetting,
     /// The agent refused a switch and kept what it had: a warning.
     SettingRefused,
