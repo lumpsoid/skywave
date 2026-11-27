@@ -2247,20 +2247,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
-        let deleted = tx.execute(
-            "DELETE FROM outbox WHERE command_id = ?1
-                AND (result IS NULL
-                    OR json_extract(result, '$.result')
-                        IN ('rejected', 'undeliverable', 'attachment_refused'))",
-            [id.0.to_string()],
-        )?;
-        if deleted == 0 {
-            return Err(StoreError::NotWithdrawable(id));
-        }
-        tx.execute(
-            "DELETE FROM outbox_files WHERE command_id = ?1",
-            [id.0.to_string()],
-        )?;
+        delete_withdrawn(&tx, id)?;
         if let Some((key, draft)) = draft {
             upsert_draft(&tx, key, draft)?;
         }
@@ -2295,6 +2282,20 @@ impl Store {
                     ],
                 )?;
             }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Takes several commands back, as [`withdraw`](Self::withdraw) does
+    /// one without a draft, in one transaction: all of them go, or, if any
+    /// is accepted or gone, none does and the call fails with
+    /// [`StoreError::NotWithdrawable`] for that one.
+    pub fn withdraw_all(&self, ids: &[CommandId]) -> Result<(), StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        for &id in ids {
+            delete_withdrawn(&tx, id)?;
         }
         tx.commit()?;
         Ok(())
@@ -3581,6 +3582,27 @@ fn read_deleted(conn: &Connection) -> Result<HashSet<SessionId>, StoreError> {
     let mut stmt = conn.prepare("SELECT session_id FROM deleted_sessions")?;
     let rows = stmt.query_map([], |row| Ok(SessionId(uuid_col(row, 0)?)))?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Deletes a withdrawn command's outbox row and its files: one the server
+/// has not answered, or refused (or its request). Anything else is
+/// [`StoreError::NotWithdrawable`].
+fn delete_withdrawn(conn: &Connection, id: CommandId) -> Result<(), StoreError> {
+    let deleted = conn.execute(
+        "DELETE FROM outbox WHERE command_id = ?1
+            AND (result IS NULL
+                OR json_extract(result, '$.result')
+                    IN ('rejected', 'undeliverable', 'attachment_refused'))",
+        [id.0.to_string()],
+    )?;
+    if deleted == 0 {
+        return Err(StoreError::NotWithdrawable(id));
+    }
+    conn.execute(
+        "DELETE FROM outbox_files WHERE command_id = ?1",
+        [id.0.to_string()],
+    )?;
+    Ok(())
 }
 
 fn upsert_draft(

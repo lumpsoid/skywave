@@ -3269,6 +3269,45 @@ fn withdraw_anything_not_accepted() {
 }
 
 #[test]
+fn withdraw_all_takes_every_one_back_or_none() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    let session = SessionId::new();
+    let [refused, undeliverable, accepted] =
+        ["refused", "undeliverable", "accepted"].map(|text| send(session, text));
+    for command in [&refused, &undeliverable, &accepted] {
+        store.enqueue(command, &[]).unwrap();
+        assert!(store.claim_send(command.id, at(1)).unwrap());
+    }
+    let rejected = CommandResult::Rejected {
+        reason: RejectReason::UnknownSession,
+    };
+    store.record_result(refused.id, &rejected, at(2)).unwrap();
+    store.record_undeliverable(undeliverable.id, at(2)).unwrap();
+    store
+        .record_result(accepted.id, &CommandResult::Accepted { seq: Seq(1) }, at(2))
+        .unwrap();
+    let left = |store: &Store| -> Vec<CommandId> {
+        store
+            .outbox()
+            .unwrap()
+            .iter()
+            .map(|e| e.command.id)
+            .collect()
+    };
+
+    // One that may not go keeps the others too: nothing is written.
+    assert!(matches!(
+        store.withdraw_all(&[refused.id, accepted.id, undeliverable.id]),
+        Err(StoreError::NotWithdrawable(id)) if id == accepted.id
+    ));
+    assert_eq!(left(&store), [refused.id, undeliverable.id, accepted.id]);
+
+    store.withdraw_all(&[refused.id, undeliverable.id]).unwrap();
+    assert_eq!(left(&store), [accepted.id]);
+}
+
+#[test]
 fn attachment_refused_settles_and_withdraws() {
     let (_tmp, dir) = data_dir();
     let store = Store::open(&dir).unwrap();

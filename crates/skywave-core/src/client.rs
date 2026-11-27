@@ -884,6 +884,9 @@ impl State {
                         .as_ref()
                         .map(|(session, files)| (*session, files.as_slice())),
                 ),
+                // Refused, writing nothing, when the store disagrees with the
+                // model; the resync below then shows what the store holds.
+                Effect::WithdrawAll(ids) => self.store.withdraw_all(&ids),
                 // Refused when the store disagrees with the model; the
                 // resync below then shows what the store holds.
                 Effect::Requeue { id, replaces } => {
