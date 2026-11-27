@@ -1735,7 +1735,7 @@ impl Model {
                 return Some(Action::OpenSession(*id));
             }
             Place::Session { id, .. } => {
-                self.summary(*id)?;
+                self.session_or_creating(*id)?;
                 match self.last_list {
                     ListKind::Active => Route::SessionList,
                     ListKind::Archived => Route::ArchivedSessions,
@@ -2134,7 +2134,8 @@ impl Model {
     /// happens. The sender hears of it, so it stops waiting to resend this
     /// one and moves on. Dismissing a failed switch also takes the earlier
     /// failed ones of its kind with it. Taking back a create also takes back
-    /// the discardable messages queued for its session, and leaves its page.
+    /// the discardable messages queued for its session and its drafts, and
+    /// leaves its page.
     fn withdraw(&mut self, id: CommandId, edit: bool) -> Vec<Effect> {
         let Some(index) = self
             .outbox
@@ -2213,11 +2214,16 @@ impl Model {
                 self.outbox.retain(|e| !ids.contains(&e.command.id));
                 let mut effects: Vec<Effect> = ids
                     .into_iter()
-                    .map(|withdrawn| Effect::Withdraw {
-                        id: withdrawn,
-                        draft: None,
-                        images: None,
-                        files: None,
+                    .map(|withdrawn| {
+                        // A create's withdrawal also empties its session's
+                        // draft images and files in the same write.
+                        let emptied = created.filter(|_| withdrawn == id);
+                        Effect::Withdraw {
+                            id: withdrawn,
+                            draft: None,
+                            images: emptied.map(|session| (session, Vec::new())),
+                            files: emptied.map(|session| (session, Vec::new())),
+                        }
                     })
                     .collect();
                 // The session a refused create named never exists, so the
@@ -2245,6 +2251,20 @@ impl Model {
                             files: None,
                         });
                     }
+                    // Its drafts go with it, in memory and in the store.
+                    let drafts: Vec<(SessionId, ComposerMode)> = self
+                        .drafts
+                        .keys()
+                        .filter(|(draft_session, _)| *draft_session == session_id)
+                        .copied()
+                        .collect();
+                    for key in drafts {
+                        effects.push(Effect::SaveDraft(key, None));
+                    }
+                    self.drafts
+                        .retain(|(draft_session, _), _| *draft_session != session_id);
+                    self.draft_images.remove(&session_id);
+                    self.draft_files.remove(&session_id);
                     if self.loaded_session() == Some(session_id) {
                         self.place = Place::SessionList(ListPage::default());
                     }
@@ -11104,6 +11124,7 @@ mod tests {
             session_id: id,
             text: "hi".into(),
         }));
+        f.dispatch(save_draft(id, "half a thought", 5));
         f.model.command_sending(create.id, Utc::now());
         f.model.command_result(
             create.id,
@@ -11118,8 +11139,8 @@ mod tests {
                 Effect::Withdraw {
                     id: create.id,
                     draft: None,
-                    images: None,
-                    files: None,
+                    images: Some((id, Vec::new())),
+                    files: Some((id, Vec::new())),
                 },
                 Effect::Withdraw {
                     id: message.id,
@@ -11127,10 +11148,12 @@ mod tests {
                     images: None,
                     files: None,
                 },
+                Effect::SaveDraft((id, ComposerMode::Agent), None),
                 Effect::Request(Request::OutboxChanged),
             ]
         );
         assert!(f.list_view().creating.is_empty());
+        assert!(f.model.drafts.is_empty(), "the session's draft went too");
     }
 
     #[test]
@@ -12330,8 +12353,8 @@ mod tests {
                 Effect::Withdraw {
                     id: command.id,
                     draft: None,
-                    images: None,
-                    files: None,
+                    images: Some((created_id(&command), Vec::new())),
+                    files: Some((created_id(&command), Vec::new())),
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -12365,6 +12388,10 @@ mod tests {
             matches!(shown.get(1), Some(Entry::UserMessage { .. })),
             "{shown:?}"
         );
+        assert!(
+            !shown.iter().any(|e| matches!(e, Entry::Created { .. })),
+            "an adopted session was not created here: {shown:?}"
+        );
         // Positive control: a plain session has no such first item.
         let plain = f.session("/srv/b");
         f.log(plain, vec![message("hi")]);
@@ -12374,6 +12401,36 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Entry::Adopted { .. } | Entry::MovedFrom { .. }))
         );
+    }
+
+    #[test]
+    fn a_fresh_session_starts_with_its_creation() {
+        let mut f = Fixture::paired();
+        let fresh = f.session("/srv/a");
+        f.log(fresh, vec![message("hi")]);
+        f.open(fresh);
+        assert_eq!(
+            entries(&f).first(),
+            Some(&Entry::Created {
+                workdir: "/srv/a".into()
+            })
+        );
+    }
+
+    #[test]
+    fn back_leaves_a_creating_page() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        // The create opened its page; nothing is logged yet, so no summary.
+        assert_eq!(shown(&f.model.view()), "session");
+        assert!(f.model.view().can_go_back);
+        f.dispatch(Action::Back);
+        assert_eq!(shown(&f.model.view()), "active list");
     }
 
     fn adopted_created() -> EventKind {
@@ -12886,8 +12943,8 @@ mod tests {
                 Effect::Withdraw {
                     id: refused.id,
                     draft: None,
-                    images: None,
-                    files: None,
+                    images: Some((created_id(&refused), Vec::new())),
+                    files: Some((created_id(&refused), Vec::new())),
                 },
                 Effect::Request(Request::OutboxChanged),
             ]

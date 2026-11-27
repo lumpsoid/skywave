@@ -330,7 +330,6 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         | Entry::ContextMoved { name, .. }
         | Entry::MovedFrom { name, .. } => vec![name],
         Entry::Adopted { conversation } => vec![conversation],
-        Entry::Created { workdir } => vec![workdir],
         Entry::AgentSetting {
             setting, refused, ..
         } => {
@@ -355,7 +354,8 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         | Entry::Archived { .. }
         | Entry::WorktreeRemoved { .. }
         | Entry::TurnUsage(_)
-        | Entry::ImportFinished { .. } => Vec::new(),
+        | Entry::ImportFinished { .. }
+        | Entry::Created { .. } => Vec::new(),
     }
 }
 

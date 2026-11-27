@@ -1449,7 +1449,8 @@ no longer decodes rather than failing.
   refused create keeps its page and its queued messages.
   `Action::RecreateSession` asks again under the same id and re-queues the
   refused or queued messages behind it, in order. Dismissing the refused
-  create withdraws them too and leaves the page. A fresh session's timeline
+  create withdraws them too, drops the session's drafts, and leaves the
+  page; Back leaves a creating page like any other. A fresh session's timeline
   starts with `Entry::Created`. `opening` now serves `MoveContext` only.
 - **Shell history** (D53): `ViewState::shell_history` holds this device's
   shell commands from every session, newest first, each once, at most

@@ -8991,17 +8991,11 @@ fn a_session_hit_opens_without_a_search() {
     let found = the_search(rig.wait(SEARCH_AFTER));
     searched(&mut rig, vec![found]);
 
-    // The session's creation entry holds "foxes" in its workdir too, so it is
-    // a hit of its own beside the session.
     let (count, rows) = search_page(&rig);
-    assert_eq!(count.as_deref(), Some("2 matches"));
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    let sessions: Vec<_> = rows
-        .iter()
-        .filter(|row| row.kind_label == "Session")
-        .collect();
-    assert_eq!(sessions.len(), 1, "{rows:?}");
-    let key = sessions[0].key.clone();
+    assert_eq!(count.as_deref(), Some("1 match"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind_label, "Session");
+    let key = rows[0].key.clone();
     rig.intent(GuiIntent::GlobalSearchOpen { key });
     rig.results();
     rig.view();
