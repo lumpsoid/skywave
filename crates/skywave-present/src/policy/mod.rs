@@ -145,7 +145,7 @@ pub(crate) mod tests {
             .iter()
             .filter_map(|item| match item {
                 TimelineItem::Logged { seq, .. } => Some(*seq),
-                TimelineItem::Pending { .. } => None,
+                TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
             })
             .max()
             .unwrap_or(Seq(0));

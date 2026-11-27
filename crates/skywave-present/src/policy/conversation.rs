@@ -146,7 +146,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 TimelineItem::Logged { seq, .. } => Some(seq.0),
-                TimelineItem::Pending { .. } => None,
+                TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
             })
             .collect()
     }

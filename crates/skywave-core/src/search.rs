@@ -305,6 +305,7 @@ fn result_texts<'a>(summary: &'a str, output: &'a Option<FullView>) -> Vec<&'a s
 fn texts(item: &TimelineItem) -> Vec<&str> {
     let entry = match item {
         TimelineItem::Pending { text, .. } => return vec![text],
+        TimelineItem::Change { .. } => return Vec::new(),
         TimelineItem::Logged { entry, .. } => entry,
     };
     match entry {

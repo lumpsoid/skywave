@@ -25,9 +25,10 @@ use skywave_core::{
 use skywave_present::blob_actions::pending_note;
 use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
-    blob_size, bytes, context_moved_line, context_started_line, context_switched_line,
-    decision_label, delivery_label, dollars, download_state, fail_reason, import_finished_line,
-    moved_from_line, outgoing_label, seconds, subagent_status, took_label, turn_time,
+    blob_size, bytes, change_state_label, context_moved_line, context_started_line,
+    context_switched_line, decision_label, delivery_label, dollars, download_state, fail_reason,
+    import_finished_line, moved_from_line, outgoing_label, pending_change_line, seconds,
+    subagent_status, took_label, turn_time,
 };
 use skywave_present::policy::in_conversation;
 use skywave_present::sections::{
@@ -380,7 +381,7 @@ impl Layout<'_> {
                 let this = at.timestamp().div_euclid(60);
                 minute.replace(this) != Some(this)
             }
-            TimelineItem::Pending { .. } => false,
+            TimelineItem::Pending { .. } | TimelineItem::Change { .. } => false,
         };
         Flags {
             above,
@@ -438,6 +439,26 @@ impl Layout<'_> {
         out.extend(match item {
             TimelineItem::Pending { text, outgoing, .. } => {
                 self.message(lead, you(Some(outgoing)), Color::Blue, text, mark)
+            }
+            TimelineItem::Change {
+                change, outgoing, ..
+            } => {
+                let style = match outgoing {
+                    Some(outgoing) => outgoing_badge(outgoing).1,
+                    None => Style::new().cyan(),
+                };
+                let mut spans = lead;
+                spans.push(
+                    Span::raw(clean(&pending_change_line(change)))
+                        .dark_gray()
+                        .italic(),
+                );
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("[{}]", change_state_label(outgoing.as_ref())),
+                    style,
+                ));
+                vec![Line::from(spans)]
             }
             // Dimmed: it happened outside Skywave.
             TimelineItem::Logged {

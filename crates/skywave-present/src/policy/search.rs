@@ -454,7 +454,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 TimelineItem::Logged { entry, .. } => search::blobs(entry)[0].id,
-                TimelineItem::Pending { .. } => unreachable!(),
+                TimelineItem::Pending { .. } | TimelineItem::Change { .. } => unreachable!(),
             })
             .collect();
         assert!(bottom.iter().all(|id| search.blob_text(*id).is_some()));

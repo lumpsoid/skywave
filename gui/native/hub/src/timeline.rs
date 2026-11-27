@@ -13,15 +13,16 @@ use skywave_core::store::OutboxFile;
 use skywave_core::{
     Answer, ApprovalStatus, AttachmentRefusal, BlobId, BlobState, BlobView, BodyFormat, CallId,
     Decision, DeviceRef, Entry, FailReason, FullView, ImportedEntry, MessageImage, Outgoing,
-    QUESTION_TOOL, RuleSuggestion, SafetyJudgment, Seq, SessionId, SessionView, TimelineItem,
-    ToolKind, ToolOutcome, ToolView, read_head,
+    PendingChange, QUESTION_TOOL, RuleSuggestion, SafetyJudgment, Seq, SessionId, SessionView,
+    TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
-    bytes, context_moved_line, context_started_line, context_switched_line, decision_label,
-    delivery_label, dollars, download_state, fail_reason, import_finished_line, moved_from_line,
-    outgoing_label, safety_approval_label, seconds, subagent_status, took_label, turn_time,
+    bytes, change_state_label, context_moved_line, context_started_line, context_switched_line,
+    decision_label, delivery_label, dollars, download_state, fail_reason, import_finished_line,
+    moved_from_line, outgoing_label, pending_change_line, safety_approval_label, seconds,
+    subagent_status, took_label, turn_time,
 };
 use skywave_present::markdown as md;
 use skywave_present::sections::{
@@ -175,7 +176,7 @@ pub fn rows(
                     at.format("%H:%M").to_string()
                 })
             }
-            TimelineItem::Pending { .. } => None,
+            TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
         };
         let key = ItemKey::of(item);
         let open = matches!(key, ItemKey::Logged(seq) if expanded.contains(&seq));
@@ -274,6 +275,29 @@ fn row(
             ..
         }
         | TimelineItem::Logged { at, entry, .. } => (at, entry),
+        TimelineItem::Change {
+            command_id,
+            change,
+            outgoing,
+        } => {
+            let kind = match change {
+                PendingChange::NewContext { .. } | PendingChange::SwitchContext { .. } => {
+                    RowKind::ContextDivider
+                }
+                PendingChange::Setting(_) => RowKind::AgentSetting,
+            };
+            set(&mut row, kind, clean_line(&pending_change_line(change)));
+            row.own = true;
+            row.command_id = Some(command_id.0.to_string());
+            row.outgoing = Some(match outgoing {
+                Some(outgoing) => outgoing_view(outgoing),
+                None => OutgoingView {
+                    state: OutgoingState::Sending,
+                    label: change_state_label(None),
+                },
+            });
+            return row;
+        }
     };
     row.at_ms = Some(at.timestamp_millis());
     match entry {
@@ -1385,6 +1409,91 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_switch_on_its_way_is_its_divider_or_setting_row_with_a_state() {
+        let (clear, mode) = (CommandId::new(), CommandId::new());
+        let rows = rows_of(vec![
+            TimelineItem::Change {
+                command_id: clear,
+                change: PendingChange::NewContext {
+                    name: "velvet walrus".into(),
+                },
+                outgoing: Some(Outgoing::Sending),
+            },
+            TimelineItem::Change {
+                command_id: mode,
+                change: PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan)),
+                outgoing: None,
+            },
+        ]);
+        let got: Vec<_> = rows
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.key.clone(),
+                    r.kind,
+                    r.text.as_str(),
+                    r.outgoing.as_ref().map(|o| (o.state, o.label.as_str())),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    key_string(ItemKey::Pending(clear)),
+                    RowKind::ContextDivider,
+                    "New context · velvet walrus",
+                    Some((OutgoingState::Sending, "sending")),
+                ),
+                (
+                    key_string(ItemKey::Pending(mode)),
+                    RowKind::AgentSetting,
+                    "mode → plan",
+                    Some((OutgoingState::Sending, "waiting for the agent")),
+                ),
+            ]
+        );
+        for (row, id) in rows.rows.iter().zip([clear, mode]) {
+            assert!(row.own, "{}", row.key);
+            assert!(!row.discardable, "{}", row.key);
+            assert_eq!(row.command_id, Some(id.0.to_string()), "{}", row.key);
+        }
+    }
+
+    #[test]
+    fn a_logged_divider_takes_the_place_of_its_switch_on_its_way() {
+        let clear = CommandId::new();
+        let old = rows_of(vec![TimelineItem::Change {
+            command_id: clear,
+            change: PendingChange::NewContext {
+                name: "velvet walrus".into(),
+            },
+            outgoing: Some(Outgoing::Sending),
+        }]);
+        let new = rows_of(vec![TimelineItem::Logged {
+            parent: None,
+            seq: Seq(2),
+            at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
+            context: ContextId::new(),
+            entry: Entry::ContextStarted {
+                name: "velvet walrus".into(),
+                by: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: true,
+                },
+            },
+        }]);
+        let updates = diff(&old.rows, &new).unwrap();
+        let removed = format!("remove {}", key_string(ItemKey::Pending(clear)));
+        assert!(keys(&updates).contains(&removed), "{:?}", keys(&updates));
+        let mut held = old.rows;
+        apply(&mut held, updates);
+        assert_eq!(held, new.rows);
     }
 
     #[test]

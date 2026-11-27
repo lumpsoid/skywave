@@ -1858,7 +1858,7 @@ enum CropContent {
 | `Unpaired` | No banner; the pairing screen. |
 | `Connecting`, `CatchingUp` | Render local replica immediately. TUI: banner. GUI: the app bar's status line (`LinkUpdate::status_label`: `Connecting…`, `Syncing · 4/9 · N queued`) in place of the page's subtitle, and a 2 dp progress line along the app bar's bottom edge; neither moves the page. |
 | `Reconnecting` with queued items | TUI: banner: offline · why · N queued · retry in Xs. GUI: the status line (`Offline · retry in 07s · why · N queued`, countdown first so a narrow app bar cuts the reason), whose tap opens a sheet with the line in full and Retry now. Input stays enabled. |
-| `Online` | Nothing, whatever is queued: a queued send says so on its own row. Settings shows the round trip. |
+| `Online` | Nothing, whatever is queued: a queued send says so on its own row, and so does a context clear or switch, or a mode, model or effort switch, until the log shows it done. Settings shows the round trip. |
 | `AwaitingApproval` while offline | Show request; the answer is queued like any command. |
 | Approval answered elsewhere | "Approved on <device>", controls removed. |
 | Question pending (`SessionView::pending_question`) | A question panel instead of the approval prompt: each question with its options, their descriptions and previews, and the user's own answer. The picks stay in the head (TUI: `skywave_present::question::QuestionDraft` behind `a`; GUI: the panel's state) until every question has an answer, then go as one `Action::AnswerQuestion`; `x` / Decline is a denial. Its call's row reads "needs an answer", then "answered here / on <device>" (`ApprovalStatus::Answered`), with what was picked in its result. |

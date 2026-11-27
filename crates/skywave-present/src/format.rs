@@ -9,9 +9,9 @@ use skywave_core::{
     AgentSetting, AgentView, AgentWork, AttachmentRefusal, BackgroundTask, BlobState, CallId,
     ContextFill, ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
     ConversationsUnavailable, Decision, Delivery, DeviceRef, Effort, FailReason, ImportOutcome,
-    Outgoing, Pause, PendingSession, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
-    RunWhen, Schedule, SessionId, SessionRef, SessionUsage, SessionView, ShellEnd, ShellRun,
-    ShellRunState, SubagentStatus, TaskId, TaskKind,
+    Outgoing, Pause, PendingChange, PendingSession, PermissionMode, RejectReason, RuleScope,
+    RuleSuggestion, RunWhen, Schedule, SessionId, SessionRef, SessionUsage, SessionView, ShellEnd,
+    ShellRun, ShellRunState, SubagentStatus, TaskId, TaskKind,
 };
 
 use crate::text::clean_line;
@@ -788,6 +788,25 @@ pub fn context_started_line(name: &str, by: &DeviceRef) -> String {
 /// start · by you`.
 pub fn context_switched_line(name: &str, by: &DeviceRef) -> String {
     format!("Back to {name} · by {}", device_word(by))
+}
+
+/// What a switch on its way asks for: `New context · velvet walrus`,
+/// `Back to start`, `mode → plan`.
+pub fn pending_change_line(change: &PendingChange) -> String {
+    match change {
+        PendingChange::NewContext { name } => format!("New context · {name}"),
+        PendingChange::SwitchContext { name } if name.is_empty() => {
+            "Back to an earlier context".to_owned()
+        }
+        PendingChange::SwitchContext { name } => format!("Back to {name}"),
+        PendingChange::Setting(setting) => agent_setting_line(setting, None),
+    }
+}
+
+/// The state of a switch on its way: its delivery, then `waiting for the
+/// agent` once it is logged and only the agent's answer is awaited.
+pub fn change_state_label(outgoing: Option<&Outgoing>) -> String {
+    outgoing.map_or_else(|| "waiting for the agent".to_owned(), outgoing_label)
 }
 
 /// A session the timeline names: its title quoted (`“fix the flaky
@@ -2195,6 +2214,36 @@ mod tests {
             viewing_hint(&view).as_deref(),
             Some("Viewing start — messages go to velvet walrus")
         );
+    }
+
+    #[test]
+    fn a_switch_on_its_way_reads_as_what_it_asks_for() {
+        assert_eq!(
+            pending_change_line(&PendingChange::NewContext {
+                name: "velvet walrus".into()
+            }),
+            "New context · velvet walrus"
+        );
+        assert_eq!(
+            pending_change_line(&PendingChange::SwitchContext {
+                name: "start".into()
+            }),
+            "Back to start"
+        );
+        assert_eq!(
+            pending_change_line(&PendingChange::SwitchContext {
+                name: String::new()
+            }),
+            "Back to an earlier context"
+        );
+        assert_eq!(
+            pending_change_line(&PendingChange::Setting(AgentSetting::Mode(
+                PermissionMode::Plan
+            ))),
+            "mode → plan"
+        );
+        assert_eq!(change_state_label(None), "waiting for the agent");
+        assert_eq!(change_state_label(Some(&Outgoing::Queued)), "queued");
     }
 
     #[test]

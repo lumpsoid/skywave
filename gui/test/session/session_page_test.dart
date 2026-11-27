@@ -150,6 +150,56 @@ void main() {
     );
   });
 
+  testWidgets('a switch on its way reads as pending, with its state', (
+    tester,
+  ) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        'p:c2',
+        RowKind.contextDivider,
+        'New context · velvet walrus',
+        own: true,
+        commandId: 'c2',
+        outgoing: const OutgoingView(
+          state: OutgoingState.sending,
+          label: 'sending',
+        ),
+      ),
+      anyRow(
+        'p:c3',
+        RowKind.agentSetting,
+        'mode → plan',
+        own: true,
+        commandId: 'c3',
+        outgoing: const OutgoingView(
+          state: OutgoingState.sending,
+          label: 'waiting for the agent',
+        ),
+      ),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+
+    for (final text in [
+      'New context · velvet walrus',
+      'sending',
+      'mode → plan',
+      'waiting for the agent',
+    ]) {
+      expect(find.text(text, findRichText: true), findsWidgets, reason: text);
+    }
+    // Both read as waiting, not as the divider or the setting they stand for.
+    expect(find.byIcon(Icons.hourglass_top), findsNWidgets(2));
+    expect(find.byIcon(Icons.alt_route), findsNothing);
+    expect(find.byIcon(Icons.tune), findsNothing);
+  });
+
   testWidgets('collapsed calls step back from the messages', (tester) async {
     tall(tester);
     final timeline = holding([

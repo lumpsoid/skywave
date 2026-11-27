@@ -49,16 +49,16 @@ use crate::view::{
     DeviceRef, DeviceStorage, DiffBody, Draft, Entry, ErrorInfo, FailReason, FeedbackSent,
     FileBody, FileChange, FileResult, FullView, IdleAlert, ImportedEntry, LineSpan, Link,
     LinkRejection, ListKind, LoginView, MessageImage, ModelChoice, Outgoing, PairedInfo,
-    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSafetyRule,
-    PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen, SHELL_ALERT_AFTER,
-    SafetyFeedbackView, SafetyRuleView, Screen, ScreenRequest, ScreenRequestState, SearchScope,
-    SearchView, Seq, ServerAddressesView, SessionId, SessionInfoView, SessionListView, SessionRef,
-    SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun,
-    ShellRunState, ShellView, Snippet, SnippetId, StorageReport, StorageSession, StorageView,
-    SubagentHeader, SubagentStatus, SubagentUsage, TimelineItem, ToolApproval, ToolOutcome,
-    ToolView, UsageLimitsResult, UsageLimitsUnavailable, UsageSession, UsageView, ViewState,
-    WaitingApproval, WorkdirBody, WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView,
-    WorktreeSession, WorktreesView,
+    PairedLink, PairingStatus, PairingView, Pause, PendingApprovalRef, PendingChange,
+    PendingSafetyRule, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
+    SHELL_ALERT_AFTER, SafetyFeedbackView, SafetyRuleView, Screen, ScreenRequest,
+    ScreenRequestState, SearchScope, SearchView, Seq, ServerAddressesView, SessionId,
+    SessionInfoView, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
+    SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet,
+    SnippetId, StorageReport, StorageSession, StorageView, SubagentHeader, SubagentStatus,
+    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageLimitsResult,
+    UsageLimitsUnavailable, UsageSession, UsageView, ViewState, WaitingApproval, WorkdirBody,
+    WorkdirDownload, WorkdirFetch, WorkdirPane, WorkdirView, WorktreeSession, WorktreesView,
 };
 use crate::workdir::{PushOutcome, WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 use crate::worktrees::Worktrees;
@@ -3871,9 +3871,23 @@ impl Model {
                 TimelineItem::Logged { context, .. } | TimelineItem::Pending { context, .. } => {
                     *context == viewing
                 }
+                TimelineItem::Change { .. } => true,
             });
         }
         let contexts = self.contexts(id, events, context);
+        if subagent.is_none() && viewing.is_none_or(|v| v == context) {
+            timeline.extend(self.pending_changes(summary, &contexts));
+            // Pending messages and switches in the order they were asked for.
+            let start = timeline
+                .iter()
+                .rposition(|item| matches!(item, TimelineItem::Logged { .. }))
+                .map_or(0, |at| at + 1);
+            timeline[start..].sort_by_key(|item| match item {
+                TimelineItem::Pending { command_id, .. }
+                | TimelineItem::Change { command_id, .. } => Some(*command_id),
+                TimelineItem::Logged { .. } => None,
+            });
+        }
         let can_clear = contexts.iter().any(|c| c.current && c.messages > 0);
         let contexts = contexts
             .into_iter()
@@ -4460,6 +4474,109 @@ impl Model {
             .find(|e| kind(&e.command.kind))
             .map(|e| Outgoing::from(&e.status))
             .filter(|outgoing| !self.in_replica(*outgoing))
+    }
+
+    /// The session's switches on their way, as timeline items, oldest first:
+    /// this device's newest clear and switch of the context until their
+    /// effect is in the replica, and each mode, model and effort switch of
+    /// this device's while it is on its way or its request is open.
+    fn pending_changes(
+        &self,
+        summary: &SessionSummary,
+        contexts: &[ContextView],
+    ) -> Vec<TimelineItem> {
+        let id = summary.id;
+        let newest = |is: &dyn Fn(&CommandKind) -> bool| {
+            self.outbox
+                .iter()
+                .rev()
+                .find(|e| is(&e.command.kind))
+                .map(|e| {
+                    (
+                        e.command.id,
+                        e.command.kind.clone(),
+                        Outgoing::from(&e.status),
+                    )
+                })
+                .filter(|(_, _, outgoing)| !self.in_replica(*outgoing))
+        };
+        let mut changes: Vec<(CommandId, PendingChange, Option<Outgoing>)> = Vec::new();
+        if let Some((command_id, CommandKind::ClearContext { name, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::ClearContext { session_id, .. } if *session_id == id),
+        ) {
+            changes.push((
+                command_id,
+                PendingChange::NewContext { name },
+                Some(outgoing),
+            ));
+        }
+        if let Some((command_id, CommandKind::SwitchContext { context, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
+        ) {
+            let name = contexts
+                .iter()
+                .find(|c| c.id == context)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            changes.push((
+                command_id,
+                PendingChange::SwitchContext { name },
+                Some(outgoing),
+            ));
+        }
+        if let Some((command_id, CommandKind::SetPermissionMode { mode, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SetPermissionMode { session_id, .. } if *session_id == id),
+        ) {
+            let setting = AgentSetting::Mode(mode);
+            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+        } else if let Some(r) = summary
+            .agent
+            .mode
+            .requested
+            .as_ref()
+            .filter(|r| self.device() == Some(r.by))
+        {
+            let setting = AgentSetting::Mode(r.value);
+            changes.push((r.command, PendingChange::Setting(setting), None));
+        }
+        if let Some((command_id, CommandKind::SetModel { model, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
+        ) {
+            let setting = AgentSetting::Model(model);
+            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+        } else if let Some(r) = summary
+            .agent
+            .model
+            .requested
+            .as_ref()
+            .filter(|r| self.device() == Some(r.by))
+        {
+            let setting = AgentSetting::Model(r.value.clone());
+            changes.push((r.command, PendingChange::Setting(setting), None));
+        }
+        if let Some((command_id, CommandKind::SetEffort { effort, .. }, outgoing)) = newest(
+            &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
+        ) {
+            let setting = AgentSetting::Effort(Some(effort));
+            changes.push((command_id, PendingChange::Setting(setting), Some(outgoing)));
+        } else if let Some(r) = summary
+            .agent
+            .effort
+            .requested_effort()
+            .filter(|r| self.device() == Some(r.by))
+        {
+            let setting = AgentSetting::Effort(Some(r.value));
+            changes.push((r.command, PendingChange::Setting(setting), None));
+        }
+        changes.sort_by_key(|(command_id, _, _)| *command_id);
+        changes
+            .into_iter()
+            .map(|(command_id, change, outgoing)| TimelineItem::Change {
+                command_id,
+                change,
+                outgoing,
+            })
+            .collect()
     }
 
     /// Where a message sent to the session now goes: the context this
@@ -5655,7 +5772,7 @@ impl ToolIndex {
         let &(item, _) = self.calls.get(&call?)?;
         match items.get(item)? {
             TimelineItem::Logged { parent, .. } => *parent,
-            TimelineItem::Pending { .. } => None,
+            TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
         }
     }
 
@@ -6437,6 +6554,7 @@ mod tests {
             .map(|item| match item {
                 TimelineItem::Logged { entry, .. } => entry,
                 TimelineItem::Pending { .. } => panic!("message shown twice: {item:?}"),
+                TimelineItem::Change { .. } => panic!("unexpected switch on its way: {item:?}"),
             })
             .collect();
         assert_eq!(
@@ -7981,6 +8099,434 @@ mod tests {
         );
         // Not activity: the session keeps its place.
         assert_eq!(f.list_view_after_back().sessions[0].id, sid);
+    }
+
+    /// The switches on their way in the open session's timeline, as
+    /// (command, change, delivery).
+    fn changes(f: &Fixture) -> Vec<(CommandId, PendingChange, Option<Outgoing>)> {
+        f.session_view()
+            .timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                TimelineItem::Change {
+                    command_id,
+                    change,
+                    outgoing,
+                } => Some((command_id, change, outgoing)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mode_switch_is_a_row_until_the_agent_answers_it() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log(
+            sid,
+            vec![EventKind::PermissionModeChanged {
+                mode: PermissionMode::Ask,
+                answers: None,
+            }],
+        );
+        f.open(sid);
+
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        let plan = PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan));
+        assert_eq!(
+            changes(&f),
+            [(command.id, plan.clone(), Some(Outgoing::Queued))]
+        );
+
+        // Logged: only the agent's answer is awaited.
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::PermissionModeRequested {
+                    mode: PermissionMode::Plan,
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        assert_eq!(changes(&f), [(command.id, plan, None)]);
+
+        f.log(
+            sid,
+            vec![EventKind::PermissionModeChanged {
+                mode: PermissionMode::Plan,
+                answers: Some(command.id),
+            }],
+        );
+        assert!(changes(&f).is_empty());
+        assert!(f.session_view().timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::Logged {
+                entry: Entry::AgentSetting {
+                    setting: AgentSetting::Mode(PermissionMode::Plan),
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_refused_mode_switch_stays_a_row_with_its_failure() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::TurnRunning,
+            },
+            Utc::now(),
+        );
+        assert_eq!(
+            changes(&f),
+            [(
+                command.id,
+                PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan)),
+                Some(Outgoing::Failed(FailReason::Rejected(
+                    RejectReason::TurnRunning
+                ))),
+            )]
+        );
+    }
+
+    #[test]
+    fn a_clear_is_a_row_until_its_divider_is_in_the_replica() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        let CommandKind::ClearContext { context, name, .. } = clear.kind.clone() else {
+            panic!("expected a clear, got {clear:?}");
+        };
+        assert_eq!(
+            changes(&f),
+            [(
+                clear.id,
+                PendingChange::NewContext { name: name.clone() },
+                Some(Outgoing::Queued),
+            )]
+        );
+
+        let me = f.me;
+        f.log_stamped(sid, vec![(Some(clear.id), context, started(&name, me))]);
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(clear.id, CommandResult::Accepted { seq }, Utc::now());
+        assert!(changes(&f).is_empty());
+        assert!(f.session_view().timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::Logged {
+                entry: Entry::ContextStarted { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_switch_is_a_row_named_for_its_context_until_pulled() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let first = ContextId::first_of(sid);
+        let later = ContextId::new();
+        f.log_in(sid, later, vec![started("velvet walrus", DeviceId::new())]);
+        f.open(sid);
+        let switch = queued(&f.dispatch(Action::SwitchContext {
+            session_id: sid,
+            context: first,
+        }));
+        let back = PendingChange::SwitchContext {
+            name: "start".into(),
+        };
+        assert_eq!(
+            changes(&f),
+            [(switch.id, back.clone(), Some(Outgoing::Queued))]
+        );
+
+        f.model.command_sending(switch.id, Utc::now());
+        f.model.command_result(
+            switch.id,
+            CommandResult::Accepted { seq: Seq(3) },
+            Utc::now(),
+        );
+        assert_eq!(
+            changes(&f),
+            [(switch.id, back, Some(Outgoing::Accepted(Seq(3))))]
+        );
+
+        f.log_stamped(
+            sid,
+            vec![(
+                Some(switch.id),
+                first,
+                EventKind::ContextSwitched { by: f.me },
+            )],
+        );
+        assert!(changes(&f).is_empty());
+    }
+
+    #[test]
+    fn another_devices_setting_request_is_no_row_here() {
+        use skywave_proto::PermissionMode;
+        // Another device's request: the header shows it, no row is this device's.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log_commands(
+            sid,
+            vec![(
+                Some(CommandId::new()),
+                EventKind::PermissionModeRequested {
+                    mode: PermissionMode::Plan,
+                    by: DeviceId::new(),
+                },
+            )],
+        );
+        f.open(sid);
+        assert!(f.session_view().agent.mode_change.is_some());
+        assert!(changes(&f).is_empty());
+
+        // This device's request: the same log shape, named by this device.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let command = CommandId::new();
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command),
+                EventKind::PermissionModeRequested {
+                    mode: PermissionMode::Plan,
+                    by: me,
+                },
+            )],
+        );
+        f.open(sid);
+        assert_eq!(
+            changes(&f),
+            [(
+                command,
+                PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan)),
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn a_switch_on_its_way_is_no_row_while_viewing_an_earlier_context() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let first = ContextId::first_of(sid);
+        let later = ContextId::new();
+        f.log_in(sid, later, vec![started("velvet walrus", DeviceId::new())]);
+        f.open(sid);
+        f.dispatch(Action::ViewContext {
+            session_id: sid,
+            context: Some(first),
+        });
+
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        // The header shows it whichever context is viewed.
+        assert!(f.session_view().agent.mode_change.is_some());
+        assert!(changes(&f).is_empty());
+
+        f.dispatch(Action::ViewContext {
+            session_id: sid,
+            context: Some(later),
+        });
+        assert_eq!(
+            changes(&f),
+            [(
+                command.id,
+                PendingChange::Setting(AgentSetting::Mode(PermissionMode::Plan)),
+                Some(Outgoing::Queued),
+            )]
+        );
+    }
+
+    #[test]
+    fn model_and_effort_switches_are_rows_until_answered() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log(
+            sid,
+            vec![
+                EventKind::ModelChanged {
+                    model: "model-s".into(),
+                    answers: None,
+                },
+                EventKind::EffortChanged {
+                    effort: Some(Effort::High),
+                    answers: None,
+                },
+            ],
+        );
+        f.open(sid);
+        let me = f.me;
+
+        let model = queued(&f.dispatch(Action::SetModel {
+            session_id: sid,
+            model: "haiku".into(),
+        }));
+        let row = PendingChange::Setting(AgentSetting::Model("haiku".into()));
+        assert_eq!(
+            changes(&f),
+            [(model.id, row.clone(), Some(Outgoing::Queued))]
+        );
+        // Logged: only the agent's answer is awaited.
+        f.log_commands(
+            sid,
+            vec![(
+                Some(model.id),
+                EventKind::ModelRequested {
+                    model: "haiku".into(),
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(model.id, CommandResult::Accepted { seq }, Utc::now());
+        assert_eq!(changes(&f), [(model.id, row, None)]);
+        f.log(
+            sid,
+            vec![EventKind::ModelChanged {
+                model: "haiku".into(),
+                answers: Some(model.id),
+            }],
+        );
+        assert!(changes(&f).is_empty());
+
+        let effort = queued(&f.dispatch(Action::SetEffort {
+            session_id: sid,
+            effort: Effort::Max,
+        }));
+        let row = PendingChange::Setting(AgentSetting::Effort(Some(Effort::Max)));
+        assert_eq!(
+            changes(&f),
+            [(effort.id, row.clone(), Some(Outgoing::Queued))]
+        );
+        f.log_commands(
+            sid,
+            vec![(
+                Some(effort.id),
+                EventKind::EffortRequested {
+                    effort: Effort::Max,
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(effort.id, CommandResult::Accepted { seq }, Utc::now());
+        assert_eq!(changes(&f), [(effort.id, row, None)]);
+        f.log(
+            sid,
+            vec![EventKind::EffortChanged {
+                effort: Some(Effort::Max),
+                answers: Some(effort.id),
+            }],
+        );
+        assert!(changes(&f).is_empty());
+    }
+
+    #[test]
+    fn a_clear_accepted_but_not_pulled_is_still_a_row() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        let CommandKind::ClearContext { context, name, .. } = clear.kind.clone() else {
+            panic!("expected a clear, got {clear:?}");
+        };
+        let row = PendingChange::NewContext { name: name.clone() };
+        // Accepted at log position 3, past the replica's cursor (1).
+        f.model.command_result(
+            clear.id,
+            CommandResult::Accepted { seq: Seq(3) },
+            Utc::now(),
+        );
+        assert_eq!(
+            changes(&f),
+            [(clear.id, row.clone(), Some(Outgoing::Accepted(Seq(3))))]
+        );
+
+        // The divider lands at 2: the replica has not reached 3 yet.
+        let me = f.me;
+        f.log_stamped(sid, vec![(Some(clear.id), context, started(&name, me))]);
+        assert_eq!(
+            changes(&f),
+            [(clear.id, row, Some(Outgoing::Accepted(Seq(3))))]
+        );
+
+        // Pulled up to 3: done.
+        f.log(
+            sid,
+            vec![EventKind::PermissionModeChanged {
+                mode: PermissionMode::Ask,
+                answers: None,
+            }],
+        );
+        assert!(changes(&f).is_empty());
+    }
+
+    #[test]
+    fn pending_messages_and_switches_keep_the_order_they_were_asked_in() {
+        use skywave_proto::PermissionMode;
+        // The kinds of the open session's pending items, in timeline order.
+        let kinds = |f: &Fixture| -> Vec<&'static str> {
+            f.session_view()
+                .timeline
+                .iter()
+                .filter_map(|item| match item {
+                    TimelineItem::Pending { .. } => Some("pending"),
+                    TimelineItem::Change { .. } => Some("change"),
+                    TimelineItem::Logged { .. } => None,
+                })
+                .collect()
+        };
+
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        });
+        send(&mut f, sid, "hi");
+        assert_eq!(kinds(&f), ["change", "pending"]);
+
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        send(&mut f, sid, "hi");
+        f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        });
+        assert_eq!(kinds(&f), ["pending", "change"]);
     }
 
     #[test]
@@ -10042,7 +10588,7 @@ mod tests {
                 TimelineItem::Pending {
                     text, discardable, ..
                 } => Some((text, discardable)),
-                TimelineItem::Logged { .. } => None,
+                TimelineItem::Logged { .. } | TimelineItem::Change { .. } => None,
             })
             .collect()
     }
@@ -10935,7 +11481,7 @@ mod tests {
             .into_iter()
             .find_map(|item| match item {
                 TimelineItem::Pending { files, .. } => Some(files),
-                TimelineItem::Logged { .. } => None,
+                TimelineItem::Logged { .. } | TimelineItem::Change { .. } => None,
             });
         assert_eq!(
             files,
@@ -11840,7 +12386,7 @@ mod tests {
             .into_iter()
             .filter_map(|item| match item {
                 TimelineItem::Logged { entry, .. } => Some(entry),
-                TimelineItem::Pending { .. } => None,
+                TimelineItem::Pending { .. } | TimelineItem::Change { .. } => None,
             })
             .collect()
     }
@@ -15056,7 +15602,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 TimelineItem::Pending { context, text, .. } => Some((text.as_str(), *context)),
-                TimelineItem::Logged { .. } => None,
+                TimelineItem::Logged { .. } | TimelineItem::Change { .. } => None,
             })
             .collect();
         assert_eq!(pending, [("hello", first), ("fresh", context)]);
@@ -15285,6 +15831,7 @@ mod tests {
                         other => format!("{other:?}"),
                     },
                     TimelineItem::Pending { text, .. } => format!("pending {text}"),
+                    TimelineItem::Change { .. } => panic!("unexpected switch on its way"),
                 })
                 .collect()
         };
@@ -15308,6 +15855,7 @@ mod tests {
                 .map(|item| match item {
                     TimelineItem::Logged { context, .. }
                     | TimelineItem::Pending { context, .. } => *context,
+                    TimelineItem::Change { .. } => panic!("unexpected switch on its way"),
                 })
                 .collect();
         assert_eq!(stamps, [a, b, b, a, b, a, a]);
