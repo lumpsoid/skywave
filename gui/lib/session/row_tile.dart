@@ -256,18 +256,13 @@ class RowTile extends StatelessWidget {
       ),
       RowKind.created => _Notice(
         row: row,
+        send: send,
         icon: Icons.add_circle_outline,
         color: colors.muted,
         hit: hit,
         mark: mark,
       ),
-      RowKind.creating => _Notice(
-        row: row,
-        icon: Icons.hourglass_top,
-        color: colors.muted,
-        hit: hit,
-        mark: mark,
-      ),
+      RowKind.creating => _Creating(row: row, hit: hit, mark: mark, send: send),
       RowKind.agentSetting => _Notice(
         row: row,
         send: send,
@@ -1020,6 +1015,64 @@ class _ToolCard extends StatelessWidget {
             size: 20,
             color: colors.muted,
           ),
+      ],
+    );
+  }
+}
+
+/// A session this device is creating: how its request stands, pending with
+/// the pending icon, refused with the error icon. A refused one that the hub
+/// still holds offers Recreate (its prompt reopens with the refused fields)
+/// and Dismiss.
+class _Creating extends StatelessWidget {
+  const _Creating({
+    required this.row,
+    required this.hit,
+    required this.mark,
+    required this.send,
+  });
+
+  final TimelineRow row;
+  final SearchHit? hit;
+  final TextStyle mark;
+  final SendIntent send;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = SkyColors.of(context);
+    final failed = row.outgoing?.state == OutgoingState.failed;
+    final color = failed ? theme.colorScheme.error : colors.muted;
+    final style = theme.textTheme.bodySmall?.copyWith(color: color);
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        if (failed)
+          Icon(Icons.error_outline, size: 14, color: color)
+        else
+          const AgentStateIcon(state: AgentState.creating, size: 14),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text.rich(
+            TextSpan(
+              style: style,
+              children: highlighted(row.text, hit?.text ?? const [], mark),
+            ),
+          ),
+        ),
+        if (failed && row.discardable && row.commandId != null) ...[
+          _LinkButton(
+            key: const Key('recreate'),
+            label: 'Recreate',
+            onPressed: () => send(const GuiIntentRecreateOpen()),
+          ),
+          _LinkButton(
+            key: const Key('dismiss-create'),
+            label: 'Dismiss',
+            onPressed: () =>
+                send.act(ActionIntentDiscard(commandId: row.commandId!)),
+          ),
+        ],
       ],
     );
   }

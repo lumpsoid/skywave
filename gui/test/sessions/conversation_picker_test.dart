@@ -8,7 +8,12 @@ const _picker = Key('conversation-picker');
 
 ScreenViewSessionList withPicker(
   ConversationsView? conversations, {
-  CreatePrompt? create = const CreatePrompt(input: '', inputRev: 0),
+  CreatePrompt? create = const CreatePrompt(
+    input: '',
+    inputRev: 0,
+    conversation: '',
+    worktree: '',
+  ),
 }) => ScreenViewSessionList(
   kind: ListKindView.active,
   title: 'Sessions',

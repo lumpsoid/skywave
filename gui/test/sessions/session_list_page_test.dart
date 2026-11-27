@@ -495,6 +495,10 @@ void main() {
     );
     expect(find.text('Creating'), findsOneWidget);
     expect(find.text('waits for the server'), findsOneWidget);
+    // Both are drawn with the pending icon, not a spinner: the queued one
+    // shows its state icon and the refused one its error icon.
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.byType(AgentStateIcon), findsOneWidget);
     expect(find.text('Dismiss'), findsOneWidget);
     await tester.tap(find.text('Dismiss'));
     expect(sent, [
@@ -536,6 +540,8 @@ void main() {
         create: const CreatePrompt(
           input: '/srv/',
           inputRev: 1,
+          conversation: '',
+          worktree: '',
           popup: CompletionPopup(
             candidates: [
               CandidateView(path: '/srv/one', label: '/srv/one', recent: true),

@@ -99,6 +99,7 @@ void main() {
         RowKind.contextDivider,
         'New context · velvet walrus · by laptop',
       ),
+      anyRow('create:1', RowKind.creating, 'creating · /srv/x'),
     ]);
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -134,6 +135,7 @@ void main() {
       'mode → plan by laptop',
       'mode bypass refused: not launched for it',
       'New context · velvet walrus · by laptop',
+      'creating · /srv/x',
     ]) {
       expect(find.text(text, findRichText: true), findsWidgets, reason: text);
     }
@@ -247,6 +249,36 @@ void main() {
     await tester.pumpAndSettle();
     expect(sent, [
       const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c3')),
+    ]);
+  });
+
+  testWidgets('a refused creation offers Recreate and Dismiss', (tester) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        'create:c9',
+        RowKind.creating,
+        'not created · refused',
+        outgoing: const OutgoingView(
+          state: OutgoingState.failed,
+          label: 'failed: refused',
+        ),
+        discardable: true,
+        commandId: 'c9',
+      ),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+    await tester.tap(find.byKey(const Key('recreate')));
+    await tester.tap(find.byKey(const Key('dismiss-create')));
+    expect(sent, [
+      const GuiIntentRecreateOpen(),
+      const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c9')),
     ]);
   });
 
