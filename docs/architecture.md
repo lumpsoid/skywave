@@ -193,10 +193,10 @@ every version.
   (`Event.command_id`), the last it appends, at the seq of its `Accepted`;
   a rejected one logs nothing. So the log acknowledges a command as its
   reply does (`MoveContext` also logs the new session's `SessionCreated`
-  first; a `CreateSession` logs its `SessionCreated`, then the session's
-  starting `SafetyCheckSet` and `PermissionModeRequested` when it asks for
-  them, the last naming it; an adopting `CreateSession` logs its
-  `SessionCreated`, its `SafetyCheckSet` if on, and the imported history
+  first; a `CreateSession` logs its `SessionCreated` under the id the device
+  minted (D68), then the session's starting `SafetyCheckSet` and
+  `PermissionModeRequested` when it asks for them, the last naming it; an
+  adopting `CreateSession` logs its `SessionCreated`, its `SafetyCheckSet` if on, and the imported history
   first, and names itself on the `ImportFinished` after them, D37). A `DeleteBlob`'s `BlobDeleted` and a `CropBlob`'s
   `BlobCropped` are stamped with the session and context of the event
   that referenced the blob, as an `ApprovalResolved` takes its approval's
@@ -1110,7 +1110,8 @@ no longer decodes rather than failing.
   `WorktreeRemoved`). Both are in `SessionSummary` and `SessionRow`. A
   schema migration backfills them from the stored events. The worktree stays
   recorded after removal, so grouping holds. `Action::CreateSession` takes a
-  `worktree`; `Action::RemoveWorktree` enqueues only for a session that has
+  `worktree` and opens its session at once, still creating (D68);
+  `Action::RemoveWorktree` enqueues only for a session that has
   one; heads offer it for any such session that is not removed, archived or
   not. The timeline shows `WorktreeRemoved`. Heads group the list by repo
   (`skywave_present::session_list::by_repo`) with this key: the session's
@@ -1438,6 +1439,18 @@ no longer decodes rather than failing.
   from an adopting `SessionCreated` until its `ImportFinished` is stored:
   an import longer than one pull shows the session beside its still
   pending creation (`PendingSession::conversation`) until then.
+- **Creating sessions** (D68): `Action::CreateSession` and
+  `CreateSessionLike` (from a list or the source session) mint the new
+  session's id, open its page at once, and queue the create through the
+  outbox under that id. Until its `SessionCreated` is in the replica the
+  session is creating (`SessionView::creating`): it takes `SendMessage`,
+  `SaveDraft`, `Attach` and `AttachFile`, and nothing else. A message sent meanwhile queues behind
+  the create, which the FIFO outbox and the serial server land first. A
+  refused create keeps its page and its queued messages.
+  `Action::RecreateSession` asks again under the same id and re-queues the
+  refused or queued messages behind it, in order. Dismissing the refused
+  create withdraws them too and leaves the page. A fresh session's timeline
+  starts with `Entry::Created`. `opening` now serves `MoveContext` only.
 - **Shell history** (D53): `ViewState::shell_history` holds this device's
   shell commands from every session, newest first, each once, at most
   `SHELL_HISTORY_MAX` (1000). `Store::load` rebuilds it from the log
@@ -1473,8 +1486,9 @@ no longer decodes rather than failing.
   offline (or with the server unreachable) it is `Unavailable(Offline)`,
   at once when the link is down, and nothing is asked later. Continuing is
   `CreateSession { workdir, conversation, worktree }` (no worktree; the core
-  adds this device's new-session defaults, D67), which ends the picker, as
-  do `EndConversations` and leaving the list.
+  mints the session's id and adds this device's new-session defaults, D67),
+  which opens the new session's page (D68) and ends the picker, as do
+  `EndConversations` and leaving the list.
   Nothing is stored: the listing goes stale at once.
 - **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
   changes; `ShowWorkdir` switches between the changes, one file's diff (a

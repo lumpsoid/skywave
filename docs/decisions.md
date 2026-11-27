@@ -372,8 +372,9 @@ cascading rejection).
 ## D30. Moving a context: one command, two events, only the last names it
 `MoveContext { session_id, context, name }` continues a context of the
 session that has a conversation and is not current as a new session in the
-source's stored workdir. The server mints the new session's id and logs, in
-one transaction, `SessionCreated { workdir, context_name: name, from:
+source's stored workdir. The server mints the new session's id (a create's
+id is the device's, D68) and logs, in one transaction,
+`SessionCreated { workdir, context_name: name, from:
 Some(ContextRef { session, context }) }` in the new session (stamped with
 its first context, naming no command), then `ContextMoved { to, by }` in the
 source (stamped with the moved context, naming the command, at its
@@ -1941,9 +1942,9 @@ device creates starts with them.
   core sends no mode where it does not, so the create is not refused, and
   the stored default stays bypass: it applies once the server allows it.
 - The core sends both on every `CreateSession` and `CreateSessionLike`
-  (`CommandKind::CreateSession { mode, safety_check }`, wire v44). A create
-  that adopts an outside conversation sends no mode, since the server
-  refuses one.
+  (`CommandKind::CreateSession { mode, safety_check }`, wire v44; v45 adds
+  the `session_id` the create is made under, D68). A create that adopts an
+  outside conversation sends no mode, since the server refuses one.
 - The server refuses a bypass `mode` unless `[agent] allow_bypass` is set
   (`BypassDisabled`), and a `mode` with an adopted `conversation`
   (`BadConversation`). Both are refused before anything is logged, as any
@@ -1970,3 +1971,55 @@ device creates starts with them.
 
 **Deferred:** the TUI's way to set both defaults. The core and the wire
 already carry them.
+
+## D68. A session opens before the server creates it (v45)
+
+A create used to show nothing until the server answered, and on a bad
+network that answer can be slow or never come. A person who starts a
+session should see it at once and write in it, offline too. So the device
+names the new session itself, and its page opens before anything is sent.
+
+**Decided:**
+- The device mints the session's id (a UUIDv7) and sends it in
+  `CommandKind::CreateSession { session_id, .. }` (wire v45). The server
+  creates the session under that id and refuses an id already used,
+  deleted ones included (`RejectReason::SessionExists`). The rest of the
+  create is unchanged: its refusals, its events and the defaults of D67.
+- The core's store step v44→v45 gives each create still in the outbox the
+  id its logged events carry, or a fresh one. The server's step is a no-op.
+- `CreateSession` and `CreateSessionLike` (from a list or the source
+  session) open the new session's page at once. Until its `SessionCreated`
+  is in the replica the session is creating (`SessionView.creating`): it
+  takes `SendMessage`, `SaveDraft`, `Attach` and `AttachFile`, and nothing
+  else. A message sent meanwhile queues behind the create. The outbox is
+  FIFO and the server serial, so the message lands after the session.
+- A refused create keeps its page. Dismissing it withdraws its queued
+  messages too and leaves the page. `Action::RecreateSession` asks again
+  under the same id and re-queues its refused or queued messages behind the
+  create, in their order.
+- A fresh session's timeline starts with `Entry::Created` ("Session created
+  · <workdir>"), so the page has a first row before the server answers.
+- The GUI draws a creating session with `AgentState::Creating` (the
+  `pending.svg` icon) in its header and on its list row, not a spinner. A
+  refused create has a row at the top of its page with Recreate and
+  Dismiss; Recreate opens the create dialog on the page, prefilled. The TUI
+  shows a creating line at the top of the page: `R` recreates, `Del`
+  dismisses.
+
+**Why:** a create that waits for the server's answer blocks the person on
+the network, and offline it cannot start at all. Writing at once keeps the
+person in the session. The core needs no hold on the messages: the outbox
+sends oldest first with one command in flight, and the server takes
+commands in that order, so a message queued behind a create always lands
+after it.
+
+**Rejected:**
+- Server-reserved ids: a `ReserveSessionId` command and a stock of ids on
+  the device. That costs a round trip and server state, and a create offline
+  fails once the stock is empty.
+- Holding a create's messages in the core until the create lands. That is
+  more state, waits a round trip, and breaks the plain FIFO outbox that
+  orders them.
+
+**Deferred:** workdir completion in the recreate prompt. The core completes
+workdirs on the session list only.
