@@ -3048,6 +3048,10 @@ mod tests {
         assert_eq!(*server.seen.lock().unwrap(), ["/bad", "/good"]);
         assert!(seam.pending_outbox().unwrap().is_empty());
 
+        // Each create opened its session's page: back to the list to read it.
+        seam.core
+            .dispatch(crate::Action::Navigate(crate::Route::SessionList))
+            .unwrap();
         let Screen::SessionList(list) = seam.core.view().screen else {
             panic!("not on the session list");
         };

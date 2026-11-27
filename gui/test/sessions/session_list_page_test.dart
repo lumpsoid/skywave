@@ -470,6 +470,7 @@ void main() {
       list(
         creating: const [
           CreatingView(
+            sessionId: 's1',
             commandId: 'c1',
             workdir: '/srv/one',
             outgoing: OutgoingView(
@@ -480,6 +481,7 @@ void main() {
             discardable: true,
           ),
           CreatingView(
+            sessionId: 's2',
             commandId: 'c2',
             workdir: '/srv/two',
             outgoing: OutgoingView(
@@ -495,10 +497,39 @@ void main() {
     );
     expect(find.text('Creating'), findsOneWidget);
     expect(find.text('waits for the server'), findsOneWidget);
+    // Both are drawn with the pending icon, not a spinner: the queued one
+    // shows its state icon and the refused one its error icon.
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.byType(AgentStateIcon), findsOneWidget);
     expect(find.text('Dismiss'), findsOneWidget);
     await tester.tap(find.text('Dismiss'));
     expect(sent, [
       const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c2')),
+    ]);
+  });
+
+  testWidgets('tapping a creating row opens its page', (tester) async {
+    await pump(
+      tester,
+      list(
+        creating: const [
+          CreatingView(
+            sessionId: 's7',
+            commandId: 'c7',
+            workdir: '/srv/seven',
+            outgoing: OutgoingView(
+              state: OutgoingState.queued,
+              label: 'queued',
+            ),
+            note: 'waits for the server',
+            discardable: true,
+          ),
+        ],
+      ),
+    );
+    await tester.tap(find.text('/srv/seven'));
+    expect(sent, [
+      const GuiIntentAct(action: ActionIntentOpenSession(sessionId: 's7')),
     ]);
   });
 
@@ -536,6 +567,8 @@ void main() {
         create: const CreatePrompt(
           input: '/srv/',
           inputRev: 1,
+          conversation: '',
+          worktree: '',
           popup: CompletionPopup(
             candidates: [
               CandidateView(path: '/srv/one', label: '/srv/one', recent: true),

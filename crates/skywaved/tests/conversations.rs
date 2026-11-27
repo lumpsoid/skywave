@@ -21,7 +21,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use skywave_proto::{
     Command, CommandId, CommandKind, CommandResult, ContextId, ConversationsResult, Event,
     EventBatch, EventKind, ImportOutcome, ImportedItem, OutsideConversation, PairRequest,
-    PairResponse, RejectReason, Seq, SessionOrigin, limits, path,
+    PairResponse, RejectReason, Seq, SessionId, SessionOrigin, limits, path,
 };
 use skywaved::agent::fake::{FakeAgent, FakeOutside, Gate};
 use skywaved::agent::import::{DEADLINE_EVERY, TIMED_OUT};
@@ -157,6 +157,7 @@ impl Fixture {
         Command {
             id: CommandId::new(),
             kind: CommandKind::CreateSession {
+                session_id: SessionId::new(),
                 workdir: workdir.to_owned(),
                 conversation: conversation.map(str::to_owned),
                 worktree: None,

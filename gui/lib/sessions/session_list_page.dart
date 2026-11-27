@@ -1,6 +1,6 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
-import 'package:skywave_gui/session/look.dart' show monoText;
+import 'package:skywave_gui/session/look.dart' show AgentStateIcon, monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_status.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
@@ -318,10 +318,7 @@ class _CreatingRow extends StatelessWidget {
     return ListTile(
       leading: failed
           ? Icon(Icons.error_outline, color: colors.error)
-          : const SizedBox.square(
-              dimension: 20,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
+          : const AgentStateIcon(state: AgentState.creating),
       title: Text(
         creating.workdir,
         style: monoText,
@@ -340,6 +337,8 @@ class _CreatingRow extends StatelessWidget {
               child: const Text('Dismiss'),
             )
           : null,
+      onTap: () =>
+          send.act(ActionIntentOpenSession(sessionId: creating.sessionId)),
     );
   }
 }

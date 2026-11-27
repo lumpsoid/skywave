@@ -1032,6 +1032,7 @@ fn screen_done(outcome: ScreenOutcome) -> EventKind {
 fn all_command_kinds() -> Vec<CommandKind> {
     vec![
         CommandKind::CreateSession {
+            session_id: session(),
             workdir: "/srv/code/skywave".into(),
             conversation: None,
             worktree: None,
@@ -1039,6 +1040,7 @@ fn all_command_kinds() -> Vec<CommandKind> {
             safety_check: false,
         },
         CommandKind::CreateSession {
+            session_id: session(),
             workdir: "/srv/code/skywave".into(),
             conversation: Some("9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into()),
             worktree: None,
@@ -1046,6 +1048,7 @@ fn all_command_kinds() -> Vec<CommandKind> {
             safety_check: false,
         },
         CommandKind::CreateSession {
+            session_id: session(),
             workdir: "/srv/code/skywave".into(),
             conversation: None,
             worktree: Some("feat/login".into()),
@@ -1053,6 +1056,7 @@ fn all_command_kinds() -> Vec<CommandKind> {
             safety_check: false,
         },
         CommandKind::CreateSession {
+            session_id: session(),
             workdir: "/srv/code/skywave".into(),
             conversation: None,
             worktree: None,
@@ -1322,6 +1326,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::BadAnswer,
             RejectReason::UnknownModel,
             RejectReason::ContextExists,
+            RejectReason::SessionExists,
             RejectReason::UnknownContext,
             RejectReason::ContextChanged,
             RejectReason::ContextMoved,
@@ -1817,16 +1822,20 @@ fn v7_model_choice_decodes_without_efforts() {
     assert_eq!(models[0].efforts, vec![Effort::Low, Effort::XHigh]);
 }
 
-/// A `CreateSession` stored before v44 has no `mode` or `safety_check`: it
+/// `mode` and `safety_check` are optional on the wire: a create without them
 /// starts in the agent's own mode, with the safety check off.
 #[test]
-fn v43_create_session_decodes_without_mode_or_safety_check() {
-    let command: CommandKind =
-        serde_json::from_str(r#"{"type":"create_session","workdir":"/w","conversation":null}"#)
-            .unwrap();
+fn create_session_decodes_without_mode_or_safety_check() {
+    let command: CommandKind = serde_json::from_str(
+        r#"{"type":"create_session",
+        "session_id":"01920000-0000-7000-8000-000000000001",
+        "workdir":"/w","conversation":null}"#,
+    )
+    .unwrap();
     assert_eq!(
         command,
         CommandKind::CreateSession {
+            session_id: session(),
             workdir: "/w".into(),
             conversation: None,
             worktree: None,
@@ -2293,8 +2302,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v44() {
-    assert_eq!(PROTOCOL_VERSION, 44);
+fn protocol_is_v45() {
+    assert_eq!(PROTOCOL_VERSION, 45);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

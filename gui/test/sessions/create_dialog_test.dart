@@ -30,7 +30,15 @@ void main() {
   setUp(() => sent = []);
 
   testWidgets('typing and the keys send their intents', (tester) async {
-    await pump(tester, const CreatePrompt(input: '', inputRev: 0));
+    await pump(
+      tester,
+      const CreatePrompt(
+        input: '',
+        inputRev: 0,
+        conversation: '',
+        worktree: '',
+      ),
+    );
     await tester.enterText(find.byKey(_field), '/srv/');
     await tester.sendKeyEvent(LogicalKeyboardKey.tab);
     await tester.sendKeyEvent(LogicalKeyboardKey.enter);
@@ -46,7 +54,15 @@ void main() {
   testWidgets('the id field sends its edits; Enter in it creates', (
     tester,
   ) async {
-    await pump(tester, const CreatePrompt(input: '', inputRev: 0));
+    await pump(
+      tester,
+      const CreatePrompt(
+        input: '',
+        inputRev: 0,
+        conversation: '',
+        worktree: '',
+      ),
+    );
     expect(
       find.text('Continue a Claude Code session (paste its id)'),
       findsOneWidget,
@@ -62,7 +78,15 @@ void main() {
   testWidgets('the worktree field sends its edits; Enter in it creates', (
     tester,
   ) async {
-    await pump(tester, const CreatePrompt(input: '', inputRev: 0));
+    await pump(
+      tester,
+      const CreatePrompt(
+        input: '',
+        inputRev: 0,
+        conversation: '',
+        worktree: '',
+      ),
+    );
     expect(find.text('New worktree on branch (optional)'), findsOneWidget);
     await tester.enterText(find.byKey(const Key('create-worktree')), 'feat/x');
     await tester.sendKeyEvent(LogicalKeyboardKey.enter);
@@ -80,6 +104,8 @@ void main() {
       const CreatePrompt(
         input: '/srv/',
         inputRev: 1,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(
           candidates: [
             CandidateView(path: '/srv/one', label: '/srv/one', recent: true),
@@ -111,17 +137,49 @@ void main() {
     ]);
   });
 
-  testWidgets('a new input rev fills the field; the same rev does not', (
+  testWidgets('a new input rev fills the three fields; the same rev does not', (
     tester,
   ) async {
-    await pump(tester, const CreatePrompt(input: '', inputRev: 0));
+    await pump(
+      tester,
+      const CreatePrompt(
+        input: '',
+        inputRev: 0,
+        conversation: '',
+        worktree: '',
+      ),
+    );
     await tester.enterText(find.byKey(_field), '/sr');
-    await pump(tester, const CreatePrompt(input: '', inputRev: 0));
-    String text() =>
-        tester.widget<TextField>(find.byKey(_field)).controller!.text;
-    expect(text(), '/sr');
-    await pump(tester, const CreatePrompt(input: '/srv/one/', inputRev: 1));
-    expect(text(), '/srv/one/');
+    await tester.enterText(find.byKey(const Key('create-conversation')), 'abc');
+    await tester.enterText(find.byKey(const Key('create-worktree')), 'feat');
+    await pump(
+      tester,
+      const CreatePrompt(
+        input: '',
+        inputRev: 0,
+        conversation: '',
+        worktree: '',
+      ),
+    );
+    List<String> texts() => [
+      for (final key in [
+        _field,
+        const Key('create-conversation'),
+        const Key('create-worktree'),
+      ])
+        tester.widget<TextField>(find.byKey(key)).controller!.text,
+    ];
+    expect(texts(), ['/sr', 'abc', 'feat']);
+    await pump(
+      tester,
+      const CreatePrompt(
+        input: '/srv/one/',
+        inputRev: 1,
+        conversation: 'sess-9',
+        worktree: 'feat/x',
+      ),
+    );
+    expect(texts(), ['/srv/one/', 'sess-9', 'feat/x']);
   });
 
   testWidgets('an empty listing says so; the dialog goes when Rust closes it', (
@@ -132,6 +190,8 @@ void main() {
       const CreatePrompt(
         input: '/nope',
         inputRev: 0,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(
           candidates: [],
           selected: 0,
@@ -154,7 +214,16 @@ void main() {
         CandidateView(path: '/srv/d$i', label: 'd$i', recent: false);
     final sizes = <Size>[];
     Future<void> show(CompletionPopup? popup) async {
-      await pump(tester, CreatePrompt(input: input, inputRev: 1, popup: popup));
+      await pump(
+        tester,
+        CreatePrompt(
+          input: input,
+          inputRev: 1,
+          conversation: '',
+          worktree: '',
+          popup: popup,
+        ),
+      );
       expect(tester.takeException(), isNull, reason: 'no overflow');
       sizes.add(tester.getSize(find.byType(AlertDialog)));
     }
@@ -212,6 +281,8 @@ void main() {
         CreatePrompt(
           input: '/srv/',
           inputRev: 1,
+          conversation: '',
+          worktree: '',
           popup: CompletionPopup(
             candidates: candidates,
             stale: false,
@@ -239,6 +310,8 @@ void main() {
       const CreatePrompt(
         input: '/srv/',
         inputRev: 1,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(candidates: [], stale: false, loading: true),
       ),
     );
@@ -248,6 +321,8 @@ void main() {
       const CreatePrompt(
         input: '/srv/',
         inputRev: 1,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(candidates: [], stale: false, loading: false),
       ),
     );
@@ -268,6 +343,8 @@ void main() {
       const CreatePrompt(
         input: '/srv/',
         inputRev: 1,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(candidates: [row], stale: true, loading: true),
       ),
     );
@@ -281,6 +358,8 @@ void main() {
       const CreatePrompt(
         input: '/srv/',
         inputRev: 1,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(candidates: [row], stale: false, loading: false),
       ),
     );
@@ -295,6 +374,8 @@ void main() {
       const CreatePrompt(
         input: '/srv/',
         inputRev: 1,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(
           candidates: [
             CandidateView(path: '/srv/api', label: 'api', recent: false),
@@ -315,6 +396,8 @@ void main() {
       CreatePrompt(
         input: '/srv/',
         inputRev: 1,
+        conversation: '',
+        worktree: '',
         popup: CompletionPopup(
           candidates: const [row],
           selected: selected,

@@ -23,7 +23,7 @@ use skywave_core::{
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, Event, EventBatch,
-    EventKind, EventsQuery, HelloResponse, RejectReason, Seq, SessionState,
+    EventKind, EventsQuery, HelloResponse, RejectReason, Seq, SessionId, SessionState,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, seed};
 use skywaved::agent::fake::{FakeAgent, FakeScript, Gate, Step};
@@ -208,6 +208,67 @@ async fn offline_queue_drains_exactly_once() {
         .collect();
     assert_eq!(delivered, texts);
     assert_same_log(&events, &client.local_events());
+}
+
+/// A message sent to a session whose create is still queued offline goes out
+/// behind the create, so the server logs the session before its message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_queued_behind_an_offline_create_lands_after_it() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+
+    proxy.down();
+    client
+        .wait("the link to drop", |_, view| is_reconnecting(&view.link))
+        .await;
+    client.dispatch(Action::CreateSession {
+        conversation: None,
+        workdir: daemon.workdir(),
+        worktree: None,
+    });
+    // The session's id is minted with the create, before the server knows it.
+    let queued = client.seam.pending_outbox().unwrap();
+    let CommandKind::CreateSession { session_id: id, .. } = queued[0].command.kind else {
+        panic!("the create is queued first: {queued:?}");
+    };
+    let create = queued[0].command.id;
+    client.dispatch(Action::SendMessage {
+        session_id: id,
+        text: "hi".into(),
+    });
+    assert_eq!(client.seam.pending_outbox().unwrap().len(), 2);
+
+    proxy.up();
+    let landed = |events: &[Event]| {
+        events
+            .iter()
+            .any(|e| e.session_id == id && matches!(e.kind, EventKind::UserMessage { .. }))
+    };
+    client
+        .wait(
+            "the message to land and the replica to catch up",
+            |c, view| {
+                let events = daemon.events();
+                view.queued == 0 && landed(&events) && c.cursor() == Seq(events.len() as u64)
+            },
+        )
+        .await;
+    assert_eq!(client.created_session(create), Some(id));
+
+    let events = daemon.events();
+    let position = |what: fn(&EventKind) -> bool| {
+        events
+            .iter()
+            .position(|e| e.session_id == id && what(&e.kind))
+    };
+    let created = position(|k| matches!(k, EventKind::SessionCreated { .. }))
+        .expect("the session was created");
+    let message =
+        position(|k| matches!(k, EventKind::UserMessage { .. })).expect("the message landed");
+    assert!(created < message, "the create lands first: {events:?}");
 }
 
 /// F9: the link dies while the agent works — mid-turn, and again and again
@@ -517,10 +578,11 @@ async fn withdrawn_message_never_reaches_the_server() {
     }
     let ids: Vec<CommandId> = client.outbox()[1..].iter().map(|e| e.command.id).collect();
     let view = client
-        .open_session(session, |s| s.timeline.len() == 3)
+        .open_session(session, |s| s.timeline.len() == 4)
         .await;
+    // Row 0 is the session's creation; the rest are the three messages.
     assert!(
-        view.timeline.iter().all(|item| matches!(
+        view.timeline[1..].iter().all(|item| matches!(
             item,
             TimelineItem::Pending {
                 discardable: true,
@@ -533,7 +595,7 @@ async fn withdrawn_message_never_reaches_the_server() {
     client.dispatch(Action::Discard(ids[1]));
     client.dispatch(Action::EditQueued(ids[2]));
     let view = client
-        .open_session(session, |s| s.timeline.len() == 1)
+        .open_session(session, |s| s.timeline.len() == 2)
         .await;
     assert_eq!(view.draft.map(|d| d.text).as_deref(), Some("edit"));
     assert_eq!(client.core.view().queued, 1);
@@ -1016,12 +1078,16 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
         other => panic!("expected the message, got {other:?}"),
     };
     let view = client
-        .open_session(session, |s| s.timeline.len() == 2)
+        .open_session(session, |s| s.timeline.len() == 3)
         .await;
     assert!(
         matches!(
             &view.timeline[..],
             [
+                TimelineItem::Logged {
+                    entry: Entry::Created { .. },
+                    ..
+                },
                 TimelineItem::Change {
                     command_id: c,
                     change: PendingChange::NewContext { name: shown },
@@ -1031,7 +1097,7 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
                 TimelineItem::Pending { command_id: m, .. },
             ] if *c == clear && *m == message && *shown == name
         ),
-        "the clear's row, then the message queued after it: {:?}",
+        "where it was created, the clear's row, then the message queued after it: {:?}",
         view.timeline
     );
     assert_eq!(view.context, cleared);
@@ -1081,7 +1147,7 @@ async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
         [(name.as_str(), 1, true)]
     );
     assert!(matches!(
-        &view.timeline[0],
+        &view.timeline[1],
         TimelineItem::Logged {
             entry: Entry::ContextStarted { name: shown, by },
             context,
@@ -1692,6 +1758,7 @@ fn create_on_server(daemon: &mut Daemon, device: skywave_core::DeviceId) {
     let command = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: daemon.workdir(),
             conversation: None,
             worktree: None,

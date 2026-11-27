@@ -47,7 +47,10 @@ use skywave_present::login;
 use skywave_present::sections::{discardable, editable, wanted_blob};
 use skywave_present::text::clean;
 
-use crate::app::{App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable};
+use crate::app::{
+    App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, discardable_create, dismissable,
+    refused_create,
+};
 use crate::notify;
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
@@ -839,6 +842,30 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
             .into();
     }
     let keys = footer_keys(app);
+    // A create the server has not made: `R` and Del are the timeline's keys,
+    // where a picker, a prompt, the run list or a rule pick does not have them.
+    let timeline = !app.ui().help
+        && app.ui().prompt.is_none()
+        && app.session().is_some_and(|(view, ui)| {
+            ui.picker.is_none()
+                && ui.focus == Focus::Timeline
+                && !ui.shell()
+                && ui.rule_pick(view).is_none()
+        });
+    let (refused, discardable) = match app.session() {
+        Some((view, _)) if timeline => (
+            refused_create(view).is_some(),
+            discardable_create(view).is_some(),
+        ),
+        _ => (false, false),
+    };
+    let keys: Cow<'static, str> = if refused {
+        format!("R recreate · Del dismiss · {keys}").into()
+    } else if discardable {
+        format!("Del dismiss · {keys}").into()
+    } else {
+        keys.into()
+    };
     // `d` says how much it would fetch.
     if !app.ui().help
         && let Some((view, ui)) = app.session()
@@ -858,7 +885,7 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
             .replacen("d download", &format!("d download ({})", bytes(size)), 1)
             .into();
     }
-    keys.into()
+    keys
 }
 
 fn footer_keys(app: &App) -> &'static str {
@@ -884,6 +911,11 @@ fn footer_keys(app: &App) -> &'static str {
                 .is_some_and(|p| matches!(p.kind, PromptKind::Rename(_))) =>
         {
             "Enter rename (empty: default title) · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
+        // The only prompt on a session but the rename: the recreate of its
+        // refused create.
+        Screen::Session(_) if app.ui().prompt.is_some() => {
+            "Enter recreate · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(_)
             if app

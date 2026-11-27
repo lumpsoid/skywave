@@ -14,9 +14,9 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
     Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
-    Entry, Link, ListKind, PairUri, PairingView, Question, Route, RunWhen, Screen, Seq,
-    ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
-    TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Entry, Link, ListKind, Outgoing, PairUri, PairingView, PendingSession, Question, Route,
+    RunWhen, Screen, Seq, ServerAddress, SessionId, SessionListView, SessionRow, SessionView,
+    ShellRun, ShellRunState, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::blob_actions::{entry_target, run_target};
 use skywave_present::format::{
@@ -171,7 +171,7 @@ pub enum PromptKind {
 }
 
 /// A one-line prompt over the session list or a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Prompt {
     pub kind: PromptKind,
     pub text: String,
@@ -185,6 +185,8 @@ pub struct Prompt {
     /// the prompt asks for the conversation id; `None` while it still asks
     /// for the workdir.
     workdir: Option<String>,
+    /// Recreating this refused session: Enter sends `RecreateSession`.
+    recreate: Option<PendingSession>,
 }
 
 impl Prompt {
@@ -195,6 +197,7 @@ impl Prompt {
             submitted: false,
             picker: WorkdirPicker::new(),
             workdir: None,
+            recreate: None,
         }
     }
 
@@ -221,16 +224,35 @@ impl Prompt {
     }
 
     /// Whether the prompt still belongs on `screen`: a new-session prompt
-    /// on the session list, a rename there or on its session, an address
+    /// on the session list (not a recreate), a rename there or on its
+    /// session, the recreate of a refused session on its page, an address
     /// on settings.
     fn fits(&self, screen: &Screen) -> bool {
         match (self.kind, screen) {
             (PromptKind::ServerAddress, screen) => matches!(screen, Screen::Settings(_)),
+            (PromptKind::Create, Screen::SessionList(_)) if self.recreate.is_some() => false,
             (_, Screen::SessionList(_)) => true,
             (PromptKind::Rename(id), Screen::Session(view)) => view.id == id,
+            (PromptKind::Create, Screen::Session(view)) => self
+                .recreate
+                .as_ref()
+                .is_some_and(|pending| pending.session_id == view.id),
             _ => false,
         }
     }
+}
+
+/// The session's create, when the server refused it: `R` asks for it again.
+pub(crate) fn refused_create(view: &SessionView) -> Option<&PendingSession> {
+    view.creating
+        .as_ref()
+        .filter(|pending| matches!(pending.outgoing, Outgoing::Failed(_)))
+}
+
+/// The session's create, while Del can take it back: the server never saw
+/// it, or refused it.
+pub(crate) fn discardable_create(view: &SessionView) -> Option<&PendingSession> {
+    view.creating.as_ref().filter(|pending| pending.discardable)
 }
 
 /// Where keys go on the session view.
@@ -2472,6 +2494,14 @@ impl App {
                     return create.picker.cancel(completing);
                 }
                 create.submitted = true;
+                if let Some(pending) = &create.recreate {
+                    return Some(Action::RecreateSession {
+                        session_id: pending.session_id,
+                        workdir: create.text.clone(),
+                        conversation: pending.conversation.clone(),
+                        worktree: pending.worktree.clone(),
+                    });
+                }
                 return Some(Action::CreateSession {
                     conversation: None,
                     workdir: create.text.clone(),
@@ -2861,6 +2891,12 @@ impl App {
                 KeyCode::Delete if discardable(view, session.shown.selected).is_some() => {
                     discardable(view, session.shown.selected).map(|(id, _)| Action::Discard(id))
                 }
+                // A create the server never saw or refused: Del takes it back
+                // with its messages. Behind the discardable item above, which
+                // keeps the key.
+                KeyCode::Delete if discardable_create(view).is_some() => {
+                    discardable_create(view).map(|pending| Action::Discard(pending.command_id))
+                }
                 // The selected call's output: delete, crop, or take back
                 // either. Shifted, as neither can be undone.
                 KeyCode::Char('D' | 'K') | KeyCode::Delete => {
@@ -2921,6 +2957,16 @@ impl App {
                 KeyCode::Char('C') => {
                     session.picker = Some(Picker::contexts(view));
                     None
+                }
+                // A refused create: `R` asks for it again. Ahead of the
+                // rename below, which it takes the key from.
+                KeyCode::Char('R') if refused_create(view).is_some() => {
+                    let pending = refused_create(view)?.clone();
+                    let mut prompt = Prompt::new(PromptKind::Create, pending.workdir.clone());
+                    let action = prompt.picker.start(&pending.workdir);
+                    prompt.recreate = Some(pending);
+                    self.ui.prompt = Some(prompt);
+                    Some(action)
                 }
                 KeyCode::Char('R') => {
                     let name = if view.named {

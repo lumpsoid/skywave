@@ -241,6 +241,34 @@ impl SessionSummary {
         summary
     }
 
+    /// A session this device asked for that is not logged yet: its page
+    /// shows, and messages queue for it.
+    pub fn creating(id: SessionId, workdir: String) -> Self {
+        SessionSummary {
+            id,
+            workdir: Some(workdir),
+            state: SessionState::Idle,
+            pending_approvals: Vec::new(),
+            last_activity: DateTime::<Utc>::UNIX_EPOCH,
+            last_seq: Seq::ZERO,
+            last_message_seq: Seq::ZERO,
+            stopped: false,
+            notable: 0,
+            name: None,
+            first_prompt: None,
+            archived: false,
+            usage: None,
+            agent: AgentSettings::default(),
+            work: AgentWork::default(),
+            context: ContextId::first_of(id),
+            importing: false,
+            adopted: None,
+            worktree: None,
+            worktree_removed: false,
+            safety_check: false,
+        }
+    }
+
     /// Folds one event of this session into the summary.
     ///
     /// A rename only sets the name, an archive only the archived flag, a

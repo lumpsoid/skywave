@@ -105,6 +105,7 @@ impl Fixture {
             DeviceId::new(),
             CommandId::new(),
             CommandKind::CreateSession {
+                session_id: SessionId::new(),
                 workdir: workdir.to_str().unwrap().to_owned(),
                 conversation: None,
                 worktree: None,

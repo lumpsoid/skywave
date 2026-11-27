@@ -43,11 +43,12 @@ IconData toolIcon(ToolKindView kind) => switch (kind) {
 
 /// An agent state's icon asset: each state has its own shape, so the icon
 /// reads without its colour. The logo's ionosphere arc sits over the
-/// station: idle a dot, working the ray bouncing off it, approval an
-/// exclamation mark, error the ray escaping a broken layer, stopped a hollow
-/// station with no sky.
+/// station: idle a dot, creating three dots, waiting, working the ray
+/// bouncing off it, approval an exclamation mark, error the ray escaping a
+/// broken layer, stopped a hollow station with no sky.
 String agentIconAsset(AgentState state) => switch (state) {
   AgentState.idle => 'assets/status/idle.svg',
+  AgentState.creating => 'assets/status/pending.svg',
   AgentState.working => 'assets/status/working.svg',
   AgentState.awaitingApproval => 'assets/status/approval.svg',
   AgentState.errored => 'assets/status/error.svg',
@@ -134,6 +135,7 @@ class SkyColors {
   /// The agent's state: its label, badge and icon.
   Color agent(AgentState state) => switch (state) {
     AgentState.idle => muted,
+    AgentState.creating => warning,
     AgentState.working => working,
     AgentState.awaitingApproval => warning,
     AgentState.errored => scheme.error,

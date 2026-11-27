@@ -1926,6 +1926,10 @@ mod tests {
                 Screen::Session(view) => match &view.timeline[..] {
                     [
                         TimelineItem::Logged {
+                            entry: Entry::Created { .. },
+                            ..
+                        },
+                        TimelineItem::Logged {
                             entry:
                                 Entry::ToolResult {
                                     output: Some(FullView::Blob(blob)),

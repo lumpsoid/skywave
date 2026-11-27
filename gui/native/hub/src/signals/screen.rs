@@ -606,6 +606,8 @@ pub struct SessionRowView {
 /// A session this device asked for, not in the replica yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct CreatingView {
+    /// The session it creates: a tap opens its page.
+    pub session_id: String,
     pub command_id: String,
     pub workdir: String,
     pub outgoing: OutgoingView,
@@ -647,9 +649,8 @@ pub struct ConversationRowView {
     pub session_id: Option<String>,
 }
 
-/// The new-session prompt: a server workdir with completion. The
-/// optional outside conversation id is not echoed: it is the user's
-/// alone, so Dart owns its field and only sends edits.
+/// The new-session prompt: a server workdir with completion, and the
+/// optional outside conversation id and worktree branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct CreatePrompt {
     /// The input as the hub last set it; Dart overwrites its field only
@@ -660,6 +661,13 @@ pub struct CreatePrompt {
     pub input_rev: u32,
     /// The candidate list; shown whenever the core has a completion.
     pub popup: Option<CompletionPopup>,
+    /// The conversation id as the hub last set it: empty, or the refused
+    /// create's when recreating. Dart overwrites its field only when
+    /// `input_rev` changes, like `input`.
+    pub conversation: String,
+    /// The worktree branch as the hub last set it; written into its field
+    /// the same way as `conversation`.
+    pub worktree: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
@@ -777,6 +785,8 @@ pub struct SessionScreen {
     pub snippets: Vec<SnippetView>,
     /// The rename prompt, while open (`RenameOpen`).
     pub rename_prompt: Option<RenamePrompt>,
+    /// The create prompt, while recreating this refused session.
+    pub create: Option<CreatePrompt>,
     /// Only the conversation shows: the timeline's rows leave out tool
     /// calls, but one an approval waits on (`ToggleConversationOnly`).
     pub conversation_only: bool,
@@ -1228,6 +1238,8 @@ pub enum ComposerModeView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]
 pub enum AgentState {
     Idle,
+    /// Its create is on its way: the server has not made it yet.
+    Creating,
     Working,
     AwaitingApproval,
     Errored,

@@ -20,8 +20,11 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// The workdir field is the user's; it takes Rust's input only when
 /// `input_rev` changes (a completion filled it in). A second, optional
 /// field takes the id of a Claude Code conversation started outside
-/// Skywave, to continue it; it is wholly Dart's, only its edits are sent,
-/// and Enter in it creates the session like Enter in the workdir field.
+/// Skywave, to continue it; a third takes an optional worktree branch.
+/// Both take Rust's value the same way, when `input_rev` changes (a
+/// recreate fills them with the refused create's), and their edits are
+/// sent; Enter in either creates the session like Enter in the workdir
+/// field.
 /// "Pick a conversation…" opens the server agent's conversations instead
 /// (`ConversationPicker`), to continue one in its own workdir.
 class CreateDialog extends StatefulWidget {
@@ -39,6 +42,8 @@ class _CreateDialogState extends State<CreateDialog> {
   static const _visibleRows = 6;
 
   final _input = TextEditingController();
+  final _conversation = TextEditingController();
+  final _worktree = TextEditingController();
   final _list = ScrollController();
   int? _rev;
 
@@ -60,11 +65,16 @@ class _CreateDialogState extends State<CreateDialog> {
   void _take(CreatePrompt prompt) {
     if (prompt.inputRev == _rev) return;
     _rev = prompt.inputRev;
-    _input.value = TextEditingValue(
-      text: prompt.input,
-      selection: TextSelection.collapsed(offset: prompt.input.length),
-    );
+    _input.value = _valueOf(prompt.input);
+    _conversation.value = _valueOf(prompt.conversation);
+    _worktree.value = _valueOf(prompt.worktree);
   }
+
+  /// A field's value, with the caret at its end.
+  static TextEditingValue _valueOf(String text) => TextEditingValue(
+    text: text,
+    selection: TextSelection.collapsed(offset: text.length),
+  );
 
   /// Scrolls the highlighted candidate into the list's view.
   void _reveal() {
@@ -119,6 +129,8 @@ class _CreateDialogState extends State<CreateDialog> {
   @override
   void dispose() {
     _input.dispose();
+    _conversation.dispose();
+    _worktree.dispose();
     _list.dispose();
     super.dispose();
   }
@@ -244,6 +256,7 @@ class _CreateDialogState extends State<CreateDialog> {
                 onKeyEvent: _idKey,
                 child: TextField(
                   key: const Key('create-conversation'),
+                  controller: _conversation,
                   autocorrect: false,
                   style: monoText,
                   decoration: const InputDecoration(
@@ -261,6 +274,7 @@ class _CreateDialogState extends State<CreateDialog> {
                 onKeyEvent: _idKey,
                 child: TextField(
                   key: const Key('create-worktree'),
+                  controller: _worktree,
                   autocorrect: false,
                   style: monoText,
                   decoration: const InputDecoration(

@@ -264,6 +264,9 @@ pub enum GuiIntent {
     },
     /// Open the new-session prompt.
     CreateOpen,
+    /// Open the new-session prompt filled from the refused create of the
+    /// session on screen.
+    RecreateOpen,
     /// The workdir input changed.
     CompletionTyped {
         input: String,

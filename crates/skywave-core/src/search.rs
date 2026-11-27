@@ -354,7 +354,8 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         | Entry::Archived { .. }
         | Entry::WorktreeRemoved { .. }
         | Entry::TurnUsage(_)
-        | Entry::ImportFinished { .. } => Vec::new(),
+        | Entry::ImportFinished { .. }
+        | Entry::Created { .. } => Vec::new(),
     }
 }
 

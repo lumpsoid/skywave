@@ -14,8 +14,9 @@ use skywave_proto::{
 use super::*;
 use crate::lifecycle::{Holder, Target};
 use crate::signals::{
-    ActionIntent, ComposerFile, CreatePrompt, ListKindView, LoginFlowState, NotificationsView,
-    PastedCode, RouteView, RowKind, ScreenView, ShellPromptView, ToolState, WorktreeSessionView,
+    ActionIntent, AgentState, ComposerFile, CreatePrompt, ListKindView, LoginFlowState,
+    NotificationsView, PastedCode, RouteView, RowKind, ScreenView, ShellPromptView, ToolState,
+    WorktreeSessionView,
 };
 
 /// The head over a detached, paired core, with one session open.
@@ -413,6 +414,15 @@ fn the_conversation_picker_lists_and_continues_one() {
     );
     rig.results();
     rig.view();
+    // The create opened its page: back to the list, where the picker was.
+    // Back does nothing from a creating page, so navigate.
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
+    });
+    rig.results();
+    rig.view();
     assert_eq!(rig.conversations(), None, "taking one closes the picker");
     // The pending creation says it imports.
     let ScreenView::SessionList { creating, .. } = rig.list() else {
@@ -442,6 +452,15 @@ fn a_picked_conversation_closes_the_new_session_prompt() {
     assert!(create.is_some(), "the prompt stays under the picker");
     rig.intent(GuiIntent::ConversationPick {
         conversation_id: "aaa".into(),
+    });
+    rig.results();
+    rig.view();
+    // The create opened its page: back to the list, where the prompt was.
+    // Back does nothing from a creating page, so navigate.
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
     });
     rig.results();
     rig.view();
@@ -1805,7 +1824,8 @@ fn snippets_are_saved_from_rows_and_the_composer_and_inserted_at_the_cursor() {
     rig.submit();
     rig.results();
     rig.view();
-    let key = rig.head.sent.timeline.as_ref().unwrap().2[0].key.clone();
+    // Row 0 is the session's creation; row 1 is the message just sent.
+    let key = rig.head.sent.timeline.as_ref().unwrap().2[1].key.clone();
     let outs = rig.intent(GuiIntent::SaveSnippet {
         key,
         name: "tests".into(),
@@ -3098,16 +3118,24 @@ fn a_context_cleared_or_switched_is_a_divider_row() {
         .iter()
         .map(|row| (row.kind, row.text.clone(), row.selectable))
         .collect();
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(rows[0].0, RowKind::ContextDivider);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        (
+            RowKind::Created,
+            "Session created · /srv/work".to_owned(),
+            false
+        )
+    );
+    assert_eq!(rows[1].0, RowKind::ContextDivider);
     assert!(
-        rows[0]
+        rows[1]
             .1
             .starts_with("New context · velvet walrus · by device …"),
         "{rows:?}"
     );
     assert_eq!(
-        rows[1],
+        rows[2],
         (
             RowKind::ContextDivider,
             "Back to start · by you".to_owned(),
@@ -3166,11 +3194,18 @@ fn a_moved_context_is_a_divider_row() {
     };
     assert_eq!(
         rows(&rig),
-        [(
-            RowKind::ContextDivider,
-            "start went on in “forked” · by you".to_owned(),
-            false
-        )]
+        [
+            (
+                RowKind::Created,
+                "Session created · /srv/work".to_owned(),
+                false
+            ),
+            (
+                RowKind::ContextDivider,
+                "start went on in “forked” · by you".to_owned(),
+                false
+            ),
+        ]
     );
 
     rig.intent(GuiIntent::Act {
@@ -3216,7 +3251,10 @@ fn a_removed_worktree_is_an_archive_style_row() {
         .collect();
     assert_eq!(
         rows,
-        [(RowKind::Archived, "worktree removed by you".to_owned())]
+        [
+            (RowKind::Created, "Session created · /srv/work".to_owned()),
+            (RowKind::Archived, "worktree removed by you".to_owned()),
+        ]
     );
 }
 
@@ -3252,7 +3290,10 @@ fn a_written_file_is_a_notice() {
         .collect();
     assert_eq!(
         rows,
-        [(RowKind::Archived, "docs/a.txt written by you".to_owned())]
+        [
+            (RowKind::Created, "Session created · /srv/work".to_owned()),
+            (RowKind::Archived, "docs/a.txt written by you".to_owned()),
+        ]
     );
 }
 
@@ -4881,6 +4922,138 @@ fn accepting_a_candidate_leaves_the_conversation_alone() {
 }
 
 #[test]
+fn a_creating_session_opens_at_once_with_its_creating_row() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    rig.results();
+    rig.view();
+    let ScreenView::Session { session } = sent_screen(&rig) else {
+        panic!("the new session's page opens at once");
+    };
+    assert_eq!(session.state, AgentState::Creating);
+    assert_eq!(rig.rows()[0].kind, RowKind::Creating);
+    assert!(rig.rows()[0].text.starts_with("Creating session · "));
+}
+
+#[test]
+fn recreate_opens_the_prompt_filled_and_sends_recreate_session() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "abc-123".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    rig.results();
+    rig.view();
+    // The server refuses the create: the command never reached it.
+    let (command, created) = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { session_id, .. } => Some((entry.command.id, session_id)),
+            _ => None,
+        })
+        .expect("the create is queued");
+    rig.seam.command_undeliverable(command).unwrap();
+    rig.view();
+
+    rig.intent(GuiIntent::RecreateOpen);
+    rig.results();
+    rig.view();
+    let ScreenView::Session { session } = sent_screen(&rig) else {
+        panic!("the refused session's page stays open");
+    };
+    let prompt = session
+        .create
+        .expect("the refused create's prompt opens on its page");
+    assert_eq!(prompt.input, "/srv/app");
+    assert_eq!(prompt.conversation, "abc-123");
+
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::RecreateSession {
+            session_id: created,
+            workdir: "/srv/app".into(),
+            conversation: Some("abc-123".into()),
+            worktree: Some(String::new()),
+        })
+    );
+    let queued: Vec<SessionId> = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { session_id, .. } => Some(session_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queued, [created]);
+}
+
+#[test]
+fn a_recreate_prompt_does_not_follow_to_the_list() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "abc-123".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    rig.results();
+    rig.view();
+    // The server refuses the create: the command never reached it.
+    let command = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession { .. } => Some(entry.command.id),
+            _ => None,
+        })
+        .expect("the create is queued");
+    rig.seam.command_undeliverable(command).unwrap();
+    rig.view();
+
+    rig.intent(GuiIntent::RecreateOpen);
+    rig.results();
+    rig.view();
+    assert!(
+        matches!(sent_screen(&rig), ScreenView::Session { session } if session.create.is_some()),
+        "the recreate prompt opens on the refused session's page"
+    );
+
+    // Back to the list: the recreate prompt stays on its page only.
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::SessionList,
+        },
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::SessionList { create, .. } = rig.list() else {
+        unreachable!()
+    };
+    assert_eq!(
+        create, None,
+        "the recreate prompt does not follow to the list"
+    );
+}
+
+#[test]
 fn opening_the_prompt_lists_at_once() {
     let mut rig = Rig::new();
     open_create_prompt(&mut rig);
@@ -5105,11 +5278,14 @@ fn conversation_only_leaves_tool_calls_out_of_the_rows_until_switched_off() {
         ),
     ]);
     let kinds = |rig: &Rig| rig.rows().iter().map(|row| row.kind).collect::<Vec<_>>();
-    assert_eq!(kinds(&rig), [RowKind::AgentMessage, RowKind::Tool]);
+    assert_eq!(
+        kinds(&rig),
+        [RowKind::Created, RowKind::AgentMessage, RowKind::Tool]
+    );
     assert!(!rig.open_session().conversation_only);
 
     rig.intent(GuiIntent::ToggleConversationOnly);
-    assert_eq!(kinds(&rig), [RowKind::AgentMessage]);
+    assert_eq!(kinds(&rig), [RowKind::Created, RowKind::AgentMessage]);
     assert!(rig.open_session().conversation_only);
     // A call logged while it is on stays out.
     rig.log(vec![a_call(
@@ -5119,12 +5295,17 @@ fn conversation_only_leaves_tool_calls_out_of_the_rows_until_switched_off() {
         skywave_proto::ToolKind::Shell,
         "make",
     )]);
-    assert_eq!(kinds(&rig), [RowKind::AgentMessage]);
+    assert_eq!(kinds(&rig), [RowKind::Created, RowKind::AgentMessage]);
 
     rig.intent(GuiIntent::ToggleConversationOnly);
     assert_eq!(
         kinds(&rig),
-        [RowKind::AgentMessage, RowKind::Tool, RowKind::Tool]
+        [
+            RowKind::Created,
+            RowKind::AgentMessage,
+            RowKind::Tool,
+            RowKind::Tool
+        ]
     );
     assert!(!rig.open_session().conversation_only);
 }

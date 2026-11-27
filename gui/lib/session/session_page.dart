@@ -11,6 +11,7 @@ import 'package:skywave_gui/session/background_sheet.dart';
 import 'package:skywave_gui/session/composer.dart';
 import 'package:skywave_gui/session/context_picker.dart';
 import 'package:skywave_gui/session/look.dart';
+import 'package:skywave_gui/sessions/create_dialog.dart';
 import 'package:skywave_gui/sessions/rename_dialog.dart';
 import 'package:skywave_gui/session/search_bar.dart';
 import 'package:skywave_gui/session/search_holder.dart';
@@ -828,6 +829,10 @@ class _SessionPageState extends State<SessionPage> {
               prompt: renamePrompt,
               send: widget.send,
             ),
+          ),
+        if (screen.create case final create?)
+          Positioned.fill(
+            child: CreateDialog(prompt: create, send: widget.send),
           ),
       ],
     );

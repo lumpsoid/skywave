@@ -74,6 +74,7 @@ impl Fixture {
     fn create_session(&mut self) -> SessionId {
         let workdir = self.root.join("project").to_str().unwrap().to_owned();
         let seq = accepted(self.handle(CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir,
             conversation: None,
             worktree: None,
@@ -409,6 +410,7 @@ fn each_accepted_command_logs_one_event_naming_it() {
     let (id, result, before) = send(
         &mut f,
         CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir,
             conversation: None,
             worktree: None,
@@ -475,6 +477,7 @@ fn each_accepted_command_logs_one_event_naming_it() {
     let adopt = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: f.root.join("project").display().to_string(),
             conversation: Some(CONVERSATION.into()),
             worktree: None,
@@ -582,6 +585,7 @@ fn concurrent_resends_of_one_command_append_once() {
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir,
             conversation: None,
             worktree: None,
@@ -692,6 +696,7 @@ fn create_session_records_the_canonical_workdir() {
     let mut f = Fixture::new();
     let dotted = f.root.join("project").join("..").join("project");
     let seq = accepted(f.handle(CommandKind::CreateSession {
+        session_id: SessionId::new(),
         workdir: workdir(&dotted),
         conversation: None,
         worktree: None,
@@ -725,6 +730,7 @@ fn create_session_records_the_canonical_workdir() {
     assert!(!info.turn_active);
     // The root itself is allowed too.
     accepted(f.handle(CommandKind::CreateSession {
+        session_id: SessionId::new(),
         workdir: workdir(&f.root),
         conversation: None,
         worktree: None,
@@ -734,12 +740,90 @@ fn create_session_records_the_canonical_workdir() {
 }
 
 #[test]
+fn a_create_makes_the_session_its_command_names() {
+    let mut f = Fixture::new();
+    let id = SessionId::new();
+    accepted(f.handle(CommandKind::CreateSession {
+        session_id: id,
+        workdir: workdir(&f.root.join("project")),
+        conversation: None,
+        worktree: None,
+        mode: None,
+        safety_check: false,
+    }));
+    let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
+    assert!(matches!(
+        batch.events[0].kind,
+        EventKind::SessionCreated { .. }
+    ));
+    assert_eq!(batch.events[0].session_id, id);
+    let info = f.log.session(&f.storage.db, id).unwrap().unwrap();
+    assert_eq!(info.id, id);
+}
+
+#[test]
+fn a_create_naming_a_taken_session_id_is_refused() {
+    let mut f = Fixture::new();
+    let id = SessionId::new();
+    let project = workdir(&f.root.join("project"));
+    accepted(f.handle(CommandKind::CreateSession {
+        session_id: id,
+        workdir: project.clone(),
+        conversation: None,
+        worktree: None,
+        mode: None,
+        safety_check: false,
+    }));
+    let head = f.log.head();
+    let result = f.handle(CommandKind::CreateSession {
+        session_id: id,
+        workdir: project,
+        conversation: None,
+        worktree: None,
+        mode: None,
+        safety_check: false,
+    });
+    assert!(matches!(
+        result,
+        CommandResult::Rejected {
+            reason: RejectReason::SessionExists
+        }
+    ));
+    assert_eq!(f.log.head(), head, "a refused create logs nothing");
+}
+
+#[test]
+fn a_create_naming_another_sessions_context_is_refused() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let second = ContextId::new();
+    accepted(f.clear(session, second, "next"));
+    let head = f.log.head();
+    let result = f.handle(CommandKind::CreateSession {
+        session_id: SessionId(second.0),
+        workdir: workdir(&f.root.join("project")),
+        conversation: None,
+        worktree: None,
+        mode: None,
+        safety_check: false,
+    });
+    assert!(matches!(
+        result,
+        CommandResult::Rejected {
+            reason: RejectReason::SessionExists
+        }
+    ));
+    assert_eq!(f.log.head(), head, "a refused create logs nothing");
+}
+
+#[test]
 fn a_created_session_logs_its_starting_safety_check_and_mode() {
     let mut f = Fixture::new();
     let device = DeviceId::new();
     let command = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir(&f.root.join("project")),
             conversation: None,
             worktree: None,
@@ -791,6 +875,7 @@ fn a_created_session_with_only_the_safety_check_names_it() {
     let command = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir(&f.root.join("project")),
             conversation: None,
             worktree: None,
@@ -827,6 +912,7 @@ fn a_created_session_in_bypass_is_refused_unless_the_server_allows_it() {
     assert!(!f.log.bypass_allowed(), "off by default");
     let project = workdir(&f.root.join("project"));
     let create = |mode| CommandKind::CreateSession {
+        session_id: SessionId::new(),
         workdir: project.clone(),
         conversation: None,
         worktree: None,
@@ -851,6 +937,7 @@ fn an_adopting_create_session_cannot_ask_for_a_mode() {
     let head = f.log.head();
     assert_eq!(
         f.handle(CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir(&f.root.join("project")),
             conversation: Some(CONVERSATION.into()),
             worktree: None,
@@ -890,6 +977,7 @@ fn create_session_rejects_workdirs_outside_roots() {
     for (dir, reason) in cases {
         assert_eq!(
             f.handle(CommandKind::CreateSession {
+                session_id: SessionId::new(),
                 workdir: dir.clone(),
                 conversation: None,
                 worktree: None,
@@ -913,6 +1001,7 @@ fn create_session_follows_symlinks_before_checking_roots() {
     std::os::unix::fs::symlink(&outside, f.root.join("escape")).unwrap();
     assert_eq!(
         f.handle(CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir(&f.root.join("escape")),
             conversation: None,
             worktree: None,
@@ -926,6 +1015,7 @@ fn create_session_follows_symlinks_before_checking_roots() {
     let link_in = f.tmp.path().join("link-in");
     std::os::unix::fs::symlink(f.root.join("project"), &link_in).unwrap();
     accepted(f.handle(CommandKind::CreateSession {
+        session_id: SessionId::new(),
         workdir: workdir(&link_in),
         conversation: None,
         worktree: None,
@@ -940,6 +1030,7 @@ fn no_roots_allow_nothing() {
     f.log = EventLog::open(&f.storage.db, vec![]).unwrap();
     assert_eq!(
         f.handle(CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir(&f.root.join("project")),
             conversation: None,
             worktree: None,
@@ -956,6 +1047,7 @@ const CONVERSATION: &str = "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8";
 
 fn adopt_kind(workdir: String, conversation: &str) -> CommandKind {
     CommandKind::CreateSession {
+        session_id: SessionId::new(),
         workdir,
         conversation: Some(conversation.to_owned()),
         worktree: None,
@@ -1963,6 +2055,7 @@ impl OpenWork {
         let head = f.log.head();
         let refused = [
             CommandKind::CreateSession {
+                session_id: SessionId::new(),
                 workdir: workdir(&f.root.join("project")),
                 conversation: None,
                 worktree: None,
@@ -3811,6 +3904,7 @@ async fn waiters_wake_on_append() {
             let command = Command {
                 id: CommandId::new(),
                 kind: CommandKind::CreateSession {
+                    session_id: SessionId::new(),
                     workdir,
                     conversation: None,
                     worktree: None,
@@ -3878,6 +3972,7 @@ impl Fixture {
     /// current: the context a move takes.
     fn movable_in(&mut self, dir: &Path) -> (SessionId, ContextId) {
         let seq = accepted(self.handle(CommandKind::CreateSession {
+            session_id: SessionId::new(),
             workdir: workdir(dir),
             conversation: None,
             worktree: None,

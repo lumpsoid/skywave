@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use skywave_core::attachment::{self, AttachedFile, AttachedImage};
 use skywave_core::search::{BlobText, SessionsFound};
 use skywave_core::{
-    Action, BlobState, BlobView, CallId, CommandId, ComposerMode, ContentHash, Entry, PairUri,
-    PairingView, RunWhen, Screen, ScreenAction, Seq, SessionId, SessionView, SnippetId,
+    Action, BlobState, BlobView, CallId, CommandId, ComposerMode, ContentHash, Entry, Outgoing,
+    PairUri, PairingView, RunWhen, Screen, ScreenAction, Seq, SessionId, SessionView, SnippetId,
     TimelineItem, ViewState, parse_pair_uri,
 };
 use skywave_present::app_screen::{self as present, Input};
@@ -579,8 +579,15 @@ impl Head {
             }
             _ => {}
         }
-        // A prompt goes with its screen.
-        if !matches!(view.screen, Screen::SessionList(_)) {
+        // A prompt goes with its screen; a recreate prompt stays on its
+        // refused session's page.
+        let keeps_prompt = match (&view.screen, &self.create) {
+            (Screen::SessionList(_), Some(create)) => create.recreate.is_none(),
+            (Screen::SessionList(_), None) => true,
+            (Screen::Session(session), Some(create)) => Some(session.id) == create.recreate,
+            _ => false,
+        };
+        if !keeps_prompt {
             self.create = None;
         }
         if let Some(rename) = &self.rename {
@@ -1367,6 +1374,30 @@ impl Head {
                     self.dispatch_user(action, Purpose::Plain, clock, out);
                 }
             }
+            GuiIntent::RecreateOpen => {
+                let refused = match self.view.as_ref().map(|v| &v.screen) {
+                    Some(Screen::Session(session)) => session
+                        .creating
+                        .as_ref()
+                        .filter(|pending| matches!(pending.outgoing, Outgoing::Failed(_)))
+                        .cloned(),
+                    _ => None,
+                };
+                if let Some(pending) = refused {
+                    self.revs += 1;
+                    let mut create = CreateUi {
+                        input: pending.workdir.clone(),
+                        rev: self.revs,
+                        conversation: pending.conversation.clone().unwrap_or_default(),
+                        worktree: pending.worktree.clone().unwrap_or_default(),
+                        recreate: Some(pending.session_id),
+                        ..Default::default()
+                    };
+                    let action = create.picker.start(&create.input);
+                    self.create = Some(create);
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
+                }
+            }
             GuiIntent::CompletionTyped { input } => {
                 let Some(create) = &mut self.create else {
                     return Ok(());
@@ -1424,10 +1455,18 @@ impl Head {
                 } else {
                     // Blank or unacceptable paths are refused by the core
                     // or the server, not here.
-                    let action = Action::CreateSession {
-                        conversation: Some(create.conversation.clone()),
-                        workdir: create.input.clone(),
-                        worktree: Some(create.worktree.clone()),
+                    let action = match create.recreate {
+                        Some(session_id) => Action::RecreateSession {
+                            session_id,
+                            workdir: create.input.clone(),
+                            conversation: Some(create.conversation.clone()),
+                            worktree: Some(create.worktree.clone()),
+                        },
+                        None => Action::CreateSession {
+                            conversation: Some(create.conversation.clone()),
+                            workdir: create.input.clone(),
+                            worktree: Some(create.worktree.clone()),
+                        },
                     };
                     let tag = self.dispatch_user(action, Purpose::Create, clock, out);
                     self.create_tag = Some(tag);

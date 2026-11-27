@@ -104,6 +104,8 @@ pub struct CreateUi {
     /// The optional new branch to run the session in a git worktree of. The
     /// user's alone, like `conversation`.
     pub worktree: String,
+    /// Recreating this refused session: Enter sends `RecreateSession`.
+    pub recreate: Option<SessionId>,
 }
 
 /// The screen for `view` with the head's `ui`.
@@ -347,6 +349,7 @@ fn rename_label(rename: Option<&Outgoing>) -> Option<String> {
 
 fn creating_view(pending: &PendingSession) -> CreatingView {
     CreatingView {
+        session_id: pending.session_id.0.to_string(),
         command_id: pending.command_id.0.to_string(),
         workdir: clean_line(&pending.workdir),
         outgoing: outgoing_view(&pending.outgoing),
@@ -412,6 +415,8 @@ fn create_prompt(create: &CreateUi, completion: Option<&Completion>, link: &Link
         input: create.input.clone(),
         input_rev: create.rev,
         popup,
+        conversation: create.conversation.clone(),
+        worktree: create.worktree.clone(),
     }
 }
 
@@ -421,23 +426,33 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
         title: clean_line(&session.title),
         workdir: session.workdir.as_deref().map(clean_line),
         workdir_name: session.workdir.as_deref().map(|w| clean_line(dir_name(w))),
-        state: agent_state(&session.state),
+        state: match &session.creating {
+            Some(pending) if matches!(pending.outgoing, Outgoing::Failed(_)) => AgentState::Errored,
+            Some(_) => AgentState::Creating,
+            None => agent_state(&session.state),
+        },
         badge_label: badge(&session.state).to_owned(),
         rename: session.rename.as_ref().map(outgoing_view),
         rename_label: rename_label(session.rename.as_ref()),
         archived_label: session
             .archived
             .then(|| "archived · a message brings it back".to_owned()),
-        agent_label: match &session.state {
-            SessionState::Idle => "agent idle".to_owned(),
-            SessionState::AgentWorking => "agent working".to_owned(),
-            SessionState::BackgroundWork => "background work running".to_owned(),
-            SessionState::AwaitingApproval(_) if session.pending_question.is_some() => {
+        agent_label: match (&session.creating, &session.state) {
+            (Some(pending), _) => match pending.outgoing {
+                Outgoing::Failed(reason) => format!("session not created: {}", fail_reason(reason)),
+                _ => "creating the session".to_owned(),
+            },
+            (None, SessionState::Idle) => "agent idle".to_owned(),
+            (None, SessionState::AgentWorking) => "agent working".to_owned(),
+            (None, SessionState::BackgroundWork) => "background work running".to_owned(),
+            (None, SessionState::AwaitingApproval(_)) if session.pending_question.is_some() => {
                 "agent waiting for an answer".to_owned()
             }
-            SessionState::AwaitingApproval(_) => "agent waiting for an approval".to_owned(),
-            SessionState::Errored(info) => format!("agent error: {}", clean_line(&info.message)),
-            SessionState::Stopped => "agent stopped · a message restarts it".to_owned(),
+            (None, SessionState::AwaitingApproval(_)) => "agent waiting for an approval".to_owned(),
+            (None, SessionState::Errored(info)) => {
+                format!("agent error: {}", clean_line(&info.message))
+            }
+            (None, SessionState::Stopped) => "agent stopped · a message restarts it".to_owned(),
         },
         can_interrupt: matches!(
             session.state,
@@ -577,6 +592,10 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .rename
             .filter(|r| r.session_id == session.id.0.to_string())
             .cloned(),
+        create: ui
+            .create
+            .filter(|create| create.recreate == Some(session.id))
+            .map(|create| create_prompt(create, None, &view.link)),
         conversation_only: ui.conversation_only,
         screen_enabled: session.screen_enabled,
     }
@@ -1995,6 +2014,7 @@ mod tests {
             archived: false,
             workdir: None,
             state: SessionState::Idle,
+            creating: None,
             timeline: Vec::new(),
             pending_approval: None,
             pending_question: None,

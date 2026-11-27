@@ -84,6 +84,7 @@ void main() {
       ),
       anyRow('s:8', RowKind.stopped, 'stopped · a message restarts it'),
       anyRow('s:9', RowKind.renamed, 'renamed to “x” by you'),
+      anyRow('created', RowKind.created, 'Session created · /srv/x'),
       anyRow('s:10', RowKind.archived, 'archived by you'),
       anyRow('s:11', RowKind.agentError, 'it broke'),
       anyRow('s:12', RowKind.turnUsage, r'turn · 12.4s · $0.04'),
@@ -98,6 +99,7 @@ void main() {
         RowKind.contextDivider,
         'New context · velvet walrus · by laptop',
       ),
+      anyRow('create:1', RowKind.creating, 'creating · /srv/x'),
     ]);
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -125,6 +127,7 @@ void main() {
       'new',
       'stopped · a message restarts it',
       'renamed to “x” by you',
+      'Session created · /srv/x',
       'archived by you',
       'agent error',
       'it broke',
@@ -132,6 +135,7 @@ void main() {
       'mode → plan by laptop',
       'mode bypass refused: not launched for it',
       'New context · velvet walrus · by laptop',
+      'creating · /srv/x',
     ]) {
       expect(find.text(text, findRichText: true), findsWidgets, reason: text);
     }
@@ -246,6 +250,66 @@ void main() {
     expect(sent, [
       const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c3')),
     ]);
+  });
+
+  testWidgets('a refused creation offers Recreate and Dismiss', (tester) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        'create:c9',
+        RowKind.creating,
+        'not created · refused',
+        outgoing: const OutgoingView(
+          state: OutgoingState.failed,
+          label: 'failed: refused',
+        ),
+        discardable: true,
+        commandId: 'c9',
+      ),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+    // Laying out sends the following state; only the taps' intents count.
+    sent.clear();
+    await tester.tap(find.byKey(const Key('recreate')));
+    await tester.tap(find.byKey(const Key('dismiss-create')));
+    expect(sent, [
+      const GuiIntentRecreateOpen(),
+      const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c9')),
+    ]);
+  });
+
+  testWidgets('a queued creation offers Dismiss but not Recreate', (
+    tester,
+  ) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        'create:c8',
+        RowKind.creating,
+        'creating · /srv/typo',
+        outgoing: const OutgoingView(
+          state: OutgoingState.queued,
+          label: 'queued',
+        ),
+        discardable: true,
+        commandId: 'c8',
+      ),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+    expect(find.byKey(const Key('dismiss-create')), findsOneWidget);
+    expect(find.byKey(const Key('recreate')), findsNothing);
   });
 
   testWidgets('collapsed calls step back from the messages', (tester) async {

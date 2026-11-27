@@ -6,6 +6,7 @@
 //! the [`Core`](crate::Core) must carry out, persistence first. The
 //! [`ViewState`] is a pure function of the model.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -453,9 +454,9 @@ pub(crate) struct Model {
     /// This device's login of the server's agent: the flow, its URL and
     /// the code. In memory only, never stored.
     login: AgentLogin,
-    /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
-    /// new session is not in the replica yet: its command, and the screen
-    /// it was asked from, still on screen. In memory only.
+    /// A [`Action::MoveContext`] whose new session is not in the replica
+    /// yet: its command, and the screen it was asked from, still on screen.
+    /// In memory only.
     opening: Option<(CommandId, OpeningFrom)>,
     /// The server's devices by name, as stored.
     devices: HashMap<DeviceId, String>,
@@ -627,8 +628,8 @@ impl Model {
         }
     }
 
-    /// The session on screen when its events are not loaded: one
-    /// [`Model::apply_batch`] opened for a [`Action::CreateSessionLike`].
+    /// The session on screen when its events are not loaded: one a create
+    /// or a move opened, before its [`Effect::LoadSession`] is served.
     pub(crate) fn unloaded_session(&self) -> Option<SessionId> {
         match &self.place {
             Place::Session { id, open: None, .. } | Place::SessionInfo { id, open: None } => {
@@ -741,51 +742,33 @@ impl Model {
                 // No local id check: dispatch has no failure channel, and a
                 // silent drop would lose what the user typed. The server's
                 // `BadConversation` shows as a failed pending session.
-                let conversation = conversation
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|c| !c.is_empty())
-                    .map(str::to_owned);
-                let worktree = worktree
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|w| !w.is_empty())
-                    .map(str::to_owned);
-                // The server refuses a mode with an adopted conversation.
-                let mode = match conversation {
-                    Some(_) => None,
-                    None => self.new_session_mode(),
-                };
                 let at = self.opening_from();
-                let effects = self.enqueue(
-                    CommandKind::CreateSession {
-                        workdir: workdir.to_owned(),
-                        conversation,
-                        worktree,
-                        mode,
-                        safety_check: self.settings.default_safety_check,
-                    },
-                    Vec::new(),
-                );
-                // Like `CreateSessionLike`: open it once it is logged, unless the
-                // user went elsewhere meanwhile.
-                if let (Some(at), Some(Effect::Enqueue(command, _))) = (at, effects.first()) {
-                    self.opening = Some((command.id, at));
+                let session_id = SessionId::new();
+                let kind = self.create_command(session_id, workdir, conversation, worktree);
+                let mut effects = self.enqueue(kind, Vec::new());
+                // Open the new session now, as a creating one: it takes
+                // messages before the server logs it.
+                if at.is_some() && !effects.is_empty() {
+                    self.place = Place::session(session_id);
+                    effects.push(Effect::LoadSession(session_id));
                 }
                 effects
             }
             Action::CreateSessionLike(from) => {
-                let Some(at) = self.opening_from().filter(|at| match at {
+                let opens_here = self.opening_from().is_some_and(|at| match at {
                     OpeningFrom::SessionList | OpeningFrom::Archived | OpeningFrom::All => true,
-                    OpeningFrom::Session(id) => *id == from,
-                }) else {
+                    OpeningFrom::Session(id) => id == from,
+                });
+                if !opens_here {
                     return Vec::new();
-                };
+                }
                 let Some(workdir) = self.summary(from).and_then(|s| s.workdir.clone()) else {
                     return Vec::new();
                 };
-                let effects = self.enqueue(
+                let session_id = SessionId::new();
+                let mut effects = self.enqueue(
                     CommandKind::CreateSession {
+                        session_id,
                         workdir,
                         conversation: None,
                         worktree: None,
@@ -794,9 +777,72 @@ impl Model {
                     },
                     Vec::new(),
                 );
-                if let Some(Effect::Enqueue(command, _)) = effects.first() {
-                    self.opening = Some((command.id, at));
+                // As `CreateSession`: opens now, as a creating session.
+                if !effects.is_empty() {
+                    self.place = Place::session(session_id);
+                    effects.push(Effect::LoadSession(session_id));
                 }
+                effects
+            }
+            Action::RecreateSession {
+                session_id,
+                workdir,
+                conversation,
+                worktree,
+            } => {
+                let workdir = workdir.trim();
+                // Commands need a paired device, as `enqueue` needs one.
+                if workdir.is_empty() || self.device().is_none() {
+                    return Vec::new();
+                }
+                let refused = self.outbox.iter().any(|e| {
+                    matches!(
+                        &e.command.kind,
+                        CommandKind::CreateSession { session_id: id, .. } if *id == session_id
+                    ) && matches!(Outgoing::from(&e.status), Outgoing::Failed(_))
+                        && e.discardable()
+                });
+                if !refused {
+                    return Vec::new();
+                }
+                let kind = self.create_command(session_id, workdir, conversation, worktree);
+                // The refused create and the messages queued for its session
+                // leave the outbox. The messages come back behind the new
+                // create, in their outbox order.
+                let (gone, kept): (Vec<OutboxEntry>, Vec<OutboxEntry>) =
+                    std::mem::take(&mut self.outbox).into_iter().partition(|e| {
+                        match &e.command.kind {
+                            CommandKind::CreateSession { session_id: id, .. } => *id == session_id,
+                            CommandKind::SendMessage { session_id: id, .. } => {
+                                *id == session_id && e.discardable()
+                            }
+                            _ => false,
+                        }
+                    });
+                self.outbox = kept;
+                let mut effects = Vec::new();
+                let mut messages = Vec::new();
+                for entry in gone {
+                    effects.push(Effect::Withdraw {
+                        id: entry.command.id,
+                        draft: None,
+                        images: None,
+                        files: None,
+                    });
+                    if matches!(entry.command.kind, CommandKind::SendMessage { .. }) {
+                        let files: Vec<AttachedFile> =
+                            entry.files.into_iter().map(|held| held.file).collect();
+                        messages.push((entry.command.kind, files));
+                    }
+                }
+                let mut queued = self.enqueue(kind, Vec::new());
+                for (message, files) in messages {
+                    queued.extend(self.enqueue(message, files));
+                }
+                // Each enqueue ends with an outbox wake-up; one is enough.
+                queued.retain(|effect| !matches!(effect, Effect::Request(Request::OutboxChanged)));
+                effects.extend(queued);
+                effects.push(Effect::Request(Request::OutboxChanged));
                 effects
             }
             Action::CompleteWorkdir { input } => {
@@ -937,7 +983,7 @@ impl Model {
                 Vec::new()
             }
             Action::SendMessage { session_id, text } => {
-                let Some(summary) = self.summary(session_id) else {
+                let Some(summary) = self.session_or_creating(session_id) else {
                     return Vec::new();
                 };
                 // The draft's images and files are the message's attachments:
@@ -954,7 +1000,7 @@ impl Model {
                 let text = with_file_lines(&text, &files);
                 // The message goes where this device's own clear or switch
                 // on its way leads, so it is not refused for that.
-                let context = self.target_context(summary);
+                let context = self.target_context(&summary);
                 let effects = self.enqueue(
                     CommandKind::SendMessage {
                         session_id,
@@ -1035,7 +1081,7 @@ impl Model {
                 when,
             } => self.save_draft((session_id, mode), text, cursor, when),
             Action::Attach { session_id, image } => {
-                if self.summary(session_id).is_none() {
+                if self.session_or_creating(session_id).is_none() {
                     return Vec::new();
                 }
                 let mut images = self.draft_images_of(session_id).to_vec();
@@ -1064,7 +1110,7 @@ impl Model {
                 vec![Effect::DetachFromDraft(session_id, sha256)]
             }
             Action::AttachFile { session_id, file } => {
-                if self.summary(session_id).is_none() || !plain_file_name(&file.name) {
+                if self.session_or_creating(session_id).is_none() || !plain_file_name(&file.name) {
                     return Vec::new();
                 }
                 let mut files = self.draft_files_of(session_id).to_vec();
@@ -1316,7 +1362,7 @@ impl Model {
                 self.enqueue(CommandKind::DeleteSession { session_id }, Vec::new())
             }
             Action::OpenSession(id) => {
-                if self.device().is_none() || self.summary(id).is_none() {
+                if self.device().is_none() || self.session_or_creating(id).is_none() {
                     return Vec::new();
                 }
                 self.place = Place::session(id);
@@ -1689,7 +1735,7 @@ impl Model {
                 return Some(Action::OpenSession(*id));
             }
             Place::Session { id, .. } => {
-                self.summary(*id)?;
+                self.session_or_creating(*id)?;
                 match self.last_list {
                     ListKind::Active => Route::SessionList,
                     ListKind::Archived => Route::ArchivedSessions,
@@ -1863,6 +1909,41 @@ impl Model {
         })]
     }
 
+    /// The create command of session `session_id` in `workdir` (trimmed by
+    /// the caller). A blank `conversation` or `worktree` is none. The mode is
+    /// the device's default, but none with an adopted conversation: the
+    /// server refuses a mode with one.
+    fn create_command(
+        &self,
+        session_id: SessionId,
+        workdir: &str,
+        conversation: Option<String>,
+        worktree: Option<String>,
+    ) -> CommandKind {
+        let conversation = conversation
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
+        let worktree = worktree
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned);
+        let mode = match conversation {
+            Some(_) => None,
+            None => self.new_session_mode(),
+        };
+        CommandKind::CreateSession {
+            session_id,
+            workdir: workdir.to_owned(),
+            conversation,
+            worktree,
+            mode,
+            safety_check: self.settings.default_safety_check,
+        }
+    }
+
     /// Queues a command under a fresh UUIDv7 id, carrying `files`, which the
     /// sender writes into the workdir root before posting. Commands need a
     /// paired device: without one there is nobody to send them to.
@@ -1992,7 +2073,7 @@ impl Model {
         cursor: usize,
         when: RunWhen,
     ) -> Vec<Effect> {
-        if self.summary(key.0).is_none() {
+        if self.session_or_creating(key.0).is_none() {
             return Vec::new();
         }
         let when = match key.1 {
@@ -2052,7 +2133,9 @@ impl Model {
     /// command answered meanwhile is no longer discardable here: nothing
     /// happens. The sender hears of it, so it stops waiting to resend this
     /// one and moves on. Dismissing a failed switch also takes the earlier
-    /// failed ones of its kind with it.
+    /// failed ones of its kind with it. Taking back a create also takes back
+    /// the discardable messages queued for its session and its drafts, and
+    /// leaves its page.
     fn withdraw(&mut self, id: CommandId, edit: bool) -> Vec<Effect> {
         let Some(index) = self
             .outbox
@@ -2096,6 +2179,10 @@ impl Model {
             ),
             _ if edit => return Vec::new(),
             _ => {
+                let created = match &self.outbox[index].command.kind {
+                    CommandKind::CreateSession { session_id, .. } => Some(*session_id),
+                    _ => None,
+                };
                 let kind = &self.outbox[index].command.kind;
                 let mut ids = Vec::new();
                 if matches!(
@@ -2127,13 +2214,61 @@ impl Model {
                 self.outbox.retain(|e| !ids.contains(&e.command.id));
                 let mut effects: Vec<Effect> = ids
                     .into_iter()
-                    .map(|withdrawn| Effect::Withdraw {
-                        id: withdrawn,
-                        draft: None,
-                        images: None,
-                        files: None,
+                    .map(|withdrawn| {
+                        // A create's withdrawal also empties its session's
+                        // draft images and files in the same write.
+                        let emptied = created.filter(|_| withdrawn == id);
+                        Effect::Withdraw {
+                            id: withdrawn,
+                            draft: None,
+                            images: emptied.map(|session| (session, Vec::new())),
+                            files: emptied.map(|session| (session, Vec::new())),
+                        }
                     })
                     .collect();
+                // The session a refused create named never exists, so the
+                // messages queued for it go too, and its page with them.
+                if let Some(session_id) = created {
+                    let messages: Vec<CommandId> = self
+                        .outbox
+                        .iter()
+                        .filter(|e| {
+                            e.discardable()
+                                && matches!(
+                                    &e.command.kind,
+                                    CommandKind::SendMessage { session_id: queued, .. }
+                                        if *queued == session_id
+                                )
+                        })
+                        .map(|e| e.command.id)
+                        .collect();
+                    for message in messages {
+                        self.outbox.retain(|e| e.command.id != message);
+                        effects.push(Effect::Withdraw {
+                            id: message,
+                            draft: None,
+                            images: None,
+                            files: None,
+                        });
+                    }
+                    // Its drafts go with it, in memory and in the store.
+                    let drafts: Vec<(SessionId, ComposerMode)> = self
+                        .drafts
+                        .keys()
+                        .filter(|(draft_session, _)| *draft_session == session_id)
+                        .copied()
+                        .collect();
+                    for key in drafts {
+                        effects.push(Effect::SaveDraft(key, None));
+                    }
+                    self.drafts
+                        .retain(|(draft_session, _), _| *draft_session != session_id);
+                    self.draft_images.remove(&session_id);
+                    self.draft_files.remove(&session_id);
+                    if self.loaded_session() == Some(session_id) {
+                        self.place = Place::SessionList(ListPage::default());
+                    }
+                }
                 effects.push(Effect::Request(Request::OutboxChanged));
                 return effects;
             }
@@ -3630,23 +3765,7 @@ impl Model {
         let creating = self
             .outbox
             .iter()
-            .filter_map(|e| match &e.command.kind {
-                CommandKind::CreateSession {
-                    workdir,
-                    conversation,
-                    ..
-                } => {
-                    let outgoing = Outgoing::from(&e.status);
-                    (!self.in_replica(outgoing)).then(|| PendingSession {
-                        command_id: e.command.id,
-                        workdir: workdir.clone(),
-                        conversation: conversation.clone(),
-                        outgoing,
-                        discardable: e.discardable(),
-                    })
-                }
-                _ => None,
-            })
+            .filter_map(|e| self.pending_session(e))
             .collect();
         let completion = page.and_then(|page| {
             page.completer
@@ -3798,7 +3917,7 @@ impl Model {
         open: Option<&OpenSession>,
         scope: Scope,
     ) -> Option<SessionView> {
-        let summary = self.summary(id)?;
+        let summary = self.session_or_creating(id)?;
         let events = open.map_or(&[][..], |open| open.events.as_slice());
         let (mut timeline, rules) = self.timeline(id, events);
         let pending_approval = summary.pending_approval().and_then(|approval| {
@@ -3848,7 +3967,7 @@ impl Model {
                 _ => None,
             })
         });
-        let state = session_state(summary);
+        let state = session_state(&summary);
         let interrupt = self
             .latest_outgoing(
                 |kind| matches!(kind, CommandKind::Interrupt { session_id } if *session_id == id),
@@ -3863,9 +3982,9 @@ impl Model {
         let switch = self.latest_outgoing(
             |kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
         );
-        let context = self.target_context(summary);
+        let context = self.target_context(&summary);
         let viewing = scope.context;
-        let title = self.title(summary);
+        let title = self.title(&summary);
         let subagent = scope
             .subagent
             .and_then(|call| subagent_header(&timeline, call));
@@ -3907,7 +4026,7 @@ impl Model {
         }
         let contexts = self.contexts(id, events, context);
         if subagent.is_none() && viewing.is_none_or(|v| v == context) {
-            timeline.extend(self.pending_changes(summary, &contexts));
+            timeline.extend(self.pending_changes(&summary, &contexts));
             // Pending messages and switches in the order they were asked for.
             let start = timeline
                 .iter()
@@ -3929,15 +4048,16 @@ impl Model {
             title: title.text,
             named: title.named,
             rename: title.rename,
-            archived: self.archived(summary),
+            archived: self.archived(&summary),
             workdir: summary.workdir.clone(),
             state,
+            creating: self.creating(id),
             timeline,
             pending_approval,
             pending_question,
             rules,
             usage: summary.usage.clone(),
-            agent: self.agent_view(summary),
+            agent: self.agent_view(&summary),
             safety_check: summary.safety_check,
             safety_check_change: self.safety_check_change(id),
             contexts,
@@ -3950,7 +4070,7 @@ impl Model {
             interrupt,
             stop,
             work: summary.work.clone(),
-            task_stops: self.task_stops(summary, events),
+            task_stops: self.task_stops(&summary, events),
             mode: self.composer_mode(id),
             draft: self.drafts.get(&(id, ComposerMode::Agent)).cloned(),
             draft_images: self.draft_images_of(id).to_vec(),
@@ -5210,12 +5330,15 @@ impl Model {
                     refused: Some(reason.clone()),
                 }),
                 EventKind::SessionCreated {
-                    context_name, from, ..
+                    workdir,
+                    context_name,
+                    from,
+                    ..
                 } => {
                     names.insert(event.context, context_name);
                     current = Some(event.context);
                     // Shown in the header, but for where a moved context
-                    // came from.
+                    // came from, and where a fresh session was created.
                     match from {
                         Some(SessionOrigin::Context(from)) => Some(Entry::MovedFrom {
                             from: self.session_ref(from.session),
@@ -5224,7 +5347,9 @@ impl Model {
                         Some(SessionOrigin::Agent { conversation }) => Some(Entry::Adopted {
                             conversation: conversation.clone(),
                         }),
-                        None => None,
+                        None => Some(Entry::Created {
+                            workdir: workdir.clone(),
+                        }),
                     }
                 }
                 EventKind::ContextStarted { by, name } => {
@@ -5557,6 +5682,62 @@ impl Model {
 
     fn summary(&self, id: SessionId) -> Option<&SessionSummary> {
         self.sessions.iter().find(|s| s.id == id)
+    }
+
+    /// The page of an outbox entry that is a create the replica does not
+    /// have yet, failed ones included; `None` for any other command.
+    fn pending_session(&self, e: &OutboxEntry) -> Option<PendingSession> {
+        let CommandKind::CreateSession {
+            session_id,
+            workdir,
+            conversation,
+            worktree,
+            ..
+        } = &e.command.kind
+        else {
+            return None;
+        };
+        let outgoing = Outgoing::from(&e.status);
+        (!self.in_replica(outgoing)).then(|| PendingSession {
+            command_id: e.command.id,
+            session_id: *session_id,
+            workdir: workdir.clone(),
+            conversation: conversation.clone(),
+            worktree: worktree.clone(),
+            outgoing,
+            discardable: e.discardable(),
+        })
+    }
+
+    /// The create of session `id` while the replica lacks the session: the
+    /// newest one this device queued for it.
+    fn creating(&self, id: SessionId) -> Option<PendingSession> {
+        if self.summary(id).is_some() {
+            return None;
+        }
+        self.outbox
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    &e.command.kind,
+                    CommandKind::CreateSession { session_id, .. } if *session_id == id
+                )
+            })
+            .and_then(|e| self.pending_session(e))
+    }
+
+    /// Session `id`'s summary, or while its create is pending, a stand-in
+    /// for it ([`SessionSummary::creating`]). What a message, a draft or an
+    /// attachment needs to find its session.
+    fn session_or_creating(&self, id: SessionId) -> Option<Cow<'_, SessionSummary>> {
+        match self.summary(id) {
+            Some(summary) => Some(Cow::Borrowed(summary)),
+            None => {
+                let pending = self.creating(id)?;
+                Some(Cow::Owned(SessionSummary::creating(id, pending.workdir)))
+            }
+        }
     }
 
     /// This device's latest delete or crop of `blob` until its effect is in
@@ -6342,6 +6523,14 @@ mod tests {
         }
     }
 
+    /// The session id a queued create names.
+    fn created_id(command: &Command) -> SessionId {
+        match &command.kind {
+            CommandKind::CreateSession { session_id, .. } => *session_id,
+            other => panic!("not a create: {other:?}"),
+        }
+    }
+
     #[test]
     fn unpaired_shows_pairing_and_tracks_progress() {
         let mut model = Model::new(empty_snapshot(), None);
@@ -6521,6 +6710,10 @@ mod tests {
         // Queued: the time comes from the command's UUIDv7 id.
         let queued_at = match &f.session_view().timeline[..] {
             [
+                TimelineItem::Logged {
+                    entry: Entry::Created { .. },
+                    ..
+                },
                 TimelineItem::Pending {
                     delivery: Some(delivery),
                     ..
@@ -6548,7 +6741,10 @@ mod tests {
             answered_at: None,
             tries: 0,
         };
-        assert_eq!(f.session_view().timeline, pending(Outgoing::Queued, fresh));
+        assert_eq!(
+            f.session_view().timeline[1..],
+            pending(Outgoing::Queued, fresh)
+        );
         assert_eq!(f.model.view().queued, 1);
 
         let sent = queued_at + TimeDelta::milliseconds(3200);
@@ -6559,7 +6755,7 @@ mod tests {
             ..fresh
         };
         assert_eq!(
-            f.session_view().timeline,
+            f.session_view().timeline[1..],
             pending(Outgoing::Sending, sending)
         );
 
@@ -6571,7 +6767,7 @@ mod tests {
             ..sending
         };
         assert_eq!(
-            f.session_view().timeline,
+            f.session_view().timeline[1..],
             pending(Outgoing::Sending, resent)
         );
 
@@ -6586,7 +6782,7 @@ mod tests {
             ..resent
         };
         assert_eq!(
-            f.session_view().timeline,
+            f.session_view().timeline[1..],
             pending(Outgoing::Accepted(Seq(2)), done)
         );
         assert_eq!(f.model.view().queued, 0);
@@ -6628,6 +6824,9 @@ mod tests {
         assert_eq!(
             entries,
             vec![
+                &Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 &Entry::UserMessage {
                     command_id: command.id,
                     text: "hello".into(),
@@ -6684,7 +6883,7 @@ mod tests {
         );
         let timeline = f.session_view().timeline;
         assert!(matches!(
-            &timeline[0],
+            &timeline[1],
             TimelineItem::Logged {
                 entry: Entry::UserMessage {
                     command_id,
@@ -6697,7 +6896,7 @@ mod tests {
             } if *command_id == phone
         ));
         assert!(matches!(
-            &timeline[1],
+            &timeline[2],
             TimelineItem::Pending {
                 command_id,
                 text,
@@ -6759,7 +6958,7 @@ mod tests {
                 answers: Vec::new(),
             })
         );
-        let Some(Entry::Tool(tool)) = entries(&f).into_iter().next() else {
+        let Some(Entry::Tool(tool)) = entries(&f).into_iter().nth(1) else {
             panic!("no tool entry");
         };
         let approval = tool.approval.unwrap();
@@ -6846,7 +7045,7 @@ mod tests {
         let view = f.session_view();
         assert_eq!(view.pending_question, None);
         assert_eq!(view.state, SessionState::Idle);
-        let Some(Entry::Tool(tool)) = entries(&f).into_iter().next() else {
+        let Some(Entry::Tool(tool)) = entries(&f).into_iter().nth(1) else {
             panic!("no tool entry");
         };
         assert!(matches!(
@@ -6888,14 +7087,19 @@ mod tests {
         f.open(sid);
         assert_eq!(
             entries(&f),
-            [Entry::Approval {
-                id: question,
-                tool: QUESTION_TOOL.into(),
-                summary: "Which bread?".into(),
-                input: None,
-                status: ApprovalStatus::Pending,
-                answer: None,
-            }]
+            [
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
+                Entry::Approval {
+                    id: question,
+                    tool: QUESTION_TOOL.into(),
+                    summary: "Which bread?".into(),
+                    input: None,
+                    status: ApprovalStatus::Pending,
+                    answer: None,
+                }
+            ]
         );
     }
 
@@ -9161,6 +9365,9 @@ mod tests {
         assert_eq!(
             entries,
             vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::Approval {
                     id: approval,
                     tool: "edit".into(),
@@ -9272,14 +9479,19 @@ mod tests {
         );
         assert_eq!(
             entries(&f),
-            vec![Entry::Renamed {
-                name: Some("flakytests".into()),
-                by: DeviceRef {
-                    id: f.me,
-                    name: None,
-                    me: true,
+            vec![
+                Entry::Created {
+                    workdir: "/srv/app".into(),
                 },
-            }]
+                Entry::Renamed {
+                    name: Some("flakytests".into()),
+                    by: DeviceRef {
+                        id: f.me,
+                        name: None,
+                        me: true,
+                    },
+                }
+            ]
         );
 
         // A blank name restores the default title.
@@ -9446,14 +9658,19 @@ mod tests {
         assert!(f.session_view().archived);
         assert_eq!(
             entries(&f),
-            vec![Entry::Archived {
-                archived: true,
-                by: DeviceRef {
-                    id: f.me,
-                    name: None,
-                    me: true,
+            vec![
+                Entry::Created {
+                    workdir: "/srv/old".into(),
                 },
-            }]
+                Entry::Archived {
+                    archived: true,
+                    by: DeviceRef {
+                        id: f.me,
+                        name: None,
+                        me: true,
+                    },
+                }
+            ]
         );
         f.open(new);
         assert!(!f.session_view().archived);
@@ -9575,13 +9792,18 @@ mod tests {
         f.open(old);
         assert_eq!(
             entries(&f),
-            vec![Entry::WorktreeRemoved {
-                by: DeviceRef {
-                    id: f.me,
-                    name: None,
-                    me: true,
+            vec![
+                Entry::Created {
+                    workdir: "/srv/old".into(),
                 },
-            }]
+                Entry::WorktreeRemoved {
+                    by: DeviceRef {
+                        id: f.me,
+                        name: None,
+                        me: true,
+                    },
+                }
+            ]
         );
     }
 
@@ -9618,6 +9840,9 @@ mod tests {
         assert_eq!(
             entries(&f),
             vec![
+                Entry::Created {
+                    workdir: "/srv/app".into(),
+                },
                 Entry::FileWritten {
                     path: "docs/a.txt".into(),
                     size: 1,
@@ -10490,14 +10715,17 @@ mod tests {
         }
         f.dispatch(Action::Navigate(Route::SessionList));
 
-        let command = queued(&f.dispatch(Action::CreateSession {
-            conversation: None,
-            workdir: "/srv/a".into(),
-            worktree: None,
-        }));
+        let command = queued(
+            &f.dispatch(Action::CreateSession {
+                conversation: None,
+                workdir: "/srv/a".into(),
+                worktree: None,
+            })[..2],
+        );
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10507,14 +10735,17 @@ mod tests {
         );
 
         // The server refuses a mode with an adopted conversation.
-        let command = queued(&f.dispatch(Action::CreateSession {
-            conversation: Some("abc".into()),
-            workdir: "/srv/a".into(),
-            worktree: None,
-        }));
+        let command = queued(
+            &f.dispatch(Action::CreateSession {
+                conversation: Some("abc".into()),
+                workdir: "/srv/a".into(),
+                worktree: None,
+            })[..2],
+        );
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: Some("abc".into()),
                 worktree: None,
@@ -10528,11 +10759,13 @@ mod tests {
     fn a_bypass_default_is_sent_only_where_the_server_allows_it() {
         let mut f = Fixture::paired();
         f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Bypass)));
-        let mode_sent = |f: &mut Fixture| match queued(&f.dispatch(Action::CreateSession {
-            conversation: None,
-            workdir: "/srv/a".into(),
-            worktree: None,
-        }))
+        let mode_sent = |f: &mut Fixture| match queued(
+            &f.dispatch(Action::CreateSession {
+                conversation: None,
+                workdir: "/srv/a".into(),
+                worktree: None,
+            })[..2],
+        )
         .kind
         {
             CommandKind::CreateSession { mode, .. } => mode,
@@ -10553,10 +10786,12 @@ mod tests {
         f.dispatch(Action::SetDefaultMode(Some(PermissionMode::AcceptEdits)));
         f.dispatch(Action::SetDefaultSafetyCheck(true));
         f.open(old);
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10578,18 +10813,25 @@ mod tests {
             })
             .is_empty()
         );
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: " /srv/new ".into(),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
+        assert_eq!(effects.last(), Some(&Effect::LoadSession(new)));
+        // The new session opens at once: the list is read after leaving it.
+        f.dispatch(Action::Navigate(Route::SessionList));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
             creating(&f),
             vec![PendingSession {
                 command_id: command.id,
+                session_id: new,
                 workdir: "/srv/new".into(),
                 conversation: None,
+                worktree: None,
                 outgoing: Outgoing::Queued,
                 discardable: true,
             }]
@@ -10603,7 +10845,18 @@ mod tests {
         assert!(!creating(&f)[0].discardable, "accepted is final");
         assert!(f.dispatch(Action::Discard(command.id)).is_empty());
 
-        let new = f.session("/srv/new");
+        f.log_commands(
+            new,
+            vec![(
+                Some(command.id),
+                EventKind::SessionCreated {
+                    workdir: "/srv/new".into(),
+                    context_name: "start".into(),
+                    from: None,
+                    worktree: None,
+                },
+            )],
+        );
         let list = f.list_view();
         assert_eq!(list.creating, Vec::new());
         let ids: Vec<SessionId> = list.sessions.iter().map(|s| s.id).collect();
@@ -10612,7 +10865,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_created_like_another_opens_once_it_is_logged() {
+    fn a_session_created_like_another_opens_at_once() {
         let mut f = Fixture::paired();
         let old = f.session("/srv/a");
         let list = f.session("/srv/b");
@@ -10622,10 +10875,13 @@ mod tests {
         f.open(list);
         assert!(f.dispatch(Action::CreateSessionLike(old)).is_empty());
         f.open(old);
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: new,
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10633,13 +10889,19 @@ mod tests {
                 safety_check: false,
             }
         );
-        assert_eq!(f.model.unloaded_session(), None);
+        assert_eq!(effects.last(), Some(&Effect::LoadSession(new)));
+        assert_eq!(f.model.open_session(), Some(new));
+        let creating = f
+            .session_view()
+            .creating
+            .expect("the new session is creating");
+        assert_eq!(creating.outgoing, Outgoing::Queued);
 
         // Another device's session in the same place is not it.
         f.session("/srv/a");
-        assert_eq!(f.model.open_session(), Some(old));
+        assert_eq!(f.model.open_session(), Some(new));
 
-        let new = SessionId::new();
+        // Logged under the id it names: it stays open, no longer creating.
         let created = EventKind::SessionCreated {
             workdir: "/srv/a".into(),
             context_name: "start".into(),
@@ -10648,21 +10910,27 @@ mod tests {
         };
         f.log_commands(new, vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(new));
-        assert_eq!(f.model.unloaded_session(), Some(new));
+        assert_eq!(f.session_view().creating, None);
 
         // Gone elsewhere meanwhile: stays there.
         f.open(old);
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         f.open(list);
-        f.log_commands(SessionId::new(), vec![(Some(command.id), created.clone())]);
+        f.log_commands(
+            created_id(&command),
+            vec![(Some(command.id), created.clone())],
+        );
         assert_eq!(f.model.open_session(), Some(list));
 
         // From a row of the session list: opens it too.
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: "/srv/a".into(),
                 conversation: None,
                 worktree: None,
@@ -10670,33 +10938,40 @@ mod tests {
                 safety_check: false,
             }
         );
-        let new = SessionId::new();
-        f.log_commands(new, vec![(Some(command.id), created.clone())]);
-        assert_eq!(f.model.open_session(), Some(new));
+        assert_eq!(f.model.open_session(), Some(created_id(&command)));
 
         // Left the list meanwhile: stays where it went.
         f.dispatch(Action::Navigate(Route::ArchivedSessions));
-        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        let effects = f.dispatch(Action::CreateSessionLike(old));
+        let command = queued(&effects[..2]);
         f.dispatch(Action::Navigate(Route::Settings));
-        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        f.log_commands(created_id(&command), vec![(Some(command.id), created)]);
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));
     }
 
     #[test]
-    fn a_session_created_from_the_dialog_opens_once_it_is_logged() {
+    fn a_session_created_from_the_dialog_opens_at_once() {
         let mut f = Fixture::paired();
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/new".into(),
             conversation: None,
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
+        assert_eq!(effects.last(), Some(&Effect::LoadSession(new)));
+        assert_eq!(f.model.open_session(), Some(new));
+        let creating = f
+            .session_view()
+            .creating
+            .expect("the new session is creating");
+        assert_eq!(creating.outgoing, Outgoing::Queued);
 
         // Another device's session in the same place is not it.
         f.session("/srv/new");
-        assert_eq!(f.model.open_session(), None);
+        assert_eq!(f.model.open_session(), Some(new));
 
-        let new = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/new".into(),
             context_name: "start".into(),
@@ -10708,13 +10983,14 @@ mod tests {
 
         // Gone elsewhere meanwhile: stays there.
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/new".into(),
             conversation: None,
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
         f.dispatch(Action::Navigate(Route::Settings));
-        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        f.log_commands(created_id(&command), vec![(Some(command.id), created)]);
         assert!(matches!(f.model.view().screen, Screen::Settings(_)));
     }
 
@@ -10724,14 +11000,17 @@ mod tests {
         f.dispatch(Action::SetDefaultMode(Some(PermissionMode::Plan)));
         f.dispatch(Action::SetDefaultSafetyCheck(true));
         f.dispatch(Action::Navigate(Route::SessionList));
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/new".into(),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let new = created_id(&command);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: new,
                 workdir: "/srv/new".into(),
                 conversation: None,
                 worktree: None,
@@ -10739,11 +11018,12 @@ mod tests {
                 safety_check: true,
             }
         );
+        // Open from the moment it is queued, as the server has not logged it.
+        assert_eq!(f.model.open_session(), Some(new));
 
         // As the server logs a create with a mode: the `SessionCreated` and
         // the safety check name no command; the mode request, logged last,
         // names the create.
-        let new = SessionId::new();
         let me = f.me;
         f.log_commands(
             new,
@@ -10769,6 +11049,205 @@ mod tests {
         );
         assert_eq!(f.model.open_session(), Some(new));
         assert_eq!(f.model.unloaded_session(), Some(new));
+    }
+
+    #[test]
+    fn a_creating_session_takes_messages_and_settles_when_logged() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let create = queued(&effects[..2]);
+        let id = created_id(&create);
+        let pending = |f: &Fixture| {
+            f.session_view()
+                .timeline
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::Pending { .. }))
+                .count()
+        };
+
+        // The page takes a message before the server has logged the session.
+        let message = queued(&f.dispatch(Action::SendMessage {
+            session_id: id,
+            text: "hi".into(),
+        }));
+        assert!(matches!(
+            &message.kind,
+            CommandKind::SendMessage { session_id, context, .. }
+                if *session_id == id && *context == ContextId::first_of(id)
+        ));
+        assert_eq!(pending(&f), 1);
+
+        // A rename needs the session in the replica: nothing is queued.
+        assert!(
+            f.dispatch(Action::RenameSession {
+                session_id: id,
+                name: "later".into(),
+            })
+            .is_empty()
+        );
+
+        // Logged: the page is no longer creating, and the message is still
+        // waiting for its turn in the log.
+        f.log_commands(
+            id,
+            vec![(
+                Some(create.id),
+                EventKind::SessionCreated {
+                    workdir: "/srv/new".into(),
+                    context_name: "start".into(),
+                    from: None,
+                    worktree: None,
+                },
+            )],
+        );
+        assert_eq!(f.session_view().creating, None);
+        assert_eq!(pending(&f), 1);
+    }
+
+    #[test]
+    fn dismissing_a_refused_creation_takes_its_messages_and_leaves_its_page() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let create = queued(&effects[..2]);
+        let id = created_id(&create);
+        let message = queued(&f.dispatch(Action::SendMessage {
+            session_id: id,
+            text: "hi".into(),
+        }));
+        f.dispatch(save_draft(id, "half a thought", 5));
+        f.model.command_sending(create.id, Utc::now());
+        f.model.command_result(
+            create.id,
+            CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotFound,
+            },
+            Utc::now(),
+        );
+        assert_eq!(
+            f.dispatch(Action::Discard(create.id)),
+            vec![
+                Effect::Withdraw {
+                    id: create.id,
+                    draft: None,
+                    images: Some((id, Vec::new())),
+                    files: Some((id, Vec::new())),
+                },
+                Effect::Withdraw {
+                    id: message.id,
+                    draft: None,
+                    images: None,
+                    files: None,
+                },
+                Effect::SaveDraft((id, ComposerMode::Agent), None),
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        assert!(f.list_view().creating.is_empty());
+        assert!(f.model.drafts.is_empty(), "the session's draft went too");
+    }
+
+    #[test]
+    fn recreating_a_refused_session_requeues_its_messages_behind_it() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let create = queued(&effects[..2]);
+        let id = created_id(&create);
+        let one = send(&mut f, id, "one");
+        let two = send(&mut f, id, "two");
+        f.model.command_sending(create.id, Utc::now());
+        f.model.command_result(
+            create.id,
+            CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotFound,
+            },
+            Utc::now(),
+        );
+        f.model.command_sending(one.id, Utc::now());
+        f.model.command_result(
+            one.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+
+        let effects = f.dispatch(Action::RecreateSession {
+            session_id: id,
+            workdir: "/srv/fixed".into(),
+            conversation: None,
+            worktree: None,
+        });
+        let withdraw = |command_id: CommandId| Effect::Withdraw {
+            id: command_id,
+            draft: None,
+            images: None,
+            files: None,
+        };
+        // The refused create and its messages go, then the new create and
+        // the messages again, behind it, with one outbox wake-up at the end.
+        assert_eq!(effects.len(), 7);
+        assert_eq!(
+            effects[..3],
+            [withdraw(create.id), withdraw(one.id), withdraw(two.id)]
+        );
+        assert_eq!(effects[6], Effect::Request(Request::OutboxChanged));
+        let requeued: Vec<Command> = effects[3..]
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Enqueue(command, _) => Some(command.clone()),
+                _ => None,
+            })
+            .collect();
+        let [again, one_again, two_again]: [Command; 3] = requeued.try_into().unwrap();
+        assert!(matches!(
+            &again.kind,
+            CommandKind::CreateSession { session_id, workdir, .. }
+                if *session_id == id && workdir == "/srv/fixed"
+        ));
+        assert_ne!(one_again.id, one.id);
+        assert_eq!(one_again.kind, one.kind);
+        assert_ne!(two_again.id, two.id);
+        assert_eq!(two_again.kind, two.kind);
+        assert_eq!(
+            f.session_view().creating.map(|page| page.outgoing),
+            Some(Outgoing::Queued)
+        );
+    }
+
+    #[test]
+    fn recreate_does_nothing_unless_the_create_was_refused() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let effects = f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        let id = created_id(&queued(&effects[..2]));
+        assert!(
+            f.dispatch(Action::RecreateSession {
+                session_id: id,
+                workdir: "/srv/fixed".into(),
+                conversation: None,
+                worktree: None,
+            })
+            .is_empty()
+        );
     }
 
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {
@@ -10978,7 +11457,13 @@ mod tests {
         }
         let command = send(&mut f, sid, "look");
         let pending_images = |f: &Fixture| match &f.session_view().timeline[..] {
-            [TimelineItem::Pending { images, .. }] => images.clone(),
+            [
+                TimelineItem::Logged {
+                    entry: Entry::Created { .. },
+                    ..
+                },
+                TimelineItem::Pending { images, .. },
+            ] => images.clone(),
             other => panic!("expected one pending message, got {other:?}"),
         };
         assert_eq!(pending_images(&f), vec![a.clone(), b.clone()]);
@@ -11783,58 +12268,71 @@ mod tests {
     #[test]
     fn a_created_session_sends_its_trimmed_conversation_unchecked() {
         let mut f = Fixture::paired();
+        // The id is minted per create, so each expected kind takes the one sent.
         let create = |f: &mut Fixture, conversation: Option<&str>| {
-            queued(&f.dispatch(Action::CreateSession {
+            let effects = f.dispatch(Action::CreateSession {
                 workdir: "/srv/a".into(),
                 conversation: conversation.map(str::to_owned),
                 worktree: None,
-            }))
-            .kind
+            });
+            let command = queued(&effects[..2]);
+            (created_id(&command), command.kind)
         };
-        let kind = |conversation: Option<&str>| CommandKind::CreateSession {
+        let kind = |session_id, conversation: Option<&str>| CommandKind::CreateSession {
+            session_id,
             workdir: "/srv/a".into(),
             conversation: conversation.map(str::to_owned),
             worktree: None,
             mode: None,
             safety_check: false,
         };
-        assert_eq!(create(&mut f, Some(" id ")), kind(Some("id")));
-        assert_eq!(create(&mut f, Some("  ")), kind(None));
-        assert_eq!(create(&mut f, None), kind(None));
+        let (id, sent) = create(&mut f, Some(" id "));
+        assert_eq!(sent, kind(id, Some("id")));
+        let (id, sent) = create(&mut f, Some("  "));
+        assert_eq!(sent, kind(id, None));
+        let (id, sent) = create(&mut f, None);
+        assert_eq!(sent, kind(id, None));
         // Not an id the agent could have: still sent, the server decides.
-        assert_eq!(create(&mut f, Some("../x y")), kind(Some("../x y")));
+        let (id, sent) = create(&mut f, Some("../x y"));
+        assert_eq!(sent, kind(id, Some("../x y")));
     }
 
     #[test]
     fn creating_a_session_asks_for_a_trimmed_worktree() {
         let mut f = Fixture::paired();
+        // The id is minted per create, so each expected kind takes the one sent.
         let create = |f: &mut Fixture, worktree: Option<&str>| {
-            queued(&f.dispatch(Action::CreateSession {
+            let effects = f.dispatch(Action::CreateSession {
                 workdir: "/srv/app".into(),
                 conversation: None,
                 worktree: worktree.map(str::to_owned),
-            }))
-            .kind
+            });
+            let command = queued(&effects[..2]);
+            (created_id(&command), command.kind)
         };
-        let kind = |worktree: Option<&str>| CommandKind::CreateSession {
+        let kind = |session_id, worktree: Option<&str>| CommandKind::CreateSession {
+            session_id,
             workdir: "/srv/app".into(),
             conversation: None,
             worktree: worktree.map(str::to_owned),
             mode: None,
             safety_check: false,
         };
-        assert_eq!(create(&mut f, Some("  feat/x ")), kind(Some("feat/x")));
-        assert_eq!(create(&mut f, Some("   ")), kind(None));
+        let (id, sent) = create(&mut f, Some("  feat/x "));
+        assert_eq!(sent, kind(id, Some("feat/x")));
+        let (id, sent) = create(&mut f, Some("   "));
+        assert_eq!(sent, kind(id, None));
     }
 
     #[test]
     fn a_refused_conversation_is_a_discardable_failed_creation() {
         let mut f = Fixture::paired();
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("nope".into()),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
         f.model.command_sending(command.id, Utc::now());
         f.model.command_result(
             command.id,
@@ -11843,6 +12341,7 @@ mod tests {
             },
             Utc::now(),
         );
+        f.dispatch(Action::Navigate(Route::SessionList));
         let creating = f.list_view().creating;
         assert_eq!(creating.len(), 1);
         assert_eq!(creating[0].workdir, "/srv/a");
@@ -11854,8 +12353,8 @@ mod tests {
                 Effect::Withdraw {
                     id: command.id,
                     draft: None,
-                    images: None,
-                    files: None,
+                    images: Some((created_id(&command), Vec::new())),
+                    files: Some((created_id(&command), Vec::new())),
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -11889,6 +12388,10 @@ mod tests {
             matches!(shown.get(1), Some(Entry::UserMessage { .. })),
             "{shown:?}"
         );
+        assert!(
+            !shown.iter().any(|e| matches!(e, Entry::Created { .. })),
+            "an adopted session was not created here: {shown:?}"
+        );
         // Positive control: a plain session has no such first item.
         let plain = f.session("/srv/b");
         f.log(plain, vec![message("hi")]);
@@ -11898,6 +12401,36 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Entry::Adopted { .. } | Entry::MovedFrom { .. }))
         );
+    }
+
+    #[test]
+    fn a_fresh_session_starts_with_its_creation() {
+        let mut f = Fixture::paired();
+        let fresh = f.session("/srv/a");
+        f.log(fresh, vec![message("hi")]);
+        f.open(fresh);
+        assert_eq!(
+            entries(&f).first(),
+            Some(&Entry::Created {
+                workdir: "/srv/a".into()
+            })
+        );
+    }
+
+    #[test]
+    fn back_leaves_a_creating_page() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::SessionList));
+        f.dispatch(Action::CreateSession {
+            conversation: None,
+            workdir: "/srv/new".into(),
+            worktree: None,
+        });
+        // The create opened its page; nothing is logged yet, so no summary.
+        assert_eq!(shown(&f.model.view()), "session");
+        assert!(f.model.view().can_go_back);
+        f.dispatch(Action::Back);
+        assert_eq!(shown(&f.model.view()), "active list");
     }
 
     fn adopted_created() -> EventKind {
@@ -12285,18 +12818,23 @@ mod tests {
     #[test]
     fn an_adopting_creation_is_pending_with_its_conversation_until_its_import_is_in() {
         let mut f = Fixture::paired();
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: "/srv/a".into(),
             conversation: Some("conv-1".into()),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
+        let adopted = created_id(&command);
+        f.dispatch(Action::Navigate(Route::SessionList));
         let creating = |f: &Fixture| f.list_view().creating;
         assert_eq!(
             creating(&f),
             vec![PendingSession {
                 command_id: command.id,
+                session_id: adopted,
                 workdir: "/srv/a".into(),
                 conversation: Some("conv-1".into()),
+                worktree: None,
                 outgoing: Outgoing::Queued,
                 discardable: true,
             }]
@@ -12306,7 +12844,6 @@ mod tests {
 
         // A long import: the first pull brings the session and part of its
         // history, the command's `ImportFinished` comes in the next.
-        let adopted = SessionId::new();
         let first = ContextId::first_of(adopted);
         let items: Vec<_> = (0..600)
             .map(|i| {
@@ -12344,9 +12881,7 @@ mod tests {
         ));
         f.log_stamped(adopted, rest);
         assert_eq!(f.events.len() as u64, finished.0);
-        // Its import is in: the creation opens it, as the dialog asked.
-        assert_eq!(f.model.open_session(), Some(adopted));
-        f.dispatch(Action::Navigate(Route::SessionList));
+        // Its import is in: the list shows it, no longer creating.
         let list = f.list_view();
         assert_eq!(list.creating, Vec::new());
         assert!(!list.sessions[0].importing);
@@ -12358,16 +12893,19 @@ mod tests {
     #[test]
     fn discard_refused_creation_hides_row() {
         let mut f = Fixture::paired();
-        let refused = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/etc".into(),
             worktree: None,
-        }));
-        let waiting = queued(&f.dispatch(Action::CreateSession {
+        });
+        let refused = queued(&effects[..2]);
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/new".into(),
             worktree: None,
-        }));
+        });
+        let waiting = queued(&effects[..2]);
+        f.dispatch(Action::Navigate(Route::SessionList));
         f.model.command_sending(refused.id, Utc::now());
         f.model.command_sending(waiting.id, Utc::now());
         f.model.command_result(
@@ -12405,8 +12943,8 @@ mod tests {
                 Effect::Withdraw {
                     id: refused.id,
                     draft: None,
-                    images: None,
-                    files: None,
+                    images: Some((created_id(&refused), Vec::new())),
+                    files: Some((created_id(&refused), Vec::new())),
                 },
                 Effect::Request(Request::OutboxChanged),
             ]
@@ -12625,7 +13163,7 @@ mod tests {
                 shell: None,
             }],
         );
-        assert_eq!(entries(&f).len(), 1, "no entry for an unlinked approval");
+        assert_eq!(entries(&f).len(), 2, "no entry for an unlinked approval");
         assert_eq!(tools(&f)[0].safety_check.as_deref(), Some("read-only: cat"));
     }
 
@@ -12878,7 +13416,7 @@ mod tests {
         assert!(row(&f, sid).last_activity > before.last_activity);
         f.open(sid);
         assert_eq!(
-            entries(&f)[0],
+            entries(&f)[1],
             Entry::AgentVersionUnconfirmed {
                 version: "2.2.0".into(),
                 confirmed: "2.1.310".into(),
@@ -12982,9 +13520,17 @@ mod tests {
             shell: None,
             outcome: ToolOutcome::Running { since: minute(2) },
         };
-        assert_eq!(entries(&f), vec![Entry::Tool(Box::new(waiting.clone()))]);
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
+                Entry::Tool(Box::new(waiting.clone())),
+            ]
+        );
         assert!(matches!(
-            view.timeline[0],
+            view.timeline[1],
             TimelineItem::Logged { seq: Seq(3), .. }
         ));
 
@@ -13034,7 +13580,15 @@ mod tests {
             },
             ..waiting
         };
-        assert_eq!(entries(&f), vec![Entry::Tool(Box::new(done))]);
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
+                Entry::Tool(Box::new(done)),
+            ]
+        );
         assert_eq!(f.session_view().pending_approval, None);
     }
 
@@ -13134,7 +13688,7 @@ mod tests {
             outcomes(&f),
             vec![(a, done("contents", 3)), (b, done("3 matches", 1))]
         );
-        assert_eq!(entries(&f).len(), 2);
+        assert_eq!(entries(&f).len(), 3);
     }
 
     #[test]
@@ -13160,7 +13714,7 @@ mod tests {
         );
         f.open(sid);
         let entries = entries(&f);
-        let [Entry::Tool(view)] = entries.as_slice() else {
+        let [Entry::Created { .. }, Entry::Tool(view)] = entries.as_slice() else {
             panic!("expected one tool item, got {entries:?}");
         };
         assert_eq!(
@@ -13230,6 +13784,9 @@ mod tests {
         assert_eq!(
             entries(&f),
             vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::Tool(Box::new(view.clone())),
                 Entry::AgentErrored {
                     message: "turn lost".into()
@@ -13305,7 +13862,7 @@ mod tests {
         // The control: a running call it does not name stays running.
         assert!(matches!(views[2].outcome, ToolOutcome::Running { .. }));
         assert_eq!(views.len(), 3, "it adds no item");
-        assert_eq!(entries(&f).len(), 3);
+        assert_eq!(entries(&f).len(), 4);
     }
 
     #[test]
@@ -13335,6 +13892,9 @@ mod tests {
         assert_eq!(
             entries(&f),
             vec![
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::ToolCall {
                     name: "agent-tool".into(),
                     summary: "{\"command\":\"ls\"}".into(),
@@ -14354,11 +14914,13 @@ mod tests {
         f.dispatch(Action::Navigate(Route::SessionList));
         assert!(complete(&mut f, "/srv/").is_some());
         // Creating the session ends the completion.
-        queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             conversation: None,
             workdir: "/srv/x".into(),
             worktree: None,
-        }));
+        });
+        queued(&effects[..2]);
+        f.dispatch(Action::Navigate(Route::SessionList));
         assert_eq!(f.list_view().completion, None);
 
         // Leaving the list ends the completion; an answer asked before it
@@ -15571,14 +16133,16 @@ mod tests {
             .conversations_listed(req, conversations(vec![outside(id, workdir, None)], false));
         let pick = picker(&f).items.remove(0);
 
-        let command = queued(&f.dispatch(Action::CreateSession {
+        let effects = f.dispatch(Action::CreateSession {
             workdir: pick.workdir,
             conversation: Some(pick.id),
             worktree: None,
-        }));
+        });
+        let command = queued(&effects[..2]);
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
+                session_id: created_id(&command),
                 workdir: workdir.into(),
                 conversation: Some(id.into()),
                 worktree: None,
@@ -15586,6 +16150,7 @@ mod tests {
                 safety_check: false,
             }
         );
+        f.dispatch(Action::Navigate(Route::SessionList));
         assert_eq!(f.list_view().conversations, None);
     }
 
@@ -16038,6 +16603,7 @@ mod tests {
         assert_eq!(
             texts(&f),
             [
+                "Created { workdir: \"/srv/a\" }",
                 "a1",
                 "started velvet walrus by laptop",
                 "b1",
@@ -16057,7 +16623,7 @@ mod tests {
                     TimelineItem::Change { .. } => panic!("unexpected switch on its way"),
                 })
                 .collect();
-        assert_eq!(stamps, [a, b, b, a, b, a, a]);
+        assert_eq!(stamps, [a, a, b, b, a, b, a, a]);
 
         let view = |f: &mut Fixture, context| {
             f.dispatch(Action::ViewContext {
@@ -16083,10 +16649,14 @@ mod tests {
             (1, 0, 0)
         );
         view(&mut f, Some(a));
-        assert_eq!(texts(&f), ["a1", "a2", "pending a3"], "not B's end");
+        assert_eq!(
+            texts(&f),
+            ["Created { workdir: \"/srv/a\" }", "a1", "a2", "pending a3"],
+            "not B's end"
+        );
         assert_eq!((find(&f, "b1"), find(&f, "a1")), (0, 1));
         view(&mut f, None);
-        assert_eq!(texts(&f).len(), 7);
+        assert_eq!(texts(&f).len(), 8);
         assert_eq!(find(&f, "walrus"), 1, "the whole session's dividers");
 
         // Kept only while the session stays open.
@@ -16303,6 +16873,9 @@ mod tests {
         assert_eq!(
             dividers,
             [
+                Entry::Created {
+                    workdir: "/srv/a".into(),
+                },
                 Entry::ContextStarted {
                     name: fresh_name.clone(),
                     by: me.clone()
@@ -16346,12 +16919,13 @@ mod tests {
         });
         let texts: Vec<Entry> = entries(&f);
         assert!(
-            texts
-                .iter()
-                .all(|e| matches!(e, Entry::UserMessage { .. } | Entry::AgentMessage { .. })),
+            texts.iter().all(|e| matches!(
+                e,
+                Entry::Created { .. } | Entry::UserMessage { .. } | Entry::AgentMessage { .. }
+            )),
             "{texts:?}"
         );
-        assert_eq!(texts.len(), 3, "fix it, done, later");
+        assert_eq!(texts.len(), 4, "created, fix it, done, later");
     }
 
     #[test]
@@ -16625,7 +17199,15 @@ mod tests {
         let n = nested(&mut f);
         let view = f.session_view();
         assert_eq!(view.subagent, None);
-        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+        assert_eq!(
+            shown_items(&f),
+            [
+                "Created { workdir: \"/srv/a\" }",
+                "main says",
+                "outer",
+                "pwd"
+            ]
+        );
 
         f.dispatch(view_subagent(n.sid, Some(n.a)));
         assert_eq!(shown_items(&f), ["inner", "outer says"]);
@@ -16646,7 +17228,15 @@ mod tests {
         // Back to the main view.
         f.dispatch(view_subagent(n.sid, None));
         assert_eq!(f.session_view().subagent, None);
-        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+        assert_eq!(
+            shown_items(&f),
+            [
+                "Created { workdir: \"/srv/a\" }",
+                "main says",
+                "outer",
+                "pwd"
+            ]
+        );
     }
 
     #[test]
@@ -16693,7 +17283,15 @@ mod tests {
         f.dispatch(Action::Navigate(Route::Settings));
         f.open(n.sid);
         assert_eq!(shown(&f), None);
-        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+        assert_eq!(
+            shown_items(&f),
+            [
+                "Created { workdir: \"/srv/a\" }",
+                "main says",
+                "outer",
+                "pwd"
+            ]
+        );
     }
 
     #[test]

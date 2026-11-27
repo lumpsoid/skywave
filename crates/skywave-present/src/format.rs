@@ -360,6 +360,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::BadAnswer => "that answer does not fit the question",
         RejectReason::UnknownModel => "no model named",
         RejectReason::ContextExists => "that context already exists",
+        RejectReason::SessionExists => "a session with this id already exists",
         RejectReason::UnknownContext => "the session has no such context",
         RejectReason::ContextChanged => "the session moved to another context first",
         RejectReason::ContextMoved => "that context was moved to a session of its own",
@@ -840,6 +841,11 @@ pub fn moved_from_line(name: &str, from: &SessionRef) -> String {
 /// [`import_finished_line`].
 pub fn adopted_line(conversation: &str) -> String {
     format!("Continues agent conversation {conversation} from outside Skywave")
+}
+
+/// The row a fresh session starts with: `Session created · /srv/x`.
+pub fn session_created_line(workdir: &str) -> String {
+    format!("Session created · {workdir}")
 }
 
 /// What a head marks a row of imported history with: it happened outside
@@ -1437,8 +1443,10 @@ mod tests {
     fn a_pending_adopting_creation_says_it_imports() {
         let pending = |conversation: Option<&str>, outgoing| PendingSession {
             command_id: CommandId::new(),
+            session_id: SessionId::new(),
             workdir: "/srv/app".into(),
             conversation: conversation.map(Into::into),
+            worktree: None,
             outgoing,
             discardable: false,
         };
@@ -2088,6 +2096,11 @@ mod tests {
     }
 
     #[test]
+    fn a_created_session_names_its_workdir() {
+        assert_eq!(session_created_line("/srv/x"), "Session created · /srv/x");
+    }
+
+    #[test]
     fn context_dividers_rows_and_the_viewing_hint() {
         use skywave_core::{ContextId, DeviceId, SessionId, SessionState};
 
@@ -2176,6 +2189,7 @@ mod tests {
             archived: false,
             workdir: None,
             state: SessionState::Idle,
+            creating: None,
             timeline: Vec::new(),
             contexts,
             context: walrus,

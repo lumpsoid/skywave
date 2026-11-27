@@ -1652,6 +1652,14 @@ pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<Sess
     .transpose()
 }
 
+/// Whether `id` is already a session's, a deleted one's included: a create
+/// naming it is refused (`SessionExists`).
+pub(crate) fn session_id_taken_in(conn: &Connection, id: SessionId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")?
+        .query_row([id.0.to_string()], |r| r.get(0))?)
+}
+
 /// [`session_in`] for an append: a `requested` session still takes the
 /// events its supervisor logs while it erases the session; an `erased` one
 /// takes none (D62).

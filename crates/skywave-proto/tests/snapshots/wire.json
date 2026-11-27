@@ -1,7 +1,7 @@
 {
-  "protocol_version": 44,
+  "protocol_version": 45,
   "hello": {
-    "protocol_version": 44,
+    "protocol_version": 45,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -1821,6 +1821,7 @@
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
         "type": "create_session",
+        "session_id": "01920000-0000-7000-8000-000000000001",
         "workdir": "/srv/code/skywave",
         "conversation": null,
         "safety_check": false
@@ -1830,6 +1831,7 @@
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
         "type": "create_session",
+        "session_id": "01920000-0000-7000-8000-000000000001",
         "workdir": "/srv/code/skywave",
         "conversation": "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8",
         "safety_check": false
@@ -1839,6 +1841,7 @@
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
         "type": "create_session",
+        "session_id": "01920000-0000-7000-8000-000000000001",
         "workdir": "/srv/code/skywave",
         "conversation": null,
         "worktree": "feat/login",
@@ -1849,6 +1852,7 @@
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
         "type": "create_session",
+        "session_id": "01920000-0000-7000-8000-000000000001",
         "workdir": "/srv/code/skywave",
         "conversation": null,
         "mode": "plan",
@@ -2379,6 +2383,10 @@
     {
       "result": "rejected",
       "reason": "context_exists"
+    },
+    {
+      "result": "rejected",
+      "reason": "session_exists"
     },
     {
       "result": "rejected",
